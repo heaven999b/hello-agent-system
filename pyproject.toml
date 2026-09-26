@@ -1,0 +1,26 @@
+[project]
+name = "agentkit"
+version = "0.1.0"
+description = "企业级 Agent 系统设计训练营：从零手写一个生产级 Agent 框架"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "openai>=1.40",
+    "pydantic>=2.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["agentkit"]
+
+[tool.pytest.ini_options]
+# importlib 模式：允许多个课程目录里都有同名的 test_exercise.py
+addopts = "--import-mode=importlib -q"
+testpaths = ["tests", "lessons", "capstone"]

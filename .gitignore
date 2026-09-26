@@ -1,0 +1,12 @@
+# 密钥绝不入库
+.env
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+# 运行时产物
+runs/
+traces/
+*.jsonl.tmp
+.DS_Store
