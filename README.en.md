@@ -14,7 +14,7 @@ No agent framework. You build every layer of an enterprise agent yourself: tools
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-orange)](CONTRIBUTING.en.md)
 [![Built with Claude Opus 5.5](https://img.shields.io/badge/built%20with-Claude%20Opus%205.5-D97757)](#-acknowledgements)
 
-Created by **heaven999b** · architecture co-designed with **Claude Opus 5.5**
+This project's architecture was co-designed with **Claude Opus 5.5**
 
 [中文](README.md) · **English**
 

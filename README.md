@@ -14,7 +14,7 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-orange)](CONTRIBUTING.md)
 [![Built with Claude Opus 5.5](https://img.shields.io/badge/built%20with-Claude%20Opus%205.5-D97757)](#-致谢)
 
-由 **heaven999b** 发起 · **Claude Opus 5.5** 协助架构设计
+本项目由 **Claude Opus 5.5** 协助架构设计
 
 **中文** · [English](README.en.md)
 
