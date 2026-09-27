@@ -197,7 +197,7 @@ def progress_bar(ratio: float, cols: int, s: Style) -> str:
 def render(lessons: list[Lesson], root: Path, s: Style) -> str:
     name_cols, count_cols = 30, 9
     rule = s("─" * (4 + name_cols + count_cols + 14), "gray")
-    lines = ["", "  " + s("企业级 Agent 训练营 · 学习进度", "bold", "cyan"), rule]
+    lines = ["", "  " + s("Hello Agent System · 学习进度", "bold", "cyan"), rule]
     lines.append("  " + s(fit("课程", name_cols + 4) + "通过/总数".rjust(count_cols - 4) + "   状态", "bold"))
     lines.append(rule)
     for les in lessons:

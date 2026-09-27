@@ -70,7 +70,7 @@ def create_app(agent: Agent | None = None, backend: Backend | None = None, runs_
     locks: dict[str, threading.Lock] = {}
     locks_guard = threading.Lock()
 
-    app = FastAPI(title="ITBuddy API", description="企业 IT 服务台 Agent（enterprise-agent-bootcamp 毕业项目）")
+    app = FastAPI(title="ITBuddy API", description="企业 IT 服务台 Agent（hello-agent-system 毕业项目）")
 
     # ------------------------------------------------------------------ 辅助
 

@@ -1,13 +1,13 @@
 <div align="center">
 
-# 🏭 Enterprise Agent Bootcamp
+# 👋 Hello Agent System
 
 ### Design production-grade AI agent systems, from first principles
 
 **From "I can call an LLM API" to "I can design production-grade agent systems": 17 lessons · bilingual (English / 中文) · every lesson has a tested exercise.**
 No agent framework. You build every layer of an enterprise agent yourself: tools, context, architectures, orchestration, reliability, security, observability, evals, concurrency, cost, and release engineering.
 
-[![CI](https://github.com/heaven999b/enterprise-agent-bootcamp/actions/workflows/ci.yml/badge.svg)](https://github.com/heaven999b/enterprise-agent-bootcamp/actions/workflows/ci.yml)
+[![CI](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml/badge.svg)](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Tests](https://img.shields.io/badge/tests-offline%20%26%20deterministic-brightgreen)
@@ -109,8 +109,8 @@ agent.run  6231ms  tokens=973→106  status=completed steps=2 cost=$0.00228
 ## 🚀 Quick start
 
 ```bash
-git clone https://github.com/heaven999b/enterprise-agent-bootcamp.git
-cd enterprise-agent-bootcamp
+git clone https://github.com/heaven999b/hello-agent-system.git
+cd hello-agent-system
 make setup          # creates .venv; the only dependencies are openai and pydantic
 ```
 
@@ -190,7 +190,7 @@ Check your progress:
 ## 🧱 Repository layout
 
 ```text
-enterprise-agent-bootcamp/
+hello-agent-system/
 ├── agentkit/            # the teaching framework: ~2,500 lines of core code; one module per lesson; comments explain every "why"
 │   ├── agent.py         #   the loop + hooks + checkpoints + tracing
 │   ├── tools.py         #   tools: schema generation, validation, timeouts, idempotency, identity injection
@@ -254,4 +254,4 @@ If this project helps you, a ⭐ helps others find it.
 
 [MIT](LICENSE)
 
-[![Star History Chart](https://api.star-history.com/svg?repos=heaven999b/enterprise-agent-bootcamp&type=Date)](https://star-history.com/#heaven999b/enterprise-agent-bootcamp&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=heaven999b/hello-agent-system&type=Date)](https://star-history.com/#heaven999b/hello-agent-system&Date)

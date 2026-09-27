@@ -36,8 +36,8 @@
 需要 Python 3.10+ 和 `make`（Windows 建议使用 WSL）。
 
 ```bash
-git clone https://github.com/<你的用户名>/enterprise-agent-bootcamp.git
-cd enterprise-agent-bootcamp
+git clone https://github.com/<你的用户名>/hello-agent-system.git
+cd hello-agent-system
 make setup        # 创建 .venv，安装 agentkit（可编辑模式）和 pytest
 ```
 

@@ -1,13 +1,13 @@
 <div align="center">
 
-# 🏭 Enterprise Agent Bootcamp
+# 👋 Hello Agent System
 
 ### 企业级 Agent 系统设计训练营
 
 **从"会调 LLM API"到"能设计生产级 Agent 系统"：17 节课 · 中英双语 · 每课都有带测试的练习。**
 不依赖任何 Agent 框架，从零手写企业级 Agent 的每一层：工具、上下文、架构、编排、可靠性、安全、可观测、评估、并发、成本、发布。
 
-[![CI](https://github.com/heaven999b/enterprise-agent-bootcamp/actions/workflows/ci.yml/badge.svg)](https://github.com/heaven999b/enterprise-agent-bootcamp/actions/workflows/ci.yml)
+[![CI](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml/badge.svg)](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Tests](https://img.shields.io/badge/tests-offline%20%26%20deterministic-brightgreen)
@@ -109,8 +109,8 @@ agent.run  6231ms  tokens=973→106  status=completed steps=2 cost=$0.00228
 ## 🚀 快速开始
 
 ```bash
-git clone https://github.com/heaven999b/enterprise-agent-bootcamp.git
-cd enterprise-agent-bootcamp
+git clone https://github.com/heaven999b/hello-agent-system.git
+cd hello-agent-system
 make setup          # 创建 .venv 并安装（依赖只有 openai + pydantic）
 ```
 
@@ -190,7 +190,7 @@ make check-env                                  # 检查模型连通性与工具
 ## 🧱 项目结构
 
 ```text
-enterprise-agent-bootcamp/
+hello-agent-system/
 ├── agentkit/            # 教学框架：核心约 2500 行，每个模块对应一节课，注释解释每个"为什么"
 │   ├── agent.py         #   主循环 + 钩子 + 检查点 + 追踪
 │   ├── tools.py         #   工具：Schema 生成、校验、超时、幂等、身份注入
@@ -254,4 +254,4 @@ enterprise-agent-bootcamp/
 
 [MIT](LICENSE)
 
-[![Star History Chart](https://api.star-history.com/svg?repos=heaven999b/enterprise-agent-bootcamp&type=Date)](https://star-history.com/#heaven999b/enterprise-agent-bootcamp&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=heaven999b/hello-agent-system&type=Date)](https://star-history.com/#heaven999b/hello-agent-system&Date)

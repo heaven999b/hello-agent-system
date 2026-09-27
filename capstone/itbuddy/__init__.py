@@ -1,4 +1,4 @@
-"""ITBuddy —— 企业 IT 服务台 Agent（enterprise-agent-bootcamp 毕业项目）。
+"""ITBuddy —— 企业 IT 服务台 Agent（hello-agent-system 毕业项目）。
 
     backend.py   模拟的企业后端（多租户员工目录 / 工单 / 知识库 / 账号 / 系统状态）
     tools.py     6 个工具，按 read / write / dangerous 分级

@@ -36,8 +36,8 @@ Every contribution is measured against that goal. Changes that make the course m
 You need Python 3.10+ and `make` (on Windows, WSL is recommended).
 
 ```bash
-git clone https://github.com/<your-username>/enterprise-agent-bootcamp.git
-cd enterprise-agent-bootcamp
+git clone https://github.com/<your-username>/hello-agent-system.git
+cd hello-agent-system
 make setup        # creates .venv and installs agentkit (in editable mode) and pytest
 ```
 

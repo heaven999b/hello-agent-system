@@ -132,7 +132,7 @@ def main(argv: list[str] | None = None, *, llm=None, ask: Callable[[str], str] =
             say(line)
             return line
 
-    say("ITBuddy —— 企业 IT 服务台 Agent（enterprise-agent-bootcamp 毕业项目）")
+    say("ITBuddy —— 企业 IT 服务台 Agent（hello-agent-system 毕业项目）")
     say(f"审计日志：{audit.path if audit else '-'}")
 
     try:

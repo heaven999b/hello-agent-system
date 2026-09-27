@@ -1,7 +1,7 @@
 [project]
 name = "agentkit"
 version = "0.1.0"
-description = "企业级 Agent 系统设计训练营：从零手写一个生产级 Agent 框架"
+description = "Hello Agent System：企业级 Agent 系统设计训练营，从零手写一个生产级 Agent 框架"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
