@@ -1,10 +1,10 @@
 [中文](README.md) | [English](README.en.md)
 
-# Lesson 10: Observability — Seeing What Your Agent Is Thinking
+# Lesson 10: Observability — seeing what your agent is thinking
 
 > 🕐 Time: 15 min | 🎯 You'll be able to: add tracing to an agent, use metrics to spot problems and traces to find root causes, and make sound trade-offs on sampling, privacy, tooling, and alerting | 📦 Source: `agentkit/tracing.py`, `agentkit/agent.py`, `agentkit/viewer.py`
 
-## 0. The short version
+## 0. In one sentence
 
 **Why do airplanes carry a black box?** Because when something goes wrong, nobody can reliably reconstruct what just happened. Agents are no different. Users only say "it gave the wrong answer," and the agent itself won't remember which tool it called, what came back, or why it answered the way it did.
 

@@ -85,6 +85,26 @@ def check(root: Path) -> list[str]:
                     continue
                 if anchor and dest.suffix == ".md" and anchor not in anchors_of(dest):
                     problems.append(f"{where}  missing anchor: {target}")
+    problems += check_language_switchers(root)
+    return problems
+
+
+def check_language_switchers(root: Path) -> list[str]:
+    """双语文档对：X.md 必须链接到 X.en.md（English），X.en.md 必须链接回 X.md（中文）。"""
+    problems = []
+    for en in sorted(root.rglob("*.en.md")):
+        if any(part in SKIP_DIRS for part in en.relative_to(root).parts):
+            continue
+        zh = en.with_name(en.name[: -len(".en.md")] + ".md")
+        if not zh.exists():
+            problems.append(f"{en.relative_to(root)}  has no Chinese counterpart {zh.name}")
+            continue
+        head_en = "\n".join(en.read_text(encoding="utf-8").splitlines()[:20])
+        head_zh = "\n".join(zh.read_text(encoding="utf-8").splitlines()[:20])
+        if f"[中文]({zh.name})" not in head_en:
+            problems.append(f"{en.relative_to(root)}  language switcher must link [中文]({zh.name})")
+        if f"[English]({en.name})" not in head_zh:
+            problems.append(f"{zh.relative_to(root)}  language switcher must link [English]({en.name})")
     return problems
 
 

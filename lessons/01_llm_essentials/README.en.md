@@ -1,12 +1,12 @@
 [中文](README.md) | [English](README.en.md)
 
-# Lesson 01: LLM Essentials for Agent Developers
+# Lesson 01: LLM essentials for agent developers
 
 > 🕐 Suggested time: 20 minutes ｜ 🎯 After this lesson you can: explain what tokens, messages, sampling, tool calling, structured output, streaming, vector search and reasoning models **mean for an agent**, and avoid the dozen or so traps that catch most newcomers ｜ 📦 Source: [`agentkit/llm.py`](../../agentkit/llm.py), [`agentkit/types.py`](../../agentkit/types.py), [`agentkit/context.py`](../../agentkit/context.py) (`estimate_tokens`), [`agentkit/pricing.py`](../../agentkit/pricing.py), [`agentkit/workflows.py`](../../agentkit/workflows.py) (`complete_json`)
 
 > Code comments and demo output are in Chinese. Demo excerpts below are translated; the numbers, identifiers and JSON are exactly as printed.
 
-## 0. The one-sentence version
+## 0. In one sentence
 
 **From an agent developer's point of view, an LLM is a stateless, pay-per-token, non-deterministic function: you give it a list of messages plus a manual for your tools, and it gives you back some text, or a note that says "please call this tool for me".**
 
@@ -37,7 +37,7 @@ flowchart LR
     C -.->|"next request"| REQ
 ```
 
-The next lesson ([Lesson 02: The Agent Loop](../02_agent_loop/README.md)) turns this diagram into a `while` loop. This lesson makes sure you know how each part of that loop behaves.
+The next lesson ([Lesson 02: The Agent Loop](../02_agent_loop/README.en.md)) turns this diagram into a `while` loop. This lesson makes sure you know how each part of that loop behaves.
 
 **The 12 topics at a glance** (short on time? Read this table, then jump to whatever you need):
 
@@ -84,9 +84,9 @@ Four things jump out of this table:
 
 | Dimension | What's counted in tokens | What it means for an agent |
 |---|---|---|
-| Cost | input price × input tokens + output price × output tokens | Every step re-sends the full history, so cost grows roughly **quadratically** with steps ([Lesson 02, §1.4](../02_agent_loop/README.md)) |
+| Cost | input price × input tokens + output price × output tokens | Every step re-sends the full history, so cost grows roughly **quadratically** with steps ([Lesson 02, §1.4](../02_agent_loop/README.en.md)) |
 | Rate limits | Providers usually cap both requests per minute (RPM) and tokens per minute (TPM) | Long-context agents tend to hit TPM long before RPM |
-| Context | There's a hard cap on input + output per request | History keeps growing until one day the request fails with a 400 ([Lesson 04](../04_context_memory/README.md)) |
+| Context | There's a hard cap on input + output per request | History keeps growing until one day the request fails with a 400 ([Lesson 04](../04_context_memory/README.en.md)) |
 
 **Context window ≠ maximum output length.** These are two different limits:
 
@@ -100,7 +100,7 @@ So a "128K window" doesn't mean you can generate 128K tokens, and it doesn't mea
 $$\text{request cost} = (\text{input} - \text{cached}) \times P_{\text{input}} + \text{cached} \times P_{\text{cached}} + \text{output} \times P_{\text{output}}$$
 
 - **Output usually costs several times more than input**: output tokens are generated one at a time, while input can be processed in parallel.
-- **Cached input is discounted**: when the beginning of a request (its prefix) exactly matches a recent request, the provider can reuse work it already did, bill those tokens at a lower rate, and respond sooner. OpenAI's docs cite discounts [of up to 90%](https://developers.openai.com/api/docs/guides/prompt-caching). Caching usually has a minimum prefix length, changing a single character in the prefix breaks it, and some providers charge extra to *write* the cache. How to design for cache hits is covered in [Lesson 04](../04_context_memory/README.md) and [Lesson 14](../14_cost_latency/README.md).
+- **Cached input is discounted**: when the beginning of a request (its prefix) exactly matches a recent request, the provider can reuse work it already did, bill those tokens at a lower rate, and respond sooner. OpenAI's docs cite discounts [of up to 90%](https://developers.openai.com/api/docs/guides/prompt-caching). Caching usually has a minimum prefix length, changing a single character in the prefix breaks it, and some providers charge extra to *write* the cache. How to design for cache hits is covered in [Lesson 04](../04_context_memory/README.en.md) and [Lesson 14](../14_cost_latency/README.en.md).
 - The `usage` object in the API response reports input, output and cached tokens separately. agentkit's [`Usage`](../../agentkit/types.py) has matching `input_tokens` / `output_tokens` / `cached_input_tokens` fields, and [`estimate_cost`](../../agentkit/pricing.py) applies exactly this formula.
 
 **How to estimate.** Three levels of precision, each with its own job:
@@ -116,16 +116,16 @@ $$\text{request cost} = (\text{input} - \text{cached}) \times P_{\text{input}} +
 - Estimating the cost of Chinese text by character count, or reusing stale rules like "one Chinese character is two tokens";
 - Leaving out the system prompt, tool definitions or full history when estimating cost (that's exactly what exercise (b) is about);
 - Reconciling a bill against estimates. Money is always counted from `usage`;
-- Assuming `max_tokens` is always honored. In our tests this course's gateway **silently ignored** it: with `max_tokens=8` the model still produced 188 tokens. Compatibility layers don't necessarily implement every parameter, so enforce the limits that matter in your own code too (for example the `BudgetHook` in [Lesson 08](../08_reliability/README.md)).
+- Assuming `max_tokens` is always honored. In our tests this course's gateway **silently ignored** it: with `max_tokens=8` the model still produced 188 tokens. Compatibility layers don't necessarily implement every parameter, so enforce the limits that matter in your own code too (for example the `BudgetHook` in [Lesson 08](../08_reliability/README.en.md)).
 
 ### 1.2 Messages and roles: the model is stateless
 
-**What it is.** The input to a request is a list of messages, each with a role. The protocol details (how `tool_calls` pair up with `tool_call_id`) are covered in [Lesson 02](../02_agent_loop/README.md). Here we focus on an angle newcomers often miss: **each role deserves a different level of trust.**
+**What it is.** The input to a request is a list of messages, each with a role. The protocol details (how `tool_calls` pair up with `tool_call_id`) are covered in [Lesson 02](../02_agent_loop/README.en.md). Here we focus on an angle newcomers often miss: **each role deserves a different level of trust.**
 
 | role | Written by | Trust | How to treat it |
 |---|---|---|---|
 | `system` | You, the developer | Highest | Rules, identity, boundaries. Naming varies: newer OpenAI APIs also have a `developer` role that plays a similar part, and Anthropic takes the system prompt as a separate top-level parameter |
-| `user` | The end user | Untrusted | Users may try to rewrite your rules (direct prompt injection, [Lesson 09](../09_security/README.md)) |
+| `user` | The end user | Untrusted | Users may try to rewrite your rules (direct prompt injection, [Lesson 09](../09_security/README.en.md)) |
 | `assistant` | The model | Untrusted until validated | Model output can be wrong, invented, or steered by injected content |
 | `tool` | Your code, with content from outside systems | Untrusted | Web pages, emails and documents can carry hidden instructions (indirect injection, Lesson 09) |
 
@@ -147,8 +147,8 @@ sequenceDiagram
 What this means for an agent:
 
 1. **Cost**: every call pays for the entire history. Some providers offer server-side conversation state, such as `previous_response_id` in OpenAI's Responses API, so you don't have to re-send the history yourself. But the official docs state that all previous input tokens in the chain [are still billed as input tokens](https://developers.openai.com/api/docs/guides/conversation-state). It saves bandwidth and code, not money.
-2. **Control**: the history is yours to trim, summarize and rewrite. That's a power (context engineering, [Lesson 04](../04_context_memory/README.md)) and a responsibility: split a `tool_calls` message from its tool results while trimming and the API rejects the request with a 400.
-3. **State must be persisted**: history that lives only in process memory disappears on restart, and in a multi-instance deployment the next request may land on a different machine ([Lesson 13](../13_distributed_concurrency/README.md)).
+2. **Control**: the history is yours to trim, summarize and rewrite. That's a power (context engineering, [Lesson 04](../04_context_memory/README.en.md)) and a responsibility: split a `tool_calls` message from its tool results while trimming and the API rejects the request with a 400.
+3. **State must be persisted**: history that lives only in process memory disappears on restart, and in a multi-instance deployment the next request may land on a different machine ([Lesson 13](../13_distributed_concurrency/README.en.md)).
 4. **Rules must be sent every time**: the system prompt has to be at the front of **every** request. "I told it in the first turn" doesn't count.
 
 The `build_messages` function in exercise (c) is what every agent does before each call: system prompt first, history trimmed by *turns*, the new user input last.
@@ -191,9 +191,9 @@ temperature=1 × 3: ['楼下咖啡', '楼下有啡', '楼下咖啡']    → 2 di
 **What it means for an agent.** Agents *amplify* non-determinism: pick a different tool at step one and the whole trajectory diverges. So:
 
 - **Unit tests** shouldn't call a real model. Use a scripted one (agentkit's `ScriptedLLM`), which is 100% reproducible;
-- **Evaluations** should run each case several times and look at pass rates, not a single pass/fail ([Lesson 11](../11_evals/README.md) covers pass@k and pass^k);
+- **Evaluations** should run each case several times and look at pass rates, not a single pass/fail ([Lesson 11](../11_evals/README.en.md) covers pass@k and pass^k);
 - **In production**, use a low temperature for tool calling and extraction and a higher one for creative work. OpenAI's API reference recommends adjusting temperature **or** top_p, not both;
-- **Observability**: production issues often can't be reproduced, so log the full input and output of every call ([Lesson 10](../10_observability/README.md)).
+- **Observability**: production issues often can't be reproduced, so log the full input and output of every call ([Lesson 10](../10_observability/README.en.md)).
 
 **Common traps:** asserting the exact string a model returns; treating `seed` as a reproducibility guarantee; calling a feature "done" because it worked once.
 
@@ -228,7 +228,7 @@ sequenceDiagram
     M-->>C: final answer, or more tool_calls
 ```
 
-**Why this matters so much.** All of the control is yours, and so is all of the responsibility: argument validation ([Lesson 03](../03_tools/README.md)), permissions and approvals ([Lesson 09](../09_security/README.md)), timeouts and retries ([Lesson 08](../08_reliability/README.md)) all live between "the model proposed it" and "it actually ran".
+**Why this matters so much.** All of the control is yours, and so is all of the responsibility: argument validation ([Lesson 03](../03_tools/README.en.md)), permissions and approvals ([Lesson 09](../09_security/README.en.md)), timeouts and retries ([Lesson 08](../08_reliability/README.en.md)) all live between "the model proposed it" and "it actually ran".
 
 **`tool_choice`: whether the model must call a tool, and which one.**
 
@@ -241,7 +241,7 @@ sequenceDiagram
 
 Note that **not every model supports forcing a call**. Anthropic's docs, for example, list models that [return a 400](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools) for `any` or `tool`. Check the official docs and test against your own gateway.
 
-**Parallel tool calls.** One reply can contain several `tool_calls` (in the demo, "create a ticket and check the weather" comes back as two). OpenAI offers `parallel_tool_calls=false` to turn this off. But in our tests the course gateway **ignored that parameter** and returned two calls anyway. Whatever your settings, your code has to handle multiple calls ([Lesson 02, §1.6](../02_agent_loop/README.md)).
+**Parallel tool calls.** One reply can contain several `tool_calls` (in the demo, "create a ticket and check the weather" comes back as two). OpenAI offers `parallel_tool_calls=false` to turn this off. But in our tests the course gateway **ignored that parameter** and returned two calls anyway. Whatever your settings, your code has to handle multiple calls ([Lesson 02, §1.6](../02_agent_loop/README.en.md)).
 
 **Why the arguments JSON can be invalid.** `arguments` is **text the model generated token by token**, not an object that was serialized. Typical failures:
 
@@ -278,7 +278,7 @@ Attempt 2: {"category": "account", "priority": "P1", "summary": "OA 登录提示
            ✅ passed validation
 ```
 
-(Attempt 1 used Chinese words for "account" and "urgent" instead of the allowed enum values.) The design of this repair loop is covered in [Lesson 06, §1.3](../06_orchestration/README.md). A practical trick: define the structure you want as a tool's parameters and force that tool with `tool_choice`. On models without `response_format`, this is the standard way to get structured output.
+(Attempt 1 used Chinese words for "account" and "urgent" instead of the allowed enum values.) The design of this repair loop is covered in [Lesson 06, §1.3](../06_orchestration/README.en.md). A practical trick: define the structure you want as a tool's parameters and force that tool with `tool_choice`. On models without `response_format`, this is the standard way to get structured output.
 
 **Common traps:** assuming JSON mode guarantees fields; regex-scraping fields out of free text; a repair loop without a retry limit; asking for JSON *and* "explain your reasoning" (put the reasoning in a schema field).
 
@@ -317,8 +317,8 @@ Other APIs use different names for the same idea: OpenAI's Responses API sends `
 **Other streaming traps:**
 
 - **Usage comes last.** With OpenAI-compatible APIs you set `stream_options={"include_usage": true}` to get usage in the final chunk. Some gateways don't support it, and then you need another way to account for streamed requests;
-- **Streams can break halfway.** A dropped connection leaves you with half an answer or half an argument. Decide what a retry means first: regenerate, or give up ([Lesson 08](../08_reliability/README.md));
-- **Output guardrails need rework.** Once text is on the user's screen you can't redact it. Check while generating, or buffer a little before releasing ([Lesson 09](../09_security/README.md));
+- **Streams can break halfway.** A dropped connection leaves you with half an answer or half an argument. Decide what a retry means first: regenerate, or give up ([Lesson 08](../08_reliability/README.en.md));
+- **Output guardrails need rework.** Once text is on the user's screen you can't redact it. Check while generating, or buffer a little before releasing ([Lesson 09](../09_security/README.en.md));
 - **Don't execute tools before the stream ends.** Arguments are only complete once `finish_reason` arrives.
 
 ### 1.7 Embeddings and vector search basics (📖 optional)
@@ -335,13 +335,13 @@ A three-dimensional illustration (real embeddings have hundreds to thousands of 
 
 Look at the first row: the two sentences share almost no words, yet they're judged nearly identical. Keyword search can't do that; this is *semantic* search.
 
-**Why RAG and memory depend on it.** Context windows are limited and an enterprise knowledge base has hundreds of thousands of documents, so you can't paste them all in. Instead you split documents into chunks, embed them and store them in a vector database ahead of time; at question time you embed the question, retrieve the most similar chunks, put them in context and let the model answer. That's RAG (retrieval-augmented generation). An agent's long-term memory is essentially the same thing ([Lesson 04](../04_context_memory/README.md)).
+**Why RAG and memory depend on it.** Context windows are limited and an enterprise knowledge base has hundreds of thousands of documents, so you can't paste them all in. Instead you split documents into chunks, embed them and store them in a vector database ahead of time; at question time you embed the question, retrieve the most similar chunks, put them in context and let the model answer. That's RAG (retrieval-augmented generation). An agent's long-term memory is essentially the same thing ([Lesson 04](../04_context_memory/README.en.md)).
 
 **Limitations (each of these has caused real incidents):**
 
 - **Similar ≠ relevant ≠ correct.** In the illustration above, "how do I turn off the VPN" and "how do I turn on the VPN" have a similarity of 0.999 despite meaning the opposite. Retrieved content only *looks* related; whether it actually answers the question, or is out of date, needs a separate check;
 - **Weak at exact matches**: error code `809`, ticket numbers, product model numbers are better served by keyword search (e.g. BM25). In practice people combine the two (**hybrid search**);
-- **No notion of permissions**: a vector database only knows "how similar", not "may you see this". Permission filtering must be enforced in the retrieval layer ([Lesson 15](../15_enterprise_rag/README.md));
+- **No notion of permissions**: a vector database only knows "how similar", not "may you see this". Permission filtering must be enforced in the retrieval layer ([Lesson 15](../15_enterprise_rag/README.en.md));
 - **Changing the model means re-indexing**: vectors from different embedding models can't be mixed;
 - **Not every gateway offers embeddings**: calling `/embeddings` on this course's gateway returns 404. Check before you commit.
 
@@ -368,7 +368,7 @@ The user sees four lines of poetry; you pay for 188 output tokens. More thinking
 | Many tools with real trade-offs between them | Latency-sensitive interactive steps |
 | Reviewing and grading (LLM as judge) | Checks that run on every single request |
 
-A common agent setup: a reasoning model plans and handles the hard parts, a fast model executes the simple steps ([Lesson 05](../05_agent_architectures/README.md), [Lesson 14](../14_cost_latency/README.md)).
+A common agent setup: a reasoning model plans and handles the hard parts, a fast model executes the simple steps ([Lesson 05](../05_agent_architectures/README.en.md), [Lesson 14](../14_cost_latency/README.en.md)).
 
 **Common traps:**
 
@@ -395,7 +395,7 @@ We asked this course's model three questions directly:
 - **Tell it what "now" is**: the current date, time zone, user identity and department should be written into the context by your code;
 - **The most dangerous hallucination is "I did it"**: the model says "Your password has been reset", but `reset_password` was never called this turn. Decide what happened from the tool execution log (agentkit's `RunResult.tools_called()`), not from the model's words;
 - **Let it say "I don't know"**: state in the prompt that it should say so when information is missing, and require sources;
-- **Measure hallucination rates with evals** ([Lesson 11](../11_evals/README.md)).
+- **Measure hallucination rates with evals** ([Lesson 11](../11_evals/README.en.md)).
 
 ### 1.10 Prompt engineering for agents: manage the system prompt like code
 
@@ -446,13 +446,13 @@ Anthropic's [Effective context engineering for AI agents](https://www.anthropic.
 **Manage the system prompt like code:**
 
 - **Version control and code review**: keep prompts in the repository, review every change, and ideally be able to say which failure each rule was added to fix;
-- **Run evals before changing it**: one edited sentence can fix one case and break three others ([Lesson 11](../11_evals/README.md));
+- **Run evals before changing it**: one edited sentence can fix one case and break three others ([Lesson 11](../11_evals/README.en.md));
 - **Templates**: variables such as the date or the user's role are filled in by code, and **placed at the end**. Keeping the start of the system prompt stable is what lets prefix caching work;
-- **Staged rollout and rollback**: prompt changes need canaries and rollback just like code ([Lesson 16](../16_release_ops/README.md));
+- **Staged rollout and rollback**: prompt changes need canaries and rollback just like code ([Lesson 16](../16_release_ops/README.en.md));
 - **No secrets in prompts**, and assume users can extract the prompt;
-- **A prompt is not a security boundary**: writing "you may not delete data" in the prompt is not access control. Permissions have to be enforced in code ([Lesson 09](../09_security/README.md)).
+- **A prompt is not a security boundary**: writing "you may not delete data" in the prompt is not access control. Permissions have to be enforced in code ([Lesson 09](../09_security/README.en.md)).
 
-Instructions specific to one tool belong in that tool's description, not in the system prompt ([Lesson 03](../03_tools/README.md)): when the permission system hides the tool, its instructions disappear with it and can't mislead the model.
+Instructions specific to one tool belong in that tool's description, not in the system prompt ([Lesson 03](../03_tools/README.en.md)): when the permission system hides the tool, its instructions disappear with it and can't mislead the model.
 
 ### 1.11 Choosing a model (📖 optional)
 
@@ -460,13 +460,13 @@ Instructions specific to one tool belong in that tool's description, not in the 
 |---|---|---|
 | Capability | How well does it do on **my** tasks? | Run your own eval set; don't rely on public leaderboards |
 | Tool-calling reliability | How often does it pick the right tool? Produce valid arguments? Does it support parallel calls, strict mode, forced calls? | Track these as separate metrics in your evals |
-| Context length | How big is the advertised window? How big is the **effective** one? | Quality drops with long contexts ([Lesson 04](../04_context_memory/README.md)); test at your real data sizes |
+| Context length | How big is the advertised window? How big is the **effective** one? | Quality drops with long contexts ([Lesson 04](../04_context_memory/README.en.md)); test at your real data sizes |
 | Latency | TTFT, output tokens per second, p99 | Load-test with real requests and look at the distribution, not the mean |
 | Price | Input, output, cached and batch prices? | Compute the total cost of **finishing a task**, not the unit price. A cheaper model that takes extra steps can cost more |
 | Data compliance | Where is data stored? Is it used for training? How long is it kept? | Read the contract and data policy. OpenAI, for example, documents that API data is [not used for training by default](https://developers.openai.com/api/docs/guides/your-data), that abuse-monitoring logs are kept for up to 30 days by default, and that zero data retention and data residency are available (with conditions). Terms differ between providers, and between consumer products and APIs |
-| Availability | What's the SLA? Are the limits (RPM / TPM) enough? Is there a fallback? | Check the status history; prepare a fallback for your primary model ([Lesson 08](../08_reliability/README.md)) |
+| Availability | What's the SLA? Are the limits (RPM / TPM) enough? Is there a fallback? | Check the status history; prepare a fallback for your primary model ([Lesson 08](../08_reliability/README.en.md)) |
 
-**How to decide:** first eliminate models on **hard constraints** (compliance, region, self-hosting requirements), then compare capability and tool-calling reliability on your **eval set**, and finally compare **cost and latency per task** among the models that pass. Keep business code dependent on a tiny model interface (agentkit's [`LLM` protocol](../../agentkit/llm.py)) so switching models doesn't mean rewriting it. Using different models for different steps (model routing) is covered in [Lesson 14](../14_cost_latency/README.md).
+**How to decide:** first eliminate models on **hard constraints** (compliance, region, self-hosting requirements), then compare capability and tool-calling reliability on your **eval set**, and finally compare **cost and latency per task** among the models that pass. Keep business code dependent on a tiny model interface (agentkit's [`LLM` protocol](../../agentkit/llm.py)) so switching models doesn't mean rewriting it. Using different models for different steps (model routing) is covered in [Lesson 14](../14_cost_latency/README.en.md).
 
 ### 1.12 Common API errors: first ask "is it worth retrying?"
 
@@ -484,7 +484,7 @@ The two kinds of 429 are distinguished in the official docs: OpenAI's error-code
 
 There's also a class of **"successful failures"**: HTTP 200, but `finish_reason` is `length` (truncated) or `content_filter` (blocked), or the output is empty, the arguments aren't valid JSON, or the model refused. None of these raise an exception, which is exactly why they're easy to miss.
 
-agentkit's [`OpenAICompatLLM`](../../agentkit/llm.py) wraps every failure in an `LLMError` whose `retryable` flag says whether a retry could succeed; retries, circuit breakers and fallbacks are the subject of [Lesson 08](../08_reliability/README.md). Note that, for simplicity, agentkit treats every 429 as retryable and doesn't distinguish "out of quota".
+agentkit's [`OpenAICompatLLM`](../../agentkit/llm.py) wraps every failure in an `LLMError` whose `retryable` flag says whether a retry could succeed; retries, circuit breakers and fallbacks are the subject of [Lesson 08](../08_reliability/README.en.md). Note that, for simplicity, agentkit treats every 429 as retryable and doesn't distinguish "out of quota".
 
 ## 2. From toy to production: where agentkit encodes all this
 
@@ -602,10 +602,10 @@ Check your work:
 
 ```bash
 .venv/bin/python -m pytest lessons/01_llm_essentials
-# once the lesson directories have been renumbered you can also use: make lesson N=01
+# or equivalently: make lesson N=01
 ```
 
-You're done when all 22 tests pass. Then compare with [`solution.py`](solution.py) and think about one more case: if the **last** turn of the history is an assistant message with `tool_calls` but no tool results (the process crashed), what should `build_messages` do? (Hint: agentkit's `_close_dangling_calls`, discussed in [Lesson 02](../02_agent_loop/README.md).)
+You're done when all 22 tests pass. Then compare with [`solution.py`](solution.py) and think about one more case: if the **last** turn of the history is an assistant message with `tool_calls` but no tool results (the process crashed), what should `build_messages` do? (Hint: agentkit's `_close_dangling_calls`, discussed in [Lesson 02](../02_agent_loop/README.en.md).)
 
 ## 5. Going deeper
 
@@ -806,4 +806,4 @@ First work out which 429 it is. If you're sending too fast and hit a rate limit,
 - [Neural Machine Translation of Rare Words with Subword Units](https://arxiv.org/abs/1508.07909) — Sennrich et al., ACL 2016. Brought BPE subword segmentation to NLP; one of the roots of modern tokenizers.
 - [Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) — Anthropic, September 2025. The "right altitude" for system prompts, organizing them into sections, and iterating from failures.
 - [tiktoken](https://github.com/openai/tiktoken) — OpenAI's open-source tokenizer library for counting OpenAI-model tokens locally.
-- This repository's [glossary](../../docs/glossary.md) — Chinese–English definitions of tokens, temperature, structured output, streaming and the other terms used here.
+- This repository's [glossary](../../docs/glossary.en.md) — Chinese–English definitions of tokens, temperature, structured output, streaming and the other terms used here.

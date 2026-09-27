@@ -1,10 +1,10 @@
 [中文](README.md) | [English](README.en.md)
 
-# Lesson 12: Production Architecture — From Script to Service
+# Lesson 12: Production architecture — from script to service
 
 > 🕐 Time: 15 min | 🎯 You'll be able to: draw a reference architecture for an enterprise agent platform and explain what problem each component solves, and make sound calls on the key architectural decisions: sync vs async, stateful vs stateless, tenant isolation, framework choice, and model gateways | 📦 Source: this lesson's exercise (multi-tenant rate limiting, model routing), `agentkit/state.py`, `agentkit/llm.py`; for a complete service example, see `capstone/server.py`
 
-## 0. The short version
+## 0. In one sentence
 
 **Cooking dinner at home and running a restaurant chain that serves over ten thousand guests a day are two completely different jobs.** A restaurant chain needs a host stand and a queue-number system, cooks who can cover for one another, order tickets that record exactly what each table ordered, centralized purchasing, food-safety spot checks, and clean books for every branch.
 

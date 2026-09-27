@@ -1,12 +1,12 @@
 [中文](README.md) | [English](README.en.md)
 
-# Lesson 15: Enterprise Knowledge & Data — Permission-Aware RAG
+# Lesson 15: Enterprise knowledge and data — permission-aware RAG
 
 > 🕐 Suggested time: 15 minutes ｜ 🎯 After this lesson you can: design an enterprise knowledge retrieval system that doesn't overshare, doesn't go stale, shows its sources, and resists poisoning — and make reasoned trade-offs between ACL filtering, multi-tenant isolation, sync strategies, citation checking, and chunking ｜ 📦 Source: [`acl_index.py`](acl_index.py), [`grounding.py`](grounding.py), reusing `tokenize` from [`agentkit/memory.py`](../../agentkit/memory.py) and `ToolOutputGuard` from [`agentkit/guardrails.py`](../../agentkit/guardrails.py)
 
 > Code comments and demo output are in Chinese; the identifiers and the logic are what matter.
 
-## 0. The one-sentence version
+## 0. In one sentence
 
 > **Enterprise RAG is not "dump the documents into a vector database". It is "on behalf of the person asking, find the answer in material they are allowed to see, that is current and trustworthy — and say where it came from."**
 

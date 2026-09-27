@@ -278,12 +278,12 @@ flowchart LR
 
 | 钩子 | 用到的时机 | 做什么 | 课 |
 |---|---|---|---|
-| `InputGuard` | `on_run_start` | 输入命中注入特征 → `StopRun` | 06 |
-| `PermissionPolicy` | `visible_tools` / `before_tool` | 按角色隐藏工具、拒绝越权调用、高风险操作 `PauseRun` | 06 |
-| `BudgetHook` | `before_llm` / `after_llm` / `before_tool` | token、金额、次数、时长超限 → `StopRun` | 05 |
-| `ToolOutputGuard` | `after_tool` | 工具输出包进 `<untrusted_data>` | 06 |
-| `OutputGuard` | `on_final` | 脱敏、拦截密钥泄露 | 06 |
-| `AuditLog` | `after_tool` / `on_run_end` | 写审计日志 | 06 |
+| `InputGuard` | `on_run_start` | 输入命中注入特征 → `StopRun` | 09 |
+| `PermissionPolicy` | `visible_tools` / `before_tool` | 按角色隐藏工具、拒绝越权调用、高风险操作 `PauseRun` | 09 |
+| `BudgetHook` | `before_llm` / `after_llm` / `before_tool` | token、金额、次数、时长超限 → `StopRun` | 08 |
+| `ToolOutputGuard` | `after_tool` | 工具输出包进 `<untrusted_data>` | 09 |
+| `OutputGuard` | `on_final` | 脱敏、拦截密钥泄露 | 09 |
+| `AuditLog` | `after_tool` / `on_run_end` | 写审计日志 | 09 |
 
 为什么说这是好架构：
 

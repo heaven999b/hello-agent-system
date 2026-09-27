@@ -4,7 +4,7 @@
 
 > 🕐 Suggested time: 15 min · 🎯 You'll learn to: pick the simplest orchestration that solves a given business need, and explain what it costs in money, latency, and reliability; tell when multi-agent is worth it and when it's a trap · 📦 Source: `agentkit/workflows.py`
 
-> 📍 This lesson is part of **Part 1: Building Blocks** (concepts → build from scratch → exercises), and it's the last lesson of Part 1.
+> 📍 This lesson is part of **Part 1: Building Blocks** (concepts → build from scratch → exercises). The previous lesson, [Lesson 05: Common agent architectures](../05_agent_architectures/README.en.md), covers the reasoning architectures inside an agent and multi-agent topologies; this lesson covers workflow orchestration patterns. The two complement each other (see Lesson 05, §1.3, for how they divide the work). The next lesson, [Lesson 07: Engineering perspectives](../07_engineering_perspectives/README.en.md), wraps up Part 1.
 >
 > 🧭 **Core path (15-minute must-read)**: §0 → §1.1–§1.3 → §2.1–§2.5, the five patterns (for each, start with the diagram and the "Best for" and "Cost" bullets) → §2.7 the costs of multi-agent and when it's worth it → §2.8 decision tree → §3 run the demo → §4 do the exercises.
 > Sections marked **📖 Optional** (going deeper, pitfalls, interview questions) are deep dives for when you have time; skip them on the first pass. Distributed execution and high concurrency for multi-agent systems are covered in Lesson 13, [High concurrency and distributed execution](../13_distributed_concurrency/README.en.md).

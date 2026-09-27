@@ -1,10 +1,10 @@
 [中文](README.md) | [English](README.en.md)
 
-# Lesson 11: Eval-Driven Development — No Evals, No Engineering
+# Lesson 11: Eval-driven development — no evals, no engineering
 
 > 🕐 Time: 20 min | 🎯 You'll be able to: build an eval set for an agent, combine rule-based, trajectory, and LLM-as-judge grading, measure reliability with pass^k, and block bad versions in CI | 📦 Source: `agentkit/evals.py`
 
-## 0. The short version
+## 0. In one sentence
 
 **Without unit tests, you don't dare refactor code. Without evals, you don't dare touch an agent's prompt.**
 

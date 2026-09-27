@@ -278,12 +278,12 @@ Every enterprise capability in this course is a hook:
 
 | Hook | When it runs | What it does | Lesson |
 |---|---|---|---|
-| `InputGuard` | `on_run_start` | Input matches injection patterns → `StopRun` | 06 |
-| `PermissionPolicy` | `visible_tools` / `before_tool` | Hides tools by role, rejects unauthorized calls, `PauseRun` for high-risk actions | 06 |
-| `BudgetHook` | `before_llm` / `after_llm` / `before_tool` | Tokens, spend, call count, or duration over the limit → `StopRun` | 05 |
-| `ToolOutputGuard` | `after_tool` | Wraps tool output in `<untrusted_data>` | 06 |
-| `OutputGuard` | `on_final` | Redacts sensitive data, blocks leaked secrets | 06 |
-| `AuditLog` | `after_tool` / `on_run_end` | Writes the audit log | 06 |
+| `InputGuard` | `on_run_start` | Input matches injection patterns → `StopRun` | 09 |
+| `PermissionPolicy` | `visible_tools` / `before_tool` | Hides tools by role, rejects unauthorized calls, `PauseRun` for high-risk actions | 09 |
+| `BudgetHook` | `before_llm` / `after_llm` / `before_tool` | Tokens, spend, call count, or duration over the limit → `StopRun` | 08 |
+| `ToolOutputGuard` | `after_tool` | Wraps tool output in `<untrusted_data>` | 09 |
+| `OutputGuard` | `on_final` | Redacts sensitive data, blocks leaked secrets | 09 |
+| `AuditLog` | `after_tool` / `on_run_end` | Writes the audit log | 09 |
 
 Why it's good architecture:
 

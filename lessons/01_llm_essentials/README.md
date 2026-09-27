@@ -598,7 +598,7 @@ Demo 分 5 节，每节验证本课的一个知识点。两种模式走的是**�
 
 ```bash
 .venv/bin/python -m pytest lessons/01_llm_essentials
-# 课程目录重排完成后也可以用：make lesson N=01
+# 也可以用：make lesson N=01
 ```
 
 22 个测试全部通过即完成。写完后对照 [`solution.py`](solution.py)，再想一想：如果历史的**最后一轮**是一条带 `tool_calls` 的 assistant 消息，但因为进程崩溃没有 tool 结果，`build_messages` 应该怎么处理？（提示：[第 02 课](../02_agent_loop/README.md)里 agentkit 的 `_close_dangling_calls`。）

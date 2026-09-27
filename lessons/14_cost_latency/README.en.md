@@ -1,10 +1,10 @@
 [中文](README.md) | [English](README.en.md)
 
-# Lesson 14: Cost & Latency Optimization — Making Agents Cheaper and Faster
+# Lesson 14: Cost and latency optimization — making agents cheaper and faster
 
 > 🕐 Time: 15 min | 🎯 You'll be able to: take an agent's bill and latency distribution, explain where the money and the time go, pick the right optimization for each item, and explain what that optimization costs you | 📦 Source: [costkit.py](costkit.py) (this lesson), [`agentkit/pricing.py`](../../agentkit/pricing.py), [`agentkit/tracing.py`](../../agentkit/tracing.py)
 
-## 0. The short version
+## 0. In one sentence
 
 **Cost and latency optimization comes down to four questions: Can you skip this call? Can something cheaper handle it? Can you send less? Can you avoid making the user sit and wait?**
 

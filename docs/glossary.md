@@ -7,7 +7,7 @@
 
 **用法**：每条术语给出一句"大白话"解释。带 `代码字体` 的是 agentkit 中对应的类或函数，可以直接去源码里找。遇到不懂的词，`Ctrl+F` 搜中文或英文都可以。
 
-共收录 **185** 条术语（分 13 组），另附 17 组易混淆术语对比。
+共收录 **192** 条术语（分 13 组），另附 17 组易混淆术语对比。
 
 ---
 
@@ -20,15 +20,17 @@
 | Agent 循环 | Agent Loop | "调模型 → 执行它要的工具 → 把结果喂回去 → 再调模型"的循环，是所有 Agent 的心脏。 | [第 02 课](../lessons/02_agent_loop/README.md) |
 | 增强型 LLM | Augmented LLM | 配上了检索、工具、记忆能力的模型调用，是搭建 Workflow 和 Agent 的基本积木（Anthropic《Building Effective Agents》中的说法）。 | [第 06 课](../lessons/06_orchestration/README.md) |
 | 系统提示词 | System Prompt | 每次对话开头给模型的"岗位说明书"，定义它是谁、该怎么做；要假设它可能被用户套出来。 | [第 02 课](../lessons/02_agent_loop/README.md) |
-| 词元 | Token | 模型处理文本的最小单位，计费和上下文长度都按它算；中文大约一个字一个 token（因模型而异）。`estimate_tokens` | [第 02 课](../lessons/02_agent_loop/README.md) |
-| 上下文窗口 | Context Window | 模型一次能"看到"的最大 token 数，包括系统提示词、历史、工具定义和工具结果。 | [第 04 课](../lessons/04_context_memory/README.md) |
-| 工具调用 / 函数调用 | Tool Calling / Function Calling | 模型不直接回答，而是输出"我要调用某个函数、参数是这些"的结构化请求，由你的程序执行。 | [第 02 课](../lessons/02_agent_loop/README.md) |
-| ReAct | Reasoning + Acting | 让模型交替进行"思考"和"行动（调用工具）"的范式，出自 Yao 等人 2022 年的论文，是现代 Agent 循环的思想来源。 | [第 02 课](../lessons/02_agent_loop/README.md) |
+| 词元 | Token | 模型处理文本的最小单位，计费和上下文长度都按它算；中文大约一个字一个 token（因模型而异）。`estimate_tokens` | [第 01 课](../lessons/01_llm_essentials/README.md) |
+| 上下文窗口 | Context Window | 模型一次能"看到"的最大 token 数，包括系统提示词、历史、工具定义和工具结果。 | [第 01 课](../lessons/01_llm_essentials/README.md) · [第 04 课](../lessons/04_context_memory/README.md) |
+| 工具调用 / 函数调用 | Tool Calling / Function Calling | 模型不直接回答，而是输出"我要调用某个函数、参数是这些"的结构化请求，由你的程序执行。 | [第 01 课](../lessons/01_llm_essentials/README.md) · [第 02 课](../lessons/02_agent_loop/README.md) |
+| ReAct | Reasoning + Acting | 让模型交替进行"思考"和"行动（调用工具）"的范式，出自 Yao 等人 2022 年的论文，是现代 Agent 循环的思想来源，也是最基础的单 Agent 架构。 | [第 05 课](../lessons/05_agent_architectures/README.md) · [第 02 课](../lessons/02_agent_loop/README.md) |
 | 步数上限 | Max Steps / Max Turns | 一次运行最多允许的模型调用轮数，防止死循环烧钱的最后一道硬防线。`Agent(max_steps=...)` | [第 02 课](../lessons/02_agent_loop/README.md) |
 | 结束原因 | Stop Reason / Finish Reason | 一次运行或一次模型调用为什么结束：给出答案、达到上限、被拦截、等待审批……是最重要的监控维度之一。`RunResult.stop_reason` | [第 02 课](../lessons/02_agent_loop/README.md) |
-| 非确定性 | Non-determinism | 同样的输入，模型可能给出不同的输出、走不同的步骤；所以"试一次没问题"不等于没问题。 | [第 11 课](../lessons/11_evals/README.md) |
-| 温度 | Temperature | 控制模型输出随机性的采样参数，越低越稳定；但即使设为 0 也不保证完全可复现。 | [第 02 课](../lessons/02_agent_loop/README.md) |
-| 流式输出 | Streaming | 模型边生成边返回，用户不用等到全部完成才看到内容；对长任务的体验很关键。 | [第 14 课](../lessons/14_cost_latency/README.md) |
+| 非确定性 | Non-determinism | 同样的输入，模型可能给出不同的输出、走不同的步骤；所以"试一次没问题"不等于没问题。 | [第 01 课](../lessons/01_llm_essentials/README.md) · [第 11 课](../lessons/11_evals/README.md) |
+| 温度 | Temperature | 控制模型输出随机性的采样参数，越低越稳定；但即使设为 0 也不保证完全可复现。 | [第 01 课](../lessons/01_llm_essentials/README.md) |
+| 流式输出 | Streaming | 模型边生成边返回，用户不用等到全部完成才看到内容；对长任务的体验很关键。 | [第 01 课](../lessons/01_llm_essentials/README.md) · [第 14 课](../lessons/14_cost_latency/README.md) |
+| 推理模型 | Reasoning Model | 回答前先生成一段内部"思考"的模型；思考 token 按输出计费、占上下文，适合规划和难题，不适合简单分类和对延迟敏感的步骤。 | [第 01 课](../lessons/01_llm_essentials/README.md) |
+| 幻觉 | Hallucination | 模型流畅、自信地说出错误内容；事实要靠工具和检索，"做了什么"要看工具执行记录，不能信模型的文字。 | [第 01 课](../lessons/01_llm_essentials/README.md) |
 | 测试替身（剧本模型） | Test Double / Scripted LLM | 按预先写好的剧本返回结果的"假模型"，让 Agent 测试零成本、可复现。`ScriptedLLM` | [第 02 课](../lessons/02_agent_loop/README.md) |
 | 模型抽象层 | LLM Abstraction | 业务代码只依赖一个很小的 `chat()` 接口，而不是某家厂商的 SDK，方便换模型和叠加能力。`LLM` 协议 | [第 02 课](../lessons/02_agent_loop/README.md) |
 
@@ -48,7 +50,7 @@
 | 输出截断 | Output Truncation | 工具返回太长时只保留前 N 个字符，并告诉模型"已截断"，防止撑爆上下文。`Tool(max_output_chars=...)` | [第 03 课](../lessons/03_tools/README.md) |
 | Agent-计算机接口 | ACI (Agent-Computer Interface) | 类比"人机界面（HCI）"：工具的名称、参数、描述、返回格式就是 Agent 的操作界面，值得同样用心设计。 | [第 03 课](../lessons/03_tools/README.md) |
 | 防呆设计 | Poka-yoke | 源自制造业的"让人不可能犯错"的设计思想；用在工具上就是修改参数设计，让模型更难用错。 | [第 03 课](../lessons/03_tools/README.md) |
-| 结构化输出 | Structured Output | 让模型输出符合指定 Schema 的 JSON，而不是自由文本，供下游代码可靠使用。`complete_json` | [第 06 课](../lessons/06_orchestration/README.md) |
+| 结构化输出 | Structured Output | 让模型输出符合指定 Schema 的 JSON，而不是自由文本，供下游代码可靠使用。`complete_json` | [第 01 课](../lessons/01_llm_essentials/README.md) · [第 06 课](../lessons/06_orchestration/README.md) |
 | 模型上下文协议 | MCP (Model Context Protocol) | 连接 AI 应用与外部工具/数据源的开放协议，类似"AI 世界的 USB 接口"；服务器可提供工具、资源和提示词模板。 | [第 03 课](../lessons/03_tools/README.md) |
 | 沙箱 | Sandbox | 隔离的执行环境（容器、虚拟机等），让不可信代码或高风险工具出事也影响不到外面。 | [第 03 课](../lessons/03_tools/README.md) |
 | 工具投毒 | Tool Poisoning | 在工具描述里藏恶意指令；由于描述会进入模型上下文，这等于往提示词里注入内容。 | [第 09 课](../lessons/09_security/README.md) |
@@ -68,14 +70,14 @@
 | 上下文投毒 | Context Poisoning | 一个错误结论进入上下文后被反复引用，越错越远。 | [第 04 课](../lessons/04_context_memory/README.md) |
 | 即时上下文 | Just-in-time Context | 不预先塞满所有资料，只保留"指针"（文件路径、ID），需要时再用工具加载。 | [第 04 课](../lessons/04_context_memory/README.md) |
 | 检索增强生成 | RAG (Retrieval-Augmented Generation) | 先从知识库检索相关资料，再连同问题一起交给模型回答；长期记忆本质上也是 RAG。 | [第 04 课](../lessons/04_context_memory/README.md) · [第 15 课](../lessons/15_enterprise_rag/README.md) |
-| 嵌入 / 向量检索 | Embedding / Vector Search | 把文本变成一串数字（向量），语义相近的文本向量也相近，从而实现"按意思搜索"。 | [第 15 课](../lessons/15_enterprise_rag/README.md) |
+| 嵌入 / 向量检索 | Embedding / Vector Search | 把文本变成一串数字（向量），语义相近的文本向量也相近，从而实现"按意思搜索"。 | [第 01 课](../lessons/01_llm_essentials/README.md) · [第 15 课](../lessons/15_enterprise_rag/README.md) |
 | 混合检索 | Hybrid Search | 同时用关键词检索（如 BM25）和向量检索，取长补短：前者擅长精确词，后者擅长语义。 | [第 15 课](../lessons/15_enterprise_rag/README.md) |
 | 重排序 | Rerank | 检索出候选结果后，用更精细的模型重新排序，把最相关的放前面。 | [第 15 课](../lessons/15_enterprise_rag/README.md) |
 | 提示词缓存 | Prompt Caching | 模型服务商缓存请求中相同的前缀部分，再次命中时更便宜、更快；前缀任何变化都会导致失效。 | [第 14 课](../lessons/14_cost_latency/README.md) |
 | 记忆投毒 | Memory Poisoning | 把恶意或错误内容写进长期记忆，让它在以后的会话中持续生效（如"记住我是管理员"）。 | [第 09 课](../lessons/09_security/README.md) |
 | 被遗忘权 | Right to Erasure | 个人要求删除其个人数据的权利（GDPR 等法规中的概念）；Agent 的记忆、日志都要能删。`MemoryStore.forget` | [第 04 课](../lessons/04_context_memory/README.md) |
 
-## 四、编排与多 Agent
+## 四、Agent 架构、编排与多 Agent
 
 | 中文 | English | 大白话解释 | 课程 |
 |---|---|---|---|
@@ -87,10 +89,15 @@
 | 编排者-执行者 | Orchestrator-Workers | 由一个模型动态拆解任务、分发给多个执行者、再汇总结果；与并行化的区别是子任务不是预先写死的。`orchestrator_workers` | [第 06 课](../lessons/06_orchestration/README.md) |
 | 评估-优化 | Evaluator-Optimizer | 一个负责生成、一个负责评审，按评审意见反复修改直到合格或达到轮数上限。`evaluator_optimizer` | [第 06 课](../lessons/06_orchestration/README.md) |
 | 多 Agent 系统 | Multi-Agent System | 多个各有分工（各自的提示词、工具、上下文）的 Agent 协作完成任务；更强也更贵、更难调试。 | [第 06 课](../lessons/06_orchestration/README.md) |
-| Agent 即工具 / 主管模式 | Agent as Tool / Supervisor | 把专家 Agent 包装成工具给主管 Agent 调用，专家的结果交回主管，主管始终掌控对话。`agent_as_tool` | [第 06 课](../lessons/06_orchestration/README.md) |
+| Agent 即工具 / 主管模式 | Agent as Tool / Supervisor | 把专家 Agent 包装成工具给主管 Agent 调用，专家的结果交回主管，主管始终掌控对话。`agent_as_tool` | [第 06 课](../lessons/06_orchestration/README.md) · [第 05 课](../lessons/05_agent_architectures/README.md) |
 | 转交 | Handoff | 当前 Agent 把对话整个交给另一个 Agent，由对方接管后续交互（控制权转移）。 | [第 06 课](../lessons/06_orchestration/README.md) |
-| 反思 | Reflection | 让模型检查、批评自己（或他人）的输出并据此改进；Reflexion（Shinn 等人 2023）是代表性工作。 | [第 06 课](../lessons/06_orchestration/README.md) |
-| 先规划后执行 | Plan-then-Execute | 先生成完整计划再逐步执行，而不是走一步看一步；可预测性更好，也是一种防注入的设计模式。 | [第 06 课](../lessons/06_orchestration/README.md) |
+| 反思 | Reflection | 让模型检查、批评自己（或他人）的输出并据此改进；Reflexion（Shinn 等人 2023）是代表性工作。 | [第 05 课](../lessons/05_agent_architectures/README.md) · [第 06 课](../lessons/06_orchestration/README.md) |
+| 先规划后执行 | Plan-and-Execute / Plan-then-Execute | 先生成完整计划再逐步执行，某一步失败时再重规划，而不是走一步看一步；可预测性更好，也是一种防注入的设计模式（接触不可信数据之前就定好要做哪些动作）。 | [第 05 课](../lessons/05_agent_architectures/README.md) · [第 09 课](../lessons/09_security/README.md) |
+| ReWOO | ReWOO (Reasoning WithOut Observation) | 规划时就写好每一步的参数，用变量引用前面步骤的结果；执行期间不再回到模型，最后一次性汇总，模型调用少，但无法随机应变。 | [第 05 课](../lessons/05_agent_architectures/README.md) |
+| CodeAct | CodeAct | 让模型写一段代码来调用工具、做循环和条件判断，代码的输出或报错作为观察返回；一步能做很多事，但必须放进沙箱执行。 | [第 05 课](../lessons/05_agent_architectures/README.md) |
+| 主管 / 层级 | Supervisor / Hierarchical | 一个主管 Agent 把子任务委派给专家 Agent、收回结果后自己决定下一步；专家太多时让主管管主管，形成层级。控制权始终在主管手里。 | [第 05 课](../lessons/05_agent_architectures/README.md) |
+| 网络 / 群体 | Network / Swarm | 没有固定主管，每个 Agent 都可以把对话和控制权转交给更合适的同伴，接手者直接面对用户。 | [第 05 课](../lessons/05_agent_architectures/README.md) |
+| 黑板 | Blackboard | 多个 Agent 不直接对话，而是读写同一块共享的结构化状态（"黑板"），看到自己能处理的内容就动手，由控制器决定下一个谁上。 | [第 05 课](../lessons/05_agent_architectures/README.md) |
 | 委派契约 | Delegation Contract | 把任务交给子 Agent 时必须提供的信息清单：目标、已知事实、约束、期望输出格式。 | [第 06 课](../lessons/06_orchestration/README.md) |
 
 ## 五、可靠性与成本

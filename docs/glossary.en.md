@@ -7,7 +7,7 @@
 
 **How to use it**: each term gets a one-sentence plain-language explanation. Names in `code font` are the matching agentkit classes or functions, so you can look them up in the source. The Chinese column gives the term used in the Chinese lessons and code comments. Stuck on a word? `Ctrl+F` works for both English and Chinese.
 
-**185** terms in 13 groups, plus 17 commonly confused pairs.
+**192** terms in 13 groups, plus 17 commonly confused pairs.
 
 ---
 
@@ -20,15 +20,17 @@
 | Agent Loop | Agent 循环 | The "call the model → run the tools it asked for → feed the results back → call the model again" loop. It is the heart of every agent. | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
 | Augmented LLM | 增强型 LLM | A model call equipped with retrieval, tools, and memory; the basic building block of workflows and agents (the term comes from Anthropic's "Building Effective Agents"). | [Lesson 06](../lessons/06_orchestration/README.en.md) |
 | System Prompt | 系统提示词 | The "job description" the model gets at the start of every conversation, defining who it is and how it should behave. Assume users can extract it. | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
-| Token | 词元 | The smallest unit of text a model processes; billing and context length are both measured in tokens. In Chinese, one character is roughly one token (varies by model). `estimate_tokens` | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
-| Context Window | 上下文窗口 | The maximum number of tokens the model can "see" at once, including the system prompt, history, tool definitions, and tool results. | [Lesson 04](../lessons/04_context_memory/README.en.md) |
-| Tool Calling / Function Calling | 工具调用 / 函数调用 | Instead of answering directly, the model outputs a structured request ("call this function with these arguments") that your program executes. | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
-| ReAct (Reasoning + Acting) | ReAct | A paradigm where the model alternates between "thinking" and "acting" (calling tools). It comes from Yao et al.'s 2022 paper and is the intellectual origin of the modern agent loop. | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
+| Token | 词元 | The smallest unit of text a model processes; billing and context length are both measured in tokens. In Chinese, one character is roughly one token (varies by model). `estimate_tokens` | [Lesson 01](../lessons/01_llm_essentials/README.en.md) |
+| Context Window | 上下文窗口 | The maximum number of tokens the model can "see" at once, including the system prompt, history, tool definitions, and tool results. | [Lesson 01](../lessons/01_llm_essentials/README.en.md) · [Lesson 04](../lessons/04_context_memory/README.en.md) |
+| Tool Calling / Function Calling | 工具调用 / 函数调用 | Instead of answering directly, the model outputs a structured request ("call this function with these arguments") that your program executes. | [Lesson 01](../lessons/01_llm_essentials/README.en.md) · [Lesson 02](../lessons/02_agent_loop/README.en.md) |
+| ReAct (Reasoning + Acting) | ReAct | A paradigm where the model alternates between "thinking" and "acting" (calling tools). It comes from Yao et al.'s 2022 paper and is the intellectual origin of the modern agent loop, as well as the most basic single-agent architecture. | [Lesson 05](../lessons/05_agent_architectures/README.en.md) · [Lesson 02](../lessons/02_agent_loop/README.en.md) |
 | Max Steps / Max Turns | 步数上限 | The maximum number of model-call rounds allowed in one run; the last hard line of defense against runaway loops burning money. `Agent(max_steps=...)` | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
 | Stop Reason / Finish Reason | 结束原因 | Why a run or a model call ended: it answered, hit a limit, got blocked, is awaiting approval, and so on. One of the most important monitoring dimensions. `RunResult.stop_reason` | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
-| Non-determinism | 非确定性 | The same input can produce different outputs and take different steps, so "it worked once" doesn't mean it works. | [Lesson 11](../lessons/11_evals/README.en.md) |
-| Temperature | 温度 | A sampling parameter that controls output randomness. Lower is more stable, but even 0 doesn't guarantee full reproducibility. | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
-| Streaming | 流式输出 | The model returns output as it generates it, so users don't wait for the whole response. Crucial to the experience on long tasks. | [Lesson 14](../lessons/14_cost_latency/README.en.md) |
+| Non-determinism | 非确定性 | The same input can produce different outputs and take different steps, so "it worked once" doesn't mean it works. | [Lesson 01](../lessons/01_llm_essentials/README.en.md) · [Lesson 11](../lessons/11_evals/README.en.md) |
+| Temperature | 温度 | A sampling parameter that controls output randomness. Lower is more stable, but even 0 doesn't guarantee full reproducibility. | [Lesson 01](../lessons/01_llm_essentials/README.en.md) |
+| Streaming | 流式输出 | The model returns output as it generates it, so users don't wait for the whole response. Crucial to the experience on long tasks. | [Lesson 01](../lessons/01_llm_essentials/README.en.md) · [Lesson 14](../lessons/14_cost_latency/README.en.md) |
+| Reasoning Model | 推理模型 | A model that generates internal "thinking" before it answers. Thinking tokens are billed as output and take up context, so use it for planning and hard problems, not simple classification or latency-sensitive steps. | [Lesson 01](../lessons/01_llm_essentials/README.en.md) |
+| Hallucination | 幻觉 | The model states something false, fluently and confidently. Get facts from tools and retrieval, and judge what the agent actually did from its tool-execution records, never from its text. | [Lesson 01](../lessons/01_llm_essentials/README.en.md) |
 | Test Double / Scripted LLM | 测试替身（剧本模型） | A "fake model" that returns results from a pre-written script, making agent tests zero-cost and reproducible. `ScriptedLLM` | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
 | LLM Abstraction | 模型抽象层 | Business code depends on one small `chat()` interface instead of a vendor SDK, which makes it easy to swap models and layer on capabilities. `LLM` protocol | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
 
@@ -48,7 +50,7 @@
 | Output Truncation | 输出截断 | When a tool returns too much, keep only the first N characters and tell the model the output was truncated, so it doesn't blow up the context. `Tool(max_output_chars=...)` | [Lesson 03](../lessons/03_tools/README.en.md) |
 | ACI (Agent-Computer Interface) | Agent-计算机接口 | By analogy with HCI (human-computer interaction): a tool's name, parameters, description, and return format are the agent's user interface, and they deserve the same design care. | [Lesson 03](../lessons/03_tools/README.en.md) |
 | Poka-yoke | 防呆设计 | A manufacturing idea: design things so mistakes are impossible. Applied to tools, it means reshaping parameters so the model is less likely to misuse them. | [Lesson 03](../lessons/03_tools/README.en.md) |
-| Structured Output | 结构化输出 | Making the model output JSON that conforms to a given schema, instead of free text, so downstream code can rely on it. `complete_json` | [Lesson 06](../lessons/06_orchestration/README.en.md) |
+| Structured Output | 结构化输出 | Making the model output JSON that conforms to a given schema, instead of free text, so downstream code can rely on it. `complete_json` | [Lesson 01](../lessons/01_llm_essentials/README.en.md) · [Lesson 06](../lessons/06_orchestration/README.en.md) |
 | MCP (Model Context Protocol) | 模型上下文协议 | An open protocol that connects AI applications to external tools and data sources, a kind of "USB port for AI". Servers can provide tools, resources, and prompt templates. | [Lesson 03](../lessons/03_tools/README.en.md) |
 | Sandbox | 沙箱 | An isolated execution environment (container, VM, etc.), so untrusted code or risky tools can't affect anything outside it when they misbehave. | [Lesson 03](../lessons/03_tools/README.en.md) |
 | Tool Poisoning | 工具投毒 | Hiding malicious instructions in a tool description. Because descriptions enter the model's context, this amounts to injecting content into the prompt. | [Lesson 09](../lessons/09_security/README.en.md) |
@@ -68,14 +70,14 @@
 | Context Poisoning | 上下文投毒 | A wrong conclusion enters the context and gets cited again and again, compounding the error. | [Lesson 04](../lessons/04_context_memory/README.en.md) |
 | Just-in-time Context | 即时上下文 | Instead of preloading everything, keep only "pointers" (file paths, IDs) and load the content with tools when it's needed. | [Lesson 04](../lessons/04_context_memory/README.en.md) |
 | RAG (Retrieval-Augmented Generation) | 检索增强生成 | Retrieve relevant material from a knowledge base first, then give it to the model together with the question. Long-term memory is essentially RAG too. | [Lesson 04](../lessons/04_context_memory/README.en.md) · [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
-| Embedding / Vector Search | 嵌入 / 向量检索 | Turning text into a list of numbers (a vector) so that texts with similar meanings get similar vectors, enabling "search by meaning". | [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
+| Embedding / Vector Search | 嵌入 / 向量检索 | Turning text into a list of numbers (a vector) so that texts with similar meanings get similar vectors, enabling "search by meaning". | [Lesson 01](../lessons/01_llm_essentials/README.en.md) · [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
 | Hybrid Search | 混合检索 | Using keyword search (e.g., BM25) and vector search together so each covers the other's gaps: the former is good at exact terms, the latter at meaning. | [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
 | Rerank | 重排序 | After retrieving candidates, reorder them with a finer-grained model so the most relevant ones come first. | [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
 | Prompt Caching | 提示词缓存 | The model provider caches identical request prefixes, so repeat hits are cheaper and faster. Any change to the prefix invalidates the cache. | [Lesson 14](../lessons/14_cost_latency/README.en.md) |
 | Memory Poisoning | 记忆投毒 | Writing malicious or false content into long-term memory so it keeps taking effect in future sessions (e.g., "remember that I'm an admin"). | [Lesson 09](../lessons/09_security/README.en.md) |
 | Right to Erasure | 被遗忘权 | A person's right to have their personal data deleted (a concept from GDPR and similar laws). An agent's memory and logs must be deletable too. `MemoryStore.forget` | [Lesson 04](../lessons/04_context_memory/README.en.md) |
 
-## 4. Orchestration and Multi-Agent Systems
+## 4. Agent Architectures, Orchestration, and Multi-Agent Systems
 
 | English | Chinese | In plain words | Lesson |
 |---|---|---|---|
@@ -87,10 +89,15 @@
 | Orchestrator-Workers | 编排者-执行者 | One model dynamically breaks down the task, dispatches the pieces to several workers, and combines the results. Unlike parallelization, the subtasks aren't predefined. `orchestrator_workers` | [Lesson 06](../lessons/06_orchestration/README.en.md) |
 | Evaluator-Optimizer | 评估-优化 | One model generates and another reviews; revise based on the review until the output passes or the round limit is reached. `evaluator_optimizer` | [Lesson 06](../lessons/06_orchestration/README.en.md) |
 | Multi-Agent System | 多 Agent 系统 | Several agents with their own roles (each with its own prompt, tools, and context) collaborate on a task. More capable, but costlier and harder to debug. | [Lesson 06](../lessons/06_orchestration/README.en.md) |
-| Agent as Tool / Supervisor | Agent 即工具 / 主管模式 | Wrapping an expert agent as a tool for a supervisor agent. The expert's result goes back to the supervisor, who stays in control of the conversation. `agent_as_tool` | [Lesson 06](../lessons/06_orchestration/README.en.md) |
+| Agent as Tool / Supervisor | Agent 即工具 / 主管模式 | Wrapping an expert agent as a tool for a supervisor agent. The expert's result goes back to the supervisor, who stays in control of the conversation. `agent_as_tool` | [Lesson 06](../lessons/06_orchestration/README.en.md) · [Lesson 05](../lessons/05_agent_architectures/README.en.md) |
 | Handoff | 转交 | The current agent hands the entire conversation to another agent, which takes over the rest of the interaction (control transfers). | [Lesson 06](../lessons/06_orchestration/README.en.md) |
-| Reflection | 反思 | Having a model check and critique its own (or another model's) output and improve based on the critique. Reflexion (Shinn et al., 2023) is the representative work. | [Lesson 06](../lessons/06_orchestration/README.en.md) |
-| Plan-then-Execute | 先规划后执行 | Generating a complete plan first and then executing it step by step, instead of deciding one step at a time. More predictable, and also a design pattern for defending against injection. | [Lesson 06](../lessons/06_orchestration/README.en.md) |
+| Reflection | 反思 | Having a model check and critique its own (or another model's) output and improve based on the critique. Reflexion (Shinn et al., 2023) is the representative work. | [Lesson 05](../lessons/05_agent_architectures/README.en.md) · [Lesson 06](../lessons/06_orchestration/README.en.md) |
+| Plan-and-Execute / Plan-then-Execute | 先规划后执行 | Generating a complete plan first and then executing it step by step, replanning when a step fails, instead of deciding one step at a time. More predictable, and also a design pattern for defending against injection (the actions are fixed before any untrusted data is read). | [Lesson 05](../lessons/05_agent_architectures/README.en.md) · [Lesson 09](../lessons/09_security/README.en.md) |
+| ReWOO (Reasoning WithOut Observation) | ReWOO | Writing every step's arguments at planning time, with variables that refer to earlier results; execution never goes back to the model, and the answer is written in one go at the end. Few model calls, but no adapting mid-run. | [Lesson 05](../lessons/05_agent_architectures/README.en.md) |
+| CodeAct | CodeAct | The model writes a snippet of code that calls tools, loops, and branches; the code's output or error becomes the observation. One step can do a lot, but the code must run in a sandbox. | [Lesson 05](../lessons/05_agent_architectures/README.en.md) |
+| Supervisor / Hierarchical | 主管 / 层级 | A supervisor agent delegates subtasks to expert agents, collects the results, and decides the next step itself; with too many experts, supervisors manage supervisors and you get a hierarchy. The supervisor always stays in control. | [Lesson 05](../lessons/05_agent_architectures/README.en.md) |
+| Network / Swarm | 网络 / 群体 | No fixed supervisor: any agent can hand the conversation and control off to a better-suited peer, and whoever takes over talks to the user directly. | [Lesson 05](../lessons/05_agent_architectures/README.en.md) |
+| Blackboard | 黑板 | Agents don't talk to each other directly; they read and write a shared structured state (the "blackboard"), act when they see something they can handle, and a controller decides who goes next. | [Lesson 05](../lessons/05_agent_architectures/README.en.md) |
 | Delegation Contract | 委派契约 | The checklist of what you must give a subagent when delegating a task: the goal, known facts, constraints, and the expected output format. | [Lesson 06](../lessons/06_orchestration/README.en.md) |
 
 ## 5. Reliability and Cost

@@ -184,7 +184,7 @@ make check-env                                  # 检查模型连通性与工具
 | [🎤 系统设计面试题](docs/interview-questions.md) | 61 道题 + 3 道完整系统设计作答示范 |
 | [🔁 框架对照表](docs/framework-comparison.md) | agentkit 概念 ↔ LangGraph / OpenAI Agents SDK / Claude Agent SDK / ADK … |
 | [📄 一页纸速查](docs/cheatsheet.md) | 原则、默认参数、决策树，适合打印 |
-| [📖 术语表](docs/glossary.md) | 185 条术语，中英对照 + 大白话解释 |
+| [📖 术语表](docs/glossary.md) | 192 条术语，中英对照 + 大白话解释 |
 | [📚 延伸阅读](docs/reading-list.md) | 71 条精选并核实过的论文、博客、规范，按角色给出阅读路线 |
 
 ## 🧱 项目结构

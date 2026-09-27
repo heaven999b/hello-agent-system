@@ -4,7 +4,7 @@
     .venv/bin/python lessons/00_overview/demo.py --offline  # 离线剧本，无需 API key
 
 现在不需要看懂每一行代码。你只需要看清楚：一个"企业级"Agent 在模型之外还包着多少层东西，
-以及每一层在什么时候起作用。学完第 02-12 课，这里的每一行你都能亲手写出来。
+以及每一层在什么时候起作用。学完第 01-12 课，这里的每一行你都能亲手写出来。
 
 运行产物（都在 runs/00_overview/ 下，已被 .gitignore 忽略）：
     checkpoints/<run_id>.json   每一步的检查点（第 08 课）

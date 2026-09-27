@@ -1,15 +1,15 @@
 [中文](README.md) | [English](README.en.md)
 
-# Lesson 05: Common Agent Architectures — From ReAct to Deep Research Systems
+# Lesson 05: Common agent architectures — from ReAct to deep-research systems
 
 > 🕐 Time: 20 minutes ｜ 🎯 You'll be able to: explain, for 7 single-agent architectures and 5 multi-agent topologies, *where the model thinks, where state lives, and who holds control*; take apart five kinds of real products (deep research, coding agents, computer use, customer support, agentic RAG); pick an architecture for a new requirement and defend the choice ｜ 📦 Source: `agentkit/agent.py` (ReAct), `agentkit/workflows.py` (Reflection, supervisor–expert), `agentkit/permissions.py` (human checkpoints), and this lesson's [demo.py](demo.py)
 
-> 📍 Part 1: Foundations. Lessons 02–04 built the parts (the loop, tools, context and memory). This lesson covers the common ways to **assemble** them. The next one, [Lesson 06: Orchestration](../06_orchestration/README.md), covers workflow patterns and how to implement multi-agent orchestration. The two lessons complement each other; §1.3 explains the split.
+> 📍 Part 1: Foundations. Lessons 02–04 built the parts (the loop, tools, context and memory). This lesson covers the common ways to **assemble** them. The next one, [Lesson 06: Orchestration](../06_orchestration/README.en.md), covers workflow patterns and how to implement multi-agent orchestration. The two lessons complement each other; §1.3 explains the split.
 >
 > 🧭 **Core path (20 min)**: §0 → §1 → §2, reading the one-liner and diagram for each architecture → §3.1 (three questions for any topology) → §3.7 (topology comparison) → §4, pick the product you care about most → §6 (summary table and decision tree) → §7 run the demo → §8 do the exercises.
 > Sections marked **📖 Optional** can be skipped on a first read.
 
-## 0. The one-sentence version
+## 0. In one sentence
 
 **An architecture is, at heart, a decision about where the model thinks.**
 
@@ -78,7 +78,7 @@ Every architecture below can be read through these four questions.
 
 ### 1.3 How this lesson splits the work with Lesson 06
 
-| | This lesson (05, architectures) | [Lesson 06, orchestration](../06_orchestration/README.md) |
+| | This lesson (05, architectures) | [Lesson 06, orchestration](../06_orchestration/README.en.md) |
 |---|---|---|
 | Core question | How an agent reasons and controls itself **internally**; which **topology** connects multiple agents and how they communicate; what real products look like | Five workflow patterns for wiring LLM calls together in code; how to implement multi-agent systems and what they cost |
 | Typical content | ReAct vs Plan-and-Execute vs ReWOO; blackboard vs supervisor vs handoff | Prompt chaining, routing, parallelization, orchestrator–workers, evaluator–optimizer; `agent_as_tool` |
@@ -271,7 +271,7 @@ print(rainy)
 | Cost and latency | Fewer steps, but longer outputs per step; you need sandbox infrastructure, and cold starts add latency |
 | Key work | [CodeAct](https://arxiv.org/abs/2402.01030) (Wang et al., ICML 2024): across 17 models, up to 20% higher success rate than JSON- or text-format actions; Hugging Face [smolagents](https://huggingface.co/docs/smolagents/index) `CodeAgent`; Anthropic's Code execution with MCP (which notes that Cloudflare calls the same idea "Code Mode") |
 
-**With agentkit**: agentkit has no built-in sandbox, and you should **never** `exec()` model-written code inside your own process. The right shape is a high-risk tool backed by an isolated environment (a container, gVisor, Firecracker). See [Lesson 09](../09_security/README.md) for the security details:
+**With agentkit**: agentkit has no built-in sandbox, and you should **never** `exec()` model-written code inside your own process. The right shape is a high-risk tool backed by an isolated environment (a container, gVisor, Firecracker). See [Lesson 09](../09_security/README.en.md) for the security details:
 
 ```python
 @tool(risk="dangerous", timeout_s=30)
@@ -354,7 +354,7 @@ sequenceDiagram
 
 **A newer trend: letting a model do some of the approving.** In Claude Code's `auto` mode, a second model (a classifier) reviews actions in your place (checked September 2026; see the permission modes docs). In effect, HITL becomes tiered: low-risk actions go through automatically, medium-risk ones are reviewed by a model, and only high-risk ones reach a human.
 
-**With agentkit** (verified locally): `PermissionPolicy` raises `PauseRun` before a high-risk tool call, the checkpointer saves the state, and `approve` resumes from where it stopped. Approval is asynchronous; see [Lesson 09](../09_security/README.md).
+**With agentkit** (verified locally): `PermissionPolicy` raises `PauseRun` before a high-risk tool call, the checkpointer saves the state, and `approve` resumes from where it stopped. Approval is asynchronous; see [Lesson 09](../09_security/README.en.md).
 
 ```python
 agent = Agent(llm, [refund_order], hooks=[PermissionPolicy(ask_risks={"dangerous"})])
@@ -376,7 +376,7 @@ The summary table and decision tree in §6 put them side by side.
 
 ## 3. Multi-agent topologies
 
-First, a reminder: multi-agent systems are expensive. Anthropic reports that multi-agent systems use about 15× the tokens of a chat interaction, and they bring new problems such as fragmented context and error propagation. Those costs, and when they're worth paying, are covered in [Lesson 06 §2.7](../06_orchestration/README.md) and not repeated here. This section answers one question: **once you've decided to use several agents, how should you connect them?**
+First, a reminder: multi-agent systems are expensive. Anthropic reports that multi-agent systems use about 15× the tokens of a chat interaction, and they bring new problems such as fragmented context and error propagation. Those costs, and when they're worth paying, are covered in [Lesson 06 §2.7](../06_orchestration/README.en.md) and not repeated here. This section answers one question: **once you've decided to use several agents, how should you connect them?**
 
 ### 3.1 Three questions for any topology
 
@@ -511,7 +511,7 @@ flowchart TB
   - 2025 research revisited the architecture: Han and Zhang's [blackboard-based multi-agent system](https://arxiv.org/abs/2507.01701) was competitive on reasoning and math tasks while using fewer tokens; Salemi et al. reported 13–57% relative gains in end-to-end success on [data discovery tasks](https://arxiv.org/abs/2510.01285). Both are arXiv preprints.
 - **Use it when**: several specialists collaborate on one evolving "working document"; the order of contributions can't be fixed in advance; you need auditable intermediate state.
 - **Strengths**: decoupling — adding a specialist doesn't require changing the others; state you can observe, persist and replay; naturally asynchronous.
-- **Failure modes**: **write conflicts** (two agents update the same entry) → version numbers or optimistic locking ([Lesson 13](../13_distributed_concurrency/README.md)); **board bloat**; **error propagation**: one agent writes a wrong conclusion and everyone treats it as fact → every entry needs a source and a confidence level; **stalls**: entries nobody picks up.
+- **Failure modes**: **write conflicts** (two agents update the same entry) → version numbers or optimistic locking ([Lesson 13](../13_distributed_concurrency/README.en.md)); **board bloat**; **error propagation**: one agent writes a wrong conclusion and everyone treats it as fact → every entry needs a source and a confidence level; **stalls**: entries nobody picks up.
 - **Implementation sketch**: the blackboard is just two tools, and writes record the source run_id for traceability (this runs):
 
 ```python
@@ -549,8 +549,8 @@ flowchart LR
 - **Communication**: asynchronous events (pub/sub, queues). **State**: one run per event, persisted through checkpoints; state shared across events lives in external storage. **Control**: event routing decides who handles what; humans take part asynchronously through an inbox.
 - **What's different from a chat agent**:
   - Nobody is watching the screen → latency matters less, **throughput** matters more;
-  - Many events can arrive at once → concurrency, rate limiting, and **idempotency** (a redelivered event must not run twice); see [Lesson 08](../08_reliability/README.md) and [Lesson 13](../13_distributed_concurrency/README.md);
-  - Nobody sees mistakes as they happen → observability and alerting ([Lesson 10](../10_observability/README.md));
+  - Many events can arrive at once → concurrency, rate limiting, and **idempotency** (a redelivered event must not run twice); see [Lesson 08](../08_reliability/README.en.md) and [Lesson 13](../13_distributed_concurrency/README.en.md);
+  - Nobody sees mistakes as they happen → observability and alerting ([Lesson 10](../10_observability/README.en.md));
   - Human involvement is asynchronous → pausing and resuming must be durable.
 - **Use it when**: first-pass alert triage, sorting email and drafting replies, ticket preprocessing, scheduled checks.
 - **Failure modes**: **event storms** (one outage fires 1,000 alerts → 1,000 agent runs) → dedupe, batch, rate-limit; **redelivery** → use the event ID as an idempotency key; **wrong actions with nobody watching** → writes go through Review by default; **self-triggering loops** (the agent's action creates an event that triggers the agent again) → tag events with their source and ignore your own.
@@ -579,7 +579,7 @@ In production the checkpoints have to live in shared storage (replace `FileCheck
 | Blackboard | Reading and writing shared state | Shared structured state | A controller, or agents claim work | Usually nobody directly | Collaboration on one working document | Write conflicts, wrong conclusions spreading |
 | Event-driven | Async events, queues | External storage + checkpoints | Event routing | Nobody online; humans join via an inbox | Background automation | Event storms, duplicate execution, unnoticed errors |
 
-When agents from different organizations or vendors need to call each other, you need a standard protocol. [A2A](https://a2a-protocol.org/latest/) (Agent2Agent) is built for this: an Agent Card describes capabilities, a Task represents a stateful unit of work, and the remote agent is a black box to the caller. Google has donated it to the Linux Foundation. See [Lesson 12](../12_production_architecture/README.md) for how it fits into a production architecture.
+When agents from different organizations or vendors need to call each other, you need a standard protocol. [A2A](https://a2a-protocol.org/latest/) (Agent2Agent) is built for this: an Agent Card describes capabilities, a Task represents a stateful unit of work, and the remote agent is a black box to the caller. Google has donated it to the Linux Foundation. See [Lesson 12](../12_production_architecture/README.en.md) for how it fits into a production architecture.
 
 ## 4. Taking apart real products
 
@@ -681,7 +681,7 @@ flowchart LR
 
 1. **The architecture is ReAct**, except observations are screenshots and actions are mouse and keyboard events. Every step is a multimodal call; screenshots are token-hungry and latency is high.
 2. **The reliability gap is still large**: this is far slower and more fragile than calling an API. **If there's an API, don't drive the screen** (the ACI principle from Lesson 03); computer use is for legacy systems without APIs.
-3. **The environment must be isolated**: any text on screen could be a prompt injection ([Lesson 09](../09_security/README.md)).
+3. **The environment must be isolated**: any text on screen could be a prompt injection ([Lesson 09](../09_security/README.en.md)).
 4. **HITL is part of the architecture**, not an add-on: takeover mode and confirmation before consequential actions.
 5. 🔍 Many browser agents also use structured page information (the DOM or accessibility tree) to depend less on pixel coordinates. This is common industry practice; most products haven't published their exact approach.
 
@@ -754,13 +754,13 @@ flowchart TB
 2. **Route first**: don't run multi-hop retrieval for simple questions (the Adaptive-RAG idea); it saves money and time.
 3. **Keep retrieval evaluation cheap**: judge relevance with a small model or rules, not the big model every time.
 4. **Cap retrieval rounds**: "let me search once more" needs brakes too.
-5. **Permissions before retrieval**: queries the agent rewrites itself must not bypass access control either; filtering has to be enforced in the retrieval layer ([Lesson 15](../15_enterprise_rag/README.md)).
+5. **Permissions before retrieval**: queries the agent rewrites itself must not bypass access control either; filtering has to be enforced in the retrieval layer ([Lesson 15](../15_enterprise_rag/README.en.md)).
 
 **Architecture in one line**: ReAct (retrieval as a tool) or routing (pick a strategy by complexity) + reflection (relevance checks, citation checks).
 
 ## 5. Memory architecture
 
-[Lesson 04, Context and Memory](../04_context_memory/README.md), covered how to implement short-term memory (truncation, summarization) and long-term memory (storage, retrieval, isolation). Here's a different angle: **architecturally, what kinds of memory does an agent have, and where does each one live?**
+[Lesson 04, Context and Memory](../04_context_memory/README.en.md), covered how to implement short-term memory (truncation, summarization) and long-term memory (storage, retrieval, isolation). Here's a different angle: **architecturally, what kinds of memory does an agent have, and where does each one live?**
 
 [CoALA](https://arxiv.org/abs/2309.02427) (Sumers et al., TMLR) splits language-agent memory into **working memory** and **long-term memory**, with long-term memory further divided into **episodic, semantic and procedural**. Combined with engineering practice:
 
@@ -776,7 +776,7 @@ flowchart LR
 |---|---|---|---|---|---|
 | **Short-term** | Raw messages of the current session | Context window | Gone when the session ends | Multi-turn messages | `RunState.messages`; Lesson 04's sliding window and summarization |
 | **Working** | Structured state **actively maintained** to finish the current task: plan, to-dos, known facts, intermediate variables | A structured block in context, or a scratch file | For the duration of the task | Plan-and-Execute's plan, ReWOO's `#E` variables, a coding agent's to-do list, the plan Anthropic's research system saves to Memory, Magentic-One's Task Ledger | Lesson 04's "structured task state"; `results` in Exercise 1 |
-| **Episodic** | Specific past experiences: "last time we did this, it failed because…" | External storage, retrieved on demand | Long-term | Reflexion's reflections; the memory stream in [Generative Agents](https://arxiv.org/abs/2304.03442) (retrieved by recency, importance and relevance) | Run records and traces ([Lesson 10](../10_observability/README.md)) |
+| **Episodic** | Specific past experiences: "last time we did this, it failed because…" | External storage, retrieved on demand | Long-term | Reflexion's reflections; the memory stream in [Generative Agents](https://arxiv.org/abs/2304.03442) (retrieved by recency, importance and relevance) | Run records and traces ([Lesson 10](../10_observability/README.en.md)) |
 | **Semantic** | Facts about the world and the user: "the user is vegetarian" | Databases, vector stores | Long-term | User profiles, company knowledge bases | Lesson 04's `MemoryStore`; RAG |
 | **Procedural** | How to do things: rules, skills, procedures | System prompts, rule files, tool code, model weights | Long-term, changes slowly | CLAUDE.md, AGENTS.md, skill libraries | `system_prompt`, the tools themselves |
 
@@ -784,7 +784,7 @@ Architectural points worth remembering:
 
 1. **Think about short-term and working memory separately**: short-term memory is a raw record that piles up **passively** and gets truncated or summarized; working memory is structured state that's **actively** maintained and should always be kept intact. The classic long-task failure — "forgot what it was doing" — usually happens because the plan lived only in the conversation history, which got compacted.
 2. **When to write is an architectural decision**: the model can call a `remember` tool mid-conversation (simple, but it costs latency and attention on the main path), or a background job can consolidate memories after the conversation ends (off the main path, but delayed).
-3. **Changes to procedural memory carry the most risk**: one edited line in a system prompt or rule file affects every future action, so it should go through the same review and release process as code ([Lesson 16](../16_release_ops/README.md)).
+3. **Changes to procedural memory carry the most risk**: one edited line in a system prompt or rule file affects every future action, so it should go through the same review and release process as code ([Lesson 16](../16_release_ops/README.en.md)).
 4. **Every long-term memory must be isolated, deletable and poisoning-resistant**: the three hard requirements for enterprise memory in Lesson 04 apply equally to episodic, semantic and procedural memory. Designs that let the agent rewrite its own procedural memory (say, automatically updating a rule file) are especially exposed to poisoning.
 5. [MemGPT](https://arxiv.org/abs/2310.08560) (Packer et al., 2023) borrows tiered memory from operating systems and lets the agent itself move data between the small, fast context and large, slow external storage — in effect, handing memory management to the agent as well.
 
@@ -900,7 +900,7 @@ Comparison: one task, three architectures
 2. **Planning first didn't save anything here**: ReAct called 3 tools **in parallel** on step 1 and finished in 3 steps while the history was still short. Meanwhile, every Plan-and-Execute planning call goes through `complete_json`, which puts the JSON Schema into the prompt, and the replanning prompt repeats the context. Plan-and-Execute pulls ahead on tasks with **many steps**: ReAct's input tokens grow roughly quadratically with step count, while Plan-and-Execute spends zero model tokens during execution. Add a few more cities to `WEATHER` and `TRIP` and rerun to watch the gap change.
 3. **Plan-and-Execute was actually the slowest**: its 3 model calls are all serial, each carrying a long structured prompt. "No model during execution" saves time in the execution phase, not in the planning itself.
 4. **Reflection's insurance premium**: in the real run the first draft passed straight away, and it still cost 1 more call and ~1,000 more tokens. In offline mode (`--offline`) the script deliberately leaves the typhoon warning out of the first draft: you'll see round 1 rejected by the **code check** without spending a single model call, and only round 2 checked by the model.
-5. **The quality-check column** is a minimal evaluation written in a few lines of code. Architecture choices should rest on data like this, not on names ([Lesson 11](../11_evals/README.md)).
+5. **The quality-check column** is a minimal evaluation written in a few lines of code. Architecture choices should rest on data like this, not on names ([Lesson 11](../11_evals/README.en.md)).
 
 ## 8. Exercises
 
@@ -935,7 +935,7 @@ OpenAI deep research and CUA both emphasize reinforcement learning that teaches 
 
 ### 9.2 ReAct's quadratic cost and prompt caching
 
-ReAct resends the whole history at every step, so N steps cost roughly N²/2 "per-step increments" of input tokens. Two mitigations: **prompt caching** (when the history prefix doesn't change, the repeated input is cheaper and faster; see [Lesson 14](../14_cost_latency/README.md)), and **compacting old tool results** (Lesson 04). This is also the root reason CodeAct and ReWOO save tokens: intermediate data never goes back into the model's context.
+ReAct resends the whole history at every step, so N steps cost roughly N²/2 "per-step increments" of input tokens. Two mitigations: **prompt caching** (when the history prefix doesn't change, the repeated input is cheaper and faster; see [Lesson 14](../14_cost_latency/README.en.md)), and **compacting old tool results** (Lesson 04). This is also the root reason CodeAct and ReWOO save tokens: intermediate data never goes back into the model's context.
 
 ### 9.3 The cost of structured output
 
@@ -947,7 +947,7 @@ Plan-and-Execute, ReWOO and Reflection all rely on structured output (plans, rev
 
 ### 9.5 Seeing architectures as state machines
 
-Every architecture can be drawn as a state graph: nodes are "call the model / run a tool / wait for a human," and edges are "where to go next." ReAct is one node looping on itself; Plan-and-Execute is "plan → execute (looping) → replan"; HITL inserts a "wait for an external event" state on an edge. That's the starting point for graph-orchestration frameworks like LangGraph: once your architecture needs branches, loops, pauses and resumption, drawing it explicitly as a state graph makes it easier to see and test than burying it in a `while` loop (see [docs/framework-comparison.md](../../docs/framework-comparison.md) for a framework mapping).
+Every architecture can be drawn as a state graph: nodes are "call the model / run a tool / wait for a human," and edges are "where to go next." ReAct is one node looping on itself; Plan-and-Execute is "plan → execute (looping) → replan"; HITL inserts a "wait for an external event" state on an edge. That's the starting point for graph-orchestration frameworks like LangGraph: once your architecture needs branches, loops, pauses and resumption, drawing it explicitly as a state graph makes it easier to see and test than burying it in a `while` loop (see [docs/framework-comparison.md](../../docs/framework-comparison.en.md) for a framework mapping).
 
 ## 10. Common pitfalls and anti-patterns (📖 Optional)
 

@@ -1,10 +1,10 @@
 [中文](README.md) | [English](README.en.md)
 
-# Lesson 13: High Concurrency and Distributed Execution — When One Machine Isn't Enough
+# Lesson 13: High concurrency and distributed execution — when one machine isn't enough
 
 > 🕐 Time: 25 min | 🎯 You'll be able to: scale a single-process agent into a cluster of workers, keep tasks from being lost, duplicated, reordered, or overwhelmed, and pick among several solutions for each problem with clear reasoning | 📦 Source: [`jobqueue.py`](jobqueue.py) (lease queue), [`session_store.py`](session_store.py) (optimistic concurrency), [`agentkit/state.py`](../../agentkit/state.py) (checkpoints), [`agentkit/tools.py`](../../agentkit/tools.py) (idempotency keys)
 
-## 0. The short version
+## 0. In one sentence
 
 **The hard part of distributed systems isn't getting many machines to work together. It's making sure that when one of them gets slow, dies, or only *looks* dead, no work is lost, duplicated, or scrambled.**
 

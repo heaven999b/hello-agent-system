@@ -1,10 +1,10 @@
 [中文](README.md) | [English](README.en.md)
 
-# Lesson 16: Release, Change & Operations — Treat a One-Line Prompt Change Like a Code Release
+# Lesson 16: Release, change, and operations — treat a one-line prompt change like a code release
 
 > 🕐 Time: 15 min | 🎯 You'll be able to: design a complete release and operations process for an agent ("versioning → eval gate → shadow comparison → canary rollout → automatic rollback → kill switch → incident postmortem → feedback loop"), and explain what each stage protects against | 📦 Source: [registry.py](registry.py), [rollout.py](rollout.py), [shadow.py](shadow.py), [killswitch.py](killswitch.py), [flywheel.py](flywheel.py) (this lesson), [`agentkit/permissions.py`](../../agentkit/permissions.py), [`agentkit/evals.py`](../../agentkit/evals.py)
 
-## 0. The short version
+## 0. In one sentence
 
 **An agent's behavior is determined jointly by its prompt, model, tools, parameters, and knowledge base. Change any one of them, and you've made a release.**
 

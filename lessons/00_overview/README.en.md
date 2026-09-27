@@ -88,23 +88,25 @@ Some common cases where you shouldn't use one:
 
 | Dimension | Demo | Enterprise | Lesson |
 |---|---|---|---|
-| Agent loop | `while True`, and hope for the best | Step limit, unified terminal states, pluggable hooks | 01 |
-| Tools | Functions exposed directly; any arguments go | Schema validation, errors as observations, identity injection, risk levels, timeouts and truncation | 02 |
-| Context | History grows until it overflows and errors out | Truncation/summarization; long-term memory isolated per tenant | 03 |
-| Orchestration | One giant prompt does everything | Use a workflow whenever one will do; multi-agent setups have clear boundaries | 04 |
-| Reliability | One model error and the whole service returns 500 | Retry + circuit breaker + fallback; budget caps; resumable checkpoints; idempotent writes | 05 |
-| Security | Trust the model to "behave" | Defense in depth: input screening, untrusted-data isolation, least privilege, human approval, output redaction | 06 |
-| Permissions | Every tool open to everyone | RBAC; approval for high-risk actions; data isolated per user and per tenant | 02 / 06 |
-| Compliance | No records | Audit log: who, when, under which identity, did what, with what outcome | 06 |
-| Observability | `print` debugging | Tracing: the inputs, outputs, latency, and tokens of every model and tool call | 07 |
-| Evaluation | Try a few questions by hand; "seems fine" | Eval set + rule-based/LLM grading + CI gates to prevent regressions | 08 |
-| Recoverability | Process restart = lost task | State saved at every step; resume from where it stopped after a crash or an approval wait | 05 |
-| Concurrency & scale | Single process, one request at a time | Multiple instances + task queue; concurrent writes to the same session don't overwrite each other; global rate limiting and backpressure | 10 |
-| Cost & latency | You find out from the bill at month's end; every request uses the most expensive model | Per-run tokens and spend are visible, cappable, and attributable; tiered model routing, caching | 05 / 11 |
-| Enterprise knowledge | Dump every document into one vector store | Retrieval filtered by user permissions, tenant isolation, stale-knowledge governance, verifiable citations | 12 |
-| Multi-tenancy | Single user | Identity propagated end to end; Company A's data never shows up in Company B's answers | 03 / 06 / 12 |
-| Release & operations | Edit the prompt and ship it straight to production | Shadow/canary releases, one-click kill switch, automatic rollback, incident response | 13 |
-| Deployment architecture | Runs on a laptop | Stateless services + external state store, async approvals, versioned prompts | 09 |
+| Model calls | Treat the model as a black box; ignore tokens, stop reasons, and error types | Understand token billing and context limits, tell retryable errors apart, validate structured output, keep the model swappable | 01 |
+| Agent loop | `while True`, and hope for the best | Step limit, unified terminal states, pluggable hooks | 02 |
+| Tools | Functions exposed directly; any arguments go | Schema validation, errors as observations, identity injection, risk levels, timeouts and truncation | 03 |
+| Context | History grows until it overflows and errors out | Truncation/summarization; long-term memory isolated per tenant | 04 |
+| Architecture & orchestration | One giant prompt does everything | Pick the architecture that fits the shape of the task; use a workflow whenever one will do; multi-agent setups have clear boundaries | 05 / 06 |
+| Reliability | One model error and the whole service returns 500 | Retry + circuit breaker + fallback; budget caps; resumable checkpoints; idempotent writes | 08 |
+| Security | Trust the model to "behave" | Defense in depth: input screening, untrusted-data isolation, least privilege, human approval, output redaction | 09 |
+| Permissions | Every tool open to everyone | RBAC; approval for high-risk actions; data isolated per user and per tenant | 03 / 09 |
+| Compliance | No records | Audit log: who, when, under which identity, did what, with what outcome | 09 |
+| Observability | `print` debugging | Tracing: the inputs, outputs, latency, and tokens of every model and tool call | 10 |
+| Evaluation | Try a few questions by hand; "seems fine" | Eval set + rule-based/LLM grading + CI gates to prevent regressions | 11 |
+| Recoverability | Process restart = lost task | State saved at every step; resume from where it stopped after a crash or an approval wait | 08 |
+| Concurrency & scale | Single process, one request at a time | Multiple instances + task queue; concurrent writes to the same session don't overwrite each other; global rate limiting and backpressure | 13 |
+| Cost & latency | You find out from the bill at month's end; every request uses the most expensive model | Per-run tokens and spend are visible, cappable, and attributable; tiered model routing, caching | 08 / 14 |
+| Enterprise knowledge | Dump every document into one vector store | Retrieval filtered by user permissions, tenant isolation, stale-knowledge governance, verifiable citations | 15 |
+| Multi-tenancy | Single user | Identity propagated end to end; Company A's data never shows up in Company B's answers | 04 / 09 / 15 |
+| Release & operations | Edit the prompt and ship it straight to production | Shadow/canary releases, one-click kill switch, automatic rollback, incident response | 16 |
+| Deployment architecture | Runs on a laptop | Stateless services + external state store, async approvals, versioned prompts | 12 |
+| Design review | Build whatever comes to mind; discover missing compliance or tenant isolation after launch | Review systematically across 20 engineering dimensions: every general check done, every situational check the project triggers confirmed one by one | 07 |
 
 An intuition about reliability: if each step of an agent is correct with 95% probability, a 10-step task is fully correct only 0.95¹⁰ ≈ 60% of the time, and a 20-step task only about 36%. **Agent errors compound.** So the core of an enterprise agent isn't "making the model smarter" — it's adding validation, safety nets, and observability to every step.
 
@@ -112,15 +114,15 @@ An intuition about reliability: if each step of an agent is correct with 95% pro
 
 ```mermaid
 flowchart TB
-    ENTRY["<b>Access layer</b><br/>Web / IM / API<br/>SSO authentication"]
+    ENTRY["<b>Access layer</b> · Lesson 12<br/>Web / IM / API<br/>API gateway: SSO authentication, tenant identification"]
     EXEC["<b>Execution and scaling layer</b> · Lesson 13<br/>Task queue + multi-instance workers<br/>Session concurrency control<br/>Global rate limiting and backpressure"]
     GUARD["<b>Guardrail layer</b> · Lesson 09<br/>Input screening (InputGuard)<br/>Tool output isolation (ToolOutputGuard)<br/>Output redaction (OutputGuard)"]
-    ORCH["<b>Orchestration layer</b> · Lessons 02, 06<br/>Agent loop + hooks<br/>Workflows and multi-agent"]
+    ORCH["<b>Orchestration layer</b> · Lessons 02, 05, 06<br/>Agent loop + hooks<br/>Reasoning architectures and multi-agent topologies<br/>Workflow orchestration patterns"]
     CTX["<b>Context and knowledge layer</b> · Lessons 04, 15<br/>Context window management<br/>Long-term memory<br/>Permission-aware RAG"]
     TOOLS["<b>Tool layer</b> · Lessons 03, 09<br/>ToolRegistry<br/>Validation, timeouts, idempotency<br/>RBAC + human approval"]
-    MODEL["<b>Model layer</b> · Lessons 08, 14<br/>ResilientLLM: retry, circuit breaker, fallback<br/>Model routing and caching<br/>Budget (BudgetHook)"]
+    MODEL["<b>Model layer</b> · Lessons 01, 08, 14<br/>Model calls: tokens, structured output, streaming<br/>ResilientLLM: retry, circuit breaker, fallback<br/>Model routing and caching<br/>Budget (BudgetHook)"]
     STATE["<b>State layer</b> · Lesson 08<br/>Checkpoints (Checkpointer)"]
-    XCUT["<b>Cross-cutting concerns</b><br/>Tracing · Lesson 10<br/>Audit log · Lesson 09<br/>Evals and CI gates · Lesson 11<br/>Release, change, and operations · Lesson 16"]
+    XCUT["<b>Cross-cutting concerns</b><br/>Engineering perspectives (20 dimensions) · Lesson 07<br/>Tracing · Lesson 10<br/>Audit log · Lesson 09<br/>Evals and CI gates · Lesson 11<br/>Release, change, and operations · Lesson 16"]
     ENTRY --> EXEC --> GUARD --> ORCH
     ORCH --> CTX
     ORCH --> TOOLS
@@ -135,62 +137,83 @@ How the lessons map to architecture layers and agentkit modules:
 
 | Part | Lesson | Topic | Architecture layer | agentkit modules |
 |---|---|---|---|---|
-| 1 | [01](../02_agent_loop/README.en.md) | The agent loop, demystified | Orchestration | [`agent.py`](../../agentkit/agent.py), [`llm.py`](../../agentkit/llm.py), [`types.py`](../../agentkit/types.py), [`hooks.py`](../../agentkit/hooks.py) |
-| 1 | [02](../03_tools/README.en.md) | Tool design | Tools | [`tools.py`](../../agentkit/tools.py) |
-| 1 | [03](../04_context_memory/README.en.md) | Context and memory | Context and knowledge | [`context.py`](../../agentkit/context.py), [`memory.py`](../../agentkit/memory.py) |
-| 1 | [04](../06_orchestration/README.en.md) | Orchestration patterns and multi-agent | Orchestration | [`workflows.py`](../../agentkit/workflows.py) |
-| 2 | [05](../08_reliability/README.en.md) | Reliability engineering | Model, state | [`reliability.py`](../../agentkit/reliability.py), [`budget.py`](../../agentkit/budget.py), [`state.py`](../../agentkit/state.py) |
-| 2 | [06](../09_security/README.en.md) | Security and governance | Guardrails, tools | [`guardrails.py`](../../agentkit/guardrails.py), [`permissions.py`](../../agentkit/permissions.py), [`audit.py`](../../agentkit/audit.py) |
-| 2 | [07](../10_observability/README.en.md) | Observability | Cross-cutting | [`tracing.py`](../../agentkit/tracing.py) |
-| 2 | [08](../11_evals/README.en.md) | Eval-driven development | Cross-cutting | [`evals.py`](../../agentkit/evals.py) |
-| 2 | [09](../12_production_architecture/README.en.md) | Production architecture overview | All | Everything combined |
-| 2 | [10](../13_distributed_concurrency/README.en.md) | High concurrency and distributed execution | Execution and scaling | See the lesson |
-| 2 | [11](../14_cost_latency/README.en.md) | Cost and latency optimization | Model | See the lesson |
-| 2 | [12](../15_enterprise_rag/README.en.md) | Enterprise knowledge and permission-aware RAG | Context and knowledge | See the lesson |
-| 2 | [13](../16_release_ops/README.en.md) | Release, change, and operations | Cross-cutting | See the lesson |
+| 1 | [01](../01_llm_essentials/README.en.md) | LLM essentials for agent developers | Model | [`llm.py`](../../agentkit/llm.py), [`types.py`](../../agentkit/types.py), [`pricing.py`](../../agentkit/pricing.py) |
+| 1 | [02](../02_agent_loop/README.en.md) | The agent loop, demystified | Orchestration | [`agent.py`](../../agentkit/agent.py), [`llm.py`](../../agentkit/llm.py), [`types.py`](../../agentkit/types.py), [`hooks.py`](../../agentkit/hooks.py) |
+| 1 | [03](../03_tools/README.en.md) | Tool design | Tools | [`tools.py`](../../agentkit/tools.py) |
+| 1 | [04](../04_context_memory/README.en.md) | Context and memory | Context and knowledge | [`context.py`](../../agentkit/context.py), [`memory.py`](../../agentkit/memory.py) |
+| 1 | [05](../05_agent_architectures/README.en.md) | Common agent architectures | Orchestration | [`agent.py`](../../agentkit/agent.py) (ReAct), [`workflows.py`](../../agentkit/workflows.py) |
+| 1 | [06](../06_orchestration/README.en.md) | Orchestration patterns: workflows and multi-agent | Orchestration | [`workflows.py`](../../agentkit/workflows.py) |
+| 1 | [07](../07_engineering_perspectives/README.en.md) | Engineering perspectives | Cross-cutting (20 dimensions for reviewing every layer) | See the lesson (`perspectives.py`) |
+| 2 | [08](../08_reliability/README.en.md) | Reliability engineering | Model, state | [`reliability.py`](../../agentkit/reliability.py), [`budget.py`](../../agentkit/budget.py), [`state.py`](../../agentkit/state.py) |
+| 2 | [09](../09_security/README.en.md) | Security and governance | Guardrails, tools | [`guardrails.py`](../../agentkit/guardrails.py), [`permissions.py`](../../agentkit/permissions.py), [`audit.py`](../../agentkit/audit.py) |
+| 2 | [10](../10_observability/README.en.md) | Observability | Cross-cutting | [`tracing.py`](../../agentkit/tracing.py), [`viewer.py`](../../agentkit/viewer.py) |
+| 2 | [11](../11_evals/README.en.md) | Eval-driven development | Cross-cutting | [`evals.py`](../../agentkit/evals.py) |
+| 2 | [12](../12_production_architecture/README.en.md) | Production architecture overview | All (including access) | Everything combined |
+| 2 | [13](../13_distributed_concurrency/README.en.md) | High concurrency and distributed execution | Execution and scaling | See the lesson |
+| 2 | [14](../14_cost_latency/README.en.md) | Cost and latency optimization | Model | See the lesson |
+| 2 | [15](../15_enterprise_rag/README.en.md) | Enterprise knowledge and permission-aware RAG | Context and knowledge | See the lesson |
+| 2 | [16](../16_release_ops/README.en.md) | Release, change, and operations | Cross-cutting | See the lesson |
 | — | [capstone](../../capstone/README.en.md) | ITBuddy capstone | All | Everything combined |
 
-### 1.6 The two parts of the course and the 4-hour learning path
+### 1.6 The two parts of the course and the learning path
 
 The course has two parts, and you study them differently:
 
 | | Part 1: Building blocks | Part 2: Enterprise problems and solutions |
 |---|---|---|
-| Lessons | 00–04 | 05–13 |
-| Time | ~80 minutes | ~160 minutes |
+| Lessons | 00–07 | 08–16 |
+| Time | ~140 minutes | ~160 minutes |
 | Goal | **Learn how to build**: what each part of an agent is and how to implement it from scratch | **Learn how to choose**: when a real problem hits in an enterprise, what the options are, what each one costs, and which to pick |
 | Approach | Concept → build from scratch → exercise | Real problem → compare several solutions → where each fits → recommendation → code |
-| What you get | An agent core you wrote yourself and fully understand | Judgment for architecture decisions (the most valuable thing in interviews and design reviews) |
+| What you get | An agent core you wrote yourself and fully understand, plus a 20-dimension map of engineering perspectives | Judgment for architecture decisions (the most valuable thing in interviews and design reviews) |
 
 Why split it this way? The hard part of enterprise agents is rarely "I don't know how to write the loop." It's problems like "state got overwritten when two windows sent messages at the same time," "the model API is rate-limiting us," or "retrieval surfaced another department's files." Most of these have no single right answer, only trade-offs among scale, consistency, cost, and team capability. That's why every Part 2 lesson is built from a set of "problem cards": each card presents a real scenario, compares several candidate solutions, and explains how to choose.
 
+Lesson 07, "Engineering perspectives," closes Part 1 and is the bridge into Part 2: it breaks agent engineering into 20 dimensions, and splits each one into **general checks** (every project needs them) and **situational checks** ("when …, consider …"). Every Part 2 lesson goes deep on one or two dimensions of that map.
+
 ```mermaid
 flowchart LR
-    P1["<b>Part 1: Building blocks</b><br/>Learn how to build · ~80 min<br/><br/>00 The big picture · 10m<br/>01 The agent loop · 20m<br/>02 Tool design · 20m<br/>03 Context and memory · 15m<br/>04 Orchestration patterns · 15m"]
-    P2["<b>Part 2: Enterprise problems and solutions</b><br/>Learn how to choose · ~160 min<br/><br/>05 Reliability engineering · 20m<br/>06 Security and governance · 20m<br/>07 Observability · 15m<br/>08 Eval-driven development · 20m<br/>09 Production architecture overview · 15m<br/>10 High concurrency and distributed execution · 25m<br/>11 Cost and latency optimization · 15m<br/>12 Permission-aware RAG · 15m<br/>13 Release, change, and operations · 15m"]
+    P1["<b>Part 1: Building blocks</b><br/>Learn how to build · ~140 min<br/><br/>00 The big picture · 10m<br/>01 LLM essentials for agent developers · 20m<br/>02 The agent loop · 20m<br/>03 Tool design · 20m<br/>04 Context and memory · 15m<br/>05 Common agent architectures · 20m<br/>06 Orchestration patterns · 15m<br/>07 Engineering perspectives · 20m"]
+    P2["<b>Part 2: Enterprise problems and solutions</b><br/>Learn how to choose · ~160 min<br/><br/>08 Reliability engineering · 20m<br/>09 Security and governance · 20m<br/>10 Observability · 15m<br/>11 Eval-driven development · 20m<br/>12 Production architecture overview · 15m<br/>13 High concurrency and distributed execution · 25m<br/>14 Cost and latency optimization · 15m<br/>15 Permission-aware RAG · 15m<br/>16 Release, change, and operations · 15m"]
     CP["<b>Capstone</b><br/>ITBuddy · 30m"]
-    P1 --> P2 --> CP
+    P1 -->|"Lesson 07's map = Part 2's table of contents"| P2 --> CP
 ```
 
 | Part | Lesson | Time | Cumulative | What you get |
 |---|---|---|---|---|
 | 1 Building blocks | [00 The big picture](README.en.md) | 10 min | 0:10 | A map and the judgment to use it |
-| | [01 The agent loop](../02_agent_loop/README.en.md) | 20 min | 0:30 | A main loop you wrote yourself |
-| | [02 Tool design](../03_tools/README.en.md) | 20 min | 0:50 | Tools the model uses correctly and attackers can't misuse |
-| | [03 Context and memory](../04_context_memory/README.en.md) | 15 min | 1:05 | Long conversations that don't overflow, and memory that never leaks across users |
-| | [04 Orchestration patterns](../06_orchestration/README.en.md) | 15 min | 1:20 | Knowing when to use a workflow and when to use an agent |
-| 2 Enterprise problems | [05 Reliability engineering](../08_reliability/README.en.md) | 20 min | 1:40 | What to do when you're rate-limited, the model goes down, or the process crashes |
-| | [06 Security and governance](../09_security/README.en.md) | 20 min | 2:00 | Defending against injection, privilege escalation, and data leaks |
-| | [07 Observability](../10_observability/README.en.md) | 15 min | 2:15 | How to investigate when something goes wrong |
-| | [08 Eval-driven development](../11_evals/README.en.md) | 20 min | 2:35 | How to know a prompt change didn't break anything |
-| | [09 Production architecture overview](../12_production_architecture/README.en.md) | 15 min | 2:50 | How the layers fit together into one system |
-| | [10 High concurrency and distributed execution](../13_distributed_concurrency/README.en.md) | 25 min | 3:15 | Multiple instances, queues, concurrent writes, rate limiting, compensation |
-| | [11 Cost and latency optimization](../14_cost_latency/README.en.md) | 15 min | 3:30 | Model routing, caching, cost attribution |
-| | [12 Enterprise knowledge and permission-aware RAG](../15_enterprise_rag/README.en.md) | 15 min | 3:45 | Retrieval that respects permissions, knowledge that stays current, citations you can verify |
-| | [13 Release, change, and operations](../16_release_ops/README.en.md) | 15 min | 4:00 | Progressive rollout, kill switches, rollback, incident response |
-| Capstone | [ITBuddy capstone](../../capstone/README.en.md) | 30 min | 4:30 | Putting it all together |
+| | [01 LLM essentials for agent developers](../01_llm_essentials/README.en.md) | 20 min | 0:30 | What tokens, sampling, tool calling, structured output, and streaming mean inside an agent |
+| | [02 The agent loop](../02_agent_loop/README.en.md) | 20 min | 0:50 | A main loop you wrote yourself |
+| | [03 Tool design](../03_tools/README.en.md) | 20 min | 1:10 | Tools the model uses correctly and attackers can't misuse |
+| | [04 Context and memory](../04_context_memory/README.en.md) | 15 min | 1:25 | Long conversations that don't overflow, and memory that never leaks across users |
+| | [05 Common agent architectures](../05_agent_architectures/README.en.md) | 20 min | 1:45 | Breaking any agent product down into its architectures, and picking one for a new requirement |
+| | [06 Orchestration patterns](../06_orchestration/README.en.md) | 15 min | 2:00 | Knowing when to use a workflow and when to use an agent |
+| | [07 Engineering perspectives](../07_engineering_perspectives/README.en.md) | 20 min | 2:20 | A 20-dimension review map: general checks + situational checks |
+| 2 Enterprise problems | [08 Reliability engineering](../08_reliability/README.en.md) | 20 min | 2:40 | What to do when you're rate-limited, the model goes down, or the process crashes |
+| | [09 Security and governance](../09_security/README.en.md) | 20 min | 3:00 | Defending against injection, privilege escalation, and data leaks |
+| | [10 Observability](../10_observability/README.en.md) | 15 min | 3:15 | How to investigate when something goes wrong |
+| | [11 Eval-driven development](../11_evals/README.en.md) | 20 min | 3:35 | How to know a prompt change didn't break anything |
+| | [12 Production architecture overview](../12_production_architecture/README.en.md) | 15 min | 3:50 | How the layers fit together into one system |
+| | [13 High concurrency and distributed execution](../13_distributed_concurrency/README.en.md) | 25 min | 4:15 | Multiple instances, queues, concurrent writes, rate limiting, compensation |
+| | [14 Cost and latency optimization](../14_cost_latency/README.en.md) | 15 min | 4:30 | Model routing, caching, cost attribution |
+| | [15 Enterprise knowledge and permission-aware RAG](../15_enterprise_rag/README.en.md) | 15 min | 4:45 | Retrieval that respects permissions, knowledge that stays current, citations you can verify |
+| | [16 Release, change, and operations](../16_release_ops/README.en.md) | 15 min | 5:00 | Progressive rollout, kill switches, rollback, incident response |
+| Capstone | [ITBuddy capstone](../../capstone/README.en.md) | 30 min | 5:30 | Putting it all together |
 
-The 14 core lessons take 4 hours; the capstone takes another 30 minutes. Short on time? 00 → 01 → 02 → 05 → 06 is the minimal end-to-end path. You can skip each lesson's "Going deeper" section at first and come back to it later.
+The 17 core lessons take 5 hours; the capstone takes another 30 minutes, for about 5.5 hours in total. You can skip each lesson's "Going deeper" section at first and come back to it later.
+
+#### The 4-hour fast track
+
+Only have about 4 hours? Keep the same order and don't skip any lesson — just read each one more thinly:
+
+| Lesson | How to read it on the fast track |
+|---|---|
+| Lessons that open with a 🧭 **Core path** (e.g. 04, 05, 06) | Read only the sections the core path lists; skip sections marked 📖 **Optional** (e.g. 1.7, 1.8, and 1.11 in Lesson 01) |
+| Lessons without these markers | Read §0 (the one-sentence summary) and §1 (core concepts) — for Part 2 lessons, also each problem card's scenario, comparison of options, and "how to choose" — then run the demo and do the exercise; come back to "Going deeper," pitfalls, and interview questions when you start a real project |
+| 07 Engineering perspectives | Read only [§1 The map](../07_engineering_perspectives/README.en.md#1-the-map) (focus on 1.3, general checks vs situational checks) and [§3 the scenario matrix](../07_engineering_perspectives/README.en.md#3-scenario-profiles--which-dimensions-to-focus-on); §2's 301 items are a reference manual to look up later |
+| Capstone | Just run the [demo script](../../capstone/README.en.md#5-demo-script-every-enterprise-capability-in-15-minutes) |
+
+If you don't even have 4 hours, 00 → 02 → 03 → 08 → 09 (big picture, loop, tools, reliability, security) is the minimal end-to-end path.
 
 Each Part 1 lesson follows the same rhythm: read the README (concepts + why) → run `demo.py` (see it in action) → do `exercise.py` (implement it yourself) → verify with `make lesson N=NN`. Part 2 lessons are read through their problem cards; you then use the demo and exercises to validate the solution you chose.
 
@@ -200,7 +223,7 @@ This lesson's [`demo.py`](demo.py) wires up an agent with nearly every enterpris
 
 ```python
 Agent(
-    ResilientLLM(default_llm(), fallbacks=[...]),       # Lesson 08: retry, circuit breaker, fallback
+    ResilientLLM(default_llm(), fallbacks=[...]),       # Lesson 01: model calls; Lesson 08: retry, circuit breaker, fallback
     [search_kb, list_my_tickets, reset_password, ...],  # Lesson 03: schemas, ctx identity, risk levels
     system_prompt=SYSTEM_PROMPT + UNTRUSTED_DATA_RULE,  # Lesson 09: tell the model tool output is data, not instructions
     max_steps=8,                                        # Lesson 02: step limit
@@ -218,6 +241,8 @@ Agent(
     idempotency_store=IdempotencyStore(),               # Lesson 08: idempotent writes
 )
 ```
+
+The lessons that don't show up directly in this code: Lesson 05 explains which architecture this loop is (ReAct) and what the alternatives are; Lesson 06 covers orchestrating several model calls or agents together; Lesson 07 gives you 20 engineering dimensions for reviewing the whole system; Lesson 11 shows how to prove a change didn't break anything; Lesson 12 turns it into a deployed service; and Lessons 13–16 cover scale, cost, enterprise knowledge, and release and operations.
 
 All of agentkit is just over 2,000 lines of Python (a large share of which are comments explaining the "why"). It depends only on `openai` and `pydantic`, and each file maps to one lesson. It's written for teaching but designed to production standards: every concept you learn here — the loop, hooks, checkpoints, guardrails, tracing — has a counterpart in mainstream frameworks such as LangGraph and the OpenAI Agents SDK.
 
@@ -281,7 +306,7 @@ Run artifacts go to `runs/00_overview/` (ignored via `.gitignore`). Open `checkp
 
 This lesson has no coding exercise. Instead:
 
-1. **Quiz**: [`quiz.en.md`](quiz.en.md), 12 questions, with the answers collapsed under each one.
+1. **Quiz**: [`quiz.en.md`](quiz.en.md), 13 questions, with the answers collapsed under each one.
 2. **Tinker with the demo (optional, 5 minutes)**:
    - In `demo.py`, change `ME`'s roles to `["it_admin"]` and see how the "tools this user can see" change;
    - In scenario 2, change `approved=True` to `False` and see how the model answers the user once it receives an "approval denied" observation;
@@ -293,7 +318,7 @@ This lesson has no coding exercise. Instead:
 
 **The "lethal trifecta."** In [The lethal trifecta for AI agents](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/) (2025-06), Simon Willison points out that when an agent has all three of ① access to private data, ② exposure to untrusted content, and ③ the ability to communicate externally, an attacker can use injection to make it send private data out. ITBuddy in scenario 1 already has the first two (ticket data, and a knowledge base that can be poisoned), so we must tightly control the third. EchoLeak (CVE-2025-32711), the zero-click Microsoft 365 Copilot vulnerability disclosed in 2025, is exactly this kind of problem: all the attacker had to do was send an email with instructions hidden inside. When you design an agent, first ask how many of the three it has.
 
-**OWASP's "Excessive Agency."** The [OWASP Top 10 for LLM Applications 2025](https://owasp.org/www-project-top-10-for-large-language-model-applications/2_0_vulns/LLM06_ExcessiveAgency.html) traces Excessive Agency (LLM06) to three root causes: excessive functionality (tools beyond what the task needs), excessive permissions (tools with more privileges than they need), and excessive autonomy (high-impact actions without human confirmation). These map neatly to tool granularity in Lesson 03, identity and RBAC in Lessons 03/06, and human approval in Lesson 09.
+**OWASP's "Excessive Agency."** The [OWASP Top 10 for LLM Applications 2025](https://owasp.org/www-project-top-10-for-large-language-model-applications/2_0_vulns/LLM06_ExcessiveAgency.html) traces Excessive Agency (LLM06) to three root causes: excessive functionality (tools beyond what the task needs), excessive permissions (tools with more privileges than they need), and excessive autonomy (high-impact actions without human confirmation). These map neatly to tool granularity in Lesson 03, identity and RBAC in Lessons 03/09, and human approval in Lesson 09.
 
 **Build your own or use a framework?** This course implements agentkit from scratch so you understand why each layer exists. Whether to use a framework like LangGraph or the OpenAI Agents SDK in production is a trade-off: frameworks save you boilerplate and come with integrations; building your own gives you full control over control flow, state, and dependencies. [12-Factor Agents](https://github.com/humanlayer/12-factor-agents) argues that many teams eventually take the critical pieces — prompts, context, control flow, state — back into their own hands. Whichever path you take, you need every layer this course covers; the only difference is whether you write it yourself or configure a framework.
 
@@ -360,7 +385,7 @@ This lesson has no coding exercise. Instead:
 - [ ] I can sketch the autonomy spectrum and explain the cost of moving to the right
 - [ ] I can use the decision tree to judge whether a requirement calls for an agent
 - [ ] I can list differences between demo and enterprise agents across at least 8 dimensions
-- [ ] I can draw the layered architecture of an enterprise agent and map Lessons 02–16 onto its layers
+- [ ] I can draw the layered architecture of an enterprise agent and map Lessons 01–16 onto its layers
 - [ ] I can explain the difference between Part 1 (learn how to build) and Part 2 (learn how to choose)
 - [ ] I've run `demo.py` and can name the enterprise capabilities at work in each of the 3 scenarios
 - [ ] I've completed [`quiz.en.md`](quiz.en.md)

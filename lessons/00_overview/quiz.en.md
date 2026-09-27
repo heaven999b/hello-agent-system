@@ -2,7 +2,7 @@
 
 # Lesson 00 quiz
 
-12 questions, about 6 minutes. Answer on your own first, then expand the answers to check. For any you get wrong, go back and reread the relevant section of the [README](README.en.md).
+13 questions, about 7 minutes. Answer on your own first, then expand the answers to check. For any you get wrong, go back and reread the relevant section of the [README](README.en.md).
 
 ---
 
@@ -149,19 +149,19 @@ Layers: model layer, tool layer (permissions), context and memory layer, cross-c
 
 | Component | Layer | Lesson |
 |---|---|---|
-| `ResilientLLM` | Model layer (retry, circuit breaker, fallback) | 05 |
-| `PermissionPolicy` | Tool layer (RBAC + human approval) | 06 |
-| `SlidingWindow` | Context and memory layer | 03 |
-| `Tracer` | Cross-cutting (observability) | 07 |
-| `FileCheckpointer` | State layer | 05 |
-| `ToolOutputGuard` | Guardrail layer (tool output isolation) | 06 |
+| `ResilientLLM` | Model layer (retry, circuit breaker, fallback) | 08 |
+| `PermissionPolicy` | Tool layer (RBAC + human approval) | 09 |
+| `SlidingWindow` | Context and memory layer | 04 |
+| `Tracer` | Cross-cutting (observability) | 10 |
+| `FileCheckpointer` | State layer | 08 |
+| `ToolOutputGuard` | Guardrail layer (tool output isolation) | 09 |
 
 (README 1.5)
 </details>
 
 ---
 
-### 11. (Single choice) How does Part 2 of the course (05–13) differ from Part 1?
+### 11. (Single choice) How does Part 2 of the course (08–16) differ from Part 1 (00–07)?
 
 - A. Part 2 has no code, only concepts
 - B. Part 2 is organized around real enterprise problems: it compares the trade-offs of several solutions, explains how to choose, and then implements one of them in code
@@ -194,4 +194,19 @@ None of these is always best: conflict frequency, latency requirements, and your
 
 ---
 
-Got them all right? Move on to [Lesson 02: The agent loop, demystified](../02_agent_loop/README.en.md).
+### 13. (Single choice) Lesson 07 splits the considerations in every engineering dimension into "general checks" and "situational checks". Which statement is correct?
+
+- A. Situational checks are optional extras you can skip when you're short on time
+- B. General checks apply to every agent project; situational checks apply only when a specific condition holds, but once it does, they're just as mandatory as the general ones
+- C. Only high-traffic consumer products need to look at situational checks
+- D. The difference is severity: general checks are all P0, situational checks are all P2
+
+<details>
+<summary>Answer</summary>
+
+**B.** "Situational" is about *whether it applies*, not *whether it's optional*. "Every tool has a timeout" and "the model never supplies identity" are general checks, whatever the scenario. "When the agent can send information out, consider data exfiltration" is a situational check — if you ever give ITBuddy a tool that sends email, it gets triggered (think back to the lethal trifecta in question 8). A mistakes "situational" for "optional". C is wrong: every scenario, from internal tools to offline batch jobs, triggers its own set of checks. D is wrong: every item carries its own P0 / P1 / P2 severity, and both kinds include all three levels. ([Lesson 07 §1.3](../07_engineering_perspectives/README.en.md#13-general-checks-vs-situational-checks))
+</details>
+
+---
+
+Got them all right? Move on to [Lesson 01: LLM essentials for agent developers](../01_llm_essentials/README.en.md).

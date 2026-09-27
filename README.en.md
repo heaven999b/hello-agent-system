@@ -184,7 +184,7 @@ Check your progress:
 | [🎤 System-design interview questions](docs/interview-questions.en.md) | 61 questions + 3 fully worked system-design answers |
 | [🔁 Framework comparison](docs/framework-comparison.en.md) | agentkit concepts ↔ LangGraph / OpenAI Agents SDK / Claude Agent SDK / ADK … |
 | [📄 Cheatsheet](docs/cheatsheet.en.md) | Principles, default parameters, decision trees; printable |
-| [📖 Glossary](docs/glossary.en.md) | 185 terms, English ↔ Chinese, explained in plain words |
+| [📖 Glossary](docs/glossary.en.md) | 192 terms, English ↔ Chinese, explained in plain words |
 | [📚 Reading list](docs/reading-list.en.md) | 71 curated and verified papers, posts, and specs, with reading paths by role |
 
 ## 🧱 Repository layout

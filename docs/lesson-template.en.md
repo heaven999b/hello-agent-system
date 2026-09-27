@@ -67,8 +67,8 @@ To run: `python lessons/NN_topic/demo.py [--offline]`, `make lesson N=NN`, `make
 
 | Part | Lessons | Share | Approach |
 |---|---|---|---|
-| Part 1: Building Blocks | 00–04 | ~1/3 | Concepts → build from scratch → exercises |
-| Part 2: Enterprise Problems and Solutions | 05–13 | ~2/3 | **Problem-driven**: a real problem → compare several solutions → when each one fits → recommended choice → code |
+| Part 1: Building Blocks | 00–07 | ~47% (~140 min) | Concepts → build from scratch → exercises |
+| Part 2: Enterprise Problems and Solutions | 08–16 | ~53% (~160 min) | **Problem-driven**: a real problem → compare several solutions → when each one fits → recommended choice → code |
 
 ## Enterprise problem cards (the main format of every Part 2 lesson)
 
