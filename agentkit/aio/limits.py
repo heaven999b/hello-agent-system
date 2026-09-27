@@ -17,6 +17,8 @@ import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable
 
+from .timeouts import wait_for
+
 
 class LimitExceeded(Exception):
     """在等待时间内没拿到并发槽位或令牌。"""
@@ -84,7 +86,9 @@ async def _acquire(sem: asyncio.Semaphore, timeout: float | None, what: str) -> 
         await sem.acquire()
         return
     try:
-        await asyncio.wait_for(sem.acquire(), timeout)
+        # 取消安全的 wait_for：3.12 之前的 asyncio.wait_for 会在"刚拿到槽位 + 外部取消"同时发生时吞掉取消；
+        # 取消优先时如果其实已经拿到了槽位，要立即归还，否则名额永久泄漏
+        await wait_for(sem.acquire(), timeout, on_discard=lambda _: sem.release())
     except asyncio.TimeoutError:
         raise LimitExceeded(f"{what} 的并发槽位已满，等待 {timeout:.2f}s 后仍未获得") from None
 

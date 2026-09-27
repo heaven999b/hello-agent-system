@@ -769,3 +769,106 @@ def test_cancel_between_db_commit_and_response_never_strands_the_run():
     outcomes = run(main())
     assert all(status == "cancelled" for status, _ in outcomes), outcomes
     assert all(conflicts == 0 for _, conflicts in outcomes)
+
+
+# ---------------------------------------------------------------- R3：wait_for 吞掉取消（CPython gh-86296）
+
+def _wait_for_impls():
+    from agentkit.aio import timeouts
+
+    impls = [pytest.param(lambda aw, t, **kw: timeouts._wait_for_via_wait(aw, t, kw.get("on_discard")), id="py310-asyncio.wait")]
+    if timeouts._HAS_TIMEOUT_CM:
+        impls.append(pytest.param(lambda aw, t, **kw: timeouts._wait_for_timeout_cm(aw, t), id="py311+-asyncio.timeout"))
+    return impls
+
+
+@pytest.mark.parametrize("wait_for", _wait_for_impls())
+def test_wait_for_never_swallows_cancel_when_result_arrives_in_same_tick(wait_for):
+    """结果和外部取消在同一轮事件循环里到达：必须以取消为准（3.11 的 asyncio.wait_for 这里 100% 返回结果）。"""
+
+    async def main():
+        lost = 0
+        for _ in range(50):
+            inner = asyncio.get_running_loop().create_future()
+            task = asyncio.ensure_future(wait_for(inner, 10))
+            await asyncio.sleep(0)
+            inner.set_result("工具刚好完成")
+            task.cancel()
+            try:
+                await task
+                lost += 1
+            except asyncio.CancelledError:
+                pass
+        return lost
+
+    assert run(main()) == 0
+
+
+@pytest.mark.parametrize("wait_for", _wait_for_impls())
+def test_wait_for_timeout_and_fast_path(wait_for):
+    async def main():
+        assert await wait_for(asyncio.sleep(0, result="ok"), 1) == "ok"
+        started = time.monotonic()
+        with pytest.raises(asyncio.TimeoutError):
+            await wait_for(asyncio.sleep(10), 0.05)
+        return time.monotonic() - started
+
+    assert run(main()) < 5  # 宽松兜底：只证明没有等满 10 秒
+
+
+@pytest.mark.parametrize("wait_for", _wait_for_impls())
+def test_wait_for_cancel_racing_semaphore_grant_does_not_leak_permit(wait_for):
+    """取消优先时，如果内部其实已经拿到了信号量，名额必须归还，否则这个租户的槽位永久少一个。"""
+
+    async def main():
+        leaked = 0
+        for _ in range(30):
+            sem = asyncio.Semaphore(1)
+            await sem.acquire()  # 先占满
+            task = asyncio.ensure_future(wait_for(sem.acquire(), 10, on_discard=lambda _: sem.release()))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            sem.release()  # 名额交给等待者……
+            task.cancel()  # ……同一轮里外部取消
+            with contextlib.suppress(asyncio.CancelledError):
+                if await task:
+                    sem.release()  # 取消没生效、拿到了名额：用完归还（这里只检查泄漏）
+            for _ in range(3):
+                await asyncio.sleep(0)
+            leaked += sem.locked()
+        return leaked
+
+    assert run(main()) == 0
+
+
+def test_tool_executor_cancel_at_tool_completion_is_not_lost():
+    """端到端：工具刚执行完的那一刻取消执行器，取消必须传出去，而不是返回结果、让运行继续。"""
+    from agentkit.aio import AsyncToolExecutor
+    from agentkit.tools import ToolRegistry
+
+    async def main():
+        lost = 0
+        for i in range(30):
+            gate = asyncio.get_running_loop().create_future()
+
+            @tool
+            async def slow_write(x: int) -> str:
+                """一个写操作"""
+                return await gate
+
+            executor = AsyncToolExecutor(ToolRegistry([slow_write]))
+            ctx = ToolContext(run_id=f"r{i}", call_id="c1", tenant_id="t", user_id="u")
+            task = asyncio.ensure_future(executor.execute(ToolCall("c1", "slow_write", '{"x": 1}'), ctx))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            gate.set_result("已写入")
+            task.cancel()
+            try:
+                await task
+                lost += 1
+            except asyncio.CancelledError:
+                pass
+            executor.close()
+        return lost
+
+    assert run(main()) == 0

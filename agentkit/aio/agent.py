@@ -38,6 +38,7 @@ from ..tracing import Span, Tracer
 from ..types import LLMResponse, Message, ToolCall, calls_in, system, tool_message, user
 from .limits import KeyedLimiter, KeyedLocks, LimitExceeded
 from .llm import StreamDone, TextDelta
+from .timeouts import wait_for
 from .tools import AsyncToolExecutor, maybe_await
 
 logger = logging.getLogger("agentkit.aio")
@@ -277,7 +278,7 @@ class AsyncAgent:
                 entered = True
             body = self._prepare_and_loop(state, prepare)
             if self.run_timeout is not None:
-                await asyncio.wait_for(body, self.run_timeout)
+                await wait_for(body, self.run_timeout)  # 取消安全版，见 timeouts.py
             else:
                 await body
         except StopRun as e:

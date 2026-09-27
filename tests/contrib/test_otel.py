@@ -378,6 +378,9 @@ def test_async_agent_50_concurrent_runs_with_parallel_tools(otel, registry, aio)
             observed["in_flight"] = sample(registry, "agent_runs_in_flight")
             state["all_in"].set()
         await state["all_in"].wait()
+        # 事件已经 set 时 wait() 不会让出事件循环：第 50 个运行的这个工具会同步跑完，
+        # 时间区间和同批工具不重叠——那不是没并行，而是工具根本没挂起。显式让出一次，让同批工具都先开始
+        await asyncio.sleep(0)
         _consistency_probe(tracer, mismatches)
         return {"order_id": order_id}
 

@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..tools import Tool, ToolContext, ToolError, ToolRegistry, ToolResult, exception_result, format_output, timeout_result
 from ..types import ToolCall
+from .timeouts import wait_for
 
 
 def isolated(t: Tool) -> Tool:
@@ -61,11 +62,12 @@ class AsyncToolExecutor:
             if getattr(t, "isolation", None) == "process":
                 output = await run_in_subprocess(t.fn, kwargs, t.timeout_s)
             elif inspect.iscoroutinefunction(t.fn):
-                output = await asyncio.wait_for(t.fn(**kwargs), t.timeout_s)
+                output = await wait_for(t.fn(**kwargs), t.timeout_s)
             else:
                 loop = asyncio.get_running_loop()
                 runner = functools.partial(contextvars.copy_context().run, t.fn, **kwargs)
-                output = await asyncio.wait_for(loop.run_in_executor(self._threads, runner), t.timeout_s)
+                # 不用 asyncio.wait_for：3.12 之前它会在"工具刚完成 + 外部取消"同时发生时吞掉取消（第 30 课 R3）
+                output = await wait_for(loop.run_in_executor(self._threads, runner), t.timeout_s)
         except asyncio.TimeoutError:
             return timeout_result(t)
         except Exception as e:  # noqa: BLE001 —— 工具异常变成观察；CancelledError 是 BaseException，会正常穿透

@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncIterator, Callable, Iterable, Iterator, Protocol
 
+from ..aio.timeouts import wait_for
 from ..hooks import Hook, StopRun
 from ..state import RunState
 from . import require
@@ -1124,7 +1125,7 @@ def _is_async_handler(handler) -> bool:
 
 async def _wait_or_timeout(stop_event: asyncio.Event, timeout: float) -> None:
     try:
-        await asyncio.wait_for(stop_event.wait(), timeout)
+        await wait_for(stop_event.wait(), timeout)  # 取消安全版：3.12 之前的 asyncio.wait_for 可能吞掉停机时的取消
     except asyncio.TimeoutError:
         pass
 

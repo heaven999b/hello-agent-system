@@ -38,6 +38,7 @@ from .llm import (
     default_async_llm,
 )
 from .reliability import AsyncCircuitBreaker, AsyncResilientLLM, aretry_call
+from .timeouts import wait_for
 from .tools import AsyncToolExecutor, isolated, maybe_await, run_in_subprocess
 
 __all__ = [name for name in dir() if not name.startswith("_")]
