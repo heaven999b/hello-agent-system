@@ -1,0 +1,33 @@
+# 非敏感配置（12-factor：全部是环境变量）。敏感值在 Secret 里。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: itdesk-config
+data:
+  DEPLOYMENT_ENV: prod
+  # 业务服务只和模型网关打交道（第 29 课）：OpenAI 兼容接口指向集群里的 LiteLLM proxy
+  LLM_BACKEND: openai
+  LLM_BASE_URL: http://litellm.llm-gateway.svc.cluster.local:4000/v1
+  LLM_MODEL: gpt-5.5
+  LLM_MAX_CONCURRENCY: "32"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability.svc.cluster.local:4318
+  OTEL_SAMPLE_RATIO: "1.0"          # 头部全采，尾部采样在 Collector 做（第 28 课）
+  RUN_TIMEOUT_SECONDS: "120"
+  # ---- 停机时间线（与 worker.yaml 的 terminationGracePeriodSeconds 对齐，见讲义问题卡片 3）----
+  WORKER_CONCURRENCY: "16"
+  WORKER_LEASE_SECONDS: "30"        # kill -9 / 节点宕机后，最长约 30 秒被别的 worker 接手
+  WORKER_HEARTBEAT_SECONDS: "10"    # 租约的 1/3：连续丢两次心跳也不会失去租约
+  WORKER_GRACE_SECONDS: "20"        # SIGTERM 后等在途任务 20 秒，之后取消 → 记 cancelled → 立刻归还
+  WORKER_POLL_SECONDS: "0.5"
+  WORKER_HEALTH_PORT: "8081"
+  METRICS_PORT: "9100"
+  METRICS_ADDR: 0.0.0.0
+  # ---- 限流与舱壁 ----
+  API_RATE_PER_SEC: "20"            # 每租户，所有 API 副本共享一个 Redis 令牌桶
+  API_BURST: "40"
+  LLM_RATE_PER_SEC: "10"            # 每租户的模型调用速率（worker 与 API 共享）
+  LLM_BURST: "20"
+  STREAMS_PER_TENANT: "50"          # 每个 API Pod 里每个租户的交互式流上限（KeyedLimiter）
+  STREAMS_GLOBAL: "300"
+  SSE_MAX_SECONDS: "300"            # 单条 SSE 最长 5 分钟，到点让客户端带 Last-Event-ID 重连（对 LB / 代理超时友好）
+  PG_POOL_MAX: "10"                 # 每个 Pod 的连接数上限；Pod 数 × 10 不能超过数据库 max_connections（否则上 PgBouncer）

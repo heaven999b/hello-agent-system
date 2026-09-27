@@ -1,0 +1,8 @@
+# 自动加载第 28 课的 Agent 总览看板（它用 datasource 变量选择 Prometheus，不绑死数据源 uid）
+apiVersion: 1
+providers:
+  - name: agentkit
+    folder: Agent
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

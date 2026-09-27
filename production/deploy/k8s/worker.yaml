@@ -1,0 +1,85 @@
+# worker：Deployment + PDB。副本数由 KEDA 按队列深度决定（keda-scaledobject.yaml）。
+#
+# 三个时间怎么对齐（数字来自 configmap.yaml；讲义问题卡片 3、练习 (b) 的 validate_shutdown_timeline）：
+#   terminationGracePeriodSeconds 35  ≥  preStop 0 + WORKER_GRACE_SECONDS 20 + 收尾 ≤5（取消、写 cancelled、归还任务、flush、关池）
+#   WORKER_LEASE_SECONDS 30 与宽限期**无关**：排空期间心跳照常续租，租约不会在排空时过期（所以不需要"租约 > 宽限期"）；
+#     租约决定的是**硬崩溃**（kill -9、节点宕机、OOM）之后多久被接手：约等于 30 秒 + 轮询间隔。
+#   WORKER_HEARTBEAT_SECONDS 10 = 租约的 1/3：连续丢两次心跳（GC 停顿、数据库抖动）也不会误判为死亡。
+#   宽限期 20 秒不必覆盖最长的任务：做不完的在宽限期后被取消、立即归还，由别的 worker 从检查点接着跑。
+# worker 不接流量，所以不需要 preStop sleep（没有"从 Endpoints 摘除"要等）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: itdesk-worker
+  labels: {app: itdesk, component: worker}
+spec:
+  # replicas 不写：KEDA 创建的 HPA（keda-hpa-itdesk-worker）负责
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: {app: itdesk, component: worker}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0   # 先起新的，再停旧的：发布期间处理能力不下降
+  template:
+    metadata:
+      labels: {app: itdesk, component: worker}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: worker
+          image: registry.example.com/itdesk:1.0.0
+          command: ["python", "-m", "production.service.worker"]
+          ports:
+            - {name: health, containerPort: 8081}
+            - {name: metrics, containerPort: 9100}
+          envFrom:
+            - configMapRef: {name: itdesk-config}
+            - secretRef: {name: itdesk-secrets}
+          env:
+            - name: POD_NAME   # worker_id：任务表的 worker_id、检查点的 writer
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: SERVICE_NAME, value: itdesk-worker}
+          livenessProbe:    # 由事件循环应答：同步代码卡死事件循环 → 应答超时 → 重启（/metrics 在另一个线程，不能当 liveness）
+            httpGet: {path: /healthz, port: health}
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:   # 停机排空时返回 503；滚动发布靠它判断新 Pod 是否就绪
+            httpGet: {path: /readyz, port: health}
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          resources:
+            # 每个 worker 并发 16 个 Agent 运行：内存主要是 16 份对话状态 + 连接池 + 解释器基线（约 60MB）
+            requests: {cpu: 250m, memory: 384Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# 节点排空时一次只驱逐一个 worker：被驱逐的那个 SIGTERM → 排空 / 归还，其余的接手
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: itdesk-worker
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels: {app: itdesk, component: worker}

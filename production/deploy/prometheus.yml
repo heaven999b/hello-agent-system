@@ -1,0 +1,19 @@
+# 第 31 课：docker compose 环境的 Prometheus 抓取配置。
+# K8s 里通常用 Prometheus Operator 的 ServiceMonitor / PodMonitor，或者按 Pod 注解发现（deploy/k8s/*.yaml 带了注解）。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+rule_files:
+  - /etc/prometheus/rules/*.yaml   # 第 28 课的 SLO 记录规则与多窗口燃烧率告警
+
+scrape_configs:
+  - job_name: itdesk-api
+    static_configs:
+      - targets: ["api:8000"]
+  # worker 有多个副本：compose 内置 DNS 对服务名返回所有容器的 IP，用 A 记录发现每一个
+  - job_name: itdesk-worker
+    dns_sd_configs:
+      - names: ["worker"]
+        type: A
+        port: 9100

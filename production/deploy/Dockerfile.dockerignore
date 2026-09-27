@@ -1,0 +1,13 @@
+# 只对 production/deploy/Dockerfile 生效的 ignore 文件（Docker 的"Dockerfile 专属 ignore 文件"约定）。
+# 最重要的一条：.env（本地密钥）绝不能进构建上下文。
+.env
+.env.*
+!.env.example
+.git
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+runs
+traces
+*.egg-info

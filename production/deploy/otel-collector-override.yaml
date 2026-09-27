@@ -1,0 +1,9 @@
+# 叠加在第 28 课 otel-collector.yaml 之上的本地覆盖（otelcol 支持多个 --config，按顺序合并；列表整体替换）。
+# 没有 Langfuse 账号时，把 LLM 平台那条管道改成只打到 debug 导出器；
+# langfuse 导出器仍然定义着，但不在任何管道里就不会启用（Collector 只启动被管道引用的组件）。
+service:
+  pipelines:
+    traces/llm:
+      receivers: [forward/sampled]
+      processors: [batch]
+      exporters: [debug]

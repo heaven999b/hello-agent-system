@@ -1,0 +1,138 @@
+# API：无状态 Deployment + Service + HPA + PDB。
+#
+# 停机时间线（Pod 被删除 / 滚动发布时）：
+#   t=0      Pod 标记为 Terminating；**同时**：控制面把它从 EndpointSlice 摘掉（ready=false），kubelet 开始执行 preStop
+#   0–5s     preStop sleep 5：等各节点的 kube-proxy / Ingress 更新完转发规则，这期间仍可能有新请求进来，照常处理
+#   t=5s     SIGTERM → uvicorn 停止接新连接，等在途请求（包括 SSE 长连接）最多 20 秒
+#   t≤25s    到点后 uvicorn 取消剩余请求：交互式运行被取消，检查点记 cancelled，客户端可以 POST /v1/runs/{id}/resume
+#   t=35s    terminationGracePeriodSeconds 到：SIGKILL（从 preStop 开始计时，preStop 的时间也算在里面）
+# 所以：35 ≥ preStop 5 + uvicorn --timeout-graceful-shutdown 20 + 收尾余量（关连接池、flush 追踪）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: itdesk-api
+  labels: {app: itdesk, component: api}
+spec:
+  # replicas 不写：交给 HPA（写死的话每次 kubectl apply 都会把 HPA 的决定改回去）
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: {app: itdesk, component: api}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # 先起一个新的，就绪后再停一个旧的
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels: {app: itdesk, component: api}
+      annotations:
+        prometheus.io/scrape: "true"   # 社区约定（按注解发现），用 Prometheus Operator 时改成 ServiceMonitor
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: api
+          image: registry.example.com/itdesk:1.0.0
+          args: ["uvicorn", "--factory", "production.service.api:create_app", "--host", "0.0.0.0", "--port", "8000",
+                 "--timeout-graceful-shutdown", "20", "--timeout-keep-alive", "75", "--no-access-log"]
+          ports:
+            - {name: http, containerPort: 8000}
+          envFrom:
+            - configMapRef: {name: itdesk-config}
+            - secretRef: {name: itdesk-secrets}
+          env:
+            - name: POD_NAME   # 写进检查点的 writer、日志和 trace 的 service.instance.id
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: SERVICE_NAME, value: itdesk-api}
+          lifecycle:
+            preStop:
+              sleep: {seconds: 5}   # K8s 1.34 起 GA 的原生 sleep 动作；更老的集群用 exec: ["sleep", "5"]
+          startupProbe:             # 启动慢（导入依赖、打开连接池）时，先别让 liveness 把它杀掉
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:            # 只看本进程：不查数据库，避免依赖抖动时所有 Pod 被一起重启
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:           # 查依赖：Postgres / Redis 不可用时摘流量，但不重启
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          resources:
+            requests: {cpu: 500m, memory: 384Mi}
+            # 只限内存不限 CPU 是常见做法（CPU limit 会引起节流，拉高尾延迟）；这里给一个宽松的 CPU 上限防止失控
+            limits: {cpu: "2", memory: 768Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      topologySpreadConstraints:   # 副本分散到不同节点 / 可用区：一个节点挂了不会带走所有 API
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: itdesk, component: api}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: itdesk-api
+  labels: {app: itdesk, component: api}
+spec:
+  selector: {app: itdesk, component: api}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+---
+# 按 CPU 扩缩。Agent API 的 CPU 往往不高（大部分时间在等模型），所以更好的信号是"在途流数"：
+# 装了 prometheus-adapter 后，把下面注释掉的 Pods 指标打开（每个 Pod 平均 150 条 SSE 流）。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: itdesk-api
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: itdesk-api}
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 60}
+    # - type: Pods
+    #   pods:
+    #     metric: {name: itdesk_sse_streams}
+    #     target: {type: AverageValue, averageValue: "150"}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - {type: Percent, value: 100, periodSeconds: 30}
+    scaleDown:
+      stabilizationWindowSeconds: 300   # 默认值；缩容会断开 SSE 长连接，宁可慢一点
+      policies:
+        - {type: Pods, value: 1, periodSeconds: 60}
+---
+# PDB 只管"自愿中断"（节点排空等走 Eviction API 的操作），**不管** Deployment 自己的滚动发布（那由 maxUnavailable 管）。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: itdesk-api
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow   # 不健康的 Pod 可以直接驱逐，避免它卡住整个节点排空
+  selector:
+    matchLabels: {app: itdesk, component: api}

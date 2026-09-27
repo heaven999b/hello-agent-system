@@ -1,0 +1,28 @@
+# 迁移在发布流水线里跑一次（先迁移、后滚动 Deployment），而不是每个 Pod 启动时各跑一遍。
+# 迁移必须向后兼容（先加列、后删列）：滚动发布期间新旧两个版本会同时读写同一张表。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: itdesk-migrate
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: migrate
+          image: registry.example.com/itdesk:1.0.0
+          command: ["python", "-m", "production.service.migrate"]
+          envFrom:
+            - configMapRef: {name: itdesk-config}
+            - secretRef: {name: itdesk-secrets}
+          env:
+            - {name: SEED_DEMO_DATA, value: "false"}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 256Mi}

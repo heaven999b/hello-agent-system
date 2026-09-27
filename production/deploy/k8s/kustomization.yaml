@@ -1,0 +1,15 @@
+# 第 31 课：参考服务的 Kubernetes 清单。kubectl apply -k production/deploy/k8s
+# ⚠️ 本机没有 Kubernetes / Docker：这些清单没有在真实集群里 apply 过，只做了 pyyaml 语法检查和
+#    "三个时间对齐"等交叉检查（production/tests/test_deploy_configs.py）。字段名按 2026-09 的官方文档核实
+#    （K8s 1.37、KEDA 2.21），上线前请在自己的集群里用 kubectl apply --dry-run=server 再验一遍。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: itdesk
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.example.yaml
+  - migrate-job.yaml
+  - api.yaml
+  - worker.yaml
+  - keda-scaledobject.yaml

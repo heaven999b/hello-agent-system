@@ -1,0 +1,47 @@
+# 按队列深度扩缩 worker（KEDA 2.21 的 postgresql scaler，字段按官方文档核实）。
+#
+# 信号 = 可执行的排队任务 + 正在执行的任务（在途的也占着 worker 的并发名额）。
+# metricType 默认 AverageValue：期望副本数 ≈ ceil(查询结果 / targetQueryValue)，
+# targetQueryValue = 每个 worker 的并发 16 × 目标利用率 0.75 = 12（留 25% 余量吸收突发）。
+# 0 ↔ 1 由 KEDA operator 按 activationTargetQueryValue 决定（严格大于才激活），1 ↔ N 由 KEDA 创建的 HPA 负责。
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: itdesk-postgres
+spec:
+  secretTargetRef:
+    - parameter: connection     # postgresql scaler 的连接串参数名
+      name: itdesk-secrets
+      key: DATABASE_URL
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: itdesk-worker
+spec:
+  scaleTargetRef:
+    name: itdesk-worker
+  pollingInterval: 15      # 默认 30s；队列型负载希望反应快一点
+  cooldownPeriod: 300      # 只作用于"缩到 0"
+  minReplicaCount: 1       # 默认是 0。保留 1 个热的：缩到 0 意味着第一个任务要等冷启动（拉镜像、导入依赖）
+  maxReplicaCount: 20      # 上限由下游决定：20 × 并发 16 = 320 个同时在跑的 Agent，模型网关配额和数据库连接要撑得住
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - {type: Pods, value: 1, periodSeconds: 60}   # 每次缩容都会让一个 worker 排空 / 取消在途任务：慢慢来
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - {type: Percent, value: 100, periodSeconds: 30}
+  triggers:
+    - type: postgresql
+      authenticationRef:
+        name: itdesk-postgres
+      metadata:
+        # 必须返回单个数字；run_at <= now()：被限流推迟（RetryLater）的任务还没到时间，不算需求
+        query: "SELECT count(*) FROM agent_jobs WHERE status = 'leased' OR (status = 'queued' AND run_at <= now())"
+        targetQueryValue: "12"
+        activationTargetQueryValue: "0"

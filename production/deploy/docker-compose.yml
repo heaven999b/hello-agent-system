@@ -1,0 +1,172 @@
+# 第 31 课：整套参考服务的 docker compose（单机"类生产"环境）。
+#
+#   cp production/.env.example production/.env   # 填好占位符（不要提交）
+#   docker compose -f production/deploy/docker-compose.yml --env-file production/.env up --build
+#
+# 打开：API http://localhost:8000/docs ｜ Jaeger http://localhost:16686 ｜ Prometheus http://localhost:9090 ｜ Grafana http://localhost:3000
+#
+# ⚠️ 本机没有 Docker，这个文件没有实际 up 过：语法与交叉引用由 production/tests/test_deploy_configs.py 用 pyyaml 检查。
+#    本机实测走的是 production/run_local.py（嵌入式 Postgres + fakeredis，同一套代码）。
+# 密钥一律来自 --env-file 的变量（${VAR}），这个文件里没有任何真实值。
+# 镜像版本按 2026-09 核实；LiteLLM 官方文档建议生产固定具体版本号，不要用浮动 tag。
+
+name: itdesk
+
+x-app: &app
+  build:
+    context: ../..
+    dockerfile: production/deploy/Dockerfile
+  image: itdesk:dev
+  environment: &app-env
+    DATABASE_URL: postgresql://itdesk:${POSTGRES_PASSWORD}@postgres:5432/itdesk
+    REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    DEPLOYMENT_ENV: compose
+    # 业务服务只认识网关：OpenAI 兼容接口指向 LiteLLM proxy，key 是网关发的虚拟 key（第 29 课）
+    LLM_BACKEND: openai
+    LLM_BASE_URL: http://litellm:4000/v1
+    LLM_API_KEY: ${LITELLM_VIRTUAL_KEY}
+    LLM_MODEL: gpt-5.5
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    API_KEYS_JSON: ${API_KEYS_JSON}
+    WORKER_LEASE_SECONDS: "30"
+    WORKER_GRACE_SECONDS: "20"
+    RUN_TIMEOUT_SECONDS: "120"
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  stop_signal: SIGTERM
+  stop_grace_period: 35s   # 默认只有 10s：worker 要排空 20s + 收尾，和 K8s 的 terminationGracePeriodSeconds 对齐
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16   # 带 pgvector 扩展（第 15、17 课的检索也能用同一个库）
+    environment:
+      POSTGRES_USER: itdesk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: itdesk
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro   # 首次初始化时给 LiteLLM 建一个单独的库
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U itdesk -d itdesk"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:8
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+  # Jaeger v2（原生接收 OTLP）。网络别名 tempo：第 28 课的 Collector 配置导出到 tempo:4317，这里原样复用
+  jaeger:
+    image: jaegertracing/jaeger:2.21.0
+    ports:
+      - "16686:16686"
+    networks:
+      default:
+        aliases: [tempo]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    # 两个 --config 会合并：第 28 课的完整配置 + 本地覆盖（把 LLM 平台那条管道改成 debug，没有 Langfuse 账号也能跑）
+    command:
+      - --config=/etc/otelcol-contrib/config.yaml
+      - --config=/etc/otelcol-contrib/override.yaml
+    volumes:
+      - ../../lessons/28_production_observability/configs/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./otel-collector-override.yaml:/etc/otelcol-contrib/override.yaml:ro
+    environment:
+      REDACTION_HMAC_KEY: ${REDACTION_HMAC_KEY}
+      LANGFUSE_AUTH: ${LANGFUSE_AUTH:-unused}
+    depends_on: [jaeger]
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../lessons/28_production_observability/configs/prometheus-rules.yaml:/etc/prometheus/rules/agent-slo.yaml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:13.2.2
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../lessons/28_production_observability/configs/grafana-dashboard.json:/var/lib/grafana/dashboards/agent.json:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+
+  # 模型网关：复用第 29 课的 LiteLLM 配置（虚拟 key、预算、共享限流计数在 Redis）
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    volumes:
+      - ../../lessons/29_gateway_and_guardrails/configs/litellm-config.yaml:/app/config.yaml:ro
+    environment:
+      CLIPROXY_API_BASE: ${CLIPROXY_API_BASE}
+      CLIPROXY_API_KEY: ${CLIPROXY_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-unused}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      DATABASE_URL: postgresql://itdesk:${POSTGRES_PASSWORD}@postgres:5432/litellm
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # 迁移：发布时跑一次（K8s 里是 Job），api / worker 等它成功退出后才启动
+  migrate:
+    <<: *app
+    command: ["python", "-m", "production.service.migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).status != 200)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "production.service.worker"]
+    environment:
+      <<: *app-env
+      WORKER_CONCURRENCY: "16"
+      METRICS_PORT: "9100"
+      METRICS_ADDR: 0.0.0.0
+    deploy:
+      replicas: 3   # docker compose up 也认这个字段（不需要 swarm）；Prometheus 用 DNS 发现全部副本
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2).status != 200)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  pgdata: {}
+  redisdata: {}
