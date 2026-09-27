@@ -75,9 +75,9 @@ def traces_file(tmp_path):
 
 
 def test_render_html_has_key_elements(traces_file):
-    page = render_html(load_spans(traces_file), title="第 07 课")
+    page = render_html(load_spans(traces_file), title="第 10 课")
     assert page.startswith("<!DOCTYPE html>")
-    assert "<title>第 07 课</title>" in page
+    assert "<title>第 10 课</title>" in page
     for element_id in ("trace-list", "waterfall", "detail", "trace-head", "theme-toggle", "trace-data"):
         assert f'id="{element_id}"' in page
     assert "prefers-color-scheme: dark" in page

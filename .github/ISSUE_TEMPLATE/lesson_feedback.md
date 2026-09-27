@@ -26,7 +26,7 @@ assignees: ""
 - [ ] 综合实战（capstone）
 - [ ] docs/ 深度资料
 
-具体位置：<!-- 章节标题、文件路径或行号，例如 lessons/03_context_memory/README.md「2. 从玩具到生产」 -->
+具体位置：<!-- 章节标题、文件路径或行号，例如 lessons/04_context_memory/README.md「2. 从玩具到生产」 -->
 
 ## 反馈类型
 

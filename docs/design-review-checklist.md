@@ -29,23 +29,23 @@
 
 | # | 分组 | 条目数 | 其中 P0 | 主要对应课程 |
 |---|---|---|---|---|
-| 1 | 需求与范围 | 9 | 4 | [第 00 课](../lessons/00_overview/README.md) · [第 04 课](../lessons/04_orchestration/README.md) |
-| 2 | 模型与提示词 | 9 | 3 | [第 01 课](../lessons/01_agent_loop/README.md) · [第 08 课](../lessons/08_evals/README.md) |
-| 3 | 工具 | 13 | 6 | [第 02 课](../lessons/02_tools/README.md) |
-| 4 | 上下文与记忆 | 9 | 4 | [第 03 课](../lessons/03_context_memory/README.md) |
-| 5 | 编排 | 8 | 3 | [第 04 课](../lessons/04_orchestration/README.md) |
-| 6 | 可靠性 | 10 | 3 | [第 05 课](../lessons/05_reliability/README.md) · [第 10 课](../lessons/10_distributed_concurrency/README.md) |
-| 7 | 安全 | 11 | 6 | [第 06 课](../lessons/06_security/README.md) |
-| 8 | 隐私与合规 | 9 | 3 | [第 06 课](../lessons/06_security/README.md) · [第 09 课](../lessons/09_production_architecture/README.md) |
-| 9 | 权限与审批 | 8 | 4 | [第 06 课](../lessons/06_security/README.md) |
-| 10 | 可观测性 | 9 | 2 | [第 07 课](../lessons/07_observability/README.md) |
-| 11 | 评估 | 10 | 2 | [第 08 课](../lessons/08_evals/README.md) |
-| 12 | 成本 | 10 | 2 | [第 05 课](../lessons/05_reliability/README.md) · [第 11 课](../lessons/11_cost_latency/README.md) |
-| 13 | 部署与运维 | 13 | 2 | [第 09 课](../lessons/09_production_architecture/README.md) · [第 13 课](../lessons/13_release_ops/README.md) |
-| 14 | 多租户 | 7 | 2 | [第 09 课](../lessons/09_production_architecture/README.md) · [第 12 课](../lessons/12_enterprise_rag/README.md) |
-| 15 | 文档与交接 | 7 | 1 | [第 09 课](../lessons/09_production_architecture/README.md) |
-| 16 | 分布式与高并发 | 12 | 4 | [第 10 课](../lessons/10_distributed_concurrency/README.md) |
-| 17 | 企业知识与 RAG | 9 | 2 | [第 12 课](../lessons/12_enterprise_rag/README.md) |
+| 1 | 需求与范围 | 9 | 4 | [第 00 课](../lessons/00_overview/README.md) · [第 06 课](../lessons/06_orchestration/README.md) |
+| 2 | 模型与提示词 | 9 | 3 | [第 02 课](../lessons/02_agent_loop/README.md) · [第 11 课](../lessons/11_evals/README.md) |
+| 3 | 工具 | 13 | 6 | [第 03 课](../lessons/03_tools/README.md) |
+| 4 | 上下文与记忆 | 9 | 4 | [第 04 课](../lessons/04_context_memory/README.md) |
+| 5 | 编排 | 8 | 3 | [第 06 课](../lessons/06_orchestration/README.md) |
+| 6 | 可靠性 | 10 | 3 | [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 7 | 安全 | 11 | 6 | [第 09 课](../lessons/09_security/README.md) |
+| 8 | 隐私与合规 | 9 | 3 | [第 09 课](../lessons/09_security/README.md) · [第 12 课](../lessons/12_production_architecture/README.md) |
+| 9 | 权限与审批 | 8 | 4 | [第 09 课](../lessons/09_security/README.md) |
+| 10 | 可观测性 | 9 | 2 | [第 10 课](../lessons/10_observability/README.md) |
+| 11 | 评估 | 10 | 2 | [第 11 课](../lessons/11_evals/README.md) |
+| 12 | 成本 | 10 | 2 | [第 08 课](../lessons/08_reliability/README.md) · [第 14 课](../lessons/14_cost_latency/README.md) |
+| 13 | 部署与运维 | 13 | 2 | [第 12 课](../lessons/12_production_architecture/README.md) · [第 16 课](../lessons/16_release_ops/README.md) |
+| 14 | 多租户 | 7 | 2 | [第 12 课](../lessons/12_production_architecture/README.md) · [第 15 课](../lessons/15_enterprise_rag/README.md) |
+| 15 | 文档与交接 | 7 | 1 | [第 12 课](../lessons/12_production_architecture/README.md) |
+| 16 | 分布式与高并发 | 12 | 4 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 17 | 企业知识与 RAG | 9 | 2 | [第 15 课](../lessons/15_enterprise_rag/README.md) |
 | | **合计** | **163** | **53** | |
 
 ---

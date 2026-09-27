@@ -60,9 +60,9 @@
 0.9⁸ ≈ **43%**. Errors compound. Design implications:
 
 - Cut unnecessary steps (design good tools; turn whatever you can into a workflow);
-- Give every step validation and a chance to self-correct (errors as observations, Lesson 02);
+- Give every step validation and a chance to self-correct (errors as observations, Lesson 03);
 - Add human confirmation to critical steps;
-- Use evals to measure **end-to-end** success, not just per-step quality (Lesson 08).
+- Use evals to measure **end-to-end** success, not just per-step quality (Lesson 11).
 </details>
 
 ---
@@ -77,7 +77,7 @@
 <details>
 <summary>Answer</summary>
 
-**B.** Input screening is cheap and stops obvious attacks, but it will always miss some. The real backstop is that even if the model is fooled, it can only access the user's own data (ctx identity), can't see tools it isn't allowed to use (RBAC), and can't perform high-risk actions (human approval). C and D are wrong: in the demo, the blocked request made 0 model calls and cost $0. (README section 3; covered in depth in Lesson 06)
+**B.** Input screening is cheap and stops obvious attacks, but it will always miss some. The real backstop is that even if the model is fooled, it can only access the user's own data (ctx identity), can't see tools it isn't allowed to use (RBAC), and can't perform high-risk actions (human approval). C and D are wrong: in the demo, the blocked request made 0 model calls and cost $0. (README section 3; covered in depth in Lesson 09)
 </details>
 
 ---
@@ -91,7 +91,7 @@
 - In the meantime, the service may restart, go through a rolling deploy, or scale up or down, and in-memory state would be lost;
 - Once the full state (message history, calls awaiting approval, usage) is in a checkpoint, any instance can resume it by `run_id` and continue from where it stopped, instead of asking the model again from scratch (which saves money and keeps the model from making a different decision).
 
-This is the idea behind durable execution, covered in depth in Lesson 05.
+This is the idea behind durable execution, covered in depth in Lesson 08.
 </details>
 
 ---
@@ -132,8 +132,8 @@ Key points (any well-reasoned answer counts):
 
 - The agent's answers speak for the company, and the company is accountable for what it says;
 - Answers about policies, prices, or legal terms must be grounded in authoritative sources (official policies retrieved via tools), not the model's memory; when unsure, the agent should say so or hand off to a human;
-- Maintain an eval set that covers these high-risk questions, with continuous regression testing (Lesson 08);
-- Keep complete traces and audit records so that, in a dispute, you can reconstruct what the agent saw and said at the time (Lessons 06, 07).
+- Maintain an eval set that covers these high-risk questions, with continuous regression testing (Lesson 11);
+- Keep complete traces and audit records so that, in a dispute, you can reconstruct what the agent saw and said at the time (Lessons 09, 10).
 </details>
 
 ---
@@ -183,7 +183,7 @@ Layers: model layer, tool layer (permissions), context and memory layer, cross-c
 
 The problem: whichever request writes last overwrites the other (a lost update), so one turn of the conversation disappears from the history. If both turns triggered write operations, those may also be executed twice.
 
-Families of solutions (Lesson 10 compares their costs and where each fits; for now, naming the general directions is enough):
+Families of solutions (Lesson 13 compares their costs and where each fits; for now, naming the general directions is enough):
 
 - **Pessimistic locking**: lock the session before processing it, so only one request can handle it at a time;
 - **Optimistic concurrency**: write back with a version number; if the version doesn't match, reject the write, re-read, and retry;
@@ -194,4 +194,4 @@ None of these is always best: conflict frequency, latency requirements, and your
 
 ---
 
-Got them all right? Move on to [Lesson 01: The agent loop, demystified](../01_agent_loop/README.en.md).
+Got them all right? Move on to [Lesson 02: The agent loop, demystified](../02_agent_loop/README.en.md).

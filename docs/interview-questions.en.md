@@ -26,7 +26,7 @@
 - **Where agents win**: open-ended tasks whose steps can't be enumerated up front.
 - **Rule of thumb**: start with the simplest thing that works: plain code → a single LLM call → a workflow → an agent. Move up a level only when the added complexity clearly pays off.
 - **Bonus points**: point out that the most common enterprise pattern is a hybrid: an outer workflow fixes the overall process, and one node runs an agent inside it. Give a concrete heuristic: "If 90% of runs follow the same tool sequence, it should be a workflow."
-- See: [Lesson 04](../lessons/04_orchestration/README.en.md)
+- See: [Lesson 06](../lessons/06_orchestration/README.en.md)
 
 </details>
 
@@ -39,7 +39,7 @@
 - **Why a limit**: the model can get stuck in a loop (calling the same tool with the same arguments over and over, or two tools bouncing the task back and forth). Without a cap, you burn money indefinitely. The cap also protects latency.
 - **When the limit is hit**: don't throw a 500 at the user. Converge to an explicit status (e.g., `status=max_steps`), give the user an outcome (a partial result + handoff to a human), and track it as a metric. A rising hit rate usually means something is wrong with a tool or the prompt.
 - **Bonus points**: max_steps is only one dimension; you also need token, dollar, and wall-clock budgets. Pick the value from the step-count distribution of successful runs (p95–p99 plus headroom), not from a gut feeling.
-- See: [Lesson 01](../lessons/01_agent_loop/README.en.md) · failure mode [M3](failure-modes.en.md#m3-tool-call-loop)
+- See: [Lesson 02](../lessons/02_agent_loop/README.en.md) · failure mode [M3](failure-modes.en.md#m3-tool-call-loop)
 
 </details>
 
@@ -52,7 +52,7 @@
 - The right approach: the system takes identity (user_id / tenant_id / roles) from the authenticated session and injects it into tools through a trusted context (agentkit's `ToolContext`: a tool declares a `ctx` parameter to receive it, and the model can neither see nor change it).
 - For tools that legitimately act on other people's resources (e.g., an admin looking up another user), authorize inside the tool based on the trusted identity. Never trust a parameter the model passed in.
 - **Bonus points**: every major framework has a similar mechanism (OpenAI Agents SDK's `RunContextWrapper`, LangChain's `ToolRuntime`, Google ADK's `ToolContext`). In multi-agent systems, identity must propagate along the delegation chain.
-- See: [Lesson 02](../lessons/02_tools/README.en.md) · failure mode [S4](failure-modes.en.md#s4-confused-deputy)
+- See: [Lesson 03](../lessons/03_tools/README.en.md) · failure mode [S4](failure-modes.en.md#s4-confused-deputy)
 
 </details>
 
@@ -65,7 +65,7 @@
 - The difference from traditional exception handling: in traditional code, the programmer writes the error-handling logic in advance. In an agent, how to handle many errors is left to the model, based on context.
 - **The key to good error messages**: say what went wrong and what to do next ("Employee ID E1234 not found. Check the ID, or use search_employee to look up by name."), not "Error 500".
 - **Caution**: never leak stack traces, SQL, internal paths, or secrets in error messages.
-- See: [Lesson 02](../lessons/02_tools/README.en.md) · failure mode [T6](failure-modes.en.md#t6-opaque-errors)
+- See: [Lesson 03](../lessons/03_tools/README.en.md) · failure mode [T6](failure-modes.en.md#t6-opaque-errors)
 
 </details>
 
@@ -78,7 +78,7 @@
 - The error only shows up once a conversation grows long enough to trigger truncation, which makes it hard to reproduce and debug.
 - The right approach: truncate by "block." An assistant message with tool_calls plus all of its tool results forms one indivisible block (agentkit `split_blocks`). Always keep the system message and the last block.
 - **Bonus points**: the same constraint applies whenever you write your own message-filtering logic (e.g., filtering history during a multi-agent handoff).
-- See: [Lesson 03](../lessons/03_context_memory/README.en.md) · failure mode [C1](failure-modes.en.md#c1-orphaned-tool-message)
+- See: [Lesson 04](../lessons/04_context_memory/README.en.md) · failure mode [C1](failure-modes.en.md#c1-orphaned-tool-message)
 
 </details>
 
@@ -94,7 +94,7 @@
   - A more reliable approach is to keep key state such as "completed actions" outside the context (in a database) and let code prevent duplicates;
   - Writing the summary into the system message changes the prefix and invalidates the prompt cache, so control how often you compact;
   - A lightweight alternative is to clear out large tool results that have already been used.
-- See: [Lesson 03](../lessons/03_context_memory/README.en.md) · failure mode [C3](failure-modes.en.md#c3-lossy-compaction)
+- See: [Lesson 04](../lessons/04_context_memory/README.en.md) · failure mode [C3](failure-modes.en.md#c3-lossy-compaction)
 
 </details>
 
@@ -108,7 +108,7 @@
 - **Why input detection isn't the baseline**: models fundamentally cannot tell "instructions" apart from "data." Detection (regexes/classifiers) catches only some attacks; obfuscated, encoded, and multilingual variants always get through. And indirect injection never passes through user input at all.
 - **The real baseline**: least privilege + human approval for high-risk actions. Even if the model is fooled, it can't do anything dangerous.
 - Five layers of defense in depth: input detection → untrusted-data isolation → least privilege + approval → output filtering → auditing.
-- See: [Lesson 06](../lessons/06_security/README.en.md) · failure modes [S1](failure-modes.en.md#s1-direct-prompt-injection), [S2](failure-modes.en.md#s2-indirect-prompt-injection)
+- See: [Lesson 09](../lessons/09_security/README.en.md) · failure modes [S1](failure-modes.en.md#s1-direct-prompt-injection), [S2](failure-modes.en.md#s2-indirect-prompt-injection)
 
 </details>
 
@@ -123,7 +123,7 @@
   - Don't render external images/links in the frontend, or allow only allowlisted domains;
   - Require approval for outbound tools, or restrict the recipients;
   - Don't give the agent that processes untrusted content access to private data (use multiple agents for privilege separation).
-- See: [Lesson 06](../lessons/06_security/README.en.md) · failure mode [S3](failure-modes.en.md#s3-lethal-trifecta-exfiltration)
+- See: [Lesson 09](../lessons/09_security/README.en.md) · failure mode [S3](failure-modes.en.md#s3-lethal-trifecta-exfiltration)
 
 </details>
 
@@ -138,7 +138,7 @@
   - The agent-side idempotency store (agentkit `IdempotencyStore`) only covers the "executed successfully and recorded" case. The in-memory version is also lost when the process crashes, so it must be persisted in production;
   - **The most reliable option is to pass the idempotency key to the downstream system that actually produces the side effect** (like the `Idempotency-Key` header in Stripe's API) and let it deduplicate. Then even "succeeded but not yet recorded" won't cause a duplicate.
 - **One kind of duplicate it can't cover**: the model itself issues a new call (with a new call_id). That requires deduplication on a business key (e.g., "at most one ticket per user per issue within 10 minutes").
-- See: [Lesson 05](../lessons/05_reliability/README.en.md) · [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) · failure mode [T5](failure-modes.en.md#t5-duplicate-side-effects)
+- See: [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · failure mode [T5](failure-modes.en.md#t5-duplicate-side-effects)
 
 </details>
 
@@ -152,7 +152,7 @@
 - As k grows, pass@k goes up and pass^k goes down.
 - Customer service faces real users, and every user expects it to be right the first time, so look at **pass^k**. A quick estimate: with a 90% single-run success rate (and independent runs), pass^8 ≈ 0.43.
 - **Bonus points**: the τ-bench paper reported that the strongest function-calling agent at the time succeeded on fewer than 50% of retail tasks in a single run, with pass^8 below 25%, which shows that consistency is the core challenge in getting agents into production.
-- See: [Lesson 08](../lessons/08_evals/README.en.md) · failure mode [E2](failure-modes.en.md#e2-flaky-single-run-evals)
+- See: [Lesson 11](../lessons/11_evals/README.en.md) · failure mode [E2](failure-modes.en.md#e2-flaky-single-run-evals)
 
 </details>
 
@@ -165,7 +165,7 @@
 - **Handoff**: the current agent hands the entire conversation to another agent, which then talks to the user directly (control is transferred). Examples: OpenAI Agents SDK's `handoffs` and Google ADK's `transfer_to_agent`.
 - **How to choose**: if you need to aggregate results from several specialists or keep a single point of oversight, use agent as a tool. If a specialist needs to interact with the user directly for an extended time (triage, then transfer to dedicated support), use a handoff.
 - **Shared pitfalls**: the sub-agent can't see the parent's context (pass it a complete task description); identity and permissions must propagate, and the sub-agent's effective permissions must never exceed the user's own.
-- See: [Lesson 04](../lessons/04_orchestration/README.en.md) · see also the [framework comparison](framework-comparison.en.md)
+- See: [Lesson 06](../lessons/06_orchestration/README.en.md) · see also the [framework comparison](framework-comparison.en.md)
 
 </details>
 
@@ -178,7 +178,7 @@
 - **Why agents need it**: runs can last a long time (waiting for approval may take days), and process restarts are routine. Starting over wastes money, bothers the user again, and repeats actions.
 - **Checkpoints can't eliminate duplicate side effects**: there's always a window where the side effect has executed but the checkpoint hasn't been written. Temporal's own docs state that an Activity may execute more than once and recommend making Activities idempotent; LangGraph's `interrupt()` reruns the entire node from the top on resume. Bottom line: **checkpoints + idempotency** must go together.
 - **Bonus points**: checkpoints should also record code/prompt/tool versions; otherwise you can get version skew on resume ([R6](failure-modes.en.md#r6-version-skew-on-resume)).
-- See: [Lesson 05](../lessons/05_reliability/README.en.md) · [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) · failure mode [R4](failure-modes.en.md#r4-lost-progress)
+- See: [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · failure mode [R4](failure-modes.en.md#r4-lost-progress)
 
 </details>
 
@@ -194,7 +194,7 @@
   - In pairwise comparisons, swap the order and judge twice;
   - Periodically sample for human review and measure judge–human agreement;
   - If a rule can grade it, don't use an LLM judge.
-- See: [Lesson 08](../lessons/08_evals/README.en.md) · failure mode [E3](failure-modes.en.md#e3-llm-as-judge-bias)
+- See: [Lesson 11](../lessons/11_evals/README.en.md) · failure mode [E3](failure-modes.en.md#e3-llm-as-judge-bias)
 
 </details>
 
@@ -207,7 +207,7 @@
 - Common stacking in agents: the model SDK's built-in retries × your retries × gateway retries × the agent itself "trying again."
 - When the downstream is already failing because it's overloaded, amplified retries make it even harder to recover (a retry storm).
 - What to do: pick one layer to retry (usually the one closest to the call and the most observable) and turn retries off everywhere else. agentkit sets the OpenAI SDK's `max_retries` to 0. Combine this with exponential backoff + jitter, a circuit breaker, and a process-wide retry budget.
-- See: [Lesson 05](../lessons/05_reliability/README.en.md) · [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) · failure mode [R1](failure-modes.en.md#r1-retry-storm)
+- See: [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · failure mode [R1](failure-modes.en.md#r1-retry-storm)
 
 </details>
 
@@ -224,7 +224,7 @@
   - Keep the tool set as stable as possible. Adding or removing tools every turn breaks the cache (Anthropic's docs note that changing tool definitions invalidates the entire cache; the Manus team's lesson is to "mask, don't remove" tools);
   - This is in tension with "expose tools on demand."
 - Monitor the cache hit rate (e.g., OpenAI's `cached_tokens` field).
-- See: [Lesson 03](../lessons/03_context_memory/README.en.md) · [Lesson 11](../lessons/11_cost_latency/README.en.md) · failure mode [B2](failure-modes.en.md#b2-prompt-cache-busting)
+- See: [Lesson 04](../lessons/04_context_memory/README.en.md) · [Lesson 14](../lessons/14_cost_latency/README.en.md) · failure mode [B2](failure-modes.en.md#b2-prompt-cache-busting)
 
 </details>
 
@@ -247,7 +247,7 @@
 - **Resisting injection and sycophancy**: a user saying "your policy allows a full refund" doesn't change the rules; external content such as order notes and merchant messages is treated as untrusted data.
 - **Audit**: every refund records who initiated it, who approved it, the amount, and the justification.
 - **Monitoring**: auto-refund rate, erroneous refund rate, approval time.
-- See: [Lesson 06](../lessons/06_security/README.en.md) · failure modes [S5](failure-modes.en.md#s5-excessive-agency), [M6](failure-modes.en.md#m6-sycophantic-capitulation), [R5](failure-modes.en.md#r5-approval-limbo)
+- See: [Lesson 09](../lessons/09_security/README.en.md) · failure modes [S5](failure-modes.en.md#s5-excessive-agency), [M6](failure-modes.en.md#m6-sycophantic-capitulation), [R5](failure-modes.en.md#r5-approval-limbo)
 
 </details>
 
@@ -264,7 +264,7 @@
   4. Scan replies for sensitive information; no attachments or external links.
 - Also require: every auto-sent email is auditable and recallable (if the mail system supports it); a kill switch; run in shadow mode (draft only, no sending) for a while first to evaluate the results.
 - **A good answer has the courage to say "no"**: explain why "fully automatic + full mailbox access" can't be built as requested, and offer workable alternatives.
-- See: [Lesson 06](../lessons/06_security/README.en.md) · failure mode [S3](failure-modes.en.md#s3-lethal-trifecta-exfiltration)
+- See: [Lesson 09](../lessons/09_security/README.en.md) · failure mode [S3](failure-modes.en.md#s3-lethal-trifecta-exfiltration)
 
 </details>
 
@@ -279,7 +279,7 @@
 - **A unified tool gateway**: every tool call passes through a single chokepoint that handles argument validation, timeouts, truncation, idempotency, auditing, identity injection, and risk tiering.
 - **For every tool**: a clear description (when to use it and when not to), a namespace prefix, a strict schema, actionable error messages, and an owner.
 - **Bonus points**: validate tool-selection accuracy with an eval set, and run a regression every time you add or remove a tool.
-- See: [Lesson 02](../lessons/02_tools/README.en.md) · [Lesson 04](../lessons/04_orchestration/README.en.md)
+- See: [Lesson 03](../lessons/03_tools/README.en.md) · [Lesson 06](../lessons/06_orchestration/README.en.md)
 
 </details>
 
@@ -295,7 +295,7 @@
 - **Quality**: do a small trial run first (e.g., 100 tickets) with human spot checks before running the full batch; track the success rate by category; route tickets the agent can't handle to a "manual handling" queue instead of forcing them through.
 - **Idempotency**: the whole batch job may be rerun, so each ticket's write operations must be idempotent.
 - **Observability**: a batch-level dashboard (progress, success rate, breakdown of failure reasons, cost).
-- See: [Lesson 05](../lessons/05_reliability/README.en.md) · [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) · [Lesson 11](../lessons/11_cost_latency/README.en.md)
+- See: [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · [Lesson 14](../lessons/14_cost_latency/README.en.md)
 
 </details>
 
@@ -313,7 +313,7 @@
   - Show a "pending approval" status to the user;
   - Write the decision and the approver's identity to the audit log.
 - **Bonus points**: the equivalent mechanisms in major frameworks: LangGraph's `interrupt()` + `Command(resume=...)` (note that the node reruns from the top), OpenAI Agents SDK's `needs_approval` + serializable `RunState`, and Temporal's Signal + `wait_condition`.
-- See: [Lesson 06](../lessons/06_security/README.en.md) · [Lesson 05](../lessons/05_reliability/README.en.md)
+- See: [Lesson 09](../lessons/09_security/README.en.md) · [Lesson 08](../lessons/08_reliability/README.en.md)
 
 </details>
 
@@ -329,7 +329,7 @@
 5. **Wire it into CI**: from then on, run evals on every change to prompts, tools, or models, and block the merge if the pass rate drops below the threshold or a regression appears;
 6. **Keep feeding it**: set up a pipeline of production bad cases → labeling → added to the eval set, and view pass rates grouped by tag (intent, difficulty, risk);
 7. **Run multiple times**: run each case several times and watch pass^k.
-- See: [Lesson 08](../lessons/08_evals/README.en.md) · failure modes [E1](failure-modes.en.md#e1-eval-production-skew), [E4](failure-modes.en.md#e4-prompt-regression)
+- See: [Lesson 11](../lessons/11_evals/README.en.md) · failure modes [E1](failure-modes.en.md#e1-eval-production-skew), [E4](failure-modes.en.md#e4-prompt-regression)
 
 </details>
 
@@ -344,7 +344,7 @@
 - **Progressive rollout**: shift traffic by percentage or by tenant, compare production business metrics (task completion rate, human handoff rate, user feedback), and have one-click rollback ready.
 - **Pin the version**: pin the new model to a specific snapshot too ([E5](failure-modes.en.md#e5-silent-model-drift)).
 - **Look at the whole bill**: is the cost reduction offset by more steps or a higher handoff rate?
-- See: [Lesson 08](../lessons/08_evals/README.en.md) · [Lesson 11](../lessons/11_cost_latency/README.en.md) · [Lesson 13](../lessons/13_release_ops/README.en.md)
+- See: [Lesson 11](../lessons/11_evals/README.en.md) · [Lesson 14](../lessons/14_cost_latency/README.en.md) · [Lesson 16](../lessons/16_release_ops/README.en.md)
 
 </details>
 
@@ -359,7 +359,7 @@
 - **Read policy**: treat retrieved memories as untrusted data; newer overrides older on conflict; support expiration.
 - **User rights**: users can view and delete their own memories; when a tenant closes its account, everything can be deleted.
 - **Bonus points**: memory is a persistence vector for indirect injection. One successful injection written into memory takes effect in every future session (ASI06 Memory & Context Poisoning in the OWASP Agentic Top 10).
-- See: [Lesson 03](../lessons/03_context_memory/README.en.md) · failure modes [C5](failure-modes.en.md#c5-cross-tenant-memory-leak), [C6](failure-modes.en.md#c6-memory-poisoning-and-staleness)
+- See: [Lesson 04](../lessons/04_context_memory/README.en.md) · failure modes [C5](failure-modes.en.md#c5-cross-tenant-memory-leak), [C6](failure-modes.en.md#c6-memory-poisoning-and-staleness)
 
 </details>
 
@@ -376,7 +376,7 @@
 - **Tool count**: will the total number of tools be too high once it's connected? Do you need per-scenario filtering?
 - **Observability and auditing**: MCP tool calls go into traces and the audit log too.
 - References: the security principles in the MCP specification (user consent and control, data privacy, tool safety) and the official security best-practices document.
-- See: [Lesson 02](../lessons/02_tools/README.en.md) · [Lesson 06](../lessons/06_security/README.en.md)
+- See: [Lesson 03](../lessons/03_tools/README.en.md) · [Lesson 09](../lessons/09_security/README.en.md)
 
 </details>
 
@@ -390,7 +390,7 @@
 - **If you must use an agent**: make "complete onboarding" a single coarse-grained tool, with code guaranteeing atomicity/compensation inside it. The tool returns which steps completed, which failed, and which were rolled back.
 - **Externalize state**: each new hire's onboarding progress lives in a database, not just in the conversation context.
 - **Observability**: every step is recorded, and failures can be retried from the breakpoint.
-- See: [Lesson 04](../lessons/04_orchestration/README.en.md) · [Lesson 05](../lessons/05_reliability/README.en.md)
+- See: [Lesson 06](../lessons/06_orchestration/README.en.md) · [Lesson 08](../lessons/08_reliability/README.en.md)
 
 </details>
 
@@ -406,7 +406,7 @@
 5. One-click rollback;
 6. Long-running tasks stay pinned to the version they started with, to avoid switching mid-run ([R6](failure-modes.en.md#r6-version-skew-on-resume)).
 - **Bonus points**: treat prompts, tool descriptions, model version, and sampling parameters as a single "agent configuration"; a change to any of them goes through the same process.
-- See: [Lesson 08](../lessons/08_evals/README.en.md) · [Lesson 13](../lessons/13_release_ops/README.en.md)
+- See: [Lesson 11](../lessons/11_evals/README.en.md) · [Lesson 16](../lessons/16_release_ops/README.en.md)
 
 </details>
 
@@ -426,7 +426,7 @@
   - Data on the model provider's side (depends on its data retention policy).
 - **Audit logs**: these usually must be retained for compliance, so confirm with legal. This is one reason audit logs themselves should be redacted.
 - **Design lesson**: from day one, set a retention period for every kind of storage and make data findable and deletable per user. Draw a data-flow diagram, or you won't be able to fully honor deletion requests.
-- See: [Lesson 06](../lessons/06_security/README.en.md) · [Lesson 09](../lessons/09_production_architecture/README.en.md)
+- See: [Lesson 09](../lessons/09_security/README.en.md) · [Lesson 12](../lessons/12_production_architecture/README.en.md)
 
 </details>
 
@@ -445,7 +445,7 @@
 4. **Everything got more expensive**: check whether the prompt cache hit rate dropped (did someone add dynamic content to the start of the prompt? See [B2](failure-modes.en.md#b2-prompt-cache-busting)), whether the context strategy stopped working, or whether traffic was mistakenly switched to a pricier model;
 5. **The traffic itself**: is some abusive user generating fake volume ([B1](failure-modes.en.md#b1-runaway-cost))?
 6. **Mitigation**: temporarily tighten budgets and quotas; **after the fix**, add the root cause to the review checklist.
-- See: [Lesson 05](../lessons/05_reliability/README.en.md) · [Lesson 07](../lessons/07_observability/README.en.md) · [Lesson 11](../lessons/11_cost_latency/README.en.md)
+- See: [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 10](../lessons/10_observability/README.en.md) · [Lesson 14](../lessons/14_cost_latency/README.en.md)
 
 </details>
 
@@ -465,7 +465,7 @@
   - Add this case to the eval set and check `must_call`;
   - Check whether the tool's error messages are clear ([T6](failure-modes.en.md#t6-opaque-errors)).
 - **Widen the investigation**: scan historical runs with rules for cases that "claimed completion without a matching successful call," and assess the blast radius.
-- See: [Lesson 07](../lessons/07_observability/README.en.md) · [Lesson 08](../lessons/08_evals/README.en.md)
+- See: [Lesson 10](../lessons/10_observability/README.en.md) · [Lesson 11](../lessons/11_evals/README.en.md)
 
 </details>
 
@@ -478,7 +478,7 @@
 - Other possibilities: the context exceeds the model's window (check whether your token estimate is accurate; rough estimates can undercount); a tool occasionally returns a huge payload.
 - Verify: add message-sequence validation before sending; reproduce by building a conversation long enough to trigger truncation.
 - Fix: truncate by block; use the model's own tokenizer or the actual usage returned by the API instead of rough estimates.
-- See: [Lesson 03](../lessons/03_context_memory/README.en.md)
+- See: [Lesson 04](../lessons/04_context_memory/README.en.md)
 
 </details>
 
@@ -492,7 +492,7 @@
 - **Backlog**: requests piled up in the queue take time to drain after recovery, and users clicking again created even more requests.
 - **Fix**: retry at one layer only + exponential backoff + full jitter + a retry budget; a circuit breaker to fail fast; cap concurrency and queue length (reject anything beyond that and ask the user to try again later); cancel background runs when the client disconnects.
 - **Verify**: failure drills. Simulate the provider returning 429/503, and measure the amplification factor and the recovery time.
-- See: [Lesson 05](../lessons/05_reliability/README.en.md) · [Lesson 10](../lessons/10_distributed_concurrency/README.en.md)
+- See: [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md)
 
 </details>
 
@@ -509,7 +509,7 @@ In order of likelihood:
 5. **The user submitted twice**: the frontend has no double-submit protection.
 
 Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; persist the idempotency store; deduplicate on a business key (a time window for the same user and the same kind of issue); add double-submit protection to the frontend.
-- See: [Lesson 05](../lessons/05_reliability/README.en.md) · [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) · failure mode [T5](failure-modes.en.md#t5-duplicate-side-effects)
+- See: [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · failure mode [T5](failure-modes.en.md#t5-duplicate-side-effects)
 
 </details>
 
@@ -525,7 +525,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Environment differences**: evals use mock tools and data, while production tools return different formats, latencies, and errors;
 - **Different production config**: the model version, fallbacks, or prompt version differ from what was evaluated ([R3](failure-modes.en.md#r3-silent-degradation), [E5](failure-modes.en.md#e5-silent-model-drift)).
 - **Action**: sample and categorize the complaints → add them to the eval set → run each case multiple times → calibrate the judge against human labels.
-- See: [Lesson 08](../lessons/08_evals/README.en.md)
+- See: [Lesson 11](../lessons/11_evals/README.en.md)
 
 </details>
 
@@ -539,7 +539,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Input distribution shift**: did a batch of new request types arrive (a new tenant, a new feature entry point)?
 - **Upstream data changes**: did some tool's output format change, causing abnormal model output?
 - **Fix**: pin model snapshots; prefer native structured output; keep a repair loop as a fallback; set up canary evals (run a fixed set of cases on a schedule and alert on sudden metric shifts).
-- See: [Lesson 08](../lessons/08_evals/README.en.md) · [Lesson 13](../lessons/13_release_ops/README.en.md)
+- See: [Lesson 11](../lessons/11_evals/README.en.md) · [Lesson 16](../lessons/16_release_ops/README.en.md)
 
 </details>
 
@@ -559,7 +559,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
   - After the agent reads untrusted content, block it from initiating high-risk actions automatically;
   - Highlight in the approval UI that "this action was initiated after reading external content";
   - Add this ticket's content to the red-team test set.
-- See: [Lesson 06](../lessons/06_security/README.en.md)
+- See: [Lesson 09](../lessons/09_security/README.en.md)
 
 </details>
 
@@ -576,7 +576,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
   - One tool starts failing a lot → the downstream API changed (check the `error_type` distribution).
 - **Slice by dimension**: look at the rate by intent, tenant, and model version to find where it's concentrated.
 - **After the fix**: add representative failing runs to the eval set.
-- See: [Lesson 01](../lessons/01_agent_loop/README.en.md) · [Lesson 07](../lessons/07_observability/README.en.md)
+- See: [Lesson 02](../lessons/02_agent_loop/README.en.md) · [Lesson 10](../lessons/10_observability/README.en.md)
 
 </details>
 
@@ -594,7 +594,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
   - Monitor the count and age of paused runs;
   - Run a periodic cleanup job.
 - **Reflect**: is the approval volume too high? If the approval rate is close to 100%, many approvals are probably unnecessary, and the risk-tiering rules should be adjusted.
-- See: [Lesson 06](../lessons/06_security/README.en.md) · [Lesson 09](../lessons/09_production_architecture/README.en.md)
+- See: [Lesson 09](../lessons/09_security/README.en.md) · [Lesson 12](../lessons/12_production_architecture/README.en.md)
 
 </details>
 
@@ -613,7 +613,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
   - Move genuinely long tasks to an async notification model;
   - Cancel background runs when the client disconnects, to avoid wasted work.
 - **Watch out**: after a frontend/gateway timeout, the backend keeps running. That wastes money and may cause side effects the user doesn't know about.
-- See: [Lesson 05](../lessons/05_reliability/README.en.md) · [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) · [Lesson 11](../lessons/11_cost_latency/README.en.md) · failure mode [P4](failure-modes.en.md#p4-tail-latency-blowup)
+- See: [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · [Lesson 14](../lessons/14_cost_latency/README.en.md) · failure mode [P4](failure-modes.en.md#p4-tail-latency-blowup)
 
 </details>
 
@@ -621,7 +621,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 
 ## Part 4: Distributed Systems, Concurrency, Cost, and Release
 
-> This part maps to Part 2 of the course: [Lesson 10](../lessons/10_distributed_concurrency/README.en.md), [Lesson 11](../lessons/11_cost_latency/README.en.md), [Lesson 12](../lessons/12_enterprise_rag/README.en.md), and [Lesson 13](../lessons/13_release_ops/README.en.md). These questions come up often in senior-level interviews: the interviewer wants to know whether you can take "an agent that runs on one machine" and turn it into "a system that handles production traffic and ships safely."
+> This part maps to Part 2 of the course: [Lesson 13](../lessons/13_distributed_concurrency/README.en.md), [Lesson 14](../lessons/14_cost_latency/README.en.md), [Lesson 15](../lessons/15_enterprise_rag/README.en.md), and [Lesson 16](../lessons/16_release_ops/README.en.md). These questions come up often in senior-level interviews: the interviewer wants to know whether you can take "an agent that runs on one machine" and turn it into "a system that handles production traffic and ships safely."
 
 ### X1. Two messages from the same session are processed concurrently by two workers. What goes wrong? What are the solutions, and how do you choose? ⭐⭐
 
@@ -638,7 +638,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
   | Distributed lock | Acquire a lock before processing | Intuitive | Unsafe without a lease and a fencing token; the lock service becomes a dependency |
 
 - **How to choose**: an agent session is naturally "one session, one timeline," so **serializing by session partition** is the first choice, with a **versioned CAS** on state writes as a safety net. If the user sends another message before the previous one has been processed, merge it into the same run or queue it.
-- See: [Lesson 10](../lessons/10_distributed_concurrency/README.en.md)
+- See: [Lesson 13](../lessons/13_distributed_concurrency/README.en.md)
 
 </details>
 
@@ -651,7 +651,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Why it's not enough**: the worker may not be dead, just "paused" (a long GC pause, a network partition, a suspended VM). After the lease expires and the task is reassigned, it wakes up without knowing it has lost the lease and keeps writing. Now two workers are processing the same task ([D2](failure-modes.en.md#d2-zombie-worker)). Checking the lease right before executing doesn't help either, because the pause can still happen between the check and the write.
 - **Fencing token**: every time a lease is granted, issue a monotonically increasing number; the worker includes it with every write; **the storage side** rejects any write whose number is smaller than one it has already seen. Even if a zombie worker wakes up, its writes get rejected. Martin Kleppmann's *How to do distributed locking* analyzes this in detail.
 - **Bonus points**: for side effects that go through external APIs (the external system doesn't know about your token), the last line of defense is still the idempotency key.
-- See: [Lesson 10](../lessons/10_distributed_concurrency/README.en.md)
+- See: [Lesson 13](../lessons/13_distributed_concurrency/README.en.md)
 
 </details>
 
@@ -668,7 +668,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
   4. Set the visibility timeout above the p99 processing time, and extend it for long tasks;
   5. Messages that fail repeatedly go to a dead-letter queue.
 - In one line: **exactly once = at least once + idempotency**.
-- See: [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) · [Lesson 05](../lessons/05_reliability/README.en.md)
+- See: [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · [Lesson 08](../lessons/08_reliability/README.en.md)
 
 </details>
 
@@ -686,7 +686,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 
 - **In practice**: a single agent often needs a combination: start with a streaming response, and automatically switch to a background task (and notify the user) once it passes a duration threshold.
 - **The key point**: timeouts must be consistent across layers (frontend < gateway < server-side budget). When the client disconnects, cancel the run or move it to the background explicitly, rather than letting it keep running in the backend "unclaimed" ([P4](failure-modes.en.md#p4-tail-latency-blowup)).
-- See: [Lesson 10](../lessons/10_distributed_concurrency/README.en.md)
+- See: [Lesson 13](../lessons/13_distributed_concurrency/README.en.md)
 
 </details>
 
@@ -699,7 +699,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Without it**: write to the database, then publish the message, and a crash in between leaves a ticket that nobody receives an event for. Publish first, then write, and a rolled-back transaction leaves a message that has already gone out. The two systems can't commit in a single transaction ([D7](failure-modes.en.md#d7-dual-write-inconsistency)).
 - **How**: write the business data and the "pending event" in **the same database transaction** (the event goes into an outbox table); a separate relay process polls or subscribes to the outbox, publishes events to the message queue, and marks them as sent on success.
 - **The cost**: the relay may publish duplicates (at least once), so consumers must be idempotent; events arrive with a small delay.
-- See: [Lesson 10](../lessons/10_distributed_concurrency/README.en.md)
+- See: [Lesson 13](../lessons/13_distributed_concurrency/README.en.md)
 
 </details>
 
@@ -713,7 +713,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Fairness**: per-tenant quotas with **weighted fair queuing** (weights assigned by plan/priority); interactive requests take priority over batch; a burst from one tenant must not crowd out the others ([P3](failure-modes.en.md#p3-noisy-neighbor)).
 - **Backpressure**: when no token is available, queue the request (with a cap) or fail fast and tell the user. Don't retry immediately (that's a retry storm, [R1](failure-modes.en.md#r1-retry-storm)).
 - **Capacity planning**: the provider quota is the real ceiling. Scaling workers on queue depth won't get you past it; request quota increases in advance or spread load across multiple providers.
-- See: [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) · [Lesson 09](../lessons/09_production_architecture/README.en.md)
+- See: [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · [Lesson 12](../lessons/12_production_architecture/README.en.md)
 
 </details>
 
@@ -729,7 +729,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
   - Prioritize new and interactive messages.
 - **Scale out with care**: if the bottleneck is model quota, more workers just produce more 429s.
 - **Prevention**: messages carry deadlines; monitor "oldest message age," not just queue depth; separate queues for interactive and batch traffic; admission control and backpressure; dead-letter queues to isolate poison messages; retries go through a delay queue instead of back to the head of the queue.
-- See: [Lesson 10](../lessons/10_distributed_concurrency/README.en.md)
+- See: [Lesson 13](../lessons/13_distributed_concurrency/README.en.md)
 
 </details>
 
@@ -746,7 +746,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Cache key**: tenant + permission scope (e.g., an ACL hash) + model version + prompt version + normalized input (a semantic cache does its similarity matching within this partition).
 - **Scope**: cache only public, non-personalized answers that don't depend on real-time data; set the similarity threshold from eval data, and monitor the "hit but wrong" rate; invalidate by source when source data changes.
 - **Don't confuse the two**: a semantic cache (application layer, hits by meaning) ≠ a prompt cache (provider layer, reuses computation by prefix, never returns a wrong answer).
-- See: [Lesson 11](../lessons/11_cost_latency/README.en.md) · [Lesson 12](../lessons/12_enterprise_rag/README.en.md)
+- See: [Lesson 14](../lessons/14_cost_latency/README.en.md) · [Lesson 15](../lessons/15_enterprise_rag/README.en.md)
 
 </details>
 
@@ -762,7 +762,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
   - It's cost-sensitive and can't be cancelled: if both model calls run to completion, you pay double;
   - The latency comes from the request itself (very long input, many steps) rather than random downstream jitter: hedging won't help.
 - **Where it fits**: idempotent requests such as read-only retrieval or short, tool-free text generation, with a sensible trigger threshold.
-- See: [Lesson 11](../lessons/11_cost_latency/README.en.md)
+- See: [Lesson 14](../lessons/14_cost_latency/README.en.md)
 
 </details>
 
@@ -775,7 +775,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Escalation criteria** (can be combined): the small model's structured output fails validation; the confidence from the small model's self-assessment or from a classifier is low; the task belongs to a known-hard category; a rule check fails (e.g., the answer cites no sources).
 - **Set thresholds with evals**: on the eval set, plot "escalation rate vs. overall quality vs. total cost," and choose the lowest-cost point that meets the quality floor.
 - **Caution**: cascading makes the latency of hard requests the sum of two calls; and if the small model is "confidently wrong," escalation never triggers, so escalation criteria can't rely on the model's self-assessment alone.
-- See: [Lesson 11](../lessons/11_cost_latency/README.en.md) · failure mode [B4](failure-modes.en.md#b4-model-over-provisioning)
+- See: [Lesson 14](../lessons/14_cost_latency/README.en.md) · failure mode [B4](failure-modes.en.md#b4-model-over-provisioning)
 
 </details>
 
@@ -791,7 +791,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
   2. Even if you remove them before the model sees them, the top-k may be filled with unauthorized documents, so authorized ones never get retrieved and quality drops;
   3. Side channels such as result counts, ranking, and snippets can leak the existence of unauthorized documents ([C7](failure-modes.en.md#c7-post-filter-acl-leak)).
 - **The challenges of pre-filtering**: ACLs must be indexed alongside the documents and kept in sync; permission changes must propagate promptly; complex permission models (inheritance, groups) must be expanded.
-- See: [Lesson 12](../lessons/12_enterprise_rag/README.en.md)
+- See: [Lesson 15](../lessons/15_enterprise_rag/README.en.md)
 
 </details>
 
@@ -804,7 +804,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Mechanisms**: index entries carry a source ID, version, update time, and expiry time; event-driven incremental sync is the primary path, with periodic full reconciliation as a safety net (to find entries that "no longer exist in the source system but are still in the index").
 - **Verification**: delete a canary document and measure how long it takes to stop being retrievable; monitor the share of stale documents in retrieval results.
 - **At the answer level**: answers include citations and the document version/date; statements that fail citation verification are not output ([C9](failure-modes.en.md#c9-citation-hallucination)).
-- See: [Lesson 12](../lessons/12_enterprise_rag/README.en.md)
+- See: [Lesson 15](../lessons/15_enterprise_rag/README.en.md)
 
 </details>
 
@@ -821,7 +821,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 
 - **A typical path for a prompt change**: offline evals pass (no regressions) → shadow-mode comparison (especially for changes that involve writes; in shadow mode, tool calls must be intercepted or mocked) → canary (e.g., 1% → 5%, watching completion rate, `stop_reason` distribution, and cost) → A/B test when you need to measure business impact → full rollout.
 - **Throughout**: bucket by a stable identifier and pin the version within a session ([D6](failure-modes.en.md#d6-unstable-canary-bucketing)); record the version on every run; have automated rollback ready.
-- See: [Lesson 13](../lessons/13_release_ops/README.en.md)
+- See: [Lesson 16](../lessons/16_release_ops/README.en.md)
 
 </details>
 
@@ -836,7 +836,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Scale effects**: full rollout hit limits the canary never reached: model quota, shifts in cache hit rate, queue backlogs, downstream rate limiting ([D9](failure-modes.en.md#d9-local-only-rate-limiting)).
 - **Interaction effects**: other changes happened to take effect during the rollout (a model alias update, a knowledge base update) ([E5](failure-modes.en.md#e5-silent-model-drift)).
 - **Response**: stratified sampling for the canary, stable bucketing, enough sample size and observation time, metrics sliced by tenant/intent, one change per release, and automated rollback conditions that stay in place after full rollout.
-- See: [Lesson 13](../lessons/13_release_ops/README.en.md)
+- See: [Lesson 16](../lessons/16_release_ops/README.en.md)
 
 </details>
 
@@ -855,7 +855,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
   - What happens to long-running tasks still in flight during a rollback (version pinning + compatible state formats);
   - Rollback must not depend on the very system that's broken (the kill switch must be independent);
   - After an automated rollback, notify a human, leave a record, and hold a postmortem.
-- See: [Lesson 13](../lessons/13_release_ops/README.en.md)
+- See: [Lesson 16](../lessons/16_release_ops/README.en.md)
 
 </details>
 
@@ -872,7 +872,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
   - A missing defense → a new item on the design review checklist;
   - Confusion during the response → an updated runbook.
 - **Data flywheel**: production issues → labeling → eval set and improvements → a better version → new production data, in a continuous loop.
-- See: [Lesson 13](../lessons/13_release_ops/README.en.md) · [Lesson 08](../lessons/08_evals/README.en.md)
+- See: [Lesson 16](../lessons/16_release_ops/README.en.md) · [Lesson 11](../lessons/11_evals/README.en.md)
 
 </details>
 
@@ -892,7 +892,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Quality**: hybrid retrieval + reranking; answers must cite sources; if nothing is found, say so ([M5](failure-modes.en.md#m5-policy-hallucination)).
 - **Security**: treat document content as untrusted data (any employee who can write a document can hide an injection in it); redact the output.
 - **Evals**: a Q&A dataset + groundedness scoring + authorization-bypass tests.
-- See: [Lesson 12](../lessons/12_enterprise_rag/README.en.md) · [Lesson 06](../lessons/06_security/README.en.md)
+- See: [Lesson 15](../lessons/15_enterprise_rag/README.en.md) · [Lesson 09](../lessons/09_security/README.en.md)
 
 </details>
 
@@ -905,7 +905,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Reliability**: multi-provider/multi-region failover; circuit breaking; **coordinate the retry policy with the application side to avoid retrying at two layers**.
 - **Observability**: log the app, tenant, model, tokens, latency, cost, and error code for every request, and emit them following the OpenTelemetry GenAI semantic conventions.
 - **Trade-offs**: the gateway adds a hop of latency; it becomes a single point of failure and needs a high-availability deployment; the more features it has, the heavier it gets, so keep the core lean.
-- See: [Lesson 09](../lessons/09_production_architecture/README.en.md) · [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) · [Lesson 11](../lessons/11_cost_latency/README.en.md)
+- See: [Lesson 12](../lessons/12_production_architecture/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · [Lesson 14](../lessons/14_cost_latency/README.en.md)
 
 </details>
 
@@ -919,7 +919,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Grading**: rule-based graders + trajectory graders + LLM judges (rubric-based, regularly calibrated against humans).
 - **Reporting**: pass rate (overall and per tag), pass^k, a regression list, cost, latency, step count, all compared against the baseline.
 - **CI gate**: a pass-rate threshold + zero regressions; keep the cost of evals themselves under control (choose a subset based on what changed, run the full suite nightly).
-- See: [Lesson 08](../lessons/08_evals/README.en.md)
+- See: [Lesson 11](../lessons/11_evals/README.en.md)
 
 </details>
 
@@ -933,7 +933,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Security**: authenticate approvers; separation of duties (an initiator can't approve their own request); tamper-proof request content (signed, or store only references); signed decisions that the agent service verifies before executing.
 - **Experience**: push requests to the channels approvers already use; clearly show the impact and context (including "was this initiated after reading external content?").
 - **Governance**: an expiry policy, approval-time monitoring, approval-rate monitoring (to catch rubber-stamping), and a full audit trail.
-- See: [Lesson 06](../lessons/06_security/README.en.md)
+- See: [Lesson 09](../lessons/09_security/README.en.md)
 
 </details>
 
@@ -948,7 +948,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Configuration isolation**: tenant-customized prompts, tools, and knowledge bases are treated as untrusted content scoped to that tenant, and must never affect other tenants.
 - **Verification**: automated cross-tenant access tests (canary data); periodic audits.
 - **Cost**: per-tenant metering and reporting.
-- See: [Lesson 09](../lessons/09_production_architecture/README.en.md) · [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) · [Lesson 12](../lessons/12_enterprise_rag/README.en.md) · failure mode [C5](failure-modes.en.md#c5-cross-tenant-memory-leak)
+- See: [Lesson 12](../lessons/12_production_architecture/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · [Lesson 15](../lessons/15_enterprise_rag/README.en.md) · failure mode [C5](failure-modes.en.md#c5-cross-tenant-memory-leak)
 
 </details>
 
@@ -963,7 +963,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Reliability**: idempotent operations; verify the effect after a fix (deterministic checks); set circuit breakers such as "at most N automatic restarts per service per hour" so that auto-remediation itself doesn't make the incident worse.
 - **Observability**: every diagnosis and action has a trace and an audit record, so it can be reviewed afterward.
 - **Evals**: build an eval set from past incidents (diagnostic accuracy, whether the right fix was chosen, whether any dangerous action was taken); run in shadow mode first (suggest, but don't execute).
-- See: [Lesson 06](../lessons/06_security/README.en.md) · [Capstone project](../capstone/README.en.md)
+- See: [Lesson 09](../lessons/09_security/README.en.md) · [Capstone project](../capstone/README.en.md)
 
 </details>
 
@@ -983,7 +983,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 - **Failure handling**: worker crash → the lease expires, another worker takes over and recovers from the checkpoint, and a fencing token blocks zombie writes ([D2](failure-modes.en.md#d2-zombie-worker)); model rate limiting → queuing + backpressure + fallback; hot spots from large tenants → weighted fair queuing; queue backlog → deadlines + admission control ([D4](failure-modes.en.md#d4-queue-backlog-avalanche)).
 - **Long tasks**: tasks that exceed a threshold move to a workflow engine or an async queue, with a notification on completion.
 - **Observability**: per-session traces, queue depth and oldest-message age, global quota utilization, per-tenant latency and error rates.
-- See: [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) · [Lesson 09](../lessons/09_production_architecture/README.en.md)
+- See: [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · [Lesson 12](../lessons/12_production_architecture/README.en.md)
 
 </details>
 
@@ -1081,7 +1081,7 @@ Key design decisions:
 - Degradation plan for sales events: once traffic crosses a threshold, the agent path keeps only lookups, and returns/exchanges switch to an async "submit a request, we'll get back to you" mode;
 - The refund tool passes its idempotency key to the refund service; checkpoints record every step, so crashes are recoverable;
 - Every abnormal termination comes with a friendly message and a way to reach a human;
-- Messages from the same session are partitioned by session ID and processed serially, avoiding concurrent writes when a user sends several messages in a row ([D1](failure-modes.en.md#d1-lost-update)); rate-limit globally against the model provider, and queue by channel/priority ([Lesson 10](../lessons/10_distributed_concurrency/README.en.md)).
+- Messages from the same session are partitioned by session ID and processed serially, avoiding concurrent writes when a user sends several messages in a row ([D1](failure-modes.en.md#d1-lost-update)); rate-limit globally against the model provider, and queue by channel/priority ([Lesson 13](../lessons/13_distributed_concurrency/README.en.md)).
 
 **Security**
 
@@ -1096,7 +1096,7 @@ Key design decisions:
 - Sample and redact historical support conversations to build the eval set, tagged by intent and difficulty;
 - Core metrics: resolution rate, human handoff rate, **erroneous refund rate (a red line)**, satisfaction;
 - Grading: rules (did it call the right tool, did it avoid unauthorized refunds) + an LLM judge (answer quality, regularly calibrated against humans); run each case multiple times and look at pass^k;
-- Launch path: shadow mode (the agent generates replies without sending them, compared against what human reps actually did) → a small canary (stable bucketing by user) → a gradual ramp-up, with automated rollback conditions ([Lesson 13](../lessons/13_release_ops/README.en.md)).
+- Launch path: shadow mode (the agent generates replies without sending them, compared against what human reps actually did) → a small canary (stable bucketing by user) → a gradual ramp-up, with automated rollback conditions ([Lesson 16](../lessons/16_release_ops/README.en.md)).
 
 **Cost**
 
@@ -1104,7 +1104,7 @@ Key design decisions:
 - Prompt caching: keep the system prompt and tool definitions stable and up front;
 - Token/dollar budgets per run and per session; a daily quota per user to prevent abuse;
 - Track cost by intent, and optimize the most expensive intents first;
-- Public FAQ answers that contain no personal information can be cached, with the model version and prompt version in the cache key; any answer involving orders or accounts stays out of the shared cache ([D5](failure-modes.en.md#d5-cross-tenant-cache-leak), [Lesson 11](../lessons/11_cost_latency/README.en.md)).
+- Public FAQ answers that contain no personal information can be cached, with the model version and prompt version in the cache key; any answer involving orders or accounts stays out of the shared cache ([D5](failure-modes.en.md#d5-cross-tenant-cache-leak), [Lesson 14](../lessons/14_cost_latency/README.en.md)).
 
 #### 5) Trade-offs
 

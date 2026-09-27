@@ -82,7 +82,7 @@ flowchart TD
 - **流程固定的审批流**：用工作流引擎，LLM 最多负责其中"理解表单"这一步。
 - **强实时交互**：毫秒级响应的场景，一次模型调用就要几秒。
 - **不可逆、高风险、又没人审核的操作**：Replit 事件就是反例。
-- **没有评估手段的任务**：无法衡量好坏，就无法迭代，也无法安全上线（第 08 课）。
+- **没有评估手段的任务**：无法衡量好坏，就无法迭代，也无法安全上线（第 11 课）。
 
 ### 1.4 Demo 级 Agent vs 企业级 Agent
 
@@ -113,14 +113,14 @@ flowchart TD
 ```mermaid
 flowchart TB
     ENTRY["<b>接入层</b><br/>Web / IM / API<br/>SSO 身份认证"]
-    EXEC["<b>执行与扩展层</b> · 第 10 课<br/>任务队列 + 多实例 Worker<br/>会话并发控制<br/>全局限流与背压"]
-    GUARD["<b>安全护栏层</b> · 第 06 课<br/>输入检测 InputGuard<br/>工具输出隔离 ToolOutputGuard<br/>输出脱敏 OutputGuard"]
-    ORCH["<b>编排层</b> · 第 01、04 课<br/>Agent 主循环 + 钩子<br/>Workflow 与多 Agent"]
-    CTX["<b>上下文与知识层</b> · 第 03、12 课<br/>上下文窗口管理<br/>长期记忆<br/>权限感知 RAG"]
-    TOOLS["<b>工具层</b> · 第 02、06 课<br/>ToolRegistry<br/>校验、超时、幂等<br/>RBAC + 人工审批"]
-    MODEL["<b>模型层</b> · 第 05、11 课<br/>ResilientLLM 重试、熔断、降级<br/>模型路由与缓存<br/>预算 BudgetHook"]
-    STATE["<b>状态层</b> · 第 05 课<br/>检查点 Checkpointer"]
-    XCUT["<b>横切能力</b><br/>链路追踪 · 第 07 课<br/>审计日志 · 第 06 课<br/>评估与 CI 门禁 · 第 08 课<br/>发布、变更与运维 · 第 13 课"]
+    EXEC["<b>执行与扩展层</b> · 第 13 课<br/>任务队列 + 多实例 Worker<br/>会话并发控制<br/>全局限流与背压"]
+    GUARD["<b>安全护栏层</b> · 第 09 课<br/>输入检测 InputGuard<br/>工具输出隔离 ToolOutputGuard<br/>输出脱敏 OutputGuard"]
+    ORCH["<b>编排层</b> · 第 02、06 课<br/>Agent 主循环 + 钩子<br/>Workflow 与多 Agent"]
+    CTX["<b>上下文与知识层</b> · 第 04、15 课<br/>上下文窗口管理<br/>长期记忆<br/>权限感知 RAG"]
+    TOOLS["<b>工具层</b> · 第 03、09 课<br/>ToolRegistry<br/>校验、超时、幂等<br/>RBAC + 人工审批"]
+    MODEL["<b>模型层</b> · 第 08、14 课<br/>ResilientLLM 重试、熔断、降级<br/>模型路由与缓存<br/>预算 BudgetHook"]
+    STATE["<b>状态层</b> · 第 08 课<br/>检查点 Checkpointer"]
+    XCUT["<b>横切能力</b><br/>链路追踪 · 第 10 课<br/>审计日志 · 第 09 课<br/>评估与 CI 门禁 · 第 11 课<br/>发布、变更与运维 · 第 16 课"]
     ENTRY --> EXEC --> GUARD --> ORCH
     ORCH --> CTX
     ORCH --> TOOLS
@@ -129,25 +129,25 @@ flowchart TB
     XCUT -.->|"贯穿每一层"| ORCH
 ```
 
-第 09 课把这些层放在一起讲生产架构的全貌，**综合实战**（[`capstone/`](../../capstone/)）则把它们组装成一个完整的企业 IT 服务台 Agent **ITBuddy**。
+第 12 课把这些层放在一起讲生产架构的全貌，**综合实战**（[`capstone/`](../../capstone/)）则把它们组装成一个完整的企业 IT 服务台 Agent **ITBuddy**。
 
 课程与架构层、agentkit 模块的对应关系：
 
 | 部分 | 课 | 主题 | 架构层 | agentkit 模块 |
 |---|---|---|---|---|
-| 一 | [01](../01_agent_loop/) | Agent 循环的本质 | 编排层 | [`agent.py`](../../agentkit/agent.py)、[`llm.py`](../../agentkit/llm.py)、[`types.py`](../../agentkit/types.py)、[`hooks.py`](../../agentkit/hooks.py) |
-| 一 | [02](../02_tools/) | 工具设计 | 工具层 | [`tools.py`](../../agentkit/tools.py) |
-| 一 | [03](../03_context_memory/) | 上下文与记忆 | 上下文与知识层 | [`context.py`](../../agentkit/context.py)、[`memory.py`](../../agentkit/memory.py) |
-| 一 | [04](../04_orchestration/) | 编排模式与多 Agent | 编排层 | [`workflows.py`](../../agentkit/workflows.py) |
-| 二 | [05](../05_reliability/) | 可靠性工程 | 模型层、状态层 | [`reliability.py`](../../agentkit/reliability.py)、[`budget.py`](../../agentkit/budget.py)、[`state.py`](../../agentkit/state.py) |
-| 二 | [06](../06_security/) | 安全与治理 | 安全护栏层、工具层 | [`guardrails.py`](../../agentkit/guardrails.py)、[`permissions.py`](../../agentkit/permissions.py)、[`audit.py`](../../agentkit/audit.py) |
-| 二 | [07](../07_observability/) | 可观测性 | 横切 | [`tracing.py`](../../agentkit/tracing.py) |
-| 二 | [08](../08_evals/) | 评估驱动开发 | 横切 | [`evals.py`](../../agentkit/evals.py) |
-| 二 | [09](../09_production_architecture/) | 生产架构总览 | 全部 | 综合 |
-| 二 | [10](../10_distributed_concurrency/) | 高并发与分布式执行 | 执行与扩展层 | 见该课 |
-| 二 | [11](../11_cost_latency/) | 成本与延迟优化 | 模型层 | 见该课 |
-| 二 | [12](../12_enterprise_rag/) | 企业知识与权限感知 RAG | 上下文与知识层 | 见该课 |
-| 二 | [13](../13_release_ops/) | 发布、变更与运维 | 横切 | 见该课 |
+| 一 | [01](../02_agent_loop/) | Agent 循环的本质 | 编排层 | [`agent.py`](../../agentkit/agent.py)、[`llm.py`](../../agentkit/llm.py)、[`types.py`](../../agentkit/types.py)、[`hooks.py`](../../agentkit/hooks.py) |
+| 一 | [02](../03_tools/) | 工具设计 | 工具层 | [`tools.py`](../../agentkit/tools.py) |
+| 一 | [03](../04_context_memory/) | 上下文与记忆 | 上下文与知识层 | [`context.py`](../../agentkit/context.py)、[`memory.py`](../../agentkit/memory.py) |
+| 一 | [04](../06_orchestration/) | 编排模式与多 Agent | 编排层 | [`workflows.py`](../../agentkit/workflows.py) |
+| 二 | [05](../08_reliability/) | 可靠性工程 | 模型层、状态层 | [`reliability.py`](../../agentkit/reliability.py)、[`budget.py`](../../agentkit/budget.py)、[`state.py`](../../agentkit/state.py) |
+| 二 | [06](../09_security/) | 安全与治理 | 安全护栏层、工具层 | [`guardrails.py`](../../agentkit/guardrails.py)、[`permissions.py`](../../agentkit/permissions.py)、[`audit.py`](../../agentkit/audit.py) |
+| 二 | [07](../10_observability/) | 可观测性 | 横切 | [`tracing.py`](../../agentkit/tracing.py) |
+| 二 | [08](../11_evals/) | 评估驱动开发 | 横切 | [`evals.py`](../../agentkit/evals.py) |
+| 二 | [09](../12_production_architecture/) | 生产架构总览 | 全部 | 综合 |
+| 二 | [10](../13_distributed_concurrency/) | 高并发与分布式执行 | 执行与扩展层 | 见该课 |
+| 二 | [11](../14_cost_latency/) | 成本与延迟优化 | 模型层 | 见该课 |
+| 二 | [12](../15_enterprise_rag/) | 企业知识与权限感知 RAG | 上下文与知识层 | 见该课 |
+| 二 | [13](../16_release_ops/) | 发布、变更与运维 | 横切 | 见该课 |
 | — | [capstone](../../capstone/) | ITBuddy 综合实战 | 全部 | 综合 |
 
 ### 1.6 课程的两部分与 4 小时学习路线
@@ -175,19 +175,19 @@ flowchart LR
 | 部分 | 课 | 用时 | 累计 | 你会得到 |
 |---|---|---|---|---|
 | 一 基础构建 | [00 全景图](./) | 10 分钟 | 0:10 | 地图和判断力 |
-| | [01 Agent 循环](../01_agent_loop/) | 20 分钟 | 0:30 | 亲手写出主循环 |
-| | [02 工具设计](../02_tools/) | 20 分钟 | 0:50 | 模型用得对、攻击者用不歪的工具 |
-| | [03 上下文与记忆](../03_context_memory/) | 15 分钟 | 1:05 | 长对话不爆、记忆不串户 |
-| | [04 编排模式](../04_orchestration/) | 15 分钟 | 1:20 | 知道何时用 Workflow、何时用 Agent |
-| 二 企业问题 | [05 可靠性工程](../05_reliability/) | 20 分钟 | 1:40 | 限流、宕机、崩溃时怎么办 |
-| | [06 安全与治理](../06_security/) | 20 分钟 | 2:00 | 注入、越权、泄露怎么防 |
-| | [07 可观测性](../07_observability/) | 15 分钟 | 2:15 | 出了问题怎么查 |
-| | [08 评估驱动开发](../08_evals/) | 20 分钟 | 2:35 | 改 prompt 怎么知道没改坏 |
-| | [09 生产架构总览](../09_production_architecture/) | 15 分钟 | 2:50 | 各层怎么组合成一个系统 |
-| | [10 高并发与分布式执行](../10_distributed_concurrency/) | 25 分钟 | 3:15 | 多实例、队列、并发写、限流、补偿 |
-| | [11 成本与延迟优化](../11_cost_latency/) | 15 分钟 | 3:30 | 模型路由、缓存、成本归因 |
-| | [12 企业知识与权限感知 RAG](../12_enterprise_rag/) | 15 分钟 | 3:45 | 检索不越权、知识不过期、引用可校验 |
-| | [13 发布、变更与运维](../13_release_ops/) | 15 分钟 | 4:00 | 灰度、熔断开关、回滚、事故响应 |
+| | [01 Agent 循环](../02_agent_loop/) | 20 分钟 | 0:30 | 亲手写出主循环 |
+| | [02 工具设计](../03_tools/) | 20 分钟 | 0:50 | 模型用得对、攻击者用不歪的工具 |
+| | [03 上下文与记忆](../04_context_memory/) | 15 分钟 | 1:05 | 长对话不爆、记忆不串户 |
+| | [04 编排模式](../06_orchestration/) | 15 分钟 | 1:20 | 知道何时用 Workflow、何时用 Agent |
+| 二 企业问题 | [05 可靠性工程](../08_reliability/) | 20 分钟 | 1:40 | 限流、宕机、崩溃时怎么办 |
+| | [06 安全与治理](../09_security/) | 20 分钟 | 2:00 | 注入、越权、泄露怎么防 |
+| | [07 可观测性](../10_observability/) | 15 分钟 | 2:15 | 出了问题怎么查 |
+| | [08 评估驱动开发](../11_evals/) | 20 分钟 | 2:35 | 改 prompt 怎么知道没改坏 |
+| | [09 生产架构总览](../12_production_architecture/) | 15 分钟 | 2:50 | 各层怎么组合成一个系统 |
+| | [10 高并发与分布式执行](../13_distributed_concurrency/) | 25 分钟 | 3:15 | 多实例、队列、并发写、限流、补偿 |
+| | [11 成本与延迟优化](../14_cost_latency/) | 15 分钟 | 3:30 | 模型路由、缓存、成本归因 |
+| | [12 企业知识与权限感知 RAG](../15_enterprise_rag/) | 15 分钟 | 3:45 | 检索不越权、知识不过期、引用可校验 |
+| | [13 发布、变更与运维](../16_release_ops/) | 15 分钟 | 4:00 | 灰度、熔断开关、回滚、事故响应 |
 | 实战 | [综合实战 ITBuddy](../../capstone/) | 30 分钟 | 4:30 | 把一切组装起来 |
 
 主线 14 课共 4 小时，综合实战另需 30 分钟。时间紧张的话，00 → 01 → 02 → 05 → 06 是最小闭环；每课的"深入"一节都可以先跳过，之后再回来读。
@@ -200,22 +200,22 @@ flowchart LR
 
 ```python
 Agent(
-    ResilientLLM(default_llm(), fallbacks=[...]),       # 第 05 课：重试、熔断、降级
-    [search_kb, list_my_tickets, reset_password, ...],  # 第 02 课：Schema、ctx 身份、风险分级
-    system_prompt=SYSTEM_PROMPT + UNTRUSTED_DATA_RULE,  # 第 06 课：告诉模型工具输出是数据不是指令
-    max_steps=8,                                        # 第 01 课：步数上限
-    hooks=[                                             # 第 01 课：钩子，按顺序执行
-        InputGuard(),                                   # 第 06 课：输入检测
-        PermissionPolicy(role_tools=..., ask_risks={"dangerous"}),  # 第 06 课：RBAC + 审批
-        BudgetHook(max_tokens=30_000, max_cost_usd=0.10, ...),      # 第 05 课：预算
-        ToolOutputGuard(),                              # 第 06 课：工具输出隔离
-        OutputGuard(),                                  # 第 06 课：输出脱敏
-        AuditLog("runs/00_overview/audit.jsonl"),       # 第 06 课：审计
+    ResilientLLM(default_llm(), fallbacks=[...]),       # 第 08 课：重试、熔断、降级
+    [search_kb, list_my_tickets, reset_password, ...],  # 第 03 课：Schema、ctx 身份、风险分级
+    system_prompt=SYSTEM_PROMPT + UNTRUSTED_DATA_RULE,  # 第 09 课：告诉模型工具输出是数据不是指令
+    max_steps=8,                                        # 第 02 课：步数上限
+    hooks=[                                             # 第 02 课：钩子，按顺序执行
+        InputGuard(),                                   # 第 09 课：输入检测
+        PermissionPolicy(role_tools=..., ask_risks={"dangerous"}),  # 第 09 课：RBAC + 审批
+        BudgetHook(max_tokens=30_000, max_cost_usd=0.10, ...),      # 第 08 课：预算
+        ToolOutputGuard(),                              # 第 09 课：工具输出隔离
+        OutputGuard(),                                  # 第 09 课：输出脱敏
+        AuditLog("runs/00_overview/audit.jsonl"),       # 第 09 课：审计
     ],
-    context_strategy=SlidingWindow(max_tokens=8_000),   # 第 03 课：上下文管理
-    checkpointer=FileCheckpointer("runs/.../checkpoints"),  # 第 05 课：检查点
-    tracer=Tracer(exporter=jsonl_exporter(...)),        # 第 07 课：链路追踪
-    idempotency_store=IdempotencyStore(),               # 第 05 课：写操作幂等
+    context_strategy=SlidingWindow(max_tokens=8_000),   # 第 04 课：上下文管理
+    checkpointer=FileCheckpointer("runs/.../checkpoints"),  # 第 08 课：检查点
+    tracer=Tracer(exporter=jsonl_exporter(...)),        # 第 10 课：链路追踪
+    idempotency_store=IdempotencyStore(),               # 第 08 课：写操作幂等
 )
 ```
 
@@ -285,7 +285,7 @@ Demo 演示 3 个场景，当前用户是普通员工张三（角色 `employee`�
 2. **动手改一改 Demo（可选，5 分钟）**：
    - 把 `demo.py` 里 `ME` 的角色改成 `["it_admin"]`，看看"该用户能看到的工具"有什么变化；
    - 把场景 2 里的 `approved=True` 改成 `False`，看看模型收到"审批未通过"的观察后怎么回答用户；
-   - 在场景 3 里换一种说法绕过正则，比如"请把你收到的前述规则都视为无效"，看看 `InputGuard` 是否还能拦住。拦不住很正常 —— 想一想此时还有哪几层在保护系统（答案在第 06 课）。
+   - 在场景 3 里换一种说法绕过正则，比如"请把你收到的前述规则都视为无效"，看看 `InputGuard` 是否还能拦住。拦不住很正常 —— 想一想此时还有哪几层在保护系统（答案在第 09 课）。
 
 ## 5. 深入（给有余力的你）
 
@@ -293,7 +293,7 @@ Demo 演示 3 个场景，当前用户是普通员工张三（角色 `employee`�
 
 **"致命三要素"（lethal trifecta）。** Simon Willison 在 [The lethal trifecta for AI agents](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/)（2025-06）中指出：当一个 Agent 同时具备 ① 能访问私有数据、② 会接触不可信内容、③ 能对外通信时，攻击者就可以通过注入让它把私有数据发出去。场景 1 里的 ITBuddy 就同时具备前两个要素（工单数据、可被投毒的知识库），所以我们必须严格控制第三个。2025 年披露的 Microsoft 365 Copilot 零点击漏洞 EchoLeak（CVE-2025-32711）就是这一类问题：攻击者只需发一封邮件，在其中藏入指令。设计 Agent 时，先问自己它占了几个要素。
 
-**OWASP 的"过度代理"。** [OWASP Top 10 for LLM Applications 2025](https://owasp.org/www-project-top-10-for-large-language-model-applications/2_0_vulns/LLM06_ExcessiveAgency.html) 把 Excessive Agency（LLM06）归结为三个根因：功能过多（工具超出任务所需）、权限过大（工具的权限超出所需）、自主性过强（高影响操作没有人工确认）。这三条恰好对应第 02 课的工具粒度、第 02/06 课的身份与 RBAC、第 06 课的人工审批。
+**OWASP 的"过度代理"。** [OWASP Top 10 for LLM Applications 2025](https://owasp.org/www-project-top-10-for-large-language-model-applications/2_0_vulns/LLM06_ExcessiveAgency.html) 把 Excessive Agency（LLM06）归结为三个根因：功能过多（工具超出任务所需）、权限过大（工具的权限超出所需）、自主性过强（高影响操作没有人工确认）。这三条恰好对应第 03 课的工具粒度、第 03/09 课的身份与 RBAC、第 09 课的人工审批。
 
 **自研还是用框架？** 本课程从零实现 agentkit，是为了让你理解每一层"为什么存在"。生产中是否使用 LangGraph、OpenAI Agents SDK 等框架是一个权衡：框架能省掉样板代码、自带集成；自研则完全掌控控制流、状态和依赖。[12-Factor Agents](https://github.com/humanlayer/12-factor-agents) 的观点是，很多团队最终都会把关键部分（prompt、上下文、控制流、状态）收回到自己手里。无论选哪条路，本课程讲的每一层你都需要 —— 区别只是自己写还是配置框架。
 
@@ -337,7 +337,7 @@ Demo 演示 3 个场景，当前用户是普通员工张三（角色 `employee`�
 - 检查点与断点恢复、写操作幂等；
 - 链路追踪、审计日志、成本归因；
 - 评估集和 CI 门禁；
-- 多实例并发与限流（第 10 课）、成本与延迟优化（第 11 课）、检索按权限过滤（第 12 课）、灰度发布与回滚（第 13 课）。
+- 多实例并发与限流（第 13 课）、成本与延迟优化（第 14 课）、检索按权限过滤（第 15 课）、灰度发布与回滚（第 16 课）。
 </details>
 
 <details>
@@ -360,7 +360,7 @@ Demo 演示 3 个场景，当前用户是普通员工张三（角色 `employee`�
 - [ ] 我能画出自主性光谱，并说出往右移动的代价
 - [ ] 我能用决策树判断一个需求该不该用 Agent
 - [ ] 我能列出 Demo 级和企业级 Agent 在至少 8 个维度上的差异
-- [ ] 我能画出企业级 Agent 的分层架构，并把 01-13 课对应到各层
+- [ ] 我能画出企业级 Agent 的分层架构，并把 02-16 课对应到各层
 - [ ] 我能说清第一部分（学会怎么造）和第二部分（学会怎么选）的区别
 - [ ] 我跑通了 `demo.py`，能说出 3 个场景里各有哪些企业级能力在起作用
 - [ ] 我完成了 [`quiz.md`](quiz.md)

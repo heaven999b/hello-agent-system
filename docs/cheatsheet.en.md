@@ -11,18 +11,18 @@
 
 | # | Principle | Why, in one sentence | Lesson |
 |---|---|---|---|
-| 1 | **If a workflow will do, don't build an agent** | Every step up in autonomy raises cost, latency, and unpredictability; it's only worth it when the payoff is clear. | [Lesson 04](../lessons/04_orchestration/README.en.md) |
-| 2 | **Assume the model will be fooled** | There's no 100% reliable way to detect injection; security design should ask "how much damage can it do once it's fooled?" | [Lesson 06](../lessons/06_security/README.en.md) |
-| 3 | **Never let the model supply identity** | user_id, tenant_id, and roles are injected by the system (`ToolContext`) and are never parameters the model can fill in. | [Lesson 02](../lessons/02_tools/README.en.md) |
-| 4 | **Errors as observations** | Write tool errors as text the model can understand and act on, not as raised exceptions or stack traces. | [Lesson 02](../lessons/02_tools/README.en.md) |
-| 5 | **Every write must be idempotent** | Retries, crash recovery, and duplicate model calls are guaranteed to replay writes. | [Lesson 05](../lessons/05_reliability/README.en.md) |
-| 6 | **Cap every dimension** | Steps, tokens, dollars, tool calls, duration, delegation depth — miss one, and that's where things run away. | [Lesson 05](../lessons/05_reliability/README.en.md) |
-| 7 | **Keep state outside the context** | Store critical business state (completed operations, approval results) in a database; don't count on the model to "remember". | [Lesson 03](../lessons/03_context_memory/README.en.md) |
-| 8 | **No traces, no troubleshooting** | Agents are nondeterministic; you must be able to reconstruct every step of every run. | [Lesson 07](../lessons/07_observability/README.en.md) |
-| 9 | **No evals, no prompt changes** | Otherwise you fix one thing and break three — and never find out. | [Lesson 08](../lessons/08_evals/README.en.md) |
-| 10 | **Give users a way out** | When the agent can't handle something, isn't sure, or hits an error, hand off to a human or say so clearly instead of making things up. | [Lesson 09](../lessons/09_production_architecture/README.en.md) |
-| 11 | **At-least-once + idempotency = exactly-once** | Duplicate delivery is normal in distributed systems; process each session serially, and rate-limit globally rather than per machine. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
-| 12 | **A version = code + prompts + model + tools + config** | Roll them out together and roll them back together; rolling back half of them is the same as not rolling back at all. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| 1 | **If a workflow will do, don't build an agent** | Every step up in autonomy raises cost, latency, and unpredictability; it's only worth it when the payoff is clear. | [Lesson 06](../lessons/06_orchestration/README.en.md) |
+| 2 | **Assume the model will be fooled** | There's no 100% reliable way to detect injection; security design should ask "how much damage can it do once it's fooled?" | [Lesson 09](../lessons/09_security/README.en.md) |
+| 3 | **Never let the model supply identity** | user_id, tenant_id, and roles are injected by the system (`ToolContext`) and are never parameters the model can fill in. | [Lesson 03](../lessons/03_tools/README.en.md) |
+| 4 | **Errors as observations** | Write tool errors as text the model can understand and act on, not as raised exceptions or stack traces. | [Lesson 03](../lessons/03_tools/README.en.md) |
+| 5 | **Every write must be idempotent** | Retries, crash recovery, and duplicate model calls are guaranteed to replay writes. | [Lesson 08](../lessons/08_reliability/README.en.md) |
+| 6 | **Cap every dimension** | Steps, tokens, dollars, tool calls, duration, delegation depth — miss one, and that's where things run away. | [Lesson 08](../lessons/08_reliability/README.en.md) |
+| 7 | **Keep state outside the context** | Store critical business state (completed operations, approval results) in a database; don't count on the model to "remember". | [Lesson 04](../lessons/04_context_memory/README.en.md) |
+| 8 | **No traces, no troubleshooting** | Agents are nondeterministic; you must be able to reconstruct every step of every run. | [Lesson 10](../lessons/10_observability/README.en.md) |
+| 9 | **No evals, no prompt changes** | Otherwise you fix one thing and break three — and never find out. | [Lesson 11](../lessons/11_evals/README.en.md) |
+| 10 | **Give users a way out** | When the agent can't handle something, isn't sure, or hits an error, hand off to a human or say so clearly instead of making things up. | [Lesson 12](../lessons/12_production_architecture/README.en.md) |
+| 11 | **At-least-once + idempotency = exactly-once** | Duplicate delivery is normal in distributed systems; process each session serially, and rate-limit globally rather than per machine. | [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) |
+| 12 | **A version = code + prompts + model + tools + config** | Roll them out together and roll them back together; rolling back half of them is the same as not rolling back at all. | [Lesson 16](../lessons/16_release_ops/README.en.md) |
 
 ---
 

@@ -12,7 +12,7 @@ This repository is bilingual. Every Markdown document has a Chinese version (`xx
 5. **Code blocks**: keep code identical. Translate Chinese comments and Chinese string literals inside code blocks shown in the docs. When a doc quotes demo output (which prints Chinese), translate the output and add a short note once per document: "(Demo output translated from Chinese.)"
 6. **Mermaid**: translate all labels; keep node IDs and structure; keep labels double-quoted.
 7. **Chinese-specific content**: keep it, and add a few words of context for international readers, e.g. "Chinese mobile numbers (11 digits starting with 1)", "PIPL (China's Personal Information Protection Law)", "resident ID numbers".
-8. **Lesson references**: "第 05 课" → "Lesson 05" (always two digits). Keep the lesson numbers and directory names exactly as in the Chinese source.
+8. **Lesson references**: "第 08 课" → "Lesson 08" (always two digits). Keep the lesson numbers and directory names exactly as in the Chinese source.
 9. **Durations / numbers / citations**: keep them exactly; do not add or remove facts.
 
 ## Glossary (use consistently)

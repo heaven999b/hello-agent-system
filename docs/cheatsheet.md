@@ -11,18 +11,18 @@
 
 | # | 原则 | 一句话理由 | 课程 |
 |---|---|---|---|
-| 1 | **能用 Workflow 就别用 Agent** | 每升一级自主性，成本、延迟、不可预测性都会上升；只有收益明确时才值得。 | [第 04 课](../lessons/04_orchestration/README.md) |
-| 2 | **假设模型一定会被骗** | 注入没有 100% 的检测方法；安全设计要问"被骗后最多能造成多大伤害"。 | [第 06 课](../lessons/06_security/README.md) |
-| 3 | **身份不交给模型** | user_id、tenant_id、角色由系统注入（`ToolContext`），永远不作为模型可填的参数。 | [第 02 课](../lessons/02_tools/README.md) |
-| 4 | **错误即观察** | 工具错误写成模型能看懂、能据此行动的文字，而不是抛异常或返回堆栈。 | [第 02 课](../lessons/02_tools/README.md) |
-| 5 | **所有写操作必须幂等** | 重试、崩溃恢复、模型重复调用，一定会重放写操作。 | [第 05 课](../lessons/05_reliability/README.md) |
-| 6 | **每个维度都要有上限** | 步数、token、金额、工具调用次数、时长、委派深度——漏掉一个，那里就会失控。 | [第 05 课](../lessons/05_reliability/README.md) |
-| 7 | **状态放在上下文之外** | 关键业务状态（已完成的操作、审批结果）存数据库，别指望模型"记得"。 | [第 03 课](../lessons/03_context_memory/README.md) |
-| 8 | **没有 trace 就没有排障** | Agent 是非确定性的，必须能还原每一次运行的每一步。 | [第 07 课](../lessons/07_observability/README.md) |
-| 9 | **没有评估就不要改提示词** | 否则就是修一个坏三个，而且你不会知道。 | [第 08 课](../lessons/08_evals/README.md) |
-| 10 | **给用户一个出口** | 处理不了、不确定、出错时，转人工或明确说明，而不是编造。 | [第 09 课](../lessons/09_production_architecture/README.md) |
-| 11 | **至少一次 + 幂等 = 恰好一次** | 分布式环境里重复投递是常态；同一会话串行处理，全局限流而不是单机限流。 | [第 10 课](../lessons/10_distributed_concurrency/README.md) |
-| 12 | **一个版本 = 代码 + 提示词 + 模型 + 工具 + 配置** | 它们要一起灰度、一起回滚，否则回滚一半等于没回滚。 | [第 13 课](../lessons/13_release_ops/README.md) |
+| 1 | **能用 Workflow 就别用 Agent** | 每升一级自主性，成本、延迟、不可预测性都会上升；只有收益明确时才值得。 | [第 06 课](../lessons/06_orchestration/README.md) |
+| 2 | **假设模型一定会被骗** | 注入没有 100% 的检测方法；安全设计要问"被骗后最多能造成多大伤害"。 | [第 09 课](../lessons/09_security/README.md) |
+| 3 | **身份不交给模型** | user_id、tenant_id、角色由系统注入（`ToolContext`），永远不作为模型可填的参数。 | [第 03 课](../lessons/03_tools/README.md) |
+| 4 | **错误即观察** | 工具错误写成模型能看懂、能据此行动的文字，而不是抛异常或返回堆栈。 | [第 03 课](../lessons/03_tools/README.md) |
+| 5 | **所有写操作必须幂等** | 重试、崩溃恢复、模型重复调用，一定会重放写操作。 | [第 08 课](../lessons/08_reliability/README.md) |
+| 6 | **每个维度都要有上限** | 步数、token、金额、工具调用次数、时长、委派深度——漏掉一个，那里就会失控。 | [第 08 课](../lessons/08_reliability/README.md) |
+| 7 | **状态放在上下文之外** | 关键业务状态（已完成的操作、审批结果）存数据库，别指望模型"记得"。 | [第 04 课](../lessons/04_context_memory/README.md) |
+| 8 | **没有 trace 就没有排障** | Agent 是非确定性的，必须能还原每一次运行的每一步。 | [第 10 课](../lessons/10_observability/README.md) |
+| 9 | **没有评估就不要改提示词** | 否则就是修一个坏三个，而且你不会知道。 | [第 11 课](../lessons/11_evals/README.md) |
+| 10 | **给用户一个出口** | 处理不了、不确定、出错时，转人工或明确说明，而不是编造。 | [第 12 课](../lessons/12_production_architecture/README.md) |
+| 11 | **至少一次 + 幂等 = 恰好一次** | 分布式环境里重复投递是常态；同一会话串行处理，全局限流而不是单机限流。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 12 | **一个版本 = 代码 + 提示词 + 模型 + 工具 + 配置** | 它们要一起灰度、一起回滚，否则回滚一半等于没回滚。 | [第 16 课](../lessons/16_release_ops/README.md) |
 
 ---
 

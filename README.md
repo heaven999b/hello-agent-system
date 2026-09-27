@@ -4,8 +4,8 @@
 
 ### 企业级 Agent 系统设计训练营
 
-**4 小时，从"会调 LLM API"到"能设计生产级 Agent 系统"。**
-不依赖任何 Agent 框架，从零手写企业级 Agent 的每一层：工具、上下文、编排、可靠性、安全、可观测、评估、部署。
+**从"会调 LLM API"到"能设计生产级 Agent 系统"：17 节课 · 中英双语 · 每课都有带测试的练习。**
+不依赖任何 Agent 框架，从零手写企业级 Agent 的每一层：工具、上下文、架构、编排、可靠性、安全、可观测、评估、并发、成本、发布。
 
 [![CI](https://github.com/heaven999b/enterprise-agent-bootcamp/actions/workflows/ci.yml/badge.svg)](https://github.com/heaven999b/enterprise-agent-bootcamp/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -13,7 +13,9 @@
 ![Tests](https://img.shields.io/badge/tests-offline%20%26%20deterministic-brightgreen)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-orange)](CONTRIBUTING.md)
 
-[快速开始](#-快速开始) · [学习路线](#-学习路线4-小时) · [综合实战](capstone/README.md) · [失败模式图鉴](docs/failure-modes.md) · [面试题](docs/interview-questions.md) · [English](README_EN.md)
+**中文** · [English](README.en.md)
+
+[快速开始](#-快速开始) · [学习路线](#-学习路线) · [综合实战](capstone/README.md) · [失败模式图鉴](docs/failure-modes.md) · [面试题](docs/interview-questions.md)
 
 </div>
 
@@ -30,18 +32,19 @@
 | | 常见 Agent 教程 | 本项目 |
 |---|---|---|
 | 目标 | 让 Agent 跑起来 | 让 Agent **在生产中可靠、安全、可控地**跑起来 |
-| 方式 | 调用框架 API（黑盒） | **从零手写每一层**（~2000 行，每行都能看懂） |
-| 覆盖 | 循环 + 工具 | 循环、工具、上下文、编排；重试熔断降级、检查点恢复、提示词注入防御、RBAC、人工审批、审计、追踪、评估；高并发与分布式执行、成本优化、权限感知 RAG、灰度发布与事故响应 |
+| 方式 | 调用框架 API（黑盒） | **从零手写每一层**（核心约 2500 行，每行都能看懂） |
+| 覆盖 | 循环 + 工具 | LLM 必备知识、循环、工具、上下文、常见架构、编排、**工程考量全景**；重试熔断降级、检查点恢复、提示词注入防御、RBAC、人工审批、审计、追踪、评估；高并发与分布式执行、成本优化、权限感知 RAG、灰度发布与事故响应 |
 | 讲法 | 一种做法 | 企业问题卡片：**每个问题 2–4 种方案对比**，讲清怎么选 |
 | 验证 | 看起来能用 | 每课都有**带自动化测试的练习**，离线、确定性、零成本 |
 | 模型 | 绑定某家厂商 | 任何 OpenAI 兼容接口（OpenAI / DeepSeek / Qwen / vLLM / 各类模型网关） |
+| 语言 | 单语 | **中英双语**：每份讲义和文档都有等价的英文版（`*.en.md`） |
 
 ## 🗺 你将亲手造出的系统
 
 ```mermaid
 flowchart TB
     U["用户请求 + 可信身份<br/>tenant / user / roles"] --> IG
-    subgraph Hooks["🛡 钩子层：横切关注点（第 05-07 课）"]
+    subgraph Hooks["🛡 钩子层：横切关注点（第 08-11 课）"]
         IG["InputGuard<br/>注入检测"]
         PP["PermissionPolicy<br/>RBAC + 人工审批"]
         TG["ToolOutputGuard<br/>不可信数据隔离"]
@@ -50,7 +53,7 @@ flowchart TB
         AU["AuditLog<br/>审计"]
     end
     IG --> LOOP
-    subgraph Core["⚙️ Agent 核心（第 01-04 课）"]
+    subgraph Core["⚙️ Agent 核心（第 01-07 课）"]
         LOOP["Agent 主循环<br/>LLM ⇄ 工具"] --> CTX["上下文策略<br/>窗口 / 摘要"]
         LOOP --> REG["工具注册表<br/>Schema 校验 / 超时 / 幂等"]
         LOOP --> WF["编排模式<br/>路由 / 并行 / 多 Agent"]
@@ -70,21 +73,21 @@ flowchart TB
 from agentkit import *
 
 agent = Agent(
-    llm=ResilientLLM(default_llm(), fallbacks=[default_llm("gpt-5.6-luna")]),   # 第 05 课：重试/熔断/降级
-    tools=[search_kb, create_ticket, reset_password],                            # 第 02 课：工具设计
-    system_prompt="你是 IT 服务台助手。" + UNTRUSTED_DATA_RULE,                    # 第 06 课：不可信数据规则
+    llm=ResilientLLM(default_llm(), fallbacks=[default_llm("gpt-5.6-luna")]),   # 第 08 课：重试/熔断/降级
+    tools=[search_kb, create_ticket, reset_password],                            # 第 03 课：工具设计
+    system_prompt="你是 IT 服务台助手。" + UNTRUSTED_DATA_RULE,                    # 第 09 课：不可信数据规则
     hooks=[
-        InputGuard(),                                                            # 第 06 课：输入检测
+        InputGuard(),                                                            # 第 09 课：输入检测
         PermissionPolicy(role_tools={"employee": {"search_kb", "create_ticket"},
-                                     "it_admin": {"*"}}),                        # 第 06 课：RBAC + 高危审批
-        ToolOutputGuard(), OutputGuard(),                                        # 第 06 课：隔离 + 脱敏
-        BudgetHook(max_cost_usd=0.10, max_tool_calls=20),                        # 第 05 课：预算
-        AuditLog("runs/audit.jsonl"),                                            # 第 06 课：审计
+                                     "it_admin": {"*"}}),                        # 第 09 课：RBAC + 高危审批
+        ToolOutputGuard(), OutputGuard(),                                        # 第 09 课：隔离 + 脱敏
+        BudgetHook(max_cost_usd=0.10, max_tool_calls=20),                        # 第 08 课：预算
+        AuditLog("runs/audit.jsonl"),                                            # 第 09 课：审计
     ],
-    context_strategy=SlidingWindow(max_tokens=8000),                             # 第 03 课：上下文工程
-    checkpointer=FileCheckpointer("runs/"),                                      # 第 05 课：检查点
-    idempotency_store=IdempotencyStore(),                                        # 第 05 课：幂等
-    tracer=Tracer(jsonl_exporter("runs/traces.jsonl")),                          # 第 07 课：追踪
+    context_strategy=SlidingWindow(max_tokens=8000),                             # 第 04 课：上下文工程
+    checkpointer=FileCheckpointer("runs/"),                                      # 第 08 课：检查点
+    idempotency_store=IdempotencyStore(),                                        # 第 08 课：幂等
+    tracer=Tracer(jsonl_exporter("runs/traces.jsonl")),                          # 第 10 课：追踪
 )
 
 result = agent.run("帮我重置密码", metadata={"tenant_id": "acme", "user_id": "alice", "roles": ["employee"]})
@@ -126,37 +129,41 @@ make check-env                                  # 检查模型连通性与工具
 
 > 💡 **没有 API key？** 所有 demo 都支持 `--offline`（用剧本模型 `ScriptedLLM` 运行），所有练习和测试都是离线的。你可以零成本学完整个课程。
 
-## 📚 学习路线（约 4 小时）
+## 📚 学习路线
 
-课程分两部分：**第一部分学会"怎么造"，第二部分学会"企业里出了问题怎么选方案"**。
+课程分两部分：**第一部分学会"怎么造"，第二部分学会"企业里出了问题怎么选方案"**。完整学习约 5.5 小时；赶时间可以走 [4 小时速通路线](lessons/00_overview/README.md)（每课只读开头的"核心路径"）。
 
-第二部分的每节课都由若干张**企业问题卡片**组成：真实场景（带具体数字）→ 为什么直觉方案会翻车 → 2–4 种方案对比（优点 / 缺点 / 适用规模）→ 怎么选 → 代码实现。
+- **第一部分**：概念 → 从零实现 → 练习。以第 07 课"工程考量全景"收尾：20 个工程维度，每个维度都分成**通用必查点**（任何项目都要做）和**情境触发点**（"当……时，要考虑……"），作为进入第二部分的地图。
+- **第二部分**：每节课由若干张**企业问题卡片**组成：真实场景（带具体数字）→ 为什么直觉方案会翻车 → 2–5 种方案对比（优点 / 缺点 / 适用规模）→ 怎么选 → 代码实现。
 
 每节课的流程都一样：**读讲义 → 跑 demo → 写练习 → `make lesson N=xx` 让测试变绿 → 过自测清单**。
 
-### 第一部分：基础构建（约 80 分钟）
+### 第一部分：基础构建（约 140 分钟）
 
-| # | 课程 | 时长 | 你会亲手实现 | 核心源码 |
+| # | 课程 | 时长 | 你会学到 / 亲手实现 | 核心源码 |
 |---|---|---|---|---|
-| 00 | [企业级 Agent 全景图](lessons/00_overview/README.md) | 10m | 建立完整的心智地图 | — |
-| 01 | [Agent 循环的本质](lessons/01_agent_loop/README.md) | 20m | 手写 Agent 主循环 | [agent.py](agentkit/agent.py) |
-| 02 | [工具设计：Agent 与世界的接口](lessons/02_tools/README.md) | 20m | 生产级工具：Schema、校验、身份注入、业务错误 | [tools.py](agentkit/tools.py) |
-| 03 | [上下文工程与记忆](lessons/03_context_memory/README.md) | 15m | 安全截断、工具结果清理 | [context.py](agentkit/context.py) · [memory.py](agentkit/memory.py) |
-| 04 | [编排模式：Workflow、Agent 与多 Agent](lessons/04_orchestration/README.md) | 15m | 混合路由、法定多数投票、门禁流水线 | [workflows.py](agentkit/workflows.py) |
+| 00 | [企业级 Agent 全景图](lessons/00_overview/README.md) | 10m | 什么时候该用、不该用 Agent；企业级比 Demo 多了哪些层 | — |
+| 01 | [**LLM 与 Agent 开发必备知识**](lessons/01_llm_essentials/README.md) | 20m | token 与计费、非确定性、function calling 的真实机制、结构化输出、**流式工具调用参数的拼接**、推理模型、提示词工程 | [llm.py](agentkit/llm.py) |
+| 02 | [Agent 循环的本质](lessons/02_agent_loop/README.md) | 20m | 手写 Agent 主循环、消息协议、停止条件、Hook 中间件 | [agent.py](agentkit/agent.py) |
+| 03 | [工具设计：Agent 与世界的接口](lessons/03_tools/README.md) | 20m | 生产级工具：Schema、校验、身份注入、业务错误 | [tools.py](agentkit/tools.py) |
+| 04 | [上下文工程与记忆](lessons/04_context_memory/README.md) | 15m | 安全截断、摘要压缩、工具结果清理、长期记忆隔离 | [context.py](agentkit/context.py) · [memory.py](agentkit/memory.py) |
+| 05 | [**常见 Agent 架构**](lessons/05_agent_architectures/README.md) | 20m | ReAct / Plan-and-Execute / ReWOO / Reflection / CodeAct、5 种多 Agent 拓扑、Deep Research / 编码 Agent 等产品架构拆解 | [workflows.py](agentkit/workflows.py) |
+| 06 | [编排模式：Workflow 与多 Agent](lessons/06_orchestration/README.md) | 15m | 路由、并行、编排者-执行者、评估-优化、Agent 即工具 | [workflows.py](agentkit/workflows.py) |
+| 07 | [**工程考量全景**](lessons/07_engineering_perspectives/README.md) | 20m | 20 个维度 × 通用必查点 / 情境触发点（共 301 条）、9 种场景画像矩阵、设计评审方法 | [perspectives.py](lessons/07_engineering_perspectives/perspectives.py) |
 
 ### 第二部分：企业问题与解决方案（约 160 分钟）
 
 | # | 课程 | 时长 | 典型问题（每个都有多种方案对比） | 你会亲手实现 |
 |---|---|---|---|---|
-| 05 | [可靠性工程](lessons/05_reliability/README.md) | 20m | 模型 429 / 宕机、Agent 死循环、进程崩溃、审批要等几小时 | 死循环检测、重试预算 |
-| 06 | [安全与治理](lessons/06_security/README.md) | 20m | 间接注入、越权、审批疲劳、PII 泄露、代码执行 | 策略引擎、脱敏、"致命三要素"检测 |
-| 07 | [可观测性](lessons/07_observability/README.md) | 15m | 追踪数据爆炸、trace 里的 PII、告警噪声 | 从 trace 计算 SLO 指标 |
-| 08 | [评估驱动开发](lessons/08_evals/README.md) | 20m | 没有标注数据、LLM 评委不可靠、评估太贵 | pass^k、轨迹评分、发布门禁 |
-| 09 | [生产架构总览](lessons/09_production_architecture/README.md) | 15m | 同步 / 流式 / 异步、多租户隔离级别、自建 vs 框架 | 多租户限流、模型路由 |
-| 10 | [**高并发与分布式执行**](lessons/10_distributed_concurrency/README.md) | 25m | 横向扩展、投递语义、会话并发写（分布式锁 vs 乐观锁 vs 分区串行）、全局限流与背压、Saga 补偿、重试风暴 | SQLite 租约队列 + fencing token + CAS（多进程真实并发） |
-| 11 | [成本与延迟优化](lessons/11_cost_latency/README.md) | 15m | 账单失控、重复请求、长尾延迟、成本归因 | 缓存、模型级联、对冲请求 |
-| 12 | [企业知识与权限感知 RAG](lessons/12_enterprise_rag/README.md) | 15m | ACL 泄露、多租户索引隔离、知识过期、幻觉引用 | ACL 前过滤检索、切块、引用校验 |
-| 13 | [发布、变更与运维](lessons/13_release_ops/README.md) | 15m | prompt 改出事故、模型静默升级、如何止血与回滚 | 金丝雀分桶、自动回滚决策、kill switch |
+| 08 | [可靠性工程](lessons/08_reliability/README.md) | 20m | 模型 429 / 宕机、Agent 死循环、进程崩溃、审批要等几小时 | 死循环检测、重试预算 |
+| 09 | [安全与治理](lessons/09_security/README.md) | 20m | 间接注入、越权、审批疲劳、PII 泄露、代码执行 | 策略引擎、脱敏、"致命三要素"检测 |
+| 10 | [可观测性](lessons/10_observability/README.md) | 15m | 追踪数据爆炸、trace 里的 PII、告警噪声 | 从 trace 计算 SLO 指标 |
+| 11 | [评估驱动开发](lessons/11_evals/README.md) | 20m | 没有标注数据、LLM 评委不可靠、评估太贵 | pass^k、轨迹评分、发布门禁 |
+| 12 | [生产架构总览](lessons/12_production_architecture/README.md) | 15m | 同步 / 流式 / 异步、多租户隔离级别、自建 vs 框架 | 多租户限流、模型路由 |
+| 13 | [**高并发与分布式执行**](lessons/13_distributed_concurrency/README.md) | 25m | 横向扩展、投递语义、会话并发写（分布式锁 vs 乐观锁 vs 分区串行）、全局限流与背压、Saga 补偿、重试风暴 | SQLite 租约队列 + fencing token + CAS（多进程真实并发） |
+| 14 | [成本与延迟优化](lessons/14_cost_latency/README.md) | 15m | 账单失控、重复请求、长尾延迟、成本归因 | 缓存、模型级联、对冲请求 |
+| 15 | [企业知识与权限感知 RAG](lessons/15_enterprise_rag/README.md) | 15m | ACL 泄露、多租户索引隔离、知识过期、幻觉引用 | ACL 前过滤检索、切块、引用校验 |
+| 16 | [发布、变更与运维](lessons/16_release_ops/README.md) | 15m | prompt 改出事故、模型静默升级、如何止血与回滚 | 金丝雀分桶、自动回滚决策、kill switch |
 
 ### 🎓 综合实战（30 分钟）
 
@@ -172,19 +179,19 @@ make check-env                                  # 检查模型连通性与工具
 
 | 文档 | 内容 |
 |---|---|
-| [🩺 Agent 失败模式图鉴](docs/failure-modes.md) | 生产中真实会遇到的失败模式：症状 → 根因 → 检测 → 修复 |
-| [✅ 设计评审清单](docs/design-review-checklist.md) | 100+ 条上线前检查项，按 P0/P1/P2 分级 |
-| [🎤 系统设计面试题](docs/interview-questions.md) | 40+ 道题 + 3 道完整系统设计作答示范 |
+| [🩺 Agent 失败模式图鉴](docs/failure-modes.md) | 67 种生产中真实会遇到的失败模式：症状 → 根因 → 检测 → 修复 |
+| [✅ 设计评审清单](docs/design-review-checklist.md) | 163 条上线前检查项，按 P0/P1/P2 分级 |
+| [🎤 系统设计面试题](docs/interview-questions.md) | 61 道题 + 3 道完整系统设计作答示范 |
 | [🔁 框架对照表](docs/framework-comparison.md) | agentkit 概念 ↔ LangGraph / OpenAI Agents SDK / Claude Agent SDK / ADK … |
 | [📄 一页纸速查](docs/cheatsheet.md) | 原则、默认参数、决策树，适合打印 |
-| [📖 术语表](docs/glossary.md) | 中英对照 + 大白话解释 |
-| [📚 延伸阅读](docs/reading-list.md) | 精选并核实过的论文、博客、规范 |
+| [📖 术语表](docs/glossary.md) | 185 条术语，中英对照 + 大白话解释 |
+| [📚 延伸阅读](docs/reading-list.md) | 71 条精选并核实过的论文、博客、规范，按角色给出阅读路线 |
 
 ## 🧱 项目结构
 
 ```text
 enterprise-agent-bootcamp/
-├── agentkit/            # 教学框架：~2000 行，每个模块对应一节课，注释解释每个"为什么"
+├── agentkit/            # 教学框架：核心约 2500 行，每个模块对应一节课，注释解释每个"为什么"
 │   ├── agent.py         #   主循环 + 钩子 + 检查点 + 追踪
 │   ├── tools.py         #   工具：Schema 生成、校验、超时、幂等、身份注入
 │   ├── context.py       #   上下文窗口策略
@@ -196,9 +203,10 @@ enterprise-agent-bootcamp/
 │   ├── tracing.py       #   链路追踪（OpenTelemetry GenAI 风格）
 │   ├── viewer.py        #   追踪 HTML 查看器
 │   └── evals.py         #   评估框架
-├── lessons/NN_topic/    # 每课：README 讲义 / demo.py / exercise.py / solution.py / test_exercise.py
+├── lessons/NN_topic/    # 17 节课：README.md + README.en.md 讲义 / demo.py / exercise.py / solution.py / test_exercise.py
 ├── capstone/            # 综合实战：ITBuddy（CLI + HTTP API + 设计文档 + 评估集）
-├── docs/                # 深度资料
+├── docs/                # 深度资料（中英双语）
+├── scripts/             # 学习进度看板、链接检查
 └── tests/               # 框架测试（全部离线）
 ```
 
@@ -221,7 +229,7 @@ enterprise-agent-bootcamp/
 <details>
 <summary><b>需要什么基础？</b></summary>
 
-能读懂 Python 函数和类、调过一次 LLM API 即可。代码刻意避免了高级技巧（没有 async、没有元编程），注释全中文。
+能读懂 Python 函数和类、调过一次 LLM API 即可。代码刻意避免了高级技巧（没有 async、没有元编程）。讲义与文档中英双语；代码注释与 demo 输出目前是中文（欢迎贡献英文化）。
 </details>
 
 <details>
@@ -233,12 +241,12 @@ enterprise-agent-bootcamp/
 <details>
 <summary><b>agentkit 能直接用于生产吗？</b></summary>
 
-它的**设计模式**是生产级的，但它是教学实现：同步、单进程、内存存储。生产中请把检查点换成数据库、追踪换成 OpenTelemetry、工具执行放进沙箱——第 09 课详细讲了怎么做。
+它的**设计模式**是生产级的，但它是教学实现：同步、单进程、内存存储。生产中请把检查点换成数据库、追踪换成 OpenTelemetry、工具执行放进沙箱——第 12、13 课详细讲了怎么做。
 </details>
 
 ## 🤝 参与贡献
 
-发现错误、想补充一节课、想翻译？非常欢迎！请看 [CONTRIBUTING.md](CONTRIBUTING.md) 与 [课程编写规范](docs/lesson-template.md)。
+发现错误、想补充一节课、想改进翻译？非常欢迎！请看 [CONTRIBUTING.md](CONTRIBUTING.md)、[课程编写规范](docs/lesson-template.md) 与 [翻译规范](docs/translation-guide.md)。
 
 如果这个项目帮到了你，请给一个 ⭐ —— 这会让更多人看到它。
 

@@ -91,7 +91,7 @@ class FileCheckpointer:
     def save(self, state: RunState) -> None:
         path = self._path(state.run_id)
         # 临时文件名必须唯一：两个进程同时保存同一个 run 时，固定的 .tmp 会互相踩。
-        # （更根本的问题——旧持有者覆盖新检查点——需要 fencing token，见第 13 课。）
+        # （更根本的问题——旧持有者覆盖新检查点——需要 fencing token，见第 16 课。）
         tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         tmp.write_text(json.dumps(state.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)

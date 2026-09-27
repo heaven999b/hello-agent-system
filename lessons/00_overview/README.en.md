@@ -82,7 +82,7 @@ Some common cases where you shouldn't use one:
 - **Fixed approval flows**: use a workflow engine; at most, the LLM handles the "understand the form" step.
 - **Hard real-time interaction**: when you need millisecond responses, a single model call already takes seconds.
 - **Irreversible, high-risk operations with no human review**: the Replit incident is the cautionary tale.
-- **Tasks you can't evaluate**: if you can't measure quality, you can't iterate, and you can't ship safely (Lesson 08).
+- **Tasks you can't evaluate**: if you can't measure quality, you can't iterate, and you can't ship safely (Lesson 11).
 
 ### 1.4 Demo agents vs. enterprise agents
 
@@ -113,14 +113,14 @@ An intuition about reliability: if each step of an agent is correct with 95% pro
 ```mermaid
 flowchart TB
     ENTRY["<b>Access layer</b><br/>Web / IM / API<br/>SSO authentication"]
-    EXEC["<b>Execution and scaling layer</b> · Lesson 10<br/>Task queue + multi-instance workers<br/>Session concurrency control<br/>Global rate limiting and backpressure"]
-    GUARD["<b>Guardrail layer</b> · Lesson 06<br/>Input screening (InputGuard)<br/>Tool output isolation (ToolOutputGuard)<br/>Output redaction (OutputGuard)"]
-    ORCH["<b>Orchestration layer</b> · Lessons 01, 04<br/>Agent loop + hooks<br/>Workflows and multi-agent"]
-    CTX["<b>Context and knowledge layer</b> · Lessons 03, 12<br/>Context window management<br/>Long-term memory<br/>Permission-aware RAG"]
-    TOOLS["<b>Tool layer</b> · Lessons 02, 06<br/>ToolRegistry<br/>Validation, timeouts, idempotency<br/>RBAC + human approval"]
-    MODEL["<b>Model layer</b> · Lessons 05, 11<br/>ResilientLLM: retry, circuit breaker, fallback<br/>Model routing and caching<br/>Budget (BudgetHook)"]
-    STATE["<b>State layer</b> · Lesson 05<br/>Checkpoints (Checkpointer)"]
-    XCUT["<b>Cross-cutting concerns</b><br/>Tracing · Lesson 07<br/>Audit log · Lesson 06<br/>Evals and CI gates · Lesson 08<br/>Release, change, and operations · Lesson 13"]
+    EXEC["<b>Execution and scaling layer</b> · Lesson 13<br/>Task queue + multi-instance workers<br/>Session concurrency control<br/>Global rate limiting and backpressure"]
+    GUARD["<b>Guardrail layer</b> · Lesson 09<br/>Input screening (InputGuard)<br/>Tool output isolation (ToolOutputGuard)<br/>Output redaction (OutputGuard)"]
+    ORCH["<b>Orchestration layer</b> · Lessons 02, 06<br/>Agent loop + hooks<br/>Workflows and multi-agent"]
+    CTX["<b>Context and knowledge layer</b> · Lessons 04, 15<br/>Context window management<br/>Long-term memory<br/>Permission-aware RAG"]
+    TOOLS["<b>Tool layer</b> · Lessons 03, 09<br/>ToolRegistry<br/>Validation, timeouts, idempotency<br/>RBAC + human approval"]
+    MODEL["<b>Model layer</b> · Lessons 08, 14<br/>ResilientLLM: retry, circuit breaker, fallback<br/>Model routing and caching<br/>Budget (BudgetHook)"]
+    STATE["<b>State layer</b> · Lesson 08<br/>Checkpoints (Checkpointer)"]
+    XCUT["<b>Cross-cutting concerns</b><br/>Tracing · Lesson 10<br/>Audit log · Lesson 09<br/>Evals and CI gates · Lesson 11<br/>Release, change, and operations · Lesson 16"]
     ENTRY --> EXEC --> GUARD --> ORCH
     ORCH --> CTX
     ORCH --> TOOLS
@@ -129,25 +129,25 @@ flowchart TB
     XCUT -.->|"spans every layer"| ORCH
 ```
 
-Lesson 09 puts these layers together into the full production architecture, and the **capstone** ([`capstone/`](../../capstone/README.en.md)) assembles them into a complete enterprise IT help-desk agent, **ITBuddy**.
+Lesson 12 puts these layers together into the full production architecture, and the **capstone** ([`capstone/`](../../capstone/README.en.md)) assembles them into a complete enterprise IT help-desk agent, **ITBuddy**.
 
 How the lessons map to architecture layers and agentkit modules:
 
 | Part | Lesson | Topic | Architecture layer | agentkit modules |
 |---|---|---|---|---|
-| 1 | [01](../01_agent_loop/README.en.md) | The agent loop, demystified | Orchestration | [`agent.py`](../../agentkit/agent.py), [`llm.py`](../../agentkit/llm.py), [`types.py`](../../agentkit/types.py), [`hooks.py`](../../agentkit/hooks.py) |
-| 1 | [02](../02_tools/README.en.md) | Tool design | Tools | [`tools.py`](../../agentkit/tools.py) |
-| 1 | [03](../03_context_memory/README.en.md) | Context and memory | Context and knowledge | [`context.py`](../../agentkit/context.py), [`memory.py`](../../agentkit/memory.py) |
-| 1 | [04](../04_orchestration/README.en.md) | Orchestration patterns and multi-agent | Orchestration | [`workflows.py`](../../agentkit/workflows.py) |
-| 2 | [05](../05_reliability/README.en.md) | Reliability engineering | Model, state | [`reliability.py`](../../agentkit/reliability.py), [`budget.py`](../../agentkit/budget.py), [`state.py`](../../agentkit/state.py) |
-| 2 | [06](../06_security/README.en.md) | Security and governance | Guardrails, tools | [`guardrails.py`](../../agentkit/guardrails.py), [`permissions.py`](../../agentkit/permissions.py), [`audit.py`](../../agentkit/audit.py) |
-| 2 | [07](../07_observability/README.en.md) | Observability | Cross-cutting | [`tracing.py`](../../agentkit/tracing.py) |
-| 2 | [08](../08_evals/README.en.md) | Eval-driven development | Cross-cutting | [`evals.py`](../../agentkit/evals.py) |
-| 2 | [09](../09_production_architecture/README.en.md) | Production architecture overview | All | Everything combined |
-| 2 | [10](../10_distributed_concurrency/README.en.md) | High concurrency and distributed execution | Execution and scaling | See the lesson |
-| 2 | [11](../11_cost_latency/README.en.md) | Cost and latency optimization | Model | See the lesson |
-| 2 | [12](../12_enterprise_rag/README.en.md) | Enterprise knowledge and permission-aware RAG | Context and knowledge | See the lesson |
-| 2 | [13](../13_release_ops/README.en.md) | Release, change, and operations | Cross-cutting | See the lesson |
+| 1 | [01](../02_agent_loop/README.en.md) | The agent loop, demystified | Orchestration | [`agent.py`](../../agentkit/agent.py), [`llm.py`](../../agentkit/llm.py), [`types.py`](../../agentkit/types.py), [`hooks.py`](../../agentkit/hooks.py) |
+| 1 | [02](../03_tools/README.en.md) | Tool design | Tools | [`tools.py`](../../agentkit/tools.py) |
+| 1 | [03](../04_context_memory/README.en.md) | Context and memory | Context and knowledge | [`context.py`](../../agentkit/context.py), [`memory.py`](../../agentkit/memory.py) |
+| 1 | [04](../06_orchestration/README.en.md) | Orchestration patterns and multi-agent | Orchestration | [`workflows.py`](../../agentkit/workflows.py) |
+| 2 | [05](../08_reliability/README.en.md) | Reliability engineering | Model, state | [`reliability.py`](../../agentkit/reliability.py), [`budget.py`](../../agentkit/budget.py), [`state.py`](../../agentkit/state.py) |
+| 2 | [06](../09_security/README.en.md) | Security and governance | Guardrails, tools | [`guardrails.py`](../../agentkit/guardrails.py), [`permissions.py`](../../agentkit/permissions.py), [`audit.py`](../../agentkit/audit.py) |
+| 2 | [07](../10_observability/README.en.md) | Observability | Cross-cutting | [`tracing.py`](../../agentkit/tracing.py) |
+| 2 | [08](../11_evals/README.en.md) | Eval-driven development | Cross-cutting | [`evals.py`](../../agentkit/evals.py) |
+| 2 | [09](../12_production_architecture/README.en.md) | Production architecture overview | All | Everything combined |
+| 2 | [10](../13_distributed_concurrency/README.en.md) | High concurrency and distributed execution | Execution and scaling | See the lesson |
+| 2 | [11](../14_cost_latency/README.en.md) | Cost and latency optimization | Model | See the lesson |
+| 2 | [12](../15_enterprise_rag/README.en.md) | Enterprise knowledge and permission-aware RAG | Context and knowledge | See the lesson |
+| 2 | [13](../16_release_ops/README.en.md) | Release, change, and operations | Cross-cutting | See the lesson |
 | — | [capstone](../../capstone/README.en.md) | ITBuddy capstone | All | Everything combined |
 
 ### 1.6 The two parts of the course and the 4-hour learning path
@@ -175,19 +175,19 @@ flowchart LR
 | Part | Lesson | Time | Cumulative | What you get |
 |---|---|---|---|---|
 | 1 Building blocks | [00 The big picture](README.en.md) | 10 min | 0:10 | A map and the judgment to use it |
-| | [01 The agent loop](../01_agent_loop/README.en.md) | 20 min | 0:30 | A main loop you wrote yourself |
-| | [02 Tool design](../02_tools/README.en.md) | 20 min | 0:50 | Tools the model uses correctly and attackers can't misuse |
-| | [03 Context and memory](../03_context_memory/README.en.md) | 15 min | 1:05 | Long conversations that don't overflow, and memory that never leaks across users |
-| | [04 Orchestration patterns](../04_orchestration/README.en.md) | 15 min | 1:20 | Knowing when to use a workflow and when to use an agent |
-| 2 Enterprise problems | [05 Reliability engineering](../05_reliability/README.en.md) | 20 min | 1:40 | What to do when you're rate-limited, the model goes down, or the process crashes |
-| | [06 Security and governance](../06_security/README.en.md) | 20 min | 2:00 | Defending against injection, privilege escalation, and data leaks |
-| | [07 Observability](../07_observability/README.en.md) | 15 min | 2:15 | How to investigate when something goes wrong |
-| | [08 Eval-driven development](../08_evals/README.en.md) | 20 min | 2:35 | How to know a prompt change didn't break anything |
-| | [09 Production architecture overview](../09_production_architecture/README.en.md) | 15 min | 2:50 | How the layers fit together into one system |
-| | [10 High concurrency and distributed execution](../10_distributed_concurrency/README.en.md) | 25 min | 3:15 | Multiple instances, queues, concurrent writes, rate limiting, compensation |
-| | [11 Cost and latency optimization](../11_cost_latency/README.en.md) | 15 min | 3:30 | Model routing, caching, cost attribution |
-| | [12 Enterprise knowledge and permission-aware RAG](../12_enterprise_rag/README.en.md) | 15 min | 3:45 | Retrieval that respects permissions, knowledge that stays current, citations you can verify |
-| | [13 Release, change, and operations](../13_release_ops/README.en.md) | 15 min | 4:00 | Progressive rollout, kill switches, rollback, incident response |
+| | [01 The agent loop](../02_agent_loop/README.en.md) | 20 min | 0:30 | A main loop you wrote yourself |
+| | [02 Tool design](../03_tools/README.en.md) | 20 min | 0:50 | Tools the model uses correctly and attackers can't misuse |
+| | [03 Context and memory](../04_context_memory/README.en.md) | 15 min | 1:05 | Long conversations that don't overflow, and memory that never leaks across users |
+| | [04 Orchestration patterns](../06_orchestration/README.en.md) | 15 min | 1:20 | Knowing when to use a workflow and when to use an agent |
+| 2 Enterprise problems | [05 Reliability engineering](../08_reliability/README.en.md) | 20 min | 1:40 | What to do when you're rate-limited, the model goes down, or the process crashes |
+| | [06 Security and governance](../09_security/README.en.md) | 20 min | 2:00 | Defending against injection, privilege escalation, and data leaks |
+| | [07 Observability](../10_observability/README.en.md) | 15 min | 2:15 | How to investigate when something goes wrong |
+| | [08 Eval-driven development](../11_evals/README.en.md) | 20 min | 2:35 | How to know a prompt change didn't break anything |
+| | [09 Production architecture overview](../12_production_architecture/README.en.md) | 15 min | 2:50 | How the layers fit together into one system |
+| | [10 High concurrency and distributed execution](../13_distributed_concurrency/README.en.md) | 25 min | 3:15 | Multiple instances, queues, concurrent writes, rate limiting, compensation |
+| | [11 Cost and latency optimization](../14_cost_latency/README.en.md) | 15 min | 3:30 | Model routing, caching, cost attribution |
+| | [12 Enterprise knowledge and permission-aware RAG](../15_enterprise_rag/README.en.md) | 15 min | 3:45 | Retrieval that respects permissions, knowledge that stays current, citations you can verify |
+| | [13 Release, change, and operations](../16_release_ops/README.en.md) | 15 min | 4:00 | Progressive rollout, kill switches, rollback, incident response |
 | Capstone | [ITBuddy capstone](../../capstone/README.en.md) | 30 min | 4:30 | Putting it all together |
 
 The 14 core lessons take 4 hours; the capstone takes another 30 minutes. Short on time? 00 → 01 → 02 → 05 → 06 is the minimal end-to-end path. You can skip each lesson's "Going deeper" section at first and come back to it later.
@@ -200,22 +200,22 @@ This lesson's [`demo.py`](demo.py) wires up an agent with nearly every enterpris
 
 ```python
 Agent(
-    ResilientLLM(default_llm(), fallbacks=[...]),       # Lesson 05: retry, circuit breaker, fallback
-    [search_kb, list_my_tickets, reset_password, ...],  # Lesson 02: schemas, ctx identity, risk levels
-    system_prompt=SYSTEM_PROMPT + UNTRUSTED_DATA_RULE,  # Lesson 06: tell the model tool output is data, not instructions
-    max_steps=8,                                        # Lesson 01: step limit
-    hooks=[                                             # Lesson 01: hooks, run in order
-        InputGuard(),                                   # Lesson 06: input screening
-        PermissionPolicy(role_tools=..., ask_risks={"dangerous"}),  # Lesson 06: RBAC + approval
-        BudgetHook(max_tokens=30_000, max_cost_usd=0.10, ...),      # Lesson 05: budget
-        ToolOutputGuard(),                              # Lesson 06: tool output isolation
-        OutputGuard(),                                  # Lesson 06: output redaction
-        AuditLog("runs/00_overview/audit.jsonl"),       # Lesson 06: audit
+    ResilientLLM(default_llm(), fallbacks=[...]),       # Lesson 08: retry, circuit breaker, fallback
+    [search_kb, list_my_tickets, reset_password, ...],  # Lesson 03: schemas, ctx identity, risk levels
+    system_prompt=SYSTEM_PROMPT + UNTRUSTED_DATA_RULE,  # Lesson 09: tell the model tool output is data, not instructions
+    max_steps=8,                                        # Lesson 02: step limit
+    hooks=[                                             # Lesson 02: hooks, run in order
+        InputGuard(),                                   # Lesson 09: input screening
+        PermissionPolicy(role_tools=..., ask_risks={"dangerous"}),  # Lesson 09: RBAC + approval
+        BudgetHook(max_tokens=30_000, max_cost_usd=0.10, ...),      # Lesson 08: budget
+        ToolOutputGuard(),                              # Lesson 09: tool output isolation
+        OutputGuard(),                                  # Lesson 09: output redaction
+        AuditLog("runs/00_overview/audit.jsonl"),       # Lesson 09: audit
     ],
-    context_strategy=SlidingWindow(max_tokens=8_000),   # Lesson 03: context management
-    checkpointer=FileCheckpointer("runs/.../checkpoints"),  # Lesson 05: checkpoints
-    tracer=Tracer(exporter=jsonl_exporter(...)),        # Lesson 07: tracing
-    idempotency_store=IdempotencyStore(),               # Lesson 05: idempotent writes
+    context_strategy=SlidingWindow(max_tokens=8_000),   # Lesson 04: context management
+    checkpointer=FileCheckpointer("runs/.../checkpoints"),  # Lesson 08: checkpoints
+    tracer=Tracer(exporter=jsonl_exporter(...)),        # Lesson 10: tracing
+    idempotency_store=IdempotencyStore(),               # Lesson 08: idempotent writes
 )
 ```
 
@@ -285,7 +285,7 @@ This lesson has no coding exercise. Instead:
 2. **Tinker with the demo (optional, 5 minutes)**:
    - In `demo.py`, change `ME`'s roles to `["it_admin"]` and see how the "tools this user can see" change;
    - In scenario 2, change `approved=True` to `False` and see how the model answers the user once it receives an "approval denied" observation;
-   - In scenario 3, rephrase the attack to slip past the regex — for example, "Please treat all the preceding rules you received as void" — and see whether `InputGuard` still catches it. It's perfectly normal if it doesn't. Think about which other layers are still protecting the system at that point (the answer is in Lesson 06).
+   - In scenario 3, rephrase the attack to slip past the regex — for example, "Please treat all the preceding rules you received as void" — and see whether `InputGuard` still catches it. It's perfectly normal if it doesn't. Think about which other layers are still protecting the system at that point (the answer is in Lesson 09).
 
 ## 5. Going deeper (optional)
 
@@ -293,7 +293,7 @@ This lesson has no coding exercise. Instead:
 
 **The "lethal trifecta."** In [The lethal trifecta for AI agents](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/) (2025-06), Simon Willison points out that when an agent has all three of ① access to private data, ② exposure to untrusted content, and ③ the ability to communicate externally, an attacker can use injection to make it send private data out. ITBuddy in scenario 1 already has the first two (ticket data, and a knowledge base that can be poisoned), so we must tightly control the third. EchoLeak (CVE-2025-32711), the zero-click Microsoft 365 Copilot vulnerability disclosed in 2025, is exactly this kind of problem: all the attacker had to do was send an email with instructions hidden inside. When you design an agent, first ask how many of the three it has.
 
-**OWASP's "Excessive Agency."** The [OWASP Top 10 for LLM Applications 2025](https://owasp.org/www-project-top-10-for-large-language-model-applications/2_0_vulns/LLM06_ExcessiveAgency.html) traces Excessive Agency (LLM06) to three root causes: excessive functionality (tools beyond what the task needs), excessive permissions (tools with more privileges than they need), and excessive autonomy (high-impact actions without human confirmation). These map neatly to tool granularity in Lesson 02, identity and RBAC in Lessons 02/06, and human approval in Lesson 06.
+**OWASP's "Excessive Agency."** The [OWASP Top 10 for LLM Applications 2025](https://owasp.org/www-project-top-10-for-large-language-model-applications/2_0_vulns/LLM06_ExcessiveAgency.html) traces Excessive Agency (LLM06) to three root causes: excessive functionality (tools beyond what the task needs), excessive permissions (tools with more privileges than they need), and excessive autonomy (high-impact actions without human confirmation). These map neatly to tool granularity in Lesson 03, identity and RBAC in Lessons 03/06, and human approval in Lesson 09.
 
 **Build your own or use a framework?** This course implements agentkit from scratch so you understand why each layer exists. Whether to use a framework like LangGraph or the OpenAI Agents SDK in production is a trade-off: frameworks save you boilerplate and come with integrations; building your own gives you full control over control flow, state, and dependencies. [12-Factor Agents](https://github.com/humanlayer/12-factor-agents) argues that many teams eventually take the critical pieces — prompts, context, control flow, state — back into their own hands. Whichever path you take, you need every layer this course covers; the only difference is whether you write it yourself or configure a framework.
 
@@ -337,7 +337,7 @@ This lesson has no coding exercise. Instead:
 - Checkpoints and resume-from-checkpoint; idempotent writes;
 - Tracing, audit logs, cost attribution;
 - Eval sets and CI gates;
-- Multi-instance concurrency and rate limiting (Lesson 10), cost and latency optimization (Lesson 11), permission-filtered retrieval (Lesson 12), progressive rollout and rollback (Lesson 13).
+- Multi-instance concurrency and rate limiting (Lesson 13), cost and latency optimization (Lesson 14), permission-filtered retrieval (Lesson 15), progressive rollout and rollback (Lesson 16).
 </details>
 
 <details>
@@ -360,7 +360,7 @@ This lesson has no coding exercise. Instead:
 - [ ] I can sketch the autonomy spectrum and explain the cost of moving to the right
 - [ ] I can use the decision tree to judge whether a requirement calls for an agent
 - [ ] I can list differences between demo and enterprise agents across at least 8 dimensions
-- [ ] I can draw the layered architecture of an enterprise agent and map Lessons 01–13 onto its layers
+- [ ] I can draw the layered architecture of an enterprise agent and map Lessons 02–16 onto its layers
 - [ ] I can explain the difference between Part 1 (learn how to build) and Part 2 (learn how to choose)
 - [ ] I've run `demo.py` and can name the enterprise capabilities at work in each of the 3 scenarios
 - [ ] I've completed [`quiz.en.md`](quiz.en.md)

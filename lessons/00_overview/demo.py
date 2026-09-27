@@ -4,12 +4,12 @@
     .venv/bin/python lessons/00_overview/demo.py --offline  # 离线剧本，无需 API key
 
 现在不需要看懂每一行代码。你只需要看清楚：一个"企业级"Agent 在模型之外还包着多少层东西，
-以及每一层在什么时候起作用。学完第 01-09 课，这里的每一行你都能亲手写出来。
+以及每一层在什么时候起作用。学完第 02-12 课，这里的每一行你都能亲手写出来。
 
 运行产物（都在 runs/00_overview/ 下，已被 .gitignore 忽略）：
-    checkpoints/<run_id>.json   每一步的检查点（第 05 课）
-    audit.jsonl                 审计日志（第 06 课）
-    traces.jsonl                链路追踪（第 07 课）
+    checkpoints/<run_id>.json   每一步的检查点（第 08 课）
+    audit.jsonl                 审计日志（第 09 课）
+    traces.jsonl                链路追踪（第 10 课）
 """
 
 from __future__ import annotations
@@ -111,7 +111,7 @@ ME = {"tenant_id": "acme", "user_id": "E100", "user_name": "张三", "roles": ["
 
 
 def build_llm(script: list | None):
-    """真实模式：主模型 + 可选的备用模型；离线模式：剧本模型。两种情况都套上 ResilientLLM（第 05 课）。"""
+    """真实模式：主模型 + 可选的备用模型；离线模式：剧本模型。两种情况都套上 ResilientLLM（第 08 课）。"""
     if OFFLINE:
         return ResilientLLM(ScriptedLLM(script or []))
     fallback = env("LLM_FALLBACK_MODEL")
@@ -133,19 +133,19 @@ def build_agent(llm) -> Agent:
         TOOLS,
         name="itbuddy",
         system_prompt=SYSTEM_PROMPT,
-        max_steps=8,  # 第 01 课：步数上限
-        hooks=[  # 第 01 课：钩子 = 可插拔的横切能力，按顺序执行
-            InputGuard(),  # 第 06 课：输入检测（直接注入）
-            permission,  # 第 06 课：RBAC + 高风险审批
-            BudgetHook(max_tokens=30_000, max_cost_usd=0.10, max_tool_calls=8, max_seconds=120),  # 第 05 课
-            ToolOutputGuard(),  # 第 06 课：工具输出标记为不可信数据（间接注入）
-            OutputGuard(),  # 第 06 课：输出脱敏
-            audit,  # 第 06 课：审计日志
+        max_steps=8,  # 第 02 课：步数上限
+        hooks=[  # 第 02 课：钩子 = 可插拔的横切能力，按顺序执行
+            InputGuard(),  # 第 09 课：输入检测（直接注入）
+            permission,  # 第 09 课：RBAC + 高风险审批
+            BudgetHook(max_tokens=30_000, max_cost_usd=0.10, max_tool_calls=8, max_seconds=120),  # 第 08 课
+            ToolOutputGuard(),  # 第 09 课：工具输出标记为不可信数据（间接注入）
+            OutputGuard(),  # 第 09 课：输出脱敏
+            audit,  # 第 09 课：审计日志
         ],
-        context_strategy=SlidingWindow(max_tokens=8_000),  # 第 03 课：上下文窗口管理
-        checkpointer=checkpointer,  # 第 05 课：每一步都存盘
-        tracer=tracer,  # 第 07 课：链路追踪
-        idempotency_store=IdempotencyStore(),  # 第 05 课：写操作幂等
+        context_strategy=SlidingWindow(max_tokens=8_000),  # 第 04 课：上下文窗口管理
+        checkpointer=checkpointer,  # 第 08 课：每一步都存盘
+        tracer=tracer,  # 第 10 课：链路追踪
+        idempotency_store=IdempotencyStore(),  # 第 08 课：写操作幂等
     )
 
 
@@ -181,12 +181,12 @@ def intro() -> None:
     banner("ITBuddy 预告片：一个企业级 Agent 由哪些部件组成")
     print(f"  模式：{'离线剧本（结果固定）' if OFFLINE else '真实模型（每次措辞会略有不同）'}")
     rows = [
-        ("Agent 主循环 + 步数上限 + 钩子", "第 01 课"),
-        ("4 个工具：Schema 校验 / ctx 注入身份 / 风险分级", "第 02 课"),
-        ("SlidingWindow 上下文管理", "第 03 课"),
-        ("ResilientLLM 重试、熔断、降级 / BudgetHook 预算 / 检查点 / 幂等", "第 05 课"),
-        ("InputGuard / ToolOutputGuard / OutputGuard / RBAC + 审批 / 审计", "第 06 课"),
-        ("Tracer 链路追踪（导出 JSONL）", "第 07 课"),
+        ("Agent 主循环 + 步数上限 + 钩子", "第 02 课"),
+        ("4 个工具：Schema 校验 / ctx 注入身份 / 风险分级", "第 03 课"),
+        ("SlidingWindow 上下文管理", "第 04 课"),
+        ("ResilientLLM 重试、熔断、降级 / BudgetHook 预算 / 检查点 / 幂等", "第 08 课"),
+        ("InputGuard / ToolOutputGuard / OutputGuard / RBAC + 审批 / 审计", "第 09 课"),
+        ("Tracer 链路追踪（导出 JSONL）", "第 10 课"),
     ]
     for what, lesson in rows:
         print(f"  • {pad(what, 66)}{lesson}")
@@ -211,20 +211,20 @@ def scenario_normal() -> None:
     first_round = next((m["tool_calls"] for m in r.messages if m.get("tool_calls")), [])
     if len(first_round) > 1:
         names = " 和 ".join(c["function"]["name"] for c in first_round)
-        say(f"模型在一轮里同时调用了 {names}（并行工具调用，第 01 课）。")
+        say(f"模型在一轮里同时调用了 {names}（并行工具调用，第 02 课）。")
     else:
-        say(f"模型依次调用了工具 {r.tools_called()}（Agent 主循环，第 01 课）。")
-    say("list_my_tickets 没有 user_id 参数 —— 身份由系统从登录态注入 ctx，模型无法冒充别人（第 02 课）。")
+        say(f"模型依次调用了工具 {r.tools_called()}（Agent 主循环，第 02 课）。")
+    say("list_my_tickets 没有 user_id 参数 —— 身份由系统从登录态注入 ctx，模型无法冒充别人（第 03 课）。")
     hit = r.metadata.get("injection_in_tool_output")
     if hit:
         say(f"知识库文章 KB-102 被人埋了一句「忽略之前的所有指令…」。ToolOutputGuard 在 {hit} 的输出里发现了它，")
-        say("  把整段结果包进 <untrusted_data> 并加上警告，告诉模型这是数据、不是命令（第 06 课）。")
+        say("  把整段结果包进 <untrusted_data> 并加上警告，告诉模型这是数据、不是命令（第 09 课）。")
     leaked = "evil.example" in (r.output or "")
     say("✅ 模型没有被间接注入带偏。" if not leaked else "⚠️ 模型复述了恶意内容 —— 这正是需要第 3 层（权限）兜底的原因。")
     if "13812345678" in (r.output or ""):
         say("⚠️ 手机号没有被脱敏（检查 OutputGuard 配置）。")
     elif "脱敏" in (r.output or ""):
-        say("✅ 回答里的手机号被 OutputGuard 替换成了「[手机号已脱敏]」（第 06 课）。")
+        say("✅ 回答里的手机号被 OutputGuard 替换成了「[手机号已脱敏]」（第 09 课）。")
     else:
         say("模型这次没有在回答里写出手机号，所以 OutputGuard 没有需要脱敏的内容。")
     show_trace(r)
@@ -257,8 +257,8 @@ def scenario_approval() -> None:
     r2 = worker.approve(r.run_id, approved=True)
     show_result(r2)
     print("\n  发生了什么：")
-    say("新实例用 run_id 从检查点加载状态，执行已批准的工具调用，再让模型继续，没有从头重来（第 05 课）。")
-    say("审计日志记录了这次调用：谁、什么时候、调用了什么、是否经过审批（第 06 课）。")
+    say("新实例用 run_id 从检查点加载状态，执行已批准的工具调用，再让模型继续，没有从头重来（第 08 课）。")
+    say("审计日志记录了这次调用：谁、什么时候、调用了什么、是否经过审批（第 09 课）。")
     show_trace(r2)
 
 
@@ -289,7 +289,7 @@ def outro() -> None:
     print("\n  运行产物：")
     for p in (RUNS / "checkpoints", RUNS / "audit.jsonl", RUNS / "traces.jsonl"):
         print(f"    {p.relative_to(root)}")
-    print("\n🎓 这就是你接下来 4 小时要亲手搭出来的东西。从第 01 课开始：Agent 的本质只是一个 while 循环。")
+    print("\n🎓 这就是你接下来 4 小时要亲手搭出来的东西。从第 02 课开始：Agent 的本质只是一个 while 循环。")
 
 
 def main() -> None:

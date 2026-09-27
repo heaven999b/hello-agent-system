@@ -51,8 +51,8 @@ If you want to check a demo against a real model, copy `.env.example` to `.env`,
 |---|---|
 | `make test-solutions` | Runs every test against the reference solutions (framework tests + each lesson's exercise tests). **It must be green before you open a PR — this is what CI runs** |
 | `make test` | Runs the tests against `exercise.py`. Failures are expected while the exercises are unfinished |
-| `make lesson N=05` | Runs only Lesson 05's exercise tests |
-| `.venv/bin/python lessons/05_reliability/demo.py --offline` | Runs one lesson's demo offline |
+| `make lesson N=08` | Runs only Lesson 08's exercise tests |
+| `.venv/bin/python lessons/08_reliability/demo.py --offline` | Runs one lesson's demo offline |
 | `.venv/bin/python scripts/progress.py` | Progress dashboard: checks exercise completion lesson by lesson |
 | `.venv/bin/python -m agentkit.viewer traces.jsonl -o trace.html` | Renders exported traces as an interactive HTML page |
 
@@ -135,7 +135,7 @@ Finally, add the lesson to the learning path table (the **📚 学习路线** se
 - **No new runtime dependencies**: the only dependencies are `openai` and `pydantic`. Put optional capabilities under `[project.optional-dependencies]`.
 - **Every behavior change needs tests** (`tests/`), kept offline and deterministic.
 - **Public API changes must be carried through the course**: search `lessons/`, `capstone/`, and `docs/` for every reference and update them in the same change.
-- Keep the teaching implementation synchronous and single-process; describe production-grade alternatives in comments or in Lesson 09.
+- Keep the teaching implementation synchronous and single-process; describe production-grade alternatives in comments or in Lesson 12.
 
 ## Code style
 

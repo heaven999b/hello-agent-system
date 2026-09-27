@@ -15,21 +15,21 @@
 
 | agentkit 模块 | 它解决的问题 | 课程 |
 |---|---|---|
-| `Agent.run` / `max_steps` | 模型 ↔ 工具的循环，以及什么时候停 | [第 01 课](../lessons/01_agent_loop/README.md) |
-| `@tool` / `ToolRegistry` | 把函数变成模型能调用的工具：Schema、校验、超时、截断 | [第 02 课](../lessons/02_tools/README.md) |
-| `ToolContext` | 身份等可信信息由系统注入，不让模型填 | [第 02 课](../lessons/02_tools/README.md) |
-| `Hook`（7 个钩子） | 在循环的关键节点插入横切逻辑（安全、预算、审计……） | [第 01 课](../lessons/01_agent_loop/README.md) |
-| `SlidingWindow` / `SummarizingCompactor` | 上下文太长怎么办 | [第 03 课](../lessons/03_context_memory/README.md) |
-| `MemoryStore` | 跨会话记住东西 | [第 03 课](../lessons/03_context_memory/README.md) |
-| `workflows.py` | 代码控制流程 vs 模型控制流程；多 Agent | [第 04 课](../lessons/04_orchestration/README.md) |
-| `ResilientLLM` / `BudgetHook` | 重试、熔断、降级、预算 | [第 05 课](../lessons/05_reliability/README.md) |
-| `Checkpointer` / `RunState` / `resume` | 崩溃恢复、暂停等人 | [第 05 课](../lessons/05_reliability/README.md) |
-| `InputGuard` / `ToolOutputGuard` / `OutputGuard` | 护栏 | [第 06 课](../lessons/06_security/README.md) |
-| `PermissionPolicy` / `PauseRun` | 最小权限、人工审批 | [第 06 课](../lessons/06_security/README.md) |
-| `Tracer` / `Span` | 追踪 | [第 07 课](../lessons/07_observability/README.md) |
-| `evals.py` | 评估 | [第 08 课](../lessons/08_evals/README.md) |
+| `Agent.run` / `max_steps` | 模型 ↔ 工具的循环，以及什么时候停 | [第 02 课](../lessons/02_agent_loop/README.md) |
+| `@tool` / `ToolRegistry` | 把函数变成模型能调用的工具：Schema、校验、超时、截断 | [第 03 课](../lessons/03_tools/README.md) |
+| `ToolContext` | 身份等可信信息由系统注入，不让模型填 | [第 03 课](../lessons/03_tools/README.md) |
+| `Hook`（7 个钩子） | 在循环的关键节点插入横切逻辑（安全、预算、审计……） | [第 02 课](../lessons/02_agent_loop/README.md) |
+| `SlidingWindow` / `SummarizingCompactor` | 上下文太长怎么办 | [第 04 课](../lessons/04_context_memory/README.md) |
+| `MemoryStore` | 跨会话记住东西 | [第 04 课](../lessons/04_context_memory/README.md) |
+| `workflows.py` | 代码控制流程 vs 模型控制流程；多 Agent | [第 06 课](../lessons/06_orchestration/README.md) |
+| `ResilientLLM` / `BudgetHook` | 重试、熔断、降级、预算 | [第 08 课](../lessons/08_reliability/README.md) |
+| `Checkpointer` / `RunState` / `resume` | 崩溃恢复、暂停等人 | [第 08 课](../lessons/08_reliability/README.md) |
+| `InputGuard` / `ToolOutputGuard` / `OutputGuard` | 护栏 | [第 09 课](../lessons/09_security/README.md) |
+| `PermissionPolicy` / `PauseRun` | 最小权限、人工审批 | [第 09 课](../lessons/09_security/README.md) |
+| `Tracer` / `Span` | 追踪 | [第 10 课](../lessons/10_observability/README.md) |
+| `evals.py` | 评估 | [第 11 课](../lessons/11_evals/README.md) |
 
-> 课程第二部分的 [第 10 课](../lessons/10_distributed_concurrency/README.md)（分布式与高并发）、[第 11 课](../lessons/11_cost_latency/README.md)（成本与延迟）、[第 12 课](../lessons/12_enterprise_rag/README.md)（企业 RAG）、[第 13 课](../lessons/13_release_ops/README.md)（发布与运维）讨论的问题——会话并发写、投递语义、全局限流、缓存隔离、权限感知检索、灰度与回滚——**大多不在 Agent 框架的职责范围内**，而属于你的基础设施层。框架能帮上忙的部分见 2.7（持久化执行）、2.12（重试）、2.13（预算）和 2.9（记忆/检索）；其余需要自己设计，这正是这几节课的价值。
+> 课程第二部分的 [第 13 课](../lessons/13_distributed_concurrency/README.md)（分布式与高并发）、[第 14 课](../lessons/14_cost_latency/README.md)（成本与延迟）、[第 15 课](../lessons/15_enterprise_rag/README.md)（企业 RAG）、[第 16 课](../lessons/16_release_ops/README.md)（发布与运维）讨论的问题——会话并发写、投递语义、全局限流、缓存隔离、权限感知检索、灰度与回滚——**大多不在 Agent 框架的职责范围内**，而属于你的基础设施层。框架能帮上忙的部分见 2.7（持久化执行）、2.12（重试）、2.13（预算）和 2.9（记忆/检索）；其余需要自己设计，这正是这几节课的价值。
 
 ---
 
@@ -124,7 +124,7 @@ agentkit 的钩子时机：`on_run_start → [before_llm → LLM → after_llm �
 | MS Agent Framework | 中间件中终止执行（`MiddlewareTermination`）；官方有专门的 "Termination & Guardrails" 文档 | |
 | Temporal | 无内置；在 Activity 中实现规则校验 | |
 
-> 无论哪个框架，都请记住第 06 课的结论：**护栏降低概率，权限限制后果**。框架提供的护栏是第 1、2、4 层，第 3 层（最小权限 + 审批）要靠 2.6 的机制。
+> 无论哪个框架，都请记住第 09 课的结论：**护栏降低概率，权限限制后果**。框架提供的护栏是第 1、2、4 层，第 3 层（最小权限 + 审批）要靠 2.6 的机制。
 
 ### 2.6 权限与人工审批（agentkit：`PermissionPolicy` + `PauseRun` + `resume` / `approve`）
 
@@ -152,7 +152,7 @@ agentkit 的钩子时机：`on_run_start → [before_llm → LLM → after_llm �
 | MS Agent Framework | Workflow 检查点：在每个 superstep 结束时创建，存储后端 `InMemoryCheckpointStorage` / `FileCheckpointStorage` 等；Agent 会话 `AgentSession` 可序列化 | |
 | Temporal | **持久化执行（Durable Execution）**：Event History + Replay（重放）。Workflow 代码必须是确定性的；外部 I/O 放在 Activity | 最彻底的方案。Activity 可能被执行多次，官方建议 Activity 幂等（可用 Workflow Run ID + Activity ID 作为幂等键）——与 agentkit `run_id:call_id` 的思路完全相同 |
 
-> 🔑 **多实例部署时还要注意**：检查点只解决"崩溃后能恢复"，不解决"同一会话被两个 worker 并发写"和"僵尸 worker 在租约过期后仍在写"——这些需要按会话串行化、版本号 CAS 或 fencing token（[第 10 课](../lessons/10_distributed_concurrency/README.md)，[失败模式 D1](failure-modes.md#d1-丢失更新lost-update)、[D2](failure-modes.md#d2-僵尸-workerzombie-worker)）。
+> 🔑 **多实例部署时还要注意**：检查点只解决"崩溃后能恢复"，不解决"同一会话被两个 worker 并发写"和"僵尸 worker 在租约过期后仍在写"——这些需要按会话串行化、版本号 CAS 或 fencing token（[第 13 课](../lessons/13_distributed_concurrency/README.md)，[失败模式 D1](failure-modes.md#d1-丢失更新lost-update)、[D2](failure-modes.md#d2-僵尸-workerzombie-worker)）。
 
 > 🔑 **通用规律**：所有检查点方案都存在"副作用已执行、但检查点还没写入"的窗口，框架无法替你消除它。**写操作幂等**是唯一的解（见[失败模式 T5](failure-modes.md#t5-重复副作用duplicate-side-effects)）。
 
@@ -168,7 +168,7 @@ agentkit 的钩子时机：`on_run_start → [before_llm → LLM → after_llm �
 | MS Agent Framework | `compaction_strategy`：`SlidingWindowStrategy`、`SummarizationStrategy`、`ToolResultCompactionStrategy` 等（文档标注为实验性） |
 | Temporal | 无（Continue-As-New 解决的是 Event History 过大，不是模型上下文问题） |
 
-> agentkit 第 03 课强调的"**按块截断，别拆散 tool_calls 和 tool 结果**"在所有框架中都成立——框架内置的策略大多已经处理了这一点，但如果你自己写过滤逻辑（如 OpenAI 的 `input_filter`、LangChain 的自定义中间件），要自己保证。
+> agentkit 第 04 课强调的"**按块截断，别拆散 tool_calls 和 tool 结果**"在所有框架中都成立——框架内置的策略大多已经处理了这一点，但如果你自己写过滤逻辑（如 OpenAI 的 `input_filter`、LangChain 的自定义中间件），要自己保证。
 
 ### 2.9 长期记忆（agentkit：`MemoryStore` + `memory_tools`）
 
@@ -182,7 +182,7 @@ agentkit 的钩子时机：`on_run_start → [before_llm → LLM → after_llm �
 | MS Agent Framework | Context Providers（`ContextProvider`，有 `before_run` / `after_run`），并有多种第三方存储集成 | |
 | Temporal | — | |
 
-> 企业知识库场景（权限感知检索、ACL 前过滤、删除传播、引用校验）超出了各框架"记忆"组件的范围，需要在检索服务层设计，见 [第 12 课](../lessons/12_enterprise_rag/README.md)。
+> 企业知识库场景（权限感知检索、ACL 前过滤、删除传播、引用校验）超出了各框架"记忆"组件的范围，需要在检索服务层设计，见 [第 15 课](../lessons/15_enterprise_rag/README.md)。
 
 ### 2.10 编排模式（agentkit：`workflows.py` 的 chain / route / parallel / orchestrator_workers / evaluator_optimizer）
 
@@ -227,7 +227,7 @@ agentkit 的钩子时机：`on_run_start → [before_llm → LLM → after_llm �
 | MS Agent Framework | 官方文档建议在中间件中实现重试逻辑 | |
 | Temporal | `RetryPolicy`（初始间隔、退避系数、最大间隔、最大次数、不可重试错误类型）；Activity 超时：Start-To-Close、Schedule-To-Close 等 | ⚠️ **Activity 默认会无限次重试**（最大次数默认不限），调用模型时务必把 400/401 这类错误配置为不可重试，并设置合理上限 |
 
-> 熔断器（circuit breaker）在上述框架中基本都**没有内置**，通常放在模型网关层实现；**跨实例的全局限流**、租户公平排队同理（[第 10 课](../lessons/10_distributed_concurrency/README.md)）。
+> 熔断器（circuit breaker）在上述框架中基本都**没有内置**，通常放在模型网关层实现；**跨实例的全局限流**、租户公平排队同理（[第 13 课](../lessons/13_distributed_concurrency/README.md)）。
 
 ### 2.13 预算与用量（agentkit：`BudgetHook(max_tokens, max_cost_usd, max_tool_calls, max_seconds)`）
 
@@ -241,7 +241,7 @@ agentkit 的钩子时机：`on_run_start → [before_llm → LLM → after_llm �
 | MS Agent Framework | 函数调用配置中的 `max_function_calls`、`max_duration_seconds` | 待核实 |
 | Temporal | Workflow / Activity 超时 | — |
 
-> 结论：**金额预算和租户级配额几乎都要自己实现**（钩子/中间件 + 网关）。这正是第 05 课手写 `BudgetHook` 的价值；模型级联、缓存、对冲请求等成本与延迟优化手段见 [第 11 课](../lessons/11_cost_latency/README.md)。
+> 结论：**金额预算和租户级配额几乎都要自己实现**（钩子/中间件 + 网关）。这正是第 08 课手写 `BudgetHook` 的价值；模型级联、缓存、对冲请求等成本与延迟优化手段见 [第 14 课](../lessons/14_cost_latency/README.md)。
 
 ### 2.14 结构化输出（agentkit：`complete_json` + 修复循环）
 
@@ -280,7 +280,7 @@ agentkit 的钩子时机：`on_run_start → [before_llm → LLM → after_llm �
 | MS Agent Framework | `evaluate_agent()`、`LocalEvaluator` 等 |
 | Temporal | — |
 
-> 框架提供的评估工具可以省掉脚手架，但**评估集本身（真实问题 + 期望行为）只能你自己积累**——这是第 08 课的核心。
+> 框架提供的评估工具可以省掉脚手架，但**评估集本身（真实问题 + 期望行为）只能你自己积累**——这是第 11 课的核心。
 
 ### 2.17 MCP 与 A2A
 
@@ -331,7 +331,7 @@ agentkit 的钩子时机：`on_run_start → [before_llm → LLM → after_llm �
 ### Temporal
 - **你已经会了**：检查点、幂等、重试退避、暂停等人——这些正是 Temporal 的核心价值。
 - **重点新学**：Workflow 确定性约束（不能在 Workflow 代码里直接调用模型、读时间、取随机数，这些都要走 Activity 或 SDK 提供的确定性 API）；Signal / Query / Update；Activity 的超时类型与默认无限重试；Event History 的大小限制与 Continue-As-New。
-- **什么时候需要它**：Agent 任务要运行几小时到几天、要等人审批、绝对不能丢进度、需要跨服务的可靠编排（长任务交付方式的选择见 [第 10 课](../lessons/10_distributed_concurrency/README.md)）。
+- **什么时候需要它**：Agent 任务要运行几小时到几天、要等人审批、绝对不能丢进度、需要跨服务的可靠编排（长任务交付方式的选择见 [第 13 课](../lessons/13_distributed_concurrency/README.md)）。
 
 ---
 
@@ -347,7 +347,7 @@ agentkit 的钩子时机：`on_run_start → [before_llm → LLM → after_llm �
 | .NET 技术栈或微软生态；从 AutoGen / Semantic Kernel 迁移 | Microsoft Agent Framework | 官方继任者，.NET 与 Python 双栈 |
 | 长时运行、必须可靠恢复、要等人几天 | Temporal（可与上面任一框架组合） | 持久化执行是它的本职 |
 
-> 另外，没有一个框架会替你管理"代码 + 提示词 + 模型版本 + 工具 Schema"的整体发布、灰度和回滚——这部分见 [第 13 课](../lessons/13_release_ops/README.md)。
+> 另外，没有一个框架会替你管理"代码 + 提示词 + 模型版本 + 工具 Schema"的整体发布、灰度和回滚——这部分见 [第 16 课](../lessons/16_release_ops/README.md)。
 
 > 无论选哪个框架，本课程的[设计评审清单](design-review-checklist.md)都适用——框架帮你省掉的是"写循环"的工作，省不掉的是**权限设计、幂等、评估集、成本治理**这些企业级决策。
 

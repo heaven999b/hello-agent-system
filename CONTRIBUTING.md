@@ -51,8 +51,8 @@ make setup        # 创建 .venv，安装 agentkit（可编辑模式）和 pytes
 |---|---|
 | `make test-solutions` | 用参考答案跑全部测试（框架测试 + 每课练习测试）。**提交 PR 前必须全绿，CI 跑的就是它** |
 | `make test` | 用 `exercise.py` 跑测试。练习没写完时会失败，这是正常的 |
-| `make lesson N=05` | 只跑第 05 课的练习测试 |
-| `.venv/bin/python lessons/05_reliability/demo.py --offline` | 离线运行某课 demo |
+| `make lesson N=08` | 只跑第 08 课的练习测试 |
+| `.venv/bin/python lessons/08_reliability/demo.py --offline` | 离线运行某课 demo |
 | `.venv/bin/python scripts/progress.py` | 学习进度看板：逐课检查练习完成情况 |
 | `.venv/bin/python -m agentkit.viewer traces.jsonl -o trace.html` | 把导出的 trace 渲染成可交互的 HTML 页面 |
 
@@ -135,7 +135,7 @@ make test-solutions                                                 # 全仓库�
 - **不引入新的运行时依赖**：目前只依赖 `openai` 和 `pydantic`。可选能力放进 `[project.optional-dependencies]`。
 - **每个行为改动都要有测试**（`tests/`），并且保持离线、确定性。
 - **公共 API 变化要同步课程**：搜索 `lessons/`、`capstone/`、`docs/` 中所有引用处一并修改。
-- 保持同步、单进程的教学实现；生产级替代方案写在注释或第 09 课里。
+- 保持同步、单进程的教学实现；生产级替代方案写在注释或第 12 课里。
 
 ## 代码风格
 

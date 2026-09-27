@@ -29,23 +29,23 @@ This checklist is designed to be pasted straight into a PR description, a design
 
 | # | Section | Items | P0 | Main lessons |
 |---|---|---|---|---|
-| 1 | Requirements and Scope | 9 | 4 | [Lesson 00](../lessons/00_overview/README.en.md) · [Lesson 04](../lessons/04_orchestration/README.en.md) |
-| 2 | Model and Prompts | 9 | 3 | [Lesson 01](../lessons/01_agent_loop/README.en.md) · [Lesson 08](../lessons/08_evals/README.en.md) |
-| 3 | Tools | 13 | 6 | [Lesson 02](../lessons/02_tools/README.en.md) |
-| 4 | Context and Memory | 9 | 4 | [Lesson 03](../lessons/03_context_memory/README.en.md) |
-| 5 | Orchestration | 8 | 3 | [Lesson 04](../lessons/04_orchestration/README.en.md) |
-| 6 | Reliability | 10 | 3 | [Lesson 05](../lessons/05_reliability/README.en.md) · [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
-| 7 | Security | 11 | 6 | [Lesson 06](../lessons/06_security/README.en.md) |
-| 8 | Privacy and Compliance | 9 | 3 | [Lesson 06](../lessons/06_security/README.en.md) · [Lesson 09](../lessons/09_production_architecture/README.en.md) |
-| 9 | Permissions and Approval | 8 | 4 | [Lesson 06](../lessons/06_security/README.en.md) |
-| 10 | Observability | 9 | 2 | [Lesson 07](../lessons/07_observability/README.en.md) |
-| 11 | Evals | 10 | 2 | [Lesson 08](../lessons/08_evals/README.en.md) |
-| 12 | Cost | 10 | 2 | [Lesson 05](../lessons/05_reliability/README.en.md) · [Lesson 11](../lessons/11_cost_latency/README.en.md) |
-| 13 | Deployment and Operations | 13 | 2 | [Lesson 09](../lessons/09_production_architecture/README.en.md) · [Lesson 13](../lessons/13_release_ops/README.en.md) |
-| 14 | Multi-Tenancy | 7 | 2 | [Lesson 09](../lessons/09_production_architecture/README.en.md) · [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
-| 15 | Documentation and Handoff | 7 | 1 | [Lesson 09](../lessons/09_production_architecture/README.en.md) |
-| 16 | Distributed Systems and Concurrency | 12 | 4 | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
-| 17 | Enterprise Knowledge and RAG | 9 | 2 | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| 1 | Requirements and Scope | 9 | 4 | [Lesson 00](../lessons/00_overview/README.en.md) · [Lesson 06](../lessons/06_orchestration/README.en.md) |
+| 2 | Model and Prompts | 9 | 3 | [Lesson 02](../lessons/02_agent_loop/README.en.md) · [Lesson 11](../lessons/11_evals/README.en.md) |
+| 3 | Tools | 13 | 6 | [Lesson 03](../lessons/03_tools/README.en.md) |
+| 4 | Context and Memory | 9 | 4 | [Lesson 04](../lessons/04_context_memory/README.en.md) |
+| 5 | Orchestration | 8 | 3 | [Lesson 06](../lessons/06_orchestration/README.en.md) |
+| 6 | Reliability | 10 | 3 | [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) |
+| 7 | Security | 11 | 6 | [Lesson 09](../lessons/09_security/README.en.md) |
+| 8 | Privacy and Compliance | 9 | 3 | [Lesson 09](../lessons/09_security/README.en.md) · [Lesson 12](../lessons/12_production_architecture/README.en.md) |
+| 9 | Permissions and Approval | 8 | 4 | [Lesson 09](../lessons/09_security/README.en.md) |
+| 10 | Observability | 9 | 2 | [Lesson 10](../lessons/10_observability/README.en.md) |
+| 11 | Evals | 10 | 2 | [Lesson 11](../lessons/11_evals/README.en.md) |
+| 12 | Cost | 10 | 2 | [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 14](../lessons/14_cost_latency/README.en.md) |
+| 13 | Deployment and Operations | 13 | 2 | [Lesson 12](../lessons/12_production_architecture/README.en.md) · [Lesson 16](../lessons/16_release_ops/README.en.md) |
+| 14 | Multi-Tenancy | 7 | 2 | [Lesson 12](../lessons/12_production_architecture/README.en.md) · [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
+| 15 | Documentation and Handoff | 7 | 1 | [Lesson 12](../lessons/12_production_architecture/README.en.md) |
+| 16 | Distributed Systems and Concurrency | 12 | 4 | [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) |
+| 17 | Enterprise Knowledge and RAG | 9 | 2 | [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
 | | **Total** | **163** | **53** | |
 
 ---

@@ -76,7 +76,7 @@ def discover(root: Path) -> list[Lesson]:
 
 
 def lesson_title(lesson_dir: Path, slug: str) -> str:
-    """从 README 第一行标题里取课程名：'# 第 01 课：Agent 主循环' → 'Agent 主循环'。"""
+    """从 README 第一行标题里取课程名：'# 第 02 课：Agent 主循环' → 'Agent 主循环'。"""
     readme = lesson_dir / "README.md"
     if readme.is_file():
         try:

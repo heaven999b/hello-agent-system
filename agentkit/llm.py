@@ -3,7 +3,7 @@
 企业级设计要点：业务代码只依赖一个很小的接口 `LLM.chat(messages, tools) -> LLMResponse`，
 而不是直接依赖某家厂商的 SDK。好处：
 - 换模型 / 换厂商 / 接模型网关，业务代码不用改；
-- 可以用"装饰器"叠加能力：重试、熔断、降级、缓存、限流（见第 05 课 ResilientLLM）；
+- 可以用"装饰器"叠加能力：重试、熔断、降级、缓存、限流（见第 08 课 ResilientLLM）；
 - 测试时换成 ScriptedLLM，零成本、100% 可复现。
 """
 
@@ -23,7 +23,7 @@ class LLM(Protocol):
 
 
 class LLMError(Exception):
-    """统一的模型调用异常。retryable 标记这个错误"重试是否可能成功"（第 05 课）。"""
+    """统一的模型调用异常。retryable 标记这个错误"重试是否可能成功"（第 08 课）。"""
 
     def __init__(
         self, message: str, *, status_code: int | None = None, retryable: bool = False, retry_after: float | None = None
@@ -38,7 +38,7 @@ class OpenAICompatLLM:
     """任何 OpenAI 兼容接口（cliproxyapi / OpenAI / DeepSeek / Qwen / vLLM ...）。
 
     注意 max_retries=0：我们故意关掉 SDK 自带的重试，
-    把重试放到自己可见、可控、可观测的 ResilientLLM 里（第 05 课）。
+    把重试放到自己可见、可控、可观测的 ResilientLLM 里（第 08 课）。
     """
 
     def __init__(

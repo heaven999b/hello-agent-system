@@ -21,7 +21,7 @@ assignees: ""
 
 ```bash
 # 例如：
-.venv/bin/python lessons/05_reliability/demo.py --offline
+.venv/bin/python lessons/08_reliability/demo.py --offline
 ```
 
 1.

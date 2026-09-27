@@ -15,21 +15,21 @@ Every agentkit module you built by hand in this course maps to a **problem that 
 
 | agentkit module | Problem it solves | Lesson |
 |---|---|---|
-| `Agent.run` / `max_steps` | The model ↔ tool loop, and when to stop | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
-| `@tool` / `ToolRegistry` | Turning functions into tools the model can call: schemas, validation, timeouts, truncation | [Lesson 02](../lessons/02_tools/README.en.md) |
-| `ToolContext` | Trusted information such as identity is injected by the system, never filled in by the model | [Lesson 02](../lessons/02_tools/README.en.md) |
-| `Hook` (7 hooks) | Inserting cross-cutting logic (security, budgets, audit, ...) at key points in the loop | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
-| `SlidingWindow` / `SummarizingCompactor` | What to do when the context gets too long | [Lesson 03](../lessons/03_context_memory/README.en.md) |
-| `MemoryStore` | Remembering things across sessions | [Lesson 03](../lessons/03_context_memory/README.en.md) |
-| `workflows.py` | Code-controlled vs. model-controlled flow; multi-agent systems | [Lesson 04](../lessons/04_orchestration/README.en.md) |
-| `ResilientLLM` / `BudgetHook` | Retries, circuit breaking, fallbacks, budgets | [Lesson 05](../lessons/05_reliability/README.en.md) |
-| `Checkpointer` / `RunState` / `resume` | Crash recovery, pausing to wait for a human | [Lesson 05](../lessons/05_reliability/README.en.md) |
-| `InputGuard` / `ToolOutputGuard` / `OutputGuard` | Guardrails | [Lesson 06](../lessons/06_security/README.en.md) |
-| `PermissionPolicy` / `PauseRun` | Least privilege, human approval | [Lesson 06](../lessons/06_security/README.en.md) |
-| `Tracer` / `Span` | Tracing | [Lesson 07](../lessons/07_observability/README.en.md) |
-| `evals.py` | Evals | [Lesson 08](../lessons/08_evals/README.en.md) |
+| `Agent.run` / `max_steps` | The model ↔ tool loop, and when to stop | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
+| `@tool` / `ToolRegistry` | Turning functions into tools the model can call: schemas, validation, timeouts, truncation | [Lesson 03](../lessons/03_tools/README.en.md) |
+| `ToolContext` | Trusted information such as identity is injected by the system, never filled in by the model | [Lesson 03](../lessons/03_tools/README.en.md) |
+| `Hook` (7 hooks) | Inserting cross-cutting logic (security, budgets, audit, ...) at key points in the loop | [Lesson 02](../lessons/02_agent_loop/README.en.md) |
+| `SlidingWindow` / `SummarizingCompactor` | What to do when the context gets too long | [Lesson 04](../lessons/04_context_memory/README.en.md) |
+| `MemoryStore` | Remembering things across sessions | [Lesson 04](../lessons/04_context_memory/README.en.md) |
+| `workflows.py` | Code-controlled vs. model-controlled flow; multi-agent systems | [Lesson 06](../lessons/06_orchestration/README.en.md) |
+| `ResilientLLM` / `BudgetHook` | Retries, circuit breaking, fallbacks, budgets | [Lesson 08](../lessons/08_reliability/README.en.md) |
+| `Checkpointer` / `RunState` / `resume` | Crash recovery, pausing to wait for a human | [Lesson 08](../lessons/08_reliability/README.en.md) |
+| `InputGuard` / `ToolOutputGuard` / `OutputGuard` | Guardrails | [Lesson 09](../lessons/09_security/README.en.md) |
+| `PermissionPolicy` / `PauseRun` | Least privilege, human approval | [Lesson 09](../lessons/09_security/README.en.md) |
+| `Tracer` / `Span` | Tracing | [Lesson 10](../lessons/10_observability/README.en.md) |
+| `evals.py` | Evals | [Lesson 11](../lessons/11_evals/README.en.md) |
 
-> Part 2 of the course covers [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) (distributed systems and high concurrency), [Lesson 11](../lessons/11_cost_latency/README.en.md) (cost and latency), [Lesson 12](../lessons/12_enterprise_rag/README.en.md) (enterprise RAG), and [Lesson 13](../lessons/13_release_ops/README.en.md) (release and operations). The problems discussed there (concurrent writes to a session, delivery semantics, global rate limiting, cache isolation, permission-aware retrieval, progressive rollout and rollback) **mostly fall outside an agent framework's responsibilities** and belong to your infrastructure layer. Where frameworks can help is covered in 2.7 (durable execution), 2.12 (retries), 2.13 (budgets), and 2.9 (memory/retrieval). The rest you have to design yourself, which is exactly why those lessons exist.
+> Part 2 of the course covers [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) (distributed systems and high concurrency), [Lesson 14](../lessons/14_cost_latency/README.en.md) (cost and latency), [Lesson 15](../lessons/15_enterprise_rag/README.en.md) (enterprise RAG), and [Lesson 16](../lessons/16_release_ops/README.en.md) (release and operations). The problems discussed there (concurrent writes to a session, delivery semantics, global rate limiting, cache isolation, permission-aware retrieval, progressive rollout and rollback) **mostly fall outside an agent framework's responsibilities** and belong to your infrastructure layer. Where frameworks can help is covered in 2.7 (durable execution), 2.12 (retries), 2.13 (budgets), and 2.9 (memory/retrieval). The rest you have to design yourself, which is exactly why those lessons exist.
 
 ---
 
@@ -124,7 +124,7 @@ Two design differences worth noting:
 | MS Agent Framework | Terminate execution in middleware (`MiddlewareTermination`); there's a dedicated official "Termination & Guardrails" doc | |
 | Temporal | Nothing built in; implement rule checks in Activities | |
 
-> Whatever the framework, remember the conclusion of Lesson 06: **guardrails lower the probability; permissions limit the consequences**. The guardrails that frameworks provide cover layers 1, 2, and 4. Layer 3 (least privilege + approval) depends on the mechanisms in 2.6.
+> Whatever the framework, remember the conclusion of Lesson 09: **guardrails lower the probability; permissions limit the consequences**. The guardrails that frameworks provide cover layers 1, 2, and 4. Layer 3 (least privilege + approval) depends on the mechanisms in 2.6.
 
 ### 2.6 Permissions and human approval (agentkit: `PermissionPolicy` + `PauseRun` + `resume` / `approve`)
 
@@ -152,7 +152,7 @@ Two design differences worth noting:
 | MS Agent Framework | Workflow checkpoints: created at the end of every superstep, with storage backends such as `InMemoryCheckpointStorage` / `FileCheckpointStorage`; the agent session `AgentSession` is serializable | |
 | Temporal | **Durable execution**: Event History + Replay. Workflow code must be deterministic; external I/O belongs in Activities | The most thorough solution. Activities may be executed more than once, and the official advice is to make Activities idempotent (the Workflow Run ID + Activity ID can serve as the idempotency key), exactly the same idea as agentkit's `run_id:call_id` |
 
-> 🔑 **For multi-instance deployments, also note**: checkpoints only solve "recover after a crash". They don't solve "two workers writing the same session concurrently" or "a zombie worker still writing after its lease expired". Those need per-session serialization, version-number CAS, or fencing tokens ([Lesson 10](../lessons/10_distributed_concurrency/README.en.md), [failure mode D1](failure-modes.en.md#d1-lost-update), [D2](failure-modes.en.md#d2-zombie-worker)).
+> 🔑 **For multi-instance deployments, also note**: checkpoints only solve "recover after a crash". They don't solve "two workers writing the same session concurrently" or "a zombie worker still writing after its lease expired". Those need per-session serialization, version-number CAS, or fencing tokens ([Lesson 13](../lessons/13_distributed_concurrency/README.en.md), [failure mode D1](failure-modes.en.md#d1-lost-update), [D2](failure-modes.en.md#d2-zombie-worker)).
 
 > 🔑 **The general rule**: every checkpointing scheme has a window where the side effect has already happened but the checkpoint hasn't been written yet, and no framework can close that window for you. **Idempotent writes** are the only fix (see [failure mode T5](failure-modes.en.md#t5-duplicate-side-effects)).
 
@@ -168,7 +168,7 @@ Two design differences worth noting:
 | MS Agent Framework | `compaction_strategy`: `SlidingWindowStrategy`, `SummarizationStrategy`, `ToolResultCompactionStrategy`, etc. (marked experimental in the docs) |
 | Temporal | None (Continue-As-New addresses an oversized Event History, not the model's context) |
 
-> The rule Lesson 03 stresses, "**truncate by block; never separate tool_calls from their tool results**", holds in every framework. Most built-in strategies already handle it, but if you write your own filtering logic (e.g., OpenAI's `input_filter` or custom LangChain middleware), guaranteeing it is up to you.
+> The rule Lesson 04 stresses, "**truncate by block; never separate tool_calls from their tool results**", holds in every framework. Most built-in strategies already handle it, but if you write your own filtering logic (e.g., OpenAI's `input_filter` or custom LangChain middleware), guaranteeing it is up to you.
 
 ### 2.9 Long-term memory (agentkit: `MemoryStore` + `memory_tools`)
 
@@ -182,7 +182,7 @@ Two design differences worth noting:
 | MS Agent Framework | Context Providers (`ContextProvider`, with `before_run` / `after_run`), plus integrations with various third-party stores | |
 | Temporal | — | |
 
-> Enterprise knowledge-base scenarios (permission-aware retrieval, ACL pre-filtering, deletion propagation, citation verification) go beyond what any framework's "memory" component covers. They need to be designed at the retrieval-service layer; see [Lesson 12](../lessons/12_enterprise_rag/README.en.md).
+> Enterprise knowledge-base scenarios (permission-aware retrieval, ACL pre-filtering, deletion propagation, citation verification) go beyond what any framework's "memory" component covers. They need to be designed at the retrieval-service layer; see [Lesson 15](../lessons/15_enterprise_rag/README.en.md).
 
 ### 2.10 Orchestration patterns (agentkit: chain / route / parallel / orchestrator_workers / evaluator_optimizer in `workflows.py`)
 
@@ -227,7 +227,7 @@ This is the most commonly confused pair of concepts. The key difference is **whe
 | MS Agent Framework | The official docs suggest implementing retry logic in middleware | |
 | Temporal | `RetryPolicy` (initial interval, backoff coefficient, maximum interval, maximum attempts, non-retryable error types); Activity timeouts: Start-To-Close, Schedule-To-Close, etc. | ⚠️ **Activities retry indefinitely by default** (maximum attempts is unlimited by default). When calling a model, be sure to mark errors such as 400/401 as non-retryable and set a sensible cap |
 
-> **None** of these frameworks really has a circuit breaker **built in**; it usually lives in the model gateway layer. The same goes for **global rate limiting across instances** and fair queuing across tenants ([Lesson 10](../lessons/10_distributed_concurrency/README.en.md)).
+> **None** of these frameworks really has a circuit breaker **built in**; it usually lives in the model gateway layer. The same goes for **global rate limiting across instances** and fair queuing across tenants ([Lesson 13](../lessons/13_distributed_concurrency/README.en.md)).
 
 ### 2.13 Budgets and usage (agentkit: `BudgetHook(max_tokens, max_cost_usd, max_tool_calls, max_seconds)`)
 
@@ -241,7 +241,7 @@ This is the most commonly confused pair of concepts. The key difference is **whe
 | MS Agent Framework | `max_function_calls`, `max_duration_seconds` in the function-calling configuration | To be verified |
 | Temporal | Workflow / Activity timeouts | — |
 
-> Bottom line: **you'll almost always have to build dollar budgets and tenant-level quotas yourself** (hooks/middleware + a gateway). That's exactly why Lesson 05 has you write `BudgetHook` by hand. For cost and latency techniques such as model cascades, caching, and hedged requests, see [Lesson 11](../lessons/11_cost_latency/README.en.md).
+> Bottom line: **you'll almost always have to build dollar budgets and tenant-level quotas yourself** (hooks/middleware + a gateway). That's exactly why Lesson 08 has you write `BudgetHook` by hand. For cost and latency techniques such as model cascades, caching, and hedged requests, see [Lesson 14](../lessons/14_cost_latency/README.en.md).
 
 ### 2.14 Structured output (agentkit: `complete_json` + repair loop)
 
@@ -280,7 +280,7 @@ This is the most commonly confused pair of concepts. The key difference is **whe
 | MS Agent Framework | `evaluate_agent()`, `LocalEvaluator`, etc. |
 | Temporal | — |
 
-> Framework eval tooling saves you the scaffolding, but **the eval set itself (real questions + expected behavior) is something only you can build up**. That's the core of Lesson 08.
+> Framework eval tooling saves you the scaffolding, but **the eval set itself (real questions + expected behavior) is something only you can build up**. That's the core of Lesson 11.
 
 ### 2.17 MCP and A2A
 
@@ -331,7 +331,7 @@ For each framework, we list only what you already know and the new things to foc
 ### Temporal
 - **You already know**: checkpoints, idempotency, retry with backoff, pausing to wait for a human. These are exactly Temporal's core value.
 - **New things to focus on**: Workflow determinism constraints (you can't call models, read the clock, or generate random numbers directly in Workflow code; these must go through Activities or the SDK's deterministic APIs); Signals / Queries / Updates; Activity timeout types and the default of infinite retries; Event History size limits and Continue-As-New.
-- **When you need it**: agent tasks that run for hours or days, wait for human approval, absolutely must not lose progress, or need reliable orchestration across services (for how to choose a delivery model for long-running tasks, see [Lesson 10](../lessons/10_distributed_concurrency/README.en.md)).
+- **When you need it**: agent tasks that run for hours or days, wait for human approval, absolutely must not lose progress, or need reliable orchestration across services (for how to choose a delivery model for long-running tasks, see [Lesson 13](../lessons/13_distributed_concurrency/README.en.md)).
 
 ---
 
@@ -347,7 +347,7 @@ For each framework, we list only what you already know and the new things to foc
 | A .NET stack or the Microsoft ecosystem; migrating from AutoGen / Semantic Kernel | Microsoft Agent Framework | The official successor, with both .NET and Python |
 | Long-running work that must recover reliably and may wait days for a human | Temporal (can be combined with any framework above) | Durable execution is its core job |
 
-> Also note that no framework will manage the combined release, progressive rollout, and rollback of "code + prompts + model version + tool schemas" for you. See [Lesson 13](../lessons/13_release_ops/README.en.md) for that.
+> Also note that no framework will manage the combined release, progressive rollout, and rollback of "code + prompts + model version + tool schemas" for you. See [Lesson 16](../lessons/16_release_ops/README.en.md) for that.
 
 > Whichever framework you choose, this course's [design review checklist](design-review-checklist.en.md) still applies. A framework saves you from writing the loop. It doesn't save you from the enterprise decisions: **permission design, idempotency, eval sets, and cost governance**.
 

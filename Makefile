@@ -1,6 +1,6 @@
 PY ?= .venv/bin/python
 
-.PHONY: setup test test-solutions lesson check-env chat progress viewer
+.PHONY: setup test test-solutions lesson check-env chat progress viewer check-links
 
 setup:            ## 创建虚拟环境并安装依赖
 	python3 -m venv .venv
@@ -17,7 +17,7 @@ test:             ## 跑框架测试 + 你的练习（练习没写完会失败�
 test-solutions:   ## 用参考答案跑所有练习测试（CI 用）
 	AGENTKIT_SOLUTION=1 $(PY) -m pytest
 
-lesson:           ## 跑某一课的练习测试：make lesson N=01
+lesson:           ## 跑某一课的练习测试：make lesson N=02
 	$(PY) -m pytest lessons/$(N)_*
 
 chat:             ## 交互式体验一个带追踪显示的 Agent
@@ -28,3 +28,6 @@ progress:         ## 查看学习进度看板
 
 viewer:           ## 把追踪渲染成 HTML：make viewer T=runs/traces.jsonl
 	$(PY) -m agentkit.viewer $(T) -o trace.html
+
+check-links:      ## 检查所有 Markdown 的相对链接与锚点
+	$(PY) scripts/check_links.py

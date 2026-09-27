@@ -26,7 +26,7 @@
 - **Agent 的优势**：能处理事先无法枚举步骤的开放式任务。
 - **选择原则**：从最简单的方案开始——普通代码 → 单次 LLM 调用 → Workflow → Agent，只有当复杂度明显带来收益时才往上走。
 - **加分点**：指出企业里最常见的是混合形态——外层 Workflow 固定大流程，某个节点内部用 Agent；能举例说明判断依据："如果 90% 的运行都走同一条工具序列，它就该是 Workflow"。
-- 课程：[第 04 课](../lessons/04_orchestration/README.md)
+- 课程：[第 06 课](../lessons/06_orchestration/README.md)
 
 </details>
 
@@ -39,7 +39,7 @@
 - **为什么需要上限**：模型可能陷入循环（同参数反复调用、两个工具互相推诿），没有上限就是无限烧钱；上限也是延迟的保护。
 - **达到上限后**：不能抛 500 给用户；应当收敛为明确的状态（如 `status=max_steps`），给用户一个结局（部分结果 + 转人工），并作为监控指标——触达比例上升通常意味着工具或提示词出了问题。
 - **加分点**：max_steps 只是一个维度，还需要 token/金额/时长预算；取值思路是看成功运行的步数分布（p95~p99 再留余量），而不是拍脑袋。
-- 课程：[第 01 课](../lessons/01_agent_loop/README.md) · 失败模式 [M3](failure-modes.md#m3-循环与重复调用tool-call-loop)
+- 课程：[第 02 课](../lessons/02_agent_loop/README.md) · 失败模式 [M3](failure-modes.md#m3-循环与重复调用tool-call-loop)
 
 </details>
 
@@ -52,7 +52,7 @@
 - 正确做法：身份信息（user_id / tenant_id / roles）由系统从认证会话中取得，通过可信上下文注入工具（agentkit 的 `ToolContext`：工具声明 `ctx` 参数即可获得，模型看不到也改不了）。
 - 需要"操作他人资源"的工具（如管理员查他人信息），在工具内部基于可信身份做授权校验，而不是相信模型传入的参数。
 - **加分点**：主流框架都有类似机制（OpenAI Agents SDK 的 `RunContextWrapper`、LangChain 的 `ToolRuntime`、Google ADK 的 `ToolContext`）；在多 Agent 场景下身份要沿委派链透传。
-- 课程：[第 02 课](../lessons/02_tools/README.md) · 失败模式 [S4](failure-modes.md#s4-身份由模型决定confused-deputy)
+- 课程：[第 03 课](../lessons/03_tools/README.md) · 失败模式 [S4](failure-modes.md#s4-身份由模型决定confused-deputy)
 
 </details>
 
@@ -65,7 +65,7 @@
 - 与传统异常处理的区别：传统代码的错误处理逻辑由程序员预先写好；Agent 中很多错误的"处理方式"交给模型根据上下文判断。
 - **写好错误信息的关键**：说清楚错在哪、可以怎么做（"找不到工号 E1234，请确认工号，或用 search_employee 按姓名查询"），而不是 "Error 500"。
 - **注意**：错误信息里不要泄露堆栈、SQL、内部路径和密钥。
-- 课程：[第 02 课](../lessons/02_tools/README.md) · 失败模式 [T6](failure-modes.md#t6-不透明错误opaque-errors)
+- 课程：[第 03 课](../lessons/03_tools/README.md) · 失败模式 [T6](failure-modes.md#t6-不透明错误opaque-errors)
 
 </details>
 
@@ -78,7 +78,7 @@
 - 这个错误只在对话长到触发截断时才出现，很难复现和排查。
 - 正确做法：按"块"截断——一个 assistant(tool_calls) + 它的全部 tool 结果 = 一个不可分割的块（agentkit `split_blocks`）；始终保留 system 消息和最后一个块。
 - **加分点**：自己写消息过滤逻辑（如多 Agent 转交时过滤历史）时同样要遵守这个约束。
-- 课程：[第 03 课](../lessons/03_context_memory/README.md) · 失败模式 [C1](failure-modes.md#c1-消息配对被截断orphaned-tool-message)
+- 课程：[第 04 课](../lessons/04_context_memory/README.md) · 失败模式 [C1](failure-modes.md#c1-消息配对被截断orphaned-tool-message)
 
 </details>
 
@@ -94,7 +94,7 @@
   - 更可靠的做法是把"已完成的操作"等关键状态存在上下文之外（数据库），由代码防重复；
   - 摘要写进 system 消息会改变前缀，导致提示词缓存失效，压缩频率要控制；
   - 另一种轻量手段是清理已经用过的大块工具结果。
-- 课程：[第 03 课](../lessons/03_context_memory/README.md) · 失败模式 [C3](failure-modes.md#c3-有损压缩lossy-compaction)
+- 课程：[第 04 课](../lessons/04_context_memory/README.md) · 失败模式 [C3](failure-modes.md#c3-有损压缩lossy-compaction)
 
 </details>
 
@@ -108,7 +108,7 @@
 - **为什么输入检测不是底线**：模型本质上无法区分"指令"和"数据"，检测（正则/分类器）只能拦住一部分，变形、编码、多语言的攻击总能绕过；间接注入根本不经过用户输入。
 - **真正的底线**：最小权限 + 高风险操作人工审批——即使模型被骗，它也做不了危险的事。
 - 纵深防御五层：输入检测 → 不可信数据隔离 → 最小权限 + 审批 → 输出过滤 → 审计。
-- 课程：[第 06 课](../lessons/06_security/README.md) · 失败模式 [S1](failure-modes.md#s1-直接提示词注入direct-prompt-injection)、[S2](failure-modes.md#s2-间接提示词注入indirect-prompt-injection)
+- 课程：[第 09 课](../lessons/09_security/README.md) · 失败模式 [S1](failure-modes.md#s1-直接提示词注入direct-prompt-injection)、[S2](failure-modes.md#s2-间接提示词注入indirect-prompt-injection)
 
 </details>
 
@@ -123,7 +123,7 @@
   - 前端不渲染外部图片/链接，或只允许白名单域名；
   - 对外发送类工具需要审批或限定收件人；
   - 处理不可信内容的 Agent 不给私有数据权限（多 Agent 做权限隔离）。
-- 课程：[第 06 课](../lessons/06_security/README.md) · 失败模式 [S3](failure-modes.md#s3-致命三要素外泄lethal-trifecta-exfiltration)
+- 课程：[第 09 课](../lessons/09_security/README.md) · 失败模式 [S3](failure-modes.md#s3-致命三要素外泄lethal-trifecta-exfiltration)
 
 </details>
 
@@ -138,7 +138,7 @@
   - Agent 侧的幂等存储（agentkit `IdempotencyStore`）只能覆盖"执行成功并已记录"的情况；而且内存版在进程崩溃后就丢了，生产中必须持久化；
   - **最可靠的是把幂等键传给真正产生副作用的下游系统**（类似 Stripe API 的 `Idempotency-Key` 请求头），由下游去重——这样即使"执行成功但没来得及记录"也不会重复。
 - **还有一种重复它覆盖不了**：模型自己又发起了一次新调用（新 call_id）。这需要业务键去重（如"同一用户同一问题 10 分钟内只建一张工单"）。
-- 课程：[第 05 课](../lessons/05_reliability/README.md) · [第 10 课](../lessons/10_distributed_concurrency/README.md) · 失败模式 [T5](failure-modes.md#t5-重复副作用duplicate-side-effects)
+- 课程：[第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · 失败模式 [T5](failure-modes.md#t5-重复副作用duplicate-side-effects)
 
 </details>
 
@@ -152,7 +152,7 @@
 - 随着 k 增大，pass@k 上升，pass^k 下降。
 - 客服场景面向真实用户，每个用户都期望一次就对，应该看 **pass^k**。简单估算：单次成功率 90%（且各次独立）时，pass^8 ≈ 0.43。
 - **加分点**：τ-bench 论文报告当时最强的函数调用 Agent 在零售场景下单次成功率不到 50%、pass^8 不到 25%——说明一致性是 Agent 落地的核心挑战。
-- 课程：[第 08 课](../lessons/08_evals/README.md) · 失败模式 [E2](failure-modes.md#e2-单次运行的假象flaky-single-run-evals)
+- 课程：[第 11 课](../lessons/11_evals/README.md) · 失败模式 [E2](failure-modes.md#e2-单次运行的假象flaky-single-run-evals)
 
 </details>
 
@@ -165,7 +165,7 @@
 - **转交**：当前 Agent 把对话整个交给另一个 Agent，之后由对方直接面对用户（控制权转移）。如 OpenAI Agents SDK 的 `handoffs`、Google ADK 的 `transfer_to_agent`。
 - **选择**：需要汇总多个专家结果、需要统一把关 → Agent 即工具；需要专家长时间直接与用户交互（分诊后转专门客服）→ 转交。
 - **共同的坑**：子 Agent 看不到父 Agent 的上下文（要传完整任务描述）；身份和权限要透传，子 Agent 的有效权限不能超过用户本人。
-- 课程：[第 04 课](../lessons/04_orchestration/README.md) · 另见[框架对照](framework-comparison.md)
+- 课程：[第 06 课](../lessons/06_orchestration/README.md) · 另见[框架对照](framework-comparison.md)
 
 </details>
 
@@ -178,7 +178,7 @@
 - **为什么 Agent 需要**：运行可能持续很久（等审批可能几天），进程重启是常态；从头重来既浪费钱，也会重复打扰用户、重复执行操作。
 - **检查点消除不了重复副作用**：永远存在"副作用已执行、检查点还没写入"的窗口。Temporal 官方也说明 Activity 可能被执行多次、建议 Activity 幂等；LangGraph 的 `interrupt()` 恢复时整个节点从头重跑。结论：**检查点 + 幂等**必须配合。
 - **加分点**：检查点还要记录代码/提示词/工具版本，否则恢复时可能出现版本错位（[R6](failure-modes.md#r6-恢复时版本错位version-skew-on-resume)）。
-- 课程：[第 05 课](../lessons/05_reliability/README.md) · [第 10 课](../lessons/10_distributed_concurrency/README.md) · 失败模式 [R4](failure-modes.md#r4-中断后从头重来lost-progress)
+- 课程：[第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · 失败模式 [R4](failure-modes.md#r4-中断后从头重来lost-progress)
 
 </details>
 
@@ -194,7 +194,7 @@
   - 对比评估时交换顺序各评一次；
   - 定期抽样人工复核，计算评委与人工的一致率；
   - 能用规则评分的就不用 LLM 评委。
-- 课程：[第 08 课](../lessons/08_evals/README.md) · 失败模式 [E3](failure-modes.md#e3-评委偏差llm-judge-bias)
+- 课程：[第 11 课](../lessons/11_evals/README.md) · 失败模式 [E3](failure-modes.md#e3-评委偏差llm-judge-bias)
 
 </details>
 
@@ -207,7 +207,7 @@
 - 在 Agent 里常见的叠加：模型 SDK 自带重试 × 你的重试 × 网关重试 × Agent 自己"再试一次"。
 - 下游本来就因为过载而失败时，放大的重试会让它更难恢复（重试风暴）。
 - 做法：选定一层（通常是离调用最近、最可观测的一层）做重试，其他层关闭——agentkit 就把 OpenAI SDK 的 `max_retries` 设为 0；配合指数退避 + 抖动、熔断器、进程级重试预算。
-- 课程：[第 05 课](../lessons/05_reliability/README.md) · [第 10 课](../lessons/10_distributed_concurrency/README.md) · 失败模式 [R1](failure-modes.md#r1-重试风暴retry-storm)
+- 课程：[第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · 失败模式 [R1](failure-modes.md#r1-重试风暴retry-storm)
 
 </details>
 
@@ -224,7 +224,7 @@
   - 尽量保持工具集稳定——每轮动态增删工具会破坏缓存（Anthropic 文档说明工具定义变化会使整个缓存失效；Manus 团队的经验是"遮蔽而不是移除"工具）；
   - 这与"按需暴露工具"存在权衡。
 - 监控缓存命中率（如 OpenAI 的 `cached_tokens` 字段）。
-- 课程：[第 03 课](../lessons/03_context_memory/README.md) · [第 11 课](../lessons/11_cost_latency/README.md) · 失败模式 [B2](failure-modes.md#b2-缓存击穿prompt-cache-busting)
+- 课程：[第 04 课](../lessons/04_context_memory/README.md) · [第 14 课](../lessons/14_cost_latency/README.md) · 失败模式 [B2](failure-modes.md#b2-缓存击穿prompt-cache-busting)
 
 </details>
 
@@ -247,7 +247,7 @@
 - **防注入/谄媚**：用户说"你们政策允许全额退款"不改变规则；订单备注、商家留言等外部内容视为不可信数据。
 - **审计**：每笔退款记录发起人、审批人、金额、依据。
 - **监控**：自动退款率、误退款率、审批时长。
-- 课程：[第 06 课](../lessons/06_security/README.md) · 失败模式 [S5](failure-modes.md#s5-过度授权excessive-agency)、[M6](failure-modes.md#m6-谄媚让步sycophantic-capitulation)、[R5](failure-modes.md#r5-审批悬挂approval-limbo)
+- 课程：[第 09 课](../lessons/09_security/README.md) · 失败模式 [S5](failure-modes.md#s5-过度授权excessive-agency)、[M6](failure-modes.md#m6-谄媚让步sycophantic-capitulation)、[R5](failure-modes.md#r5-审批悬挂approval-limbo)
 
 </details>
 
@@ -264,7 +264,7 @@
   4. 回复内容做敏感信息检测，禁止附件和外部链接。
 - 同时要求：所有自动发送的邮件可审计、可撤回（若邮件系统支持）；紧急开关；先在影子模式（只起草不发送）下运行一段时间看效果。
 - **好的回答要敢于说"不"**：解释为什么"全自动 + 全邮箱权限"不能直接做，并给出可行的替代方案。
-- 课程：[第 06 课](../lessons/06_security/README.md) · 失败模式 [S3](failure-modes.md#s3-致命三要素外泄lethal-trifecta-exfiltration)
+- 课程：[第 09 课](../lessons/09_security/README.md) · 失败模式 [S3](failure-modes.md#s3-致命三要素外泄lethal-trifecta-exfiltration)
 
 </details>
 
@@ -279,7 +279,7 @@
 - **统一的工具网关**：所有工具调用经过一个关口，统一做参数校验、超时、截断、幂等、审计、身份注入、风险分级。
 - **每个工具**：清晰的描述（何时用、何时不用）、命名空间前缀、严格 Schema、可操作的错误信息、owner。
 - **加分点**：用评估集验证工具选择准确率，每次增减工具都回归。
-- 课程：[第 02 课](../lessons/02_tools/README.md) · [第 04 课](../lessons/04_orchestration/README.md)
+- 课程：[第 03 课](../lessons/03_tools/README.md) · [第 06 课](../lessons/06_orchestration/README.md)
 
 </details>
 
@@ -295,7 +295,7 @@
 - **质量**：先小批量试跑（如 100 张）并人工抽检，再全量；按类别统计成功率；无法处理的工单归入"人工处理"队列而不是强行处理。
 - **幂等**：批任务整体可能被重跑，每张工单的写操作要幂等。
 - **可观测**：批次级看板（进度、成功率、失败原因分布、成本）。
-- 课程：[第 05 课](../lessons/05_reliability/README.md) · [第 10 课](../lessons/10_distributed_concurrency/README.md) · [第 11 课](../lessons/11_cost_latency/README.md)
+- 课程：[第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 14 课](../lessons/14_cost_latency/README.md)
 
 </details>
 
@@ -313,7 +313,7 @@
   - 用户侧展示"待审批"状态；
   - 审批决定和审批人身份写入审计。
 - **加分点**：主流框架的对应机制——LangGraph 的 `interrupt()` + `Command(resume=...)`（注意节点会从头重跑）、OpenAI Agents SDK 的 `needs_approval` + 可序列化 `RunState`、Temporal 的 Signal + `wait_condition`。
-- 课程：[第 06 课](../lessons/06_security/README.md) · [第 05 课](../lessons/05_reliability/README.md)
+- 课程：[第 09 课](../lessons/09_security/README.md) · [第 08 课](../lessons/08_reliability/README.md)
 
 </details>
 
@@ -329,7 +329,7 @@
 5. **接入 CI**：之后每次修改提示词、工具、模型都跑评估，通过率低于阈值或出现回归就阻止合并；
 6. **持续回流**：建立线上 bad case → 标注 → 入库的流程，并按标签（意图、难度、风险）分组看通过率；
 7. **多次运行**：每条用例跑多次，关注 pass^k。
-- 课程：[第 08 课](../lessons/08_evals/README.md) · 失败模式 [E1](failure-modes.md#e1-评估集脱节evalproduction-skew)、[E4](failure-modes.md#e4-修一坏三prompt-regression)
+- 课程：[第 11 课](../lessons/11_evals/README.md) · 失败模式 [E1](failure-modes.md#e1-评估集脱节evalproduction-skew)、[E4](failure-modes.md#e4-修一坏三prompt-regression)
 
 </details>
 
@@ -344,7 +344,7 @@
 - **灰度上线**：按比例或按租户切流量，对比线上业务指标（任务完成率、转人工率、用户反馈）；准备好一键回滚。
 - **固定版本**：新模型也要固定到具体快照（[E5](failure-modes.md#e5-模型静默漂移silent-model-drift)）。
 - **算总账**：成本下降是否被更多步数、更高转人工率抵消？
-- 课程：[第 08 课](../lessons/08_evals/README.md) · [第 11 课](../lessons/11_cost_latency/README.md) · [第 13 课](../lessons/13_release_ops/README.md)
+- 课程：[第 11 课](../lessons/11_evals/README.md) · [第 14 课](../lessons/14_cost_latency/README.md) · [第 16 课](../lessons/16_release_ops/README.md)
 
 </details>
 
@@ -359,7 +359,7 @@
 - **读取策略**：检索出的记忆作为不可信数据处理；冲突时新覆盖旧；支持过期。
 - **用户权利**：用户可以查看、删除自己的记忆；租户注销时能整体删除。
 - **加分点**：记忆是间接注入的持久化载体——一次成功的注入写进记忆，就会在之后的每次会话中生效（OWASP Agentic Top 10 的 ASI06 Memory & Context Poisoning）。
-- 课程：[第 03 课](../lessons/03_context_memory/README.md) · 失败模式 [C5](failure-modes.md#c5-记忆串户cross-tenant-memory-leak)、[C6](failure-modes.md#c6-记忆投毒与过期memory-poisoning--staleness)
+- 课程：[第 04 课](../lessons/04_context_memory/README.md) · 失败模式 [C5](failure-modes.md#c5-记忆串户cross-tenant-memory-leak)、[C6](failure-modes.md#c6-记忆投毒与过期memory-poisoning--staleness)
 
 </details>
 
@@ -376,7 +376,7 @@
 - **工具数量**：接入后工具总数是否过多？是否需要按场景过滤？
 - **可观测与审计**：MCP 工具调用同样进入 trace 和审计。
 - 参考：MCP 规范中的安全原则（用户同意与控制、数据隐私、工具安全）以及官方的安全最佳实践文档。
-- 课程：[第 02 课](../lessons/02_tools/README.md) · [第 06 课](../lessons/06_security/README.md)
+- 课程：[第 03 课](../lessons/03_tools/README.md) · [第 09 课](../lessons/09_security/README.md)
 
 </details>
 
@@ -390,7 +390,7 @@
 - **如果一定要用 Agent**：把"完整入职"做成一个粗粒度工具，内部由代码保证原子性/补偿；工具返回"已完成哪些步骤、哪些失败、哪些已回滚"。
 - **状态外置**：每个员工的入职进度存在数据库里，而不是只存在对话上下文中。
 - **可观测**：每一步都有记录，失败可以从断点重试。
-- 课程：[第 04 课](../lessons/04_orchestration/README.md) · [第 05 课](../lessons/05_reliability/README.md)
+- 课程：[第 06 课](../lessons/06_orchestration/README.md) · [第 08 课](../lessons/08_reliability/README.md)
 
 </details>
 
@@ -406,7 +406,7 @@
 5. 一键回滚；
 6. 长时间运行的任务固定在启动时的版本，避免中途切换（[R6](failure-modes.md#r6-恢复时版本错位version-skew-on-resume)）。
 - **加分点**：提示词、工具描述、模型版本、采样参数统一视为"Agent 配置"，任何一项变化都走同样的流程。
-- 课程：[第 08 课](../lessons/08_evals/README.md) · [第 13 课](../lessons/13_release_ops/README.md)
+- 课程：[第 11 课](../lessons/11_evals/README.md) · [第 16 课](../lessons/16_release_ops/README.md)
 
 </details>
 
@@ -426,7 +426,7 @@
   - 模型服务商侧的数据（取决于其数据保留政策）。
 - **审计日志**：通常需要保留以满足合规要求，要与法务确认；这也是审计日志本身要脱敏的原因之一。
 - **设计启示**：从一开始就为每类存储设置保留期、按用户可检索可删除；画一张数据流图，否则删除请求无法完整执行。
-- 课程：[第 06 课](../lessons/06_security/README.md) · [第 09 课](../lessons/09_production_architecture/README.md)
+- 课程：[第 09 课](../lessons/09_security/README.md) · [第 12 课](../lessons/12_production_architecture/README.md)
 
 </details>
 
@@ -445,7 +445,7 @@
 4. **普遍变贵**：检查提示词缓存命中率是否下降（有人在提示词开头加了动态内容？——[B2](failure-modes.md#b2-缓存击穿prompt-cache-busting)）、上下文策略是否失效、是否误切到更贵的模型；
 5. **流量本身**：是否有异常用户在刷量（[B1](failure-modes.md#b1-成本失控runaway-cost)）？
 6. **止血**：临时收紧预算和配额；**修复后**把原因写进评审清单。
-- 课程：[第 05 课](../lessons/05_reliability/README.md) · [第 07 课](../lessons/07_observability/README.md) · [第 11 课](../lessons/11_cost_latency/README.md)
+- 课程：[第 08 课](../lessons/08_reliability/README.md) · [第 10 课](../lessons/10_observability/README.md) · [第 14 课](../lessons/14_cost_latency/README.md)
 
 </details>
 
@@ -465,7 +465,7 @@
   - 评估集中加入该用例，检查 `must_call`；
   - 检查工具的错误信息是否清晰（[T6](failure-modes.md#t6-不透明错误opaque-errors)）。
 - **扩大排查**：用规则扫描历史运行中"声称完成但没有对应成功调用"的案例，评估影响面。
-- 课程：[第 07 课](../lessons/07_observability/README.md) · [第 08 课](../lessons/08_evals/README.md)
+- 课程：[第 10 课](../lessons/10_observability/README.md) · [第 11 课](../lessons/11_evals/README.md)
 
 </details>
 
@@ -478,7 +478,7 @@
 - 其他可能：上下文超过模型窗口上限（检查 token 估算是否准确——粗略估算可能低估）；某个工具偶发返回超大内容。
 - 验证：在发送前加消息序列校验；复现方法是构造足够长的对话触发截断。
 - 修复：按块截断；用模型对应的 tokenizer 或 API 返回的真实用量代替粗略估算。
-- 课程：[第 03 课](../lessons/03_context_memory/README.md)
+- 课程：[第 04 课](../lessons/04_context_memory/README.md)
 
 </details>
 
@@ -492,7 +492,7 @@
 - **积压**：队列中堆积的请求在恢复后需要时间消化；用户侧的重复点击又制造了更多请求。
 - **修复**：只在一层重试 + 指数退避 + 全抖动 + 重试预算；熔断器快速失败；限制并发和队列长度（超出直接拒绝并提示用户稍后再试）；客户端断开时取消后台运行。
 - **验证**：故障演练——模拟服务商返回 429/503，观察放大系数和恢复时间。
-- 课程：[第 05 课](../lessons/05_reliability/README.md) · [第 10 课](../lessons/10_distributed_concurrency/README.md)
+- 课程：[第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md)
 
 </details>
 
@@ -509,7 +509,7 @@
 5. **用户重复提交**：前端没有防重复提交。
 
 修复：幂等键（`run_id:call_id`）传递给工单系统；幂等存储持久化；业务键去重（同一用户同类问题的时间窗口）；前端防重复提交。
-- 课程：[第 05 课](../lessons/05_reliability/README.md) · [第 10 课](../lessons/10_distributed_concurrency/README.md) · 失败模式 [T5](failure-modes.md#t5-重复副作用duplicate-side-effects)
+- 课程：[第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · 失败模式 [T5](failure-modes.md#t5-重复副作用duplicate-side-effects)
 
 </details>
 
@@ -525,7 +525,7 @@
 - **环境差异**：评估用的是模拟工具/数据，线上工具返回的数据格式、延迟、错误都不一样；
 - **线上配置不同**：模型版本、降级、提示词版本和评估时不一致（[R3](failure-modes.md#r3-降级后静默变差silent-degradation)、[E5](failure-modes.md#e5-模型静默漂移silent-model-drift)）。
 - **行动**：抽取投诉样本分析归类 → 补进评估集 → 多次运行 → 人工校准评委。
-- 课程：[第 08 课](../lessons/08_evals/README.md)
+- 课程：[第 11 课](../lessons/11_evals/README.md)
 
 </details>
 
@@ -539,7 +539,7 @@
 - **输入分布变化**：是否来了一批新类型的请求（新租户、新功能入口）？
 - **上游数据变化**：某个工具返回的数据格式变了，导致模型输出异常？
 - **修复**：固定模型快照；优先使用原生结构化输出；保留修复循环作为兜底；建立金丝雀评估（定时跑固定用例，指标突变即告警）。
-- 课程：[第 08 课](../lessons/08_evals/README.md) · [第 13 课](../lessons/13_release_ops/README.md)
+- 课程：[第 11 课](../lessons/11_evals/README.md) · [第 16 课](../lessons/16_release_ops/README.md)
 
 </details>
 
@@ -559,7 +559,7 @@
   - 读取不可信内容后，禁止自动发起高风险操作；
   - 审批界面突出显示"本次操作发生在读取外部内容之后"；
   - 把该工单内容加入红队测试集。
-- 课程：[第 06 课](../lessons/06_security/README.md)
+- 课程：[第 09 课](../lessons/09_security/README.md)
 
 </details>
 
@@ -576,7 +576,7 @@
   - 某个工具开始大量失败 → 下游 API 变更（查 `error_type` 分布）。
 - **按维度拆分**：按意图、租户、模型版本看比例，定位集中在哪里。
 - **修复后**：把典型失败运行加入评估集。
-- 课程：[第 01 课](../lessons/01_agent_loop/README.md) · [第 07 课](../lessons/07_observability/README.md)
+- 课程：[第 02 课](../lessons/02_agent_loop/README.md) · [第 10 课](../lessons/10_observability/README.md)
 
 </details>
 
@@ -594,7 +594,7 @@
   - 监控 paused 运行的数量和年龄；
   - 定期清理任务。
 - **反思**：审批量是否过大？如果审批通过率接近 100%，可能有很多不必要的审批，应当调整风险分级规则。
-- 课程：[第 06 课](../lessons/06_security/README.md) · [第 09 课](../lessons/09_production_architecture/README.md)
+- 课程：[第 09 课](../lessons/09_security/README.md) · [第 12 课](../lessons/12_production_architecture/README.md)
 
 </details>
 
@@ -613,7 +613,7 @@
   - 真正的长任务改为异步通知模式；
   - 客户端断开时取消后台运行，避免无效消耗。
 - **注意**：前端/网关超时之后后台还在执行，既浪费钱，又可能产生用户不知道的副作用。
-- 课程：[第 05 课](../lessons/05_reliability/README.md) · [第 10 课](../lessons/10_distributed_concurrency/README.md) · [第 11 课](../lessons/11_cost_latency/README.md) · 失败模式 [P4](failure-modes.md#p4-长尾延迟爆炸tail-latency-blowup)
+- 课程：[第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 14 课](../lessons/14_cost_latency/README.md) · 失败模式 [P4](failure-modes.md#p4-长尾延迟爆炸tail-latency-blowup)
 
 </details>
 
@@ -621,7 +621,7 @@
 
 ## 四、分布式、高并发、成本与发布
 
-> 这一部分对应第二部分的 [第 10 课](../lessons/10_distributed_concurrency/README.md)、[第 11 课](../lessons/11_cost_latency/README.md)、[第 12 课](../lessons/12_enterprise_rag/README.md)、[第 13 课](../lessons/13_release_ops/README.md)。这类题在高级岗位面试中出现频率很高：面试官想知道你能不能把一个"单机能跑的 Agent"变成"能扛生产流量、能安全发布的系统"。
+> 这一部分对应第二部分的 [第 13 课](../lessons/13_distributed_concurrency/README.md)、[第 14 课](../lessons/14_cost_latency/README.md)、[第 15 课](../lessons/15_enterprise_rag/README.md)、[第 16 课](../lessons/16_release_ops/README.md)。这类题在高级岗位面试中出现频率很高：面试官想知道你能不能把一个"单机能跑的 Agent"变成"能扛生产流量、能安全发布的系统"。
 
 ### X1. 同一会话的两条消息被两个 worker 并发处理，会出什么问题？有哪些解决方案？怎么选？ ⭐⭐
 
@@ -638,7 +638,7 @@
   | 分布式锁 | 处理前抢锁 | 直观 | 必须有租约和 fencing token，否则不安全；锁服务成为依赖 |
 
 - **怎么选**：Agent 会话天然是"一个会话一条时间线"，首选**按会话分区串行化**；状态写入再加一层**版本号 CAS** 兜底。用户在上一条还没处理完时又发了一条，可以合并进同一次运行，或排队等待。
-- 课程：[第 10 课](../lessons/10_distributed_concurrency/README.md)
+- 课程：[第 13 课](../lessons/13_distributed_concurrency/README.md)
 
 </details>
 
@@ -651,7 +651,7 @@
 - **为什么不够**：worker 可能并没有死，只是"暂停"了（长时间 GC、网络分区、虚拟机被挂起）。租约过期、任务被转交后，它醒过来并不知道自己已经失去租约，继续写入——出现两个 worker 同时处理同一任务（[D2](failure-modes.md#d2-僵尸-workerzombie-worker)）。在执行前检查一下租约也不行，因为检查和写入之间仍然可能暂停。
 - **fencing token**：每次授予租约时发一个单调递增的号码；worker 写入时带上它；**存储端**拒绝号码比已见过的更小的写入。这样即使僵尸 worker 醒来，它的写入也会被拒绝。Martin Kleppmann 的《How to do distributed locking》对此有详细分析。
 - **加分点**：对于调用外部 API 的副作用（外部系统不认识你的 token），最后一道防线仍然是幂等键。
-- 课程：[第 10 课](../lessons/10_distributed_concurrency/README.md)
+- 课程：[第 13 课](../lessons/13_distributed_concurrency/README.md)
 
 </details>
 
@@ -668,7 +668,7 @@
   4. 可见性超时大于处理时长 p99，长任务要续期；
   5. 多次失败进死信队列。
 - 一句话总结：**恰好一次 = 至少一次 + 幂等**。
-- 课程：[第 10 课](../lessons/10_distributed_concurrency/README.md) · [第 05 课](../lessons/05_reliability/README.md)
+- 课程：[第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 08 课](../lessons/08_reliability/README.md)
 
 </details>
 
@@ -686,7 +686,7 @@
 
 - **实践**：同一个 Agent 往往需要组合——先流式响应，超过某个时长阈值自动转为后台任务并通知用户。
 - **关键**：各层超时要一致（前端 < 网关 < 服务端预算），客户端断开时取消或转后台，而不是让后台"无人认领"地继续执行（[P4](failure-modes.md#p4-长尾延迟爆炸tail-latency-blowup)）。
-- 课程：[第 10 课](../lessons/10_distributed_concurrency/README.md)
+- 课程：[第 13 课](../lessons/13_distributed_concurrency/README.md)
 
 </details>
 
@@ -699,7 +699,7 @@
 - **不用的问题**：先写库再发消息——两步之间崩溃，库里有工单但没人收到事件；先发消息再写库——事务回滚了，消息却已发出。两个系统无法在一个事务中提交（[D7](failure-modes.md#d7-双写不一致dual-write-inconsistency)）。
 - **做法**：业务数据和"待发送事件"在**同一个数据库事务**里写入（事件进 outbox 表）；独立的中继进程轮询或订阅 outbox，把事件发布到消息队列，成功后标记已发送。
 - **代价**：中继进程可能重复发送（至少一次），所以消费端要幂等；事件有少量延迟。
-- 课程：[第 10 课](../lessons/10_distributed_concurrency/README.md)
+- 课程：[第 13 课](../lessons/13_distributed_concurrency/README.md)
 
 </details>
 
@@ -713,7 +713,7 @@
 - **公平**：按租户划分配额，**加权公平排队**（按套餐/优先级分配权重）；交互式请求优先于批处理；单个租户的突发不能挤占其他租户（[P3](failure-modes.md#p3-吵闹邻居noisy-neighbor)）。
 - **背压**：拿不到令牌时排队（有上限）或快速失败并告知用户，不要立即重试（否则就是重试风暴，[R1](failure-modes.md#r1-重试风暴retry-storm)）。
 - **容量规划**：服务商配额是真正的上限——按队列深度扩容 worker 并不能突破它，需要提前申请配额或多供应商分流。
-- 课程：[第 10 课](../lessons/10_distributed_concurrency/README.md) · [第 09 课](../lessons/09_production_architecture/README.md)
+- 课程：[第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 12 课](../lessons/12_production_architecture/README.md)
 
 </details>
 
@@ -729,7 +729,7 @@
   - 优先处理新消息和交互式消息。
 - **扩容要谨慎**：如果瓶颈是模型配额，扩容 worker 只会制造更多 429。
 - **预防**：消息带截止时间；监控"最老消息年龄"而不只是队列深度；交互式与批处理分队列；准入控制与背压；死信队列隔离毒消息；重试走延迟队列而不是回到队头。
-- 课程：[第 10 课](../lessons/10_distributed_concurrency/README.md)
+- 课程：[第 13 课](../lessons/13_distributed_concurrency/README.md)
 
 </details>
 
@@ -746,7 +746,7 @@
 - **缓存键**：租户 + 权限范围（如 ACL 哈希）+ 模型版本 + 提示词版本 + 规范化输入（语义缓存则在这个分区内做相似度匹配）。
 - **适用范围**：只缓存公共、非个性化、不依赖实时数据的回答；相似度阈值用评估数据确定，并监控"命中但答错"的比例；源数据变更时按来源失效。
 - **区分**：语义缓存（应用层，按意思命中）≠ 提示词缓存（服务商层，按前缀复用计算，不会返回错误答案）。
-- 课程：[第 11 课](../lessons/11_cost_latency/README.md) · [第 12 课](../lessons/12_enterprise_rag/README.md)
+- 课程：[第 14 课](../lessons/14_cost_latency/README.md) · [第 15 课](../lessons/15_enterprise_rag/README.md)
 
 </details>
 
@@ -762,7 +762,7 @@
   - 成本敏感且无法取消——模型调用如果两个都跑完，就是双倍成本；
   - 延迟来自请求本身（输入很长、步骤很多），而不是下游的随机抖动——对冲无效。
 - **适合的地方**：只读检索、无工具的短文本生成等幂等请求，并设置合理的触发阈值。
-- 课程：[第 11 课](../lessons/11_cost_latency/README.md)
+- 课程：[第 14 课](../lessons/14_cost_latency/README.md)
 
 </details>
 
@@ -775,7 +775,7 @@
 - **升级条件**（可组合）：小模型的结构化输出校验失败；小模型自评或分类器给出的置信度低；任务类型属于已知的困难类别；规则检查不通过（如回答没有引用来源）。
 - **用评估定阈值**：在评估集上画出"升级比例 vs 总体质量 vs 总成本"的曲线，选择满足质量底线的最低成本点。
 - **注意**：级联会让困难请求的延迟变成两次调用之和；小模型的错误如果"看起来很自信"就不会触发升级——所以升级条件不能只依赖模型自评。
-- 课程：[第 11 课](../lessons/11_cost_latency/README.md) · 失败模式 [B4](failure-modes.md#b4-杀鸡用牛刀model-over-provisioning)
+- 课程：[第 14 课](../lessons/14_cost_latency/README.md) · 失败模式 [B4](failure-modes.md#b4-杀鸡用牛刀model-over-provisioning)
 
 </details>
 
@@ -791,7 +791,7 @@
   2. 即使在进入模型前剔除，top-k 可能被无权文档占满，有权文档反而没被召回，质量下降；
   3. 检索结果的数量、排序、摘要等侧信道可能泄露无权文档的存在（[C7](failure-modes.md#c7-权限后过滤泄露post-filter-acl-leak)）。
 - **前过滤的挑战**：ACL 要随文档一起入索引并保持同步；权限变更要及时传播；复杂的权限模型（继承、群组）需要展开。
-- 课程：[第 12 课](../lessons/12_enterprise_rag/README.md)
+- 课程：[第 15 课](../lessons/15_enterprise_rag/README.md)
 
 </details>
 
@@ -804,7 +804,7 @@
 - **机制**：索引条目带来源 ID、版本、更新时间和过期时间；事件驱动的增量同步为主，定期全量对账兜底（找出"源系统已不存在但索引中还在"的条目）。
 - **验证**：删除一篇金丝雀文档，测量多久之后检索不到；监控检索结果中陈旧文档的比例。
 - **回答层面**：回答附带引用和文档版本/日期，引用校验不通过的陈述不输出（[C9](failure-modes.md#c9-引用失真citation-hallucination)）。
-- 课程：[第 12 课](../lessons/12_enterprise_rag/README.md)
+- 课程：[第 15 课](../lessons/15_enterprise_rag/README.md)
 
 </details>
 
@@ -821,7 +821,7 @@
 
 - **一次提示词修改的典型路径**：离线评估通过（无回归）→ 影子模式对比（尤其是涉及写操作的改动，影子模式中工具调用要被拦截或模拟）→ 金丝雀（如 1% → 5%，观察完成率、`stop_reason` 分布、成本）→ 需要衡量业务效果时做 A/B → 全量。
 - **贯穿始终**：按稳定标识分桶、会话内版本固定（[D6](failure-modes.md#d6-灰度分桶不稳定unstable-canary-bucketing)）；每次运行记录版本；准备好自动回滚。
-- 课程：[第 13 课](../lessons/13_release_ops/README.md)
+- 课程：[第 16 课](../lessons/16_release_ops/README.md)
 
 </details>
 
@@ -836,7 +836,7 @@
 - **规模效应**：全量后触发了灰度时没触发的限制——模型配额、缓存命中率变化、队列积压、下游限流（[D9](failure-modes.md#d9-限流只在单机生效local-only-rate-limiting)）。
 - **交互影响**：全量期间恰好有其他变更（模型别名更新、知识库更新）同时生效（[E5](failure-modes.md#e5-模型静默漂移silent-model-drift)）。
 - **应对**：分层抽样的灰度、稳定分桶、足够的样本量和观察时长、按租户/意图拆分指标、一次只发布一个变更、全量后仍保留自动回滚条件。
-- 课程：[第 13 课](../lessons/13_release_ops/README.md)
+- 课程：[第 16 课](../lessons/16_release_ops/README.md)
 
 </details>
 
@@ -855,7 +855,7 @@
   - 回滚后正在运行的长任务怎么办（版本锁定 + 兼容的状态格式）；
   - 回滚不能依赖出问题的那套系统（紧急开关独立）；
   - 自动回滚之后要通知人并留下记录，进入复盘。
-- 课程：[第 13 课](../lessons/13_release_ops/README.md)
+- 课程：[第 16 课](../lessons/16_release_ops/README.md)
 
 </details>
 
@@ -872,7 +872,7 @@
   - 缺失的防线 → 设计评审清单新增条目；
   - 处置过程中的混乱 → 更新运行手册。
 - **数据飞轮**：线上问题 → 标注 → 评估集与改进 → 更好的版本 → 新的线上数据，持续循环。
-- 课程：[第 13 课](../lessons/13_release_ops/README.md) · [第 08 课](../lessons/08_evals/README.md)
+- 课程：[第 16 课](../lessons/16_release_ops/README.md) · [第 11 课](../lessons/11_evals/README.md)
 
 </details>
 
@@ -892,7 +892,7 @@
 - **质量**：混合检索 + 重排序；回答必须引用来源；找不到就说找不到（[M5](failure-modes.md#m5-政策幻觉policy-hallucination)）。
 - **安全**：文档内容视为不可信数据（任何员工都能写文档，就能在文档里藏注入）；输出脱敏。
 - **评估**：问答对数据集 + 有据性（groundedness）评分 + 权限越权测试。
-- 课程：[第 12 课](../lessons/12_enterprise_rag/README.md) · [第 06 课](../lessons/06_security/README.md)
+- 课程：[第 15 课](../lessons/15_enterprise_rag/README.md) · [第 09 课](../lessons/09_security/README.md)
 
 </details>
 
@@ -905,7 +905,7 @@
 - **可靠性**：多供应商/多区域故障转移；熔断；**重试策略要与应用侧协调，避免双层重试**。
 - **可观测性**：每次请求记录应用、租户、模型、token、延迟、成本、错误码；按 OpenTelemetry GenAI 约定输出。
 - **权衡**：网关增加一跳延迟；成为单点，需要高可用部署；功能越多越重——保持核心精简。
-- 课程：[第 09 课](../lessons/09_production_architecture/README.md) · [第 10 课](../lessons/10_distributed_concurrency/README.md) · [第 11 课](../lessons/11_cost_latency/README.md)
+- 课程：[第 12 课](../lessons/12_production_architecture/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 14 课](../lessons/14_cost_latency/README.md)
 
 </details>
 
@@ -919,7 +919,7 @@
 - **评分**：规则评分器 + 轨迹评分器 + LLM 评委（细则化、定期人工校准）。
 - **报告**：通过率（总体与分标签）、pass^k、回归列表、成本、延迟、步数；与基线对比。
 - **CI 门禁**：通过率阈值 + 回归为零；评估成本本身也要控制（按变更范围选择子集，夜间跑全量）。
-- 课程：[第 08 课](../lessons/08_evals/README.md)
+- 课程：[第 11 课](../lessons/11_evals/README.md)
 
 </details>
 
@@ -933,7 +933,7 @@
 - **安全**：审批人身份认证；职责分离（发起人不能审批自己）；审批请求内容防篡改（签名或只存引用）；审批结果带签名，Agent 服务验证后才执行。
 - **体验**：推送到审批人常用的渠道；清晰展示影响范围和上下文（包括"是否在读取外部内容后发起"）。
 - **治理**：过期策略、审批时长监控、通过率监控（防橡皮图章）、完整审计。
-- 课程：[第 06 课](../lessons/06_security/README.md)
+- 课程：[第 09 课](../lessons/09_security/README.md)
 
 </details>
 
@@ -948,7 +948,7 @@
 - **配置隔离**：租户自定义的提示词、工具、知识库都视为该租户范围内的不可信内容，不能影响其他租户。
 - **验证**：自动化跨租户越权测试（金丝雀数据）；定期审计。
 - **成本**：按租户计量与报表。
-- 课程：[第 09 课](../lessons/09_production_architecture/README.md) · [第 10 课](../lessons/10_distributed_concurrency/README.md) · [第 12 课](../lessons/12_enterprise_rag/README.md) · 失败模式 [C5](failure-modes.md#c5-记忆串户cross-tenant-memory-leak)
+- 课程：[第 12 课](../lessons/12_production_architecture/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 15 课](../lessons/15_enterprise_rag/README.md) · 失败模式 [C5](failure-modes.md#c5-记忆串户cross-tenant-memory-leak)
 
 </details>
 
@@ -963,7 +963,7 @@
 - **可靠性**：操作幂等；修复后验证效果（确定性检查）；设置"同一服务 1 小时内最多自动重启 N 次"之类的熔断，防止自动修复本身把事故放大。
 - **可观测**：每次诊断和操作都有 trace 和审计，事后可复盘。
 - **评估**：用历史事故构造评估集（诊断准确率、是否选择了正确的修复动作、是否有危险动作）；先在影子模式下运行（只给建议不执行）。
-- 课程：[第 06 课](../lessons/06_security/README.md) · [综合实战](../capstone/README.md)
+- 课程：[第 09 课](../lessons/09_security/README.md) · [综合实战](../capstone/README.md)
 
 </details>
 
@@ -983,7 +983,7 @@
 - **故障处理**：worker 崩溃 → 租约过期由别的 worker 接手，从检查点恢复，fencing token 挡住僵尸写入（[D2](failure-modes.md#d2-僵尸-workerzombie-worker)）；模型限流 → 排队 + 背压 + 降级；大租户热点 → 加权公平排队；队列积压 → 截止时间 + 准入控制（[D4](failure-modes.md#d4-队列积压雪崩queue-backlog-avalanche)）。
 - **长任务**：超过阈值的任务转入工作流引擎或异步队列，完成后通知。
 - **可观测**：每会话 trace、队列深度与最老消息年龄、全局配额使用率、按租户的延迟和错误率。
-- 课程：[第 10 课](../lessons/10_distributed_concurrency/README.md) · [第 09 课](../lessons/09_production_architecture/README.md)
+- 课程：[第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 12 课](../lessons/12_production_architecture/README.md)
 
 </details>
 
@@ -1081,7 +1081,7 @@ flowchart TD
 - 大促降级预案：流量超过阈值时，Agent 路径只保留查询能力，退换货改为"提交申请，稍后处理"的异步模式；
 - 退款工具的幂等键传给退款服务；检查点记录每一步，崩溃可恢复；
 - 所有非正常结束都有友好话术和转人工入口；
-- 同一会话的消息按会话 ID 分区串行处理，避免用户连续发消息时的并发写（[D1](failure-modes.md#d1-丢失更新lost-update)）；对模型服务商做全局限流，并按渠道/优先级排队（[第 10 课](../lessons/10_distributed_concurrency/README.md)）。
+- 同一会话的消息按会话 ID 分区串行处理，避免用户连续发消息时的并发写（[D1](failure-modes.md#d1-丢失更新lost-update)）；对模型服务商做全局限流，并按渠道/优先级排队（[第 13 课](../lessons/13_distributed_concurrency/README.md)）。
 
 **安全**
 
@@ -1096,7 +1096,7 @@ flowchart TD
 - 从历史客服对话中抽样、脱敏，构建评估集，按意图和难度打标签；
 - 核心指标：问题解决率、转人工率、**误退款率（红线）**、满意度；
 - 评估方式：规则（是否调用了正确工具、是否没有越权退款）+ LLM 评委（回答质量，定期人工校准）；每条用例多次运行看 pass^k；
-- 上线路径：影子模式（Agent 生成回复但不发送，与人工客服的实际处理对比）→ 小流量灰度（按用户稳定分桶）→ 逐步放量，并设置自动回滚条件（[第 13 课](../lessons/13_release_ops/README.md)）。
+- 上线路径：影子模式（Agent 生成回复但不发送，与人工客服的实际处理对比）→ 小流量灰度（按用户稳定分桶）→ 逐步放量，并设置自动回滚条件（[第 16 课](../lessons/16_release_ops/README.md)）。
 
 **成本**
 
@@ -1104,7 +1104,7 @@ flowchart TD
 - 提示词缓存：系统提示词和工具定义保持稳定、放在前面；
 - 每次运行和每个会话都有 token/金额预算；每用户每日有配额，防止刷量；
 - 按意图统计成本，找到最贵的意图优先优化；
-- 不含个人信息的公共 FAQ 回答可以缓存，缓存键包含模型版本和提示词版本；任何涉及订单、账户的回答都不进共享缓存（[D5](failure-modes.md#d5-缓存跨租户泄露cross-tenant-cache-leak)，[第 11 课](../lessons/11_cost_latency/README.md)）。
+- 不含个人信息的公共 FAQ 回答可以缓存，缓存键包含模型版本和提示词版本；任何涉及订单、账户的回答都不进共享缓存（[D5](failure-modes.md#d5-缓存跨租户泄露cross-tenant-cache-leak)，[第 14 课](../lessons/14_cost_latency/README.md)）。
 
 #### 5）权衡
 

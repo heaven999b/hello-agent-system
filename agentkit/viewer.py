@@ -6,7 +6,7 @@
 在 Python 里用：
 
     from agentkit.viewer import load_spans, render_html
-    html = render_html(load_spans("traces.jsonl"), title="第 07 课")
+    html = render_html(load_spans("traces.jsonl"), title="第 10 课")
     html = render_html(tracer.traces)          # 也可以直接传 Span 对象（会自动展开子 span）
 
 页面长这样：左侧是 trace 列表（每个根 span 一条），右侧是瀑布图（waterfall）——

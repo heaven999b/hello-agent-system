@@ -1,15 +1,15 @@
 """agentkit —— 一个为教学而写、按生产标准设计的最小 Agent 框架。
 
 每个模块对应一节课：
-    types / llm        LLM 抽象与消息格式            （第 01 课）
-    agent              Agent 主循环                  （第 01 课）
-    tools              工具系统                      （第 02 课）
-    context / memory   上下文工程与长期记忆          （第 03 课）
-    workflows          编排模式与多 Agent            （第 04 课）
-    reliability/budget/state  可靠性、预算、检查点   （第 05 课）
-    guardrails / permissions / audit  安全与治理     （第 06 课）
-    tracing            可观测性                      （第 07 课）
-    evals              评估                          （第 08 课）
+    types / llm        LLM 抽象与消息格式            （第 02 课）
+    agent              Agent 主循环                  （第 02 课）
+    tools              工具系统                      （第 03 课）
+    context / memory   上下文工程与长期记忆          （第 04 课）
+    workflows          编排模式与多 Agent            （第 06 课）
+    reliability/budget/state  可靠性、预算、检查点   （第 08 课）
+    guardrails / permissions / audit  安全与治理     （第 09 课）
+    tracing            可观测性                      （第 10 课）
+    evals              评估                          （第 11 课）
 """
 
 from .agent import Agent, RunResult
