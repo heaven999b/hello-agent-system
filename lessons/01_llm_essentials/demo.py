@@ -1,14 +1,15 @@
 """第 01 课 Demo：用真实模型把"写 Agent 之前必须懂的 LLM 知识"逐条验证一遍。
 
-    .venv/bin/python lessons/01_llm_essentials/demo.py            # 真实模型（读取 .env；约 18 次调用，约 1 分钟）
+    .venv/bin/python lessons/01_llm_essentials/demo.py            # 真实模型（读取 .env；约 19 次调用，约 1 分钟）
     .venv/bin/python lessons/01_llm_essentials/demo.py --offline  # 离线：剧本 + 模拟数据，无需 API key
 
-五个小节：
+六个小节：
     1. Token 与成本：估算值 vs API 返回的真实 usage；工具定义也要花钱
     2. 采样与非确定性：同一个问题在 temperature 0 和 1 下各跑 3 次
     3. Function calling 的真实机制：模型只输出一段 JSON，执行工具的是你的代码
     4. 流式输出：首 token 延迟（TTFT），以及工具调用参数是一片一片到达的
     5. 结构化输出：原生 JSON Schema 约束 vs "提示词 + 校验 + 修复"
+    6. 约束解码与 logprobs：格式合法 ≠ 判断正确；让模型告诉你它有多确定（网关不支持时降级）
 
 两种模式走的是**同一套代码**：离线模式只是把 OpenAI 客户端换成了一个按剧本返回的假客户端。
 """
@@ -80,7 +81,7 @@ def run_section(fn: Callable[[], None]) -> None:
 
 
 class Backend:
-    """client：OpenAI 兼容客户端（原始 API，第 1~5 节都用它）；llm：agentkit 的 LLM（第 5 节 complete_json 用）。"""
+    """client：OpenAI 兼容客户端（原始 API，第 1~6 节都用它）；llm：agentkit 的 LLM（第 5 节 complete_json 用）。"""
 
     def __init__(self, client: Any, model: str, llm: Any):
         self.client, self.model, self.llm = client, model, llm
@@ -514,6 +515,73 @@ def section_5_structured_output(b: Backend) -> None:
         note(f"一共调用了 {len(rec.outputs)} 次模型。修复有上限，成本可预期；修不好就抛异常，交给上层处理。")
 
 
+# ════════════════════════════════════════════════════════════════════ 第 6 节：约束解码与 logprobs
+
+LABELS = ("network", "account", "hardware", "software")
+CLASSIFY_PROMPT = f"把下面这条 IT 求助分类，只输出一个英文单词（{' / '.join(LABELS)}），不要输出其他任何内容。\n\n{EMAIL}"
+CONFIDENCE_THRESHOLD = 0.9  # 低于它就转人工复核。阈值要用标注数据校准，这里只是演示
+
+
+def section_6_decoding(b: Backend) -> None:
+    banner("第 6 节  约束解码与 logprobs：\"只许说合法的话\"，以及\"它有多确定\"")
+    say("6a. 约束解码的原理（纯本地计算，数字是为了演示编的；把每个候选值当成一个 token 是简化）")
+    say("   模型要给工单填 priority，Schema 只允许 P1 / P2 / P3 / P4。假设第一步的候选打分如下：")
+    logits = {"紧急": 2.6, "P2": 1.4, "P1": 1.1, "high": 0.9, "P3": 0.2}
+    allowed = {"P1", "P2", "P3", "P4"}
+    probs = softmax(logits, 1.0)
+    kept = {k: v for k, v in probs.items() if k in allowed}
+    total = sum(kept.values())
+    say(f"   {pad('候选', 8)}{pad('原始概率', 12, True)}{pad('Schema 允许?', 16, True)}{pad('约束后概率', 14, True)}")
+    for k, p in probs.items():
+        after = f"{kept[k] / total:.1%}" if k in kept else "0（被屏蔽）"
+        say(f"   {pad(k, 8)}{pad(f'{p:.1%}', 12, True)}{pad('是' if k in allowed else '否', 16, True)}{pad(after, 14, True)}")
+    free = max(probs, key=probs.get)
+    forced = max(kept, key=kept.get)
+    say(f"   不加约束，贪心选最高分：{free!r} → 不在枚举里，校验失败")
+    say(f"   约束解码：把不合法的候选概率置零、剩下的重新归一化 → 选出 {forced!r}，格式一定合法")
+    note(f"模型\"想说\"的是紧急（也就是 P1），约束把它挤到了 {forced}：格式合法，判断却错了。约束管得了格式，管不了内容。")
+    say("   complete_json 的修复循环走另一条路：先让它说出\"紧急\"，校验失败后把错误发回去，模型有机会重新想（第 5 节）。")
+    say("   代价是多一次调用。真实模型在提示词里看到 Schema 后，概率通常已经集中在合法值上，这种\"挤压\"没这么夸张。")
+
+    say()
+    say("6b. 请求 logprobs：让模型给出每个输出 token 的对数概率，当作分类的置信度")
+    messages = [{"role": "user", "content": CLASSIFY_PROMPT}]
+    try:
+        r = b.create(messages=messages, logprobs=True, top_logprobs=5)
+    except Exception as e:  # noqa: BLE001 —— 有的网关 / 推理模型直接拒绝这个参数
+        say(f"   ⚠️  这个模型 / 网关拒绝了 logprobs 参数：{str(e)[:140]}")
+        show_logprob_fallback()
+        return
+    content = (r.choices[0].message.content or "").strip()
+    lp = r.choices[0].logprobs
+    say(f"   模型输出：{content!r}")
+    if lp is None or not lp.content:
+        say("   ⚠️  请求成功（HTTP 200），但返回里没有 logprobs：这个网关 / 模型静默忽略了它，不报错，只是不生效。")
+        show_logprob_fallback()
+        return
+    first = lp.content[0]
+    say(f"   第一个 token {first.token!r} 的候选（top_logprobs）：")
+    dist = {}
+    for alt in first.top_logprobs:
+        p = math.exp(alt.logprob)
+        dist[alt.token.strip()] = dist.get(alt.token.strip(), 0.0) + p
+        say(f"      {pad(repr(alt.token), 14)} logprob={alt.logprob:7.3f}   概率={p:6.1%}")
+    label_probs = {k: v for k, v in dist.items() if k in LABELS}
+    top = max(label_probs, key=label_probs.get) if label_probs else content
+    conf = label_probs.get(top, 0.0)
+    action = "自动路由" if conf >= CONFIDENCE_THRESHOLD else "转人工复核（或升级到更强的模型）"
+    say(f"   置信度 = P({top!r}) = {conf:.1%}，阈值 {CONFIDENCE_THRESHOLD:.0%} → {action}")
+    note("logprobs 是模型自己算出来的概率，不等于\"答对的概率\"：后训练可能破坏校准（GPT-4 技术报告的观察），阈值要用标注数据定。")
+
+
+def show_logprob_fallback() -> None:
+    say("   降级方案（按可靠程度排序）：")
+    say("     ① 换一个支持 logprobs 的接口或模型（很多推理模型不支持）；")
+    say("     ② 同一问题采样多次，看答案是否一致（第 2 节的做法，要多花几次调用）；")
+    say("     ③ 让模型在 JSON 里自报置信度 —— 最便宜也最不可靠，只能当参考。")
+    say("   离线模式（--offline）演示了拿到 logprobs 之后怎么算置信度、怎么按阈值分流。")
+
+
 # ════════════════════════════════════════════════════════════════════ 离线模式：假的 OpenAI 客户端
 #
 # 数字取自一次真实运行（本课程的 OpenAI 兼容网关，模型 gpt-5.5，2026-09），让离线输出和真实情况接近。
@@ -544,7 +612,8 @@ class FakeOpenAIClient:
         prompt, completion = spec.get("usage", (20, 10))
         return ChatCompletion.model_validate({
             "id": "chatcmpl-offline", "object": "chat.completion", "created": 0, "model": kwargs["model"],
-            "choices": [{"index": 0, "message": message, "finish_reason": spec.get("finish_reason", "stop")}],
+            "choices": [{"index": 0, "message": message, "finish_reason": spec.get("finish_reason", "stop"),
+                         "logprobs": spec.get("logprobs")}],
             "usage": {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion,
                       "prompt_tokens_details": {"cached_tokens": 0}},
         })
@@ -618,6 +687,16 @@ def _offline_responder(kwargs: dict) -> Any:
         out += [(0.01, {"tool_calls": [{"index": 1, "function": {"arguments": '{"city":"杭州"}'}}]}, None)]
         return out + [(0.0, {}, "tool_calls")]
 
+    # 第 6b 节：logprobs。本课程网关实测会静默忽略 logprobs（返回 None）；
+    # 离线剧本模拟一个支持它的接口（如 OpenAI 官方接口），数值是示意用的，不是任何模型的真实输出
+    if last == CLASSIFY_PROMPT:
+        alts = [("account", -0.12), ("software", -2.30), ("network", -4.80), ("hardware", -7.20), ("acc", -9.10)]
+        top = [{"token": t, "logprob": lp, "bytes": list(t.encode())} for t, lp in alts]
+        spec = {"content": "account", "usage": (160, 1)}
+        if kwargs.get("logprobs"):
+            spec["logprobs"] = {"content": [{**top[0], "top_logprobs": top[:kwargs.get("top_logprobs", 0)]}], "refusal": None}
+        return spec
+
     # 第 5a 节：原生结构化输出
     if kwargs.get("response_format"):
         return {"content": '{"category":"account","priority":"P1","summary":"OA 登录提示密码错误，急需报销","needs_human":true}'}
@@ -641,7 +720,8 @@ def main() -> None:
     b = offline_backend() if OFFLINE else online_backend()
     mode = "离线模式：剧本 + 模拟数据（数字取自一次真实运行记录）" if OFFLINE else f"真实模型：{b.model}"
     print(f"第 01 课 Demo · LLM 与 Agent 开发必备知识 · {mode}")
-    for section in (section_1_tokens, section_2_sampling, section_3_function_calling, section_4_streaming, section_5_structured_output):
+    for section in (section_1_tokens, section_2_sampling, section_3_function_calling, section_4_streaming,
+                    section_5_structured_output, section_6_decoding):
         run_section(lambda: section(b))
     banner("小结")
     say("1. Token：按 token 计费和限流；估算只用于预算，算钱看 usage；工具定义和隐藏指令都算输入。")
@@ -649,6 +729,7 @@ def main() -> None:
     say("3. Function calling：模型只输出\"想调用什么\"的 JSON，执行权永远在你的代码手里。")
     say("4. 流式：降低的是感知延迟（TTFT）；工具参数分片到达，必须按 index 攒齐再解析。")
     say("5. 结构化输出：优先用原生 Schema 约束；无论如何都要校验，失败就修复或大声失败。")
+    say("6. 约束解码只保证格式；logprobs 能当置信度，但要校准，而且不是每个网关都支持。")
 
 
 if __name__ == "__main__":

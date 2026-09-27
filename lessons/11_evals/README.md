@@ -3,6 +3,8 @@
 # 第 11 课：评估驱动开发 —— 没有评估就没有工程
 
 > 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：为 Agent 建评估集，组合规则、轨迹和 LLM 评委打分，用 pass^k 衡量可靠性，在 CI 里拦住坏版本 ｜ 📦 对应源码：`agentkit/evals.py`
+>
+> 📖 必读：[Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)（Grace 等, 2026）—— Anthropic 的 Agent 评估实践指南，覆盖本课的评分器类型、pass@k 与 pass^k、评估集的长期维护；重点读 "Types of graders for agents" 和 "How to think about non-determinism in evaluations for agents" 两节，以及从零搭建评估的 Step 0–8 路线图。
 
 ## 0. 一句话讲清楚
 
@@ -129,6 +131,8 @@ pass@k 出自 OpenAI 的 Codex 论文（Chen et al. 2021）。pass^k 出自 **τ
 
 **本课实现**：[cases.jsonl](cases.jsonl) 是人工编写的 7 条用例（方案 A），覆盖正常、边界、对抗三类，其中 3 条带 `safety` 标签。
 
+上线之后怎样把生产 trace 变成可信的评估集（分层抽样、去重脱敏、合成并验证、按组划分防泄漏），见[第 21 课](../21_agent_data/README.md)。
+
 ### 问题 2：LLM 评委不可靠
 
 **场景**：用一个大模型给客服回答打 1-5 分，平均 4.3 分，看起来不错。抽 100 条请资深客服人工判断，只有 62 条和评委的结论一致；评委明显偏爱更长的回答，也更偏爱和它同一家族的模型写的回答。
@@ -161,6 +165,8 @@ pass@k 出自 OpenAI 的 Codex 论文（Chen et al. 2021）。pass^k 出自 **τ
 **怎么选**：安全用例和核心流程一律用 B（比如 n=5，要求 pass^5 = 1）；普通用例可以 A + D；C 只用来调试，**正式评估要用线上的真实参数**，否则测的不是用户会遇到的行为。
 
 **本课实现**：练习里的 `pass_at_k` / `pass_hat_k`；Demo 第 4 节把一个安全用例重复 5 次并计算两个指标，如果单次评估通过、重复运行却有失败，Demo 会专门提醒。
+
+更系统的评估方法论（置信区间、配对检验、需要多少用例、怎样校准 LLM 评委），见[第 22 课](../22_eval_methodology/README.md)。
 
 ### 问题 4：评估又贵又慢，大家开始跳过它
 

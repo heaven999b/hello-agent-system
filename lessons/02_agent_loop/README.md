@@ -3,6 +3,8 @@
 # 第 02 课：Agent 循环的本质
 
 > 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：不依赖任何框架手写一个正确的 Agent 循环，并说清"企业版"循环多了什么、为什么 ｜ 📦 对应源码：[`agentkit/agent.py`](../../agentkit/agent.py)、[`agentkit/types.py`](../../agentkit/types.py)、[`agentkit/llm.py`](../../agentkit/llm.py)、[`agentkit/hooks.py`](../../agentkit/hooks.py)
+>
+> 📖 必读：[ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)（Yao 等, 2023）—— "推理 → 行动 → 观察"循环的原始论文；重点读 §2 的形式化定义和 §3.3 的人工失败模式分析（Table 2），其中模型反复生成之前的思考和行动、跳不出循环的错误，正是本课必须设 `max_steps` 的原因之一。
 
 ## 0. 一句话讲清楚
 

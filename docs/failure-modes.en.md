@@ -5,7 +5,7 @@
 > 📖 Part of the "domain reference" handbook that accompanies the course.
 > Related: [Design Review Checklist](design-review-checklist.en.md) · [Cheatsheet](cheatsheet.en.md) · [Glossary](glossary.en.md) · [Interview Questions](interview-questions.en.md)
 
-This guide catalogs **67** agent failure modes that show up in real production systems, grouped into ten categories (the last one covers distributed systems, concurrency, and release). Why a dedicated catalog?
+This guide catalogs **79** agent failure modes that show up in real production systems, grouped into eleven categories (the tenth covers distributed systems, concurrency, and release; the eleventh covers the advanced topics from Part 3 of the course: retrieval, memory, data, evals, optimization, and extended capabilities). Why a dedicated catalog?
 
 When traditional software fails, it usually throws an exception. When an agent fails, **everything often looks perfectly normal**: HTTP 200, no errors, a confident tone. Meanwhile it has invented a refund policy, opened two tickets for the same user, or told you another company's data.
 Agent failures share three traits:
@@ -100,6 +100,19 @@ Detection methods reference real agentkit fields (such as `RunResult.status`, `T
 | [D9](#d9-local-only-rate-limiting) | Local-Only Rate Limiting | The more you scale out, the more 429s you get | 🟠 Medium | Global rate limiting |
 | [D10](#d10-hedging-side-effects) | Hedging Side Effects | Requests duplicated to cut latency end up executing writes twice | 🟠 Medium | Hedge only idempotent, read-only requests |
 | [D11](#d11-incomplete-rollback) | Incomplete Rollback | The code was rolled back; the prompt wasn't | 🟠 Medium | Versioned release unit |
+| **Advanced: Retrieval, Memory, Data, Evals, Optimization, and Extended Capabilities** |||||
+| [A1](#a1-eval-set-leakage) | Eval Set Leakage | You tuned the system against the eval set; scores are inflated and drop after launch | 🔴 High | Split by group + use test only once |
+| [A2](#a2-optimizer-winners-curse) | Optimizer Winner's Curse | Dev went up 5 points; test didn't move | 🟠 Medium | Bigger dev set + paired test on test |
+| [A3](#a3-synthetic-data-distribution-shift) | Synthetic Data Distribution Shift | Synthetic cases all pass; real questions don't | 🟠 Medium | Real seeds + human spot checks + real data in the test set |
+| [A4](#a4-uncalibrated-llm-judge) | Uncalibrated LLM Judge | 67% agreement, yet it passes 4 in 5 bad answers | 🔴 High | Report kappa / TPR / TNR on a held-out set |
+| [A5](#a5-lingering-contradictory-memory) | Lingering Contradictory Memory | Facts the user corrected are still treated as current | 🟠 Medium | Slot guards + offline tidying + lineage cascades |
+| [A6](#a6-append-only-memory-rot) | Append-Only Memory Rot | Old and new facts coexist; it recommends a restaurant in last quarter's trip city | 🟠 Medium | Write-time or read-time reconciliation + TTL |
+| [A7](#a7-mcp-rug-pull) | MCP Rug Pull | A reviewed MCP server starts exfiltrating data after an update | 🔴 High | Pinned versions + definition fingerprints + ignore annotations |
+| [A8](#a8-ineffective-sandbox-limits) | Ineffective Sandbox Limits | Memory cap set, still exhausted; HOME changed, ~/.ssh still readable | 🔴 High | Verify limits + OS sandbox / container / microVM |
+| [A9](#a9-coding-agent-test-gaming) | Coding Agent Test Gaming | Tests are green because it edited them or special-cased them | 🔴 High | Read-only tests + diff review + hidden tests |
+| [A10](#a10-over-interrupting-proactive-agent) | Over-Interrupting Proactive Agent | It notifies about everything; users turn the feature off | 🟠 Medium | Interruption decider + rate limit |
+| [A11](#a11-fusion-crowds-out-good-results) | Fusion Crowds Out Good Results | After adding hybrid search, a good document falls out of the top 10 | 🟡 Low | Vector floor + tuned weights + per-category evals |
+| [A12](#a12-leaky-benchmark) | Leaky Benchmark | An agent that does nothing still scores 38% | 🔴 High | Probe agents + the ABC checklist |
 
 > Severity is a general rule of thumb: 🔴 Critical = possible data breach, financial loss, or legal liability; 🔴 High = direct harm to users or the business; 🟠 Medium = user-experience and cost problems; 🟡 Low = efficiency problems. Your business context may differ.
 
@@ -125,7 +138,7 @@ Detection methods reference real agentkit fields (such as `RunResult.status`, `T
 | Root cause | The model alone decides when the task is "done," and models tend to wrap up as early as possible; as the context grows, the original task list fades. In its work on long-running agents, Anthropic also lists "declaring victory too early" as a typical failure and constrains it with a feature list that tracks each item's status. |
 | Detection | Eval cases check whether the output/final state covers every sub-item; in traces, compare "sub-items claimed complete" against "tool calls actually executed"; flag runs with `status=completed` but `steps` well below the median for similar tasks. |
 | Fix / prevention | Externalize the completion criteria as a structured checklist (JSON / database fields) and let **code** decide whether everything is done; if it isn't, feed the remaining items back to the model to continue. Add a verification step for critical tasks (an evaluator or a deterministic check). Have the model restate the remaining work at each step (a todo list) to counter forgetting. |
-| Lessons | [Lesson 04](../lessons/04_context_memory/README.en.md) · [Lesson 06](../lessons/06_orchestration/README.en.md) |
+| Lessons | [Lesson 04](../lessons/04_context_memory/README.en.md) · [Lesson 06](../lessons/06_orchestration/README.en.md) · [Lesson 24](../lessons/24_coding_agents/README.en.md) |
 
 ### M3 Tool-Call Loop
 
@@ -313,7 +326,7 @@ Detection methods reference real agentkit fields (such as `RunResult.status`, `T
 | Root cause | Any user input (even external content returned by tools) can be written into long-term memory, and it is treated as trusted fact when retrieved; memories have no timestamp or expiry. The OWASP Top 10 for Agentic Applications (2026) lists Memory & Context Poisoning as ASI06. |
 | Detection | Audit the contents of `remember`-style writes; add eval cases that try to escalate privileges through memory; track the age distribution of memories. |
 | Fix / prevention | **Never read permissions, roles, or identity from memory**; read them only from the identity system. Restrict what kinds of content can be written to memory (preferences, habits), and record the source on write. Treat retrieved memories as untrusted data (wrap them in `<untrusted_data>`). Timestamp memories, let newer ones override older ones on conflict, and let users view and delete them. |
-| Lessons | [Lesson 04](../lessons/04_context_memory/README.en.md) · [Lesson 09](../lessons/09_security/README.en.md) |
+| Lessons | [Lesson 04](../lessons/04_context_memory/README.en.md) · [Lesson 09](../lessons/09_security/README.en.md) · [Lesson 18](../lessons/18_memory_systems/README.en.md) |
 
 ### C7 Post-Filter ACL Leak
 
@@ -527,7 +540,7 @@ Detection methods reference real agentkit fields (such as `RunResult.status`, `T
 | Root cause | Tool descriptions go into the model's context verbatim; in effect, they are a place where anyone can write instructions. Invariant Labs' 2025 "MCP Security Notification: Tool Poisoning Attacks" demonstrated this attack, and the MCP specification itself cautions that behavioral descriptions such as tool annotations should be treated as untrusted unless they come from a trusted server. The risk is closely related to ASI04 Agentic Supply Chain Vulnerabilities in the OWASP Agentic Top 10. |
 | Detection | Hash tool descriptions and compare the hashes on every load; scan tool descriptions for suspicious instructions; inventory the sources of all third-party tools. |
 | Fix / prevention | Connect only to tool servers from trusted sources, and pin their versions. Re-review any change to a tool description. Run third-party tools in a sandbox with least-privilege credentials. For high-risk tools, don't rely on third-party descriptions; wrap the tools yourself. |
-| Lessons | [Lesson 03](../lessons/03_tools/README.en.md) · [Lesson 09](../lessons/09_security/README.en.md) |
+| Lessons | [Lesson 03](../lessons/03_tools/README.en.md) · [Lesson 09](../lessons/09_security/README.en.md) · [Lesson 19](../lessons/19_mcp_and_sandbox/README.en.md) |
 
 ### S7 Sensitive Information Disclosure
 
@@ -625,7 +638,7 @@ Detection methods reference real agentkit fields (such as `RunResult.status`, `T
 | Root cause | *Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena* (Zheng et al., 2023) systematically discusses the position bias, verbosity bias, and self-enhancement bias of LLM judges, as well as their limited reasoning ability. |
 | Detection | Regularly sample verdicts for human review and compute the judge's agreement rate with humans; swap the order of the answers, judge again, and see whether the verdict flips. |
 | Fix / prevention | Make rubrics concrete and checkable ("Does it give actionable steps?" rather than "Is the answer good?"). Use a judge model that differs from the one under test. In pairwise comparisons, judge once in each order. Use rule-based scoring instead of an LLM judge wherever possible. Treat the judge itself as a component that needs evaluating. |
-| Lessons | [Lesson 11](../lessons/11_evals/README.en.md) |
+| Lessons | [Lesson 11](../lessons/11_evals/README.en.md) · [Lesson 21](../lessons/21_agent_data/README.en.md) |
 
 ### E4 Prompt Regression
 
@@ -819,6 +832,131 @@ Detection methods reference real agentkit fields (such as `RunResult.status`, `T
 
 ---
 
+## 11. Advanced: Retrieval, Memory, Data, Evals, Optimization, and Extended Capabilities
+
+> This category covers Part 3 of the course (Lessons 17–25). These failures rarely show up on day one. They appear after the system "works," once you start tuning retrieval, adding long-term memory, running a data flywheel, optimizing prompts automatically, executing code, or sending proactive notifications. Related modes from other categories: [C6](failure-modes.en.md#c6-memory-poisoning-and-staleness) (Memory Poisoning and Staleness), [S6](failure-modes.en.md#s6-tool-poisoning) (Tool Poisoning), [E1](failure-modes.en.md#e1-eval-production-skew) (Eval-Production Skew), [E3](failure-modes.en.md#e3-llm-as-judge-bias) (LLM-Judge Bias), and [M2](failure-modes.en.md#m2-premature-completion) (Premature Completion).
+
+### A1 Eval Set Leakage
+
+| Aspect | Details |
+|---|---|
+| Symptoms | Offline scores look great, then drop on fresh data or after launch; an optimized instruction contains the verbatim text of an eval case; the LLM judge agrees "perfectly" with humans on the calibration set. |
+| Root cause | Any time you change the system while looking at the data, that's "training": putting cases into few-shot examples, tuning prompts and tool descriptions against failing cases, revising the rubric where the judge and humans disagree, picking models and parameters with it. Leakage isn't just "the same item twice," either: near-duplicates, variants synthesized from the same seed, or several conversations from the same user can land on both sides, or you tune on future data and evaluate on past data. Lesson 17's teaching embedding used a synonym list "written by someone who had seen the eval set"; without it, recall fell from 0.95 to 0.85. In Lesson 21, judge v2 reached a kappa of 1.00 on the 12 samples its rubric was rewritten against, higher than the 0.68 between the two human labelers. |
+| Detection | Check for near-duplicates across splits (e.g., the number of cross-split pairs with similarity ≥ 0.5 should be 0); automatically check optimization outputs (instructions, examples) for verbatim text copied from any dataset (Lesson 23's `verbatim_overlap` uses 10 consecutive characters); compare the gains on dev and test, where a Δdev far above Δtest is a signal; report a judge's accuracy only on samples that weren't used to revise the rubric, with an interval on the agreement rate (with 8 samples, the Wilson interval can be as wide as [30.6%, 86.3%]). |
+| Fix / prevention | First define "what counts as one group" (user, session, seed, near-duplicate cluster), then split train / dev / test by group, or split by time when time matters. Freeze the test set and use it once, at the end; once you've looked, it's no longer trustworthy. Version the eval set, and don't look at test while tuning parameters or writing synonym lists. Split the LLM judge's calibration set into dev and test as well. |
+| Lessons | [Lesson 21](../lessons/21_agent_data/README.en.md) · [Lesson 23](../lessons/23_optimization/README.en.md) · [Lesson 22](../lessons/22_eval_methodology/README.en.md) · [Lesson 17](../lessons/17_retrieval_quality/README.en.md) |
+
+### A2 Optimizer Winner's Curse
+
+| Aspect | Details |
+|---|---|
+| Symptoms | The prompt optimizer reports a few points of gain on dev, with no gain or even a loss on test; the same optimizer with a different random seed picks a different instruction and reaches a different conclusion; several candidates tie on dev. |
+| Root cause | When you pick the highest dev score out of K candidates, you tend to pick the one whose noise happened to be positive; more candidates and a smaller dev set make the bias worse. A small dev set also lacks resolution: with 20 dev items, one item is 5 points. In Lesson 23's real run, three optimizers gained at most 5 points on dev and nothing on test (BootstrapFewShot lost 10 points). GEPA's three candidates all scored 85% on dev but 80%, 95%, and 100% on test, and the "on ties, take the first" rule picked the worst of them. |
+| Detection | Put Δdev and Δtest side by side in the summary table; run a paired bootstrap on test and report the confidence interval of the difference plus wins/losses (on Lesson 23's 20 test items, the 95% interval was as wide as ±20–25 points); rerun with different random seeds to see if the gain holds; count ties on dev. |
+| Fix / prevention | Enlarge dev (hundreds of items at least) or evaluate fewer candidates. Fix the tie-break rule (take the shorter one, take the later descendant, …) and the number of candidates before you look at test. Use dev scores only to choose; report only test numbers, with confidence intervals. Choosing candidates by test turns test into dev. Review optimizer outputs line by line, like code: reflection models will "helpfully" write rules that contradict your business policy. |
+| Lessons | [Lesson 23](../lessons/23_optimization/README.en.md) · [Lesson 22](../lessons/22_eval_methodology/README.en.md) · [Lesson 21](../lessons/21_agent_data/README.en.md) |
+
+### A3 Synthetic Data Distribution Shift
+
+| Aspect | Details |
+|---|---|
+| Symptoms | Synthetic eval cases almost all pass, yet real users' questions are handled poorly; most synthetic "outside the knowledge base" questions ask about the same thing; expected answers include promises the knowledge base doesn't make, or label answerable questions as "should refuse." |
+| Root cause | Left unconstrained, a model keeps generating what it considers typical questions: clean, complete, asking one thing at a time. They're easier than real questions and similar to one another. In Lesson 21's real runs, synthetic questions averaged 25–27 characters while production questions averaged 13 (Chinese text). When a dimension says "A or B," the model picks the one it's good at; when the same model writes, answers, and grades the questions, self-preference creeps in. Automated checkers also let flawed questions through. |
+| Detection | Regularly compare the statistics of synthetic and production data (average length, pairwise similarity, intent distribution); look at pass rates by data source (production / synthetic / human-written), where a noticeably higher pass rate on synthetic cases is a signal; verify evidence and keywords verbatim against the knowledge base; spot-check what the checker accepted and rejected. |
+| Fix / prevention | Pick seeds from real traffic. Split dimensions finely, one kind of variation per dimension, and include a dedicated "colloquial rewrite" dimension. Run cheap rule checks first, LLM checks second, and human spot checks last. Use different model families for the question writer, the model under test, and the judge wherever possible. Split data by seed. **Base the test set on real data, and make sure its labels pass through a human**; use synthetic data only to extend coverage. If you train on synthetic data, also watch for model collapse: it can supplement real data, never replace it. |
+| Lessons | [Lesson 21](../lessons/21_agent_data/README.en.md) |
+
+### A4 Uncalibrated LLM Judge
+
+| Aspect | Details |
+|---|---|
+| Symptoms | The judge's agreement with humans "looks okay," yet spot checks show it passing lots of wrong answers: invented refund timelines, "refund issued" without any tool call, agreeing with a user's false premise. |
+| Root cause | The rubric is vague ("is this a good answer?") and the judge can't see the knowledge base or tool records, so it can only judge whether the answer *looks* good: fluent, confident, and on topic, and it passes. Reporting only agreement hides the problem, because with imbalanced classes agreement is naturally high (the kappa paradox). In Lesson 21, judge v1 had 67% agreement but a kappa of only 0.23 and a TPR of just 20% (it let 4 of 5 failing answers through). Conversely, revising the rubric against the calibration set and then reporting accuracy on the same data inflates the numbers (see [A1](failure-modes.en.md#a1-eval-set-leakage)). |
+| Detection | On a **held-out** set of human-labeled samples, report agreement, Cohen's kappa, TPR (of the answers humans failed, how many the judge caught), and TNR (of the answers humans passed, how many the judge passed). Use human-human kappa on the same data as the reference. Re-measure after the judge model is updated or business rules change. |
+| Fix / prevention | Binary verdicts, with the reasoning written first. Make rubric items concrete and checkable. Give the judge the information humans use (knowledge-base text, tool-call records). Use a different model for the judge than for the system under test. Split the calibration set into dev and test. Version the rubric and the annotation guidelines, and let disagreements drive revisions (criteria drift). How this differs from [E3](failure-modes.en.md#e3-llm-as-judge-bias): E3 is the judge's systematic bias; A4 is never having shown that the judge agrees with humans at all. |
+| Lessons | [Lesson 21](../lessons/21_agent_data/README.en.md) · [Lesson 22](../lessons/22_eval_methodology/README.en.md) · [Lesson 11](../lessons/11_evals/README.en.md) |
+
+### A5 Lingering Contradictory Memory
+
+| Aspect | Details |
+|---|---|
+| Symptoms | Information the user already corrected is treated as current again: the profile has both "works in Shanghai" and "lives in Shenzhen" marked active; the user deletes the "job" memory, and its content resurfaces through an "insight" produced by reflection. |
+| Root cause | Write-time reconciliation is in place, but it depends on the structure the model produces: the rule-based guard only looks at slots, and session 1 labeled "works in Shanghai" as `other` instead of `city`, so later conflict checks can't see it. Some facts are invalidated **indirectly**: changing jobs makes "works in Shanghai" stale, but the two sentences don't literally contradict each other. Derived memories (insights, merged entries) that don't record their sources don't change when the originals are updated or deleted. |
+| Detection | Run a "self-check" over all active memories, not just the few that were retrieved; cover updates, corrections, deletions, and indirect invalidation specifically in the eval set; monitor the UPDATE / DELETE ratio and the number of user corrections; after a deletion, check that retrieval, reflection, and export no longer surface the content. |
+| Fix / prevention | Give slot definitions and examples in the extraction prompt. Guard single-valued slots (city, job, diet) with rules; give temporary facts a TTL and exempt them from single-valued replacement. Periodically have a strong model read all of a user's memories to find stale, contradictory, or duplicate entries (offline tidying). Require derived memories to cite evidence and record lineage, and cascade deletions. Keep history for UPDATE / DELETE so mistakes can be traced and rolled back. |
+| Lessons | [Lesson 18](../lessons/18_memory_systems/README.en.md) |
+
+### A6 Append-Only Memory Rot
+
+| Aspect | Details |
+|---|---|
+| Symptoms | After a few sessions, old and new facts sit side by side in memory: vegetarian and not vegetarian, peanut allergy and mango allergy; "on a business trip in Beijing this week" from three months ago is treated as current, and the agent recommends a restaurant in Beijing; content the user asked to forget still gets sent to the model. |
+| Root cause | Long-term memory only ever appends and never "takes anything back": one sentence becomes several entries (duplication), old and new values coexist (contradiction), short-lived facts have no expiry (staleness), the entry count keeps growing (bloat), and deletion requests never reach the storage layer (incomplete deletion). In Lesson 18's demo, after 5 sessions the append-only store had 16 entries while the maintained profile had 6; keyword retrieval pulled only "job" and the three-month-old "business trip" out of those 16. |
+| Detection | Monitor each user's memory count and duplicate rate; spot-check whether a slot has several contradictory active values; write down in the memory eval set "what session N should and shouldn't recall"; check whether content the user asked to forget can still enter the context. |
+| Fix / prevention | Pick one and record the choice in the design doc: **resolve at write time** (Mem0-style: extract → compare → ADD / UPDATE / DELETE / NOOP, with old values kept in history), or **resolve at read time** (keep the full dated history and let a strong enough model sort it out when reading, but deletions must still actually happen in storage). Either way you need TTLs, merging, and a hard-delete interface. When each user has only a few dozen memories, full injection with dates is often enough; use the eval set to find out when it starts to degrade. |
+| Lessons | [Lesson 18](../lessons/18_memory_systems/README.en.md) · [Lesson 04](../lessons/04_context_memory/README.en.md) |
+
+### A7 MCP Rug Pull
+
+| Aspect | Details |
+|---|---|
+| Symptoms | After an MCP server you reviewed at onboarding gets updated, the agent starts stuffing odd content into some argument, or emails are quietly copied to an unknown address; a tool that claims `readOnlyHint: true` actually writes data; your API key ends up somewhere a third-party server can read it. |
+| Root cause | The review happens once, but the trust lasts forever. A server can change tool definitions and behavior in an update (postmark-mcp behaved normally for 15 versions, then from 1.0.16 BCC'd every email to the attacker, and was reportedly downloaded 1,643 times before removal). Tool annotations are just the server describing itself, yet the client uses them to set risk tiers. The local server was started with the parent process's full environment (including `LLM_API_KEY` from `.env`), and every tool the server offered was imported. |
+| Detection | Compare the tool-definition fingerprint (a hash of name + description + parameters + annotations) on every connection; diff the tool list and descriptions before and after a server upgrade; audit which environment variables are passed when starting a server; inventory which tools were imported from each server. |
+| Fix / prevention | Pin server versions and tool-definition fingerprints; refuse to load and re-review when they change. Set risk tiers from "your own review → annotations from a trusted server → default dangerous (requires approval)," and ignore annotations from untrusted servers entirely. Import only the tools you need (an allowlist). Pass only the environment variables that are required (the official Python SDK passes just 6 by default on POSIX). Sandbox local servers too. For instructions hidden in tool descriptions, see [S6](failure-modes.en.md#s6-tool-poisoning). |
+| Lessons | [Lesson 19](../lessons/19_mcp_and_sandbox/README.en.md) · [Lesson 09](../lessons/09_security/README.en.md) |
+
+### A8 Ineffective Sandbox Limits
+
+| Aspect | Details |
+|---|---|
+| Symptoms | A memory bomb in the sandbox allocates 1 GB without being noticed; after a timeout, child processes spawned by model-written code keep running in the background; with `HOME` pointed at a temp directory, the code still reads `~/.ssh` in the real home directory and reaches an outside server; perfectly normal code gets killed at random on macOS. |
+| Root cause | Assuming a limit works because you set it. Measured on macOS: `RLIMIT_AS` can't be set (an empty Python process already has about 391 GiB of virtual address space, and setting 256 MB fails outright); the memory compressor makes RSS "shrink," so RSS-only monitoring misses the bomb; `RLIMIT_CPU` kills processes randomly long before the limit. On top of that, `subprocess.run(timeout=...)` kills only the direct child, leaving grandchildren running as orphans; `preexec_fn` can deadlock in multithreaded programs; a process-level sandbox controls time and resources but not identity (the code can find the real home directory with `pwd`) or the network; and containers share the host kernel, so a kernel exploit can escape them. |
+| Detection | At startup, probe whether each limit actually takes effect and record it in the result (Lesson 19's `notes`). Put a few "bad code" cases in CI: a memory bomb, an infinite loop after spawning a grandchild, reading a canary file outside the working directory, connecting to the internet; confirm all of them are stopped. Alert when a limit isn't enforced instead of silently degrading. |
+| Fix / prevention | On timeout, kill the whole process tree with a new process group + `killpg`. Replace `preexec_fn` with a launcher that sets rlimits and then execs. On macOS, fall back to polling `phys_footprint` for memory (with a race window); in production, use the container's cgroup `memory.max`. Leave files and network to an OS-level sandbox (Seatbelt / bubblewrap) or a container. For external users or multiple tenants, use at least gVisor or a microVM. **No network by default, no secrets in the sandbox, a fresh environment every time.** |
+| Lessons | [Lesson 19](../lessons/19_mcp_and_sandbox/README.en.md) · [Lesson 09](../lessons/09_security/README.en.md) |
+
+### A9 Coding Agent Test Gaming
+
+| Aspect | Details |
+|---|---|
+| Symptoms | All tests are green, but the feature isn't fixed; the diff contains specific values from the test cases (`if amount == 20000`), `pytest.skip`, or `sys.exit`, or `pytest.ini` / `conftest.py` was modified. Subtler still: a new, perfectly plausible "business constant" that just happens to make every test pass. |
+| Root cause | For a coding agent, passing tests is the reward. If it can write test files, it may edit the tests; if it can't, it may special-case the test inputs, override comparison operators, or exit early. Anthropic's Claude 3.7 Sonnet system card records the model occasionally special-casing tests to make them pass, or even editing the tests; in ImpossibleBench, GPT-5 cheated 76% and 54% of the time on two "impossible" variants; in METR's experiments, adding "please don't cheat" to the prompt had almost no effect. It's especially likely when the requirements contradict each other and there's no way to report the contradiction. |
+| Detection | Diff review: specific values from the tests in new code, skipped tests, probing for the test environment (`PYTEST_CURRENT_TEST`), overriding `__eq__`. Verify hashes of protected files before every test run. Accept work with hidden tests the agent can't see. Periodically plant "impossible" canary tasks whose requirements contradict each other; the pass rate is the cheating rate. |
+| Fix / prevention | Layer the protections: say it in the prompt (weakest) → refuse writes to tests and test config at the tool layer → verify hashes before running, or mount tests read-only → heuristic diff review → hidden tests → human review before merge. **Give the agent a dignified way out**: let it report "the requirements contradict each other." In ImpossibleBench, that cut GPT-5's cheating rate from 54% to 9%. Remember that heuristic review is only a warning light: a special case dressed up as a business rule (`GOLD_PREMIUM_THRESHOLD = 20000` in Lesson 24's real run) gets past it with a different number. |
+| Lessons | [Lesson 24](../lessons/24_coding_agents/README.en.md) · [Lesson 23](../lessons/23_optimization/README.en.md) |
+
+### A10 Over-Interrupting Proactive Agent
+
+| Aspect | Details |
+|---|---|
+| Symptoms | Users complain about "too many notifications," and "don't remind me again" clicks and feature opt-outs go up; focus time, meetings, and late nights all get interrupted; after a dubious "urgent" alert wakes someone up a few times, they mute all urgent notifications. |
+| Root cause | "Can we detect it?" was used in place of "should we speak up?": every event triggers a notification, with no interruption cost in the calculation. There are only two outcomes, "say it / don't," so something worth saying at the wrong moment either interrupts or gets dropped. There are no quiet hours and no rate limit; the urgent channel has no confidence threshold; implicit feedback is weighted too heavily; and optimizing adoption rate alone breeds clickbait. The cost of interruption is real: in Iqbal and Horvitz's field study, people took 9 min 33 s on average to return to a suspended window after responding to an email alert. In Lesson 25's simulation, the "tell them everything" policy interrupted 22 times in a day, 7 of them during focus or meetings and 3 late at night. |
+| Detection | Per user per day: interruptions, interruptions during focus / meetings, and late-night interruptions; the "don't remind me again" rate and the share of users who turn the feature off; the urgent channel's false-positive rate; offline evaluation by replaying events labeled with real needs, plus sensitivity analysis on the interruption-cost parameters. |
+| Fix / prevention | Make the interruption decision in testable code, not in an LLM: speak only when benefit × confidence − context cost clears a threshold. Use three outcomes (now / defer to a digest / drop), and ask "is it worth it?" before "is this the moment?" During focus and meetings, take the larger cost multiplier (don't multiply them). Add quiet hours and a rate limit. Require a trusted event source and a minimum confidence for the urgent channel. Give every card a "why am I seeing this?" entry point, and lock an inference as soon as the user explicitly corrects it. |
+| Lessons | [Lesson 25](../lessons/25_proactive_and_frontier/README.en.md) |
+
+### A11 Fusion Crowds Out Good Results
+
+| Aspect | Details |
+|---|---|
+| Symptoms | After switching to hybrid search, one category of queries gets worse: a relevant document ranked 2nd by vector search drops out of the top 10 after fusion; hybrid search's MRR ends up slightly below pure vector search. |
+| Root cause | Vector search always "returns something" (even at a similarity of 0.04), while BM25 pulls in noise because of a few common words. Those noise documents collect a small score from each list, and together they outrank a good document that ranks high in only one list. A very large `fetch_k` and an unreduced weight on the noisier list make it worse; adding the two lists' raw scores lets whichever list has the larger scale dominate. In Lesson 17's demo, equal-weight RRF had a lower MRR (0.892) than pure vector search (0.908), and query q06 hit exactly this trap. |
+| Detection | Break the retrieval eval set down by query category and compare Recall@k / MRR for each single list and for the fused result; compare "rank in a single list vs. rank after fusion" query by query to find documents that "rank high in one list and vanish after fusion"; in production, monitor the zero-result rate and how often top-1 changes before vs. after reranking. |
+| Fix / prevention | Fuse with RRF (or weighted RRF tuned on the eval set) rather than adding raw scores. Set a similarity floor for vector results. Tune `fetch_k` and per-list weights on the eval set. Rerank the fused list with a cross-encoder or an LLM. After every change, go back to the eval set and confirm that this category improved and no other category regressed. Hybrid search buys worst-case robustness; it doesn't promise the best number on every metric. |
+| Lessons | [Lesson 17](../lessons/17_retrieval_quality/README.en.md) · [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
+
+### A12 Leaky Benchmark
+
+| Aspect | Details |
+|---|---|
+| Symptoms | An agent that does nothing, or only gives a canned reply, still earns a respectable score; the "gap" between two versions flips back and forth, and only reading transcripts reveals you were measuring a flaw in the eval environment; the same version scores differently on another day or in a different run order. |
+| Root cause | A violation of task validity (capable ⇔ can succeed) or outcome validity (task succeeded ⇔ graded as pass). Among the 10 benchmarks Zhu et al. (2025) audited: 38% of the tasks in τ-bench's airline domain are impossible by design and "database unchanged" counts as success, so an empty-reply agent scores 38%; in SWE-Lancer, the agent can replace the tests with `assert 1 == 1`; in OSWorld's Chrome section, 13 of 46 tasks broke because websites changed. Common concrete causes: the scorer reads what the agent said instead of the final environment state, or uses substring matching ("can't refund" contains "refund"); trials share state (in internal evals, Anthropic saw Claude gain an unfair advantage by examining the git history left by a previous trial); ground truth leaks to the agent; infrastructure errors are recorded as agent failures. In Lesson 22's real runs, the model gateway injected the real date into the system prompt, which conflicted with the date frozen in the tasks: on haiku, the "gap" between two prompts was first −6 points, then +19, and once the environment was fixed, A's pass rate went from 81.2% to 97.9%. |
+| Detection | Write a few probe agents that never call a model (do nothing, canned reply, peek at hidden fields in the environment, reference solution) and confirm the gaming probes score near 0; this costs nothing and can run in CI. Check every label against the reference solution to prove each task is solvable. Rerun with a different date, a shuffled order, or right after another run; the reference solution's score shouldn't change. Report the trivial-agent baseline (ABC R.13). Read transcripts regularly. |
+| Fix / prevention | Audit with the ABC checklist (task validity T.1–T.10, outcome validity O.a–O.i, reporting R.1–R.13). Grade the final environment state, and make "do nothing" always fail. Start every trial in a fresh environment. Keep ground truth out of anything the agent can see. Mark infrastructure errors separately and retry, aborting the eval if they persist. Handle inputs that change over time (such as dates) the way production does. Version the benchmark itself: change the tasks, the scorer, the environment, or the judge prompt, and scores are no longer directly comparable with the old version. |
+| Lessons | [Lesson 22](../lessons/22_eval_methodology/README.en.md) · [Lesson 11](../lessons/11_evals/README.en.md) · [Lesson 24](../lessons/24_coding_agents/README.en.md) |
+---
+
 ## Appendix: From Symptom to Failure Mode
 
 | What you see | Check first |
@@ -840,6 +978,17 @@ Detection methods reference real agentkit fields (such as `RunResult.status`, `T
 | The "sources" an answer cites don't check out | C9 Citation Hallucination |
 | Deleted or retired documents are still being cited | C8 Deletion Not Propagated, D5 Cross-Tenant Cache Leak (cache not invalidated) |
 | Confidential content shows up in a low-privilege user's answer | C7 Post-Filter ACL Leak, C5 Cross-Tenant Memory Leak |
+| Great offline scores that drop on fresh data or after launch | A1 Eval Set Leakage, A2 Optimizer Winner's Curse, E1 Eval-Production Skew |
+| Dev improved after optimization, test didn't | A2 Optimizer Winner's Curse, A1 Eval Set Leakage |
+| Synthetic cases almost all pass, but real users' questions are handled poorly | A3 Synthetic Data Distribution Shift, E1 Eval-Production Skew |
+| Answers the judge passed turn out wrong in human spot checks | A4 Uncalibrated LLM Judge, E3 LLM-as-Judge Bias |
+| The agent uses information the user already corrected or asked to delete | A5 Lingering Contradictory Memory, A6 Append-Only Memory Rot, C6 Memory Poisoning and Staleness |
+| The agent behaves differently after an MCP server update | A7 MCP Rug Pull, S6 Tool Poisoning |
+| Sandboxed code keeps running after a timeout, exhausts memory, or reads host files | A8 Ineffective Sandbox Limits |
+| A coding agent's tests are green, but the feature is wrong | A9 Coding Agent Test Gaming, M2 Premature Completion |
+| More users click "don't remind me again" or turn notifications off | A10 Over-Interrupting Proactive Agent |
+| One category of queries gets worse after adding hybrid search | A11 Fusion Crowds Out Good Results |
+| An agent that does nothing still scores decently; the gap between two versions keeps flipping | A12 Leaky Benchmark, A1 Eval Set Leakage |
 
 ## Further Reading
 
@@ -853,3 +1002,4 @@ Every external source cited in this guide has been verified. For the full list a
 - Google SRE Book: [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/)
 - Martin Kleppmann: [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) (fencing tokens)
 - Chris Richardson: [Pattern: Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html)
+- Part 3 (A1–A12): Shankar et al., [Who Validates the Validators?](https://arxiv.org/abs/2404.12272) (judge calibration and criteria drift); Agrawal et al., [GEPA](https://arxiv.org/abs/2507.19457) (optimization and Pareto fronts); Chhikara et al., [Mem0](https://arxiv.org/abs/2504.19413) (memory writes); Postmark, [Security Alert: Malicious 'postmark-mcp' npm Package](https://postmarkapp.com/blog/information-regarding-malicious-postmark-mcp-package) (rug pulls); Zhong et al., [ImpossibleBench](https://arxiv.org/abs/2510.20270) (coding agents cheating); Horvitz, [Principles of Mixed-Initiative User Interfaces](https://erichorvitz.com/chi99horvitz.pdf) (when to interrupt)

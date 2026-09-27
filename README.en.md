@@ -4,8 +4,8 @@
 
 ### Design production-grade AI agent systems, from first principles
 
-**From "I can call an LLM API" to "I can design production-grade agent systems": 17 lessons · bilingual (English / 中文) · every lesson has a tested exercise.**
-No agent framework. You build every layer of an enterprise agent yourself: tools, context, architectures, orchestration, reliability, security, observability, evals, concurrency, cost, and release engineering.
+**From "I can call an LLM API" to "I can design production-grade agent systems": 26 lessons · bilingual (English / 中文) · every lesson has a tested exercise.**
+No agent framework. You build every layer of an enterprise agent yourself: tools, context, architectures, orchestration, reliability, security, observability, evals, concurrency, cost, and release engineering — then retrieval, memory, MCP, data, eval methodology, optimization, coding agents, and proactive agents.
 
 [![CI](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml/badge.svg)](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -36,7 +36,7 @@ A working agent loop is 20 lines of code. Put it in front of thousands of employ
 |---|---|---|
 | Goal | Get an agent running | Keep an agent running **reliably, safely, and under control in production** |
 | Approach | Call a framework API (black box) | **Build every layer from scratch** (~2,500 lines of core code you can read in one sitting) |
-| Coverage | Loop + tools | LLM essentials, the loop, tools, context, agent architectures, orchestration, an **engineering-perspectives map**; retries / circuit breakers / fallbacks, checkpoints, prompt-injection defense, RBAC, human approval, audit, tracing, evals; high concurrency and distributed execution, cost optimization, permission-aware RAG, progressive rollout and incident response |
+| Coverage | Loop + tools | LLM essentials, the loop, tools, context, agent architectures, orchestration, an **engineering-perspectives map**; retries / circuit breakers / fallbacks, checkpoints, prompt-injection defense, RBAC, human approval, audit, tracing, evals; high concurrency and distributed execution, cost optimization, permission-aware RAG, progressive rollout and incident response; retrieval quality, memory systems, MCP and sandboxes, mainstream frameworks, agent data, eval methodology, prompt optimization and test-time compute, coding agents, proactive agents |
 | Teaching style | One way to do it | Enterprise problem cards: **every problem compares 2–5 solutions** and explains how to choose |
 | Verification | "Looks like it works" | Every lesson has an **exercise with automated tests**: offline, deterministic, free |
 | Models | Locked to one vendor | Any OpenAI-compatible endpoint (OpenAI, DeepSeek, Qwen, vLLM, any model gateway) |
@@ -134,12 +134,13 @@ make check-env                                  # checks connectivity and tool-c
 
 ## 📚 Curriculum
 
-The course has two parts. **Part 1 teaches you how to build an agent. Part 2 teaches you which solution to pick when an enterprise problem shows up.** The full course takes about 5.5 hours; if you are short on time, take the [4-hour fast track](lessons/00_overview/README.en.md) (read only the "core path" at the top of each lesson).
+The course has three parts. **Part 1 teaches you how to build an agent. Part 2 teaches you which solution to pick when an enterprise problem shows up. Part 3 teaches you how to make an agent keep getting better.** Parts 1–2 plus the capstone take about 5.5 hours; Part 3 adds about 3.5 hours and is meant as the advanced track. If you are short on time, take the [4-hour fast track](lessons/00_overview/README.en.md) (read only the "core path" at the top of each lesson).
 
 - **Part 1**: concept → build it from scratch → exercise. It ends with Lesson 07, the **engineering-perspectives map**: 20 engineering dimensions, each split into **universal checks** (every project needs them) and **situational triggers** ("when X, consider Y"). It is your map for Part 2.
 - **Part 2**: every lesson is a set of **enterprise problem cards**. Each card gives a concrete scenario with real numbers, explains why the obvious fix breaks, compares 2–5 solutions (pros, cons, and the scale where each fits), says how to choose, and then shows code.
+- **Part 3**: deeper building blocks (retrieval, memory, MCP, frameworks), the ML loop that keeps an agent improving (data → evaluation → optimization), and the application frontier: coding agents and proactive agents.
 
-Every lesson follows the same loop: **read the notes → run the demo → write the exercise → `make lesson N=xx` until the tests pass → go through the self-check list**.
+Every lesson follows the same loop: **read the notes → run the demo → write the exercise → `make lesson N=xx` until the tests pass → go through the self-check list**. Each lesson opens with one 📖 primary reading.
 
 ### Part 1 — Building blocks (~140 min)
 
@@ -168,9 +169,23 @@ Every lesson follows the same loop: **read the notes → run the demo → write 
 | 15 | [Permission-aware enterprise RAG](lessons/15_enterprise_rag/README.en.md) | 15m | ACL leaks, multi-tenant index isolation, stale knowledge, fabricated citations | ACL pre-filtered search, chunking, citation checks |
 | 16 | [Release & operations](lessons/16_release_ops/README.en.md) | 15m | A prompt change causes an incident, silent model drift, how to stop the bleeding and roll back | Canary bucketing, automated rollback decisions, kill switch |
 
+### Part 3 — Advanced: deeper building blocks, the ML loop, and the frontier (~210 min)
+
+| # | Lesson | Time | What you learn / build |
+|---|---|---|---|
+| 17 | [Retrieval quality: vectors, hybrid search, reranking](lessons/17_retrieval_quality/README.en.md) | 20m | A teaching embedding, BM25, RRF fusion, LLM reranking, Recall@k / MRR / nDCG, compared step by step on a labeled eval set |
+| 18 | [Advanced memory systems: from notebooks to MemGPT / Mem0](lessons/18_memory_systems/README.en.md) | 20m | ADD / UPDATE / DELETE memory writes, three-factor retrieval scoring, MemGPT-style tiered memory, consolidation |
+| 19 | [MCP and code-execution sandboxes](lessons/19_mcp_and_sandbox/README.en.md) | 25m | **A hand-written MCP server and client** (both spec generations, interoperable with the official SDK), a process-level sandbox |
+| 20 | [From agentkit to frameworks](lessons/20_frameworks_bridge/README.en.md) | 25m | One task implemented in DSPy / LangGraph / the OpenAI Agents SDK side by side; a mini StateGraph |
+| 21 | [Agent data](lessons/21_agent_data/README.en.md) | 25m | Trace mining, dedup and clustering, stratified sampling, synthetic data and filtering, Cohen's kappa, leak-free splits |
+| 22 | [Advanced eval methodology](lessons/22_eval_methodology/README.en.md) | 25m | Benchmark design checklists, position-debiased pairwise judging, confidence intervals and paired tests |
+| 23 | [Optimization: prompts, test-time compute, and when to fine-tune](lessons/23_optimization/README.en.md) | 25m | OPRO-style instruction search, BootstrapFewShot, GEPA-style reflective mutation, best-of-N, Pareto fronts |
+| 24 | [Coding agents and long-running harnesses](lessons/24_coding_agents/README.en.md) | 25m | **Build a coding agent that fixes bugs**: ACI tools, test protection, diff review, cross-session handoff |
+| 25 | [Proactive agents and the frontier](lessons/25_proactive_and_frontier/README.en.md) | 20m | User models, a when-to-interrupt decider, frontier directions and open problems, a course recap |
+
 ### 🎓 Capstone (30 min)
 
-[**ITBuddy, an enterprise IT help-desk agent**](capstone/README.en.md) puts everything together into one working system: a CLI, an HTTP API with asynchronous approvals, a realistic design doc with a threat model and ADRs, and 24 eval cases (10 of them security cases).
+[**ITBuddy, an enterprise IT help-desk agent**](capstone/README.en.md) puts everything together into one working system: a CLI, an HTTP API with asynchronous approvals, a realistic design doc with a threat model and ADRs, 24 eval cases (10 of them security cases), a component ablation study, and a [report template](capstone/REPORT_TEMPLATE.en.md) for your own project (baselines, ablations, and error analysis required).
 
 Check your progress:
 
@@ -180,24 +195,25 @@ Check your progress:
 
 ## 🎓 Studying alongside Stanford CS329Z
 
-Stanford's Fall 2026 course [CS 329Z: Engineering AI Agents](https://cs329z.stanford.edu/) is about engineering agentic systems, which lines up closely with this project's goal. The table maps each weekly topic on its public schedule to the matching lessons here, so you can study the two side by side:
+Stanford's Fall 2026 course [CS 329Z: Engineering AI Agents](https://cs329z.stanford.edu/) is about engineering agentic systems. The table maps each weekly topic on its public schedule to the matching lessons here, so you can study the two side by side:
 
 | CS329Z week & topic | Matching lessons here |
 |---|---|
-| W1 Foundations & Landscape · Agentic Systems Spectrum | [00 The big picture](lessons/00_overview/README.en.md) (the autonomy spectrum) |
-| W2 LLMs for Builders | [01 LLM essentials](lessons/01_llm_essentials/README.en.md) |
-| W2 Building Blocks: Retrieval-Augmented Generation | [04 Context & memory](lessons/04_context_memory/README.en.md) · [15 Permission-aware RAG](lessons/15_enterprise_rag/README.en.md) |
-| W3 Tool Use & Function Calling | [01](lessons/01_llm_essentials/README.en.md) · [03 Tool design](lessons/03_tools/README.en.md) |
-| W3 Frameworks & Agent Design | [02 The agent loop](lessons/02_agent_loop/README.en.md) · [framework comparison](docs/framework-comparison.en.md) |
+| W1 Foundations & Landscape · Agentic Systems Spectrum | [00 The big picture](lessons/00_overview/README.en.md) |
+| W2 LLMs for Builders | [01 LLM essentials](lessons/01_llm_essentials/README.en.md) (incl. constrained generation and decoding) |
+| W2 Building Blocks: Retrieval-Augmented Generation | [04](lessons/04_context_memory/README.en.md) · [15 Permission-aware RAG](lessons/15_enterprise_rag/README.en.md) · [17 Retrieval quality](lessons/17_retrieval_quality/README.en.md) |
+| W3 Tool Use & Function Calling | [03 Tool design](lessons/03_tools/README.en.md) · [19 MCP and sandboxes](lessons/19_mcp_and_sandbox/README.en.md) |
+| W3 Frameworks & Agent Design | [02 The agent loop](lessons/02_agent_loop/README.en.md) · [20 From agentkit to frameworks](lessons/20_frameworks_bridge/README.en.md) |
 | W4 Agent Design Patterns & Scaffolds | [05 Agent architectures](lessons/05_agent_architectures/README.en.md) · [06 Orchestration](lessons/06_orchestration/README.en.md) |
-| W4–W5 Memory & Multi-Agent Systems | [04](lessons/04_context_memory/README.en.md) · [05](lessons/05_agent_architectures/README.en.md) · [06](lessons/06_orchestration/README.en.md) |
-| W5 Optimization | Partly [14 Cost & latency](lessons/14_cost_latency/README.en.md) (cost and latency; automated prompt / pipeline optimization is not covered here) |
-| W6–W7 Data for Agentic Systems · Data Selection & Quality | Not covered (only eval-set construction in [11 Evals](lessons/11_evals/README.en.md)) |
-| W7 Evaluation Fundamentals & Benchmark Design | [11 Eval-driven development](lessons/11_evals/README.en.md) |
-| W8 LLM-as-Judge & Evaluation Infrastructure | [11 Eval-driven development](lessons/11_evals/README.en.md) |
-| W8 Agent Safety & Guardrails | [09 Security & governance](lessons/09_security/README.en.md) |
-| W9 Coding Agents & Software Agents | [05 Agent architectures](lessons/05_agent_architectures/README.en.md) (coding-agent teardown) |
-| W11 Proactive Agents | [05 Agent architectures](lessons/05_agent_architectures/README.en.md) (event-driven / ambient agents) |
+| W4–W5 Memory & Multi-Agent Systems | [18 Advanced memory](lessons/18_memory_systems/README.en.md) · [06 Orchestration](lessons/06_orchestration/README.en.md) (incl. why multi-agent systems fail) |
+| W5 Optimization | [23 Optimization](lessons/23_optimization/README.en.md) |
+| W6–W7 Data for Agentic Systems · Data Selection & Quality | [21 Agent data](lessons/21_agent_data/README.en.md) |
+| W7 Evaluation Fundamentals & Benchmark Design | [11 Eval-driven development](lessons/11_evals/README.en.md) · [22 Advanced eval methodology](lessons/22_eval_methodology/README.en.md) |
+| W8 LLM-as-Judge & Evaluation Infrastructure | [11](lessons/11_evals/README.en.md) · [21](lessons/21_agent_data/README.en.md) · [22](lessons/22_eval_methodology/README.en.md) |
+| W8 Agent Safety & Guardrails | [09 Security & governance](lessons/09_security/README.en.md) (incl. privacy and red teaming) |
+| W9 Coding Agents & Software Agents | [24 Coding agents](lessons/24_coding_agents/README.en.md) |
+| W11 Proactive Agents · Open Problems | [25 Proactive agents and the frontier](lessons/25_proactive_and_frontier/README.en.md) |
+| Project: baselines, ablations, error analysis, reproducibility | [Capstone](capstone/README.en.md) · [report template](capstone/REPORT_TEMPLATE.en.md) |
 
 In the other direction, this project **leans harder into running agents in enterprise production**, so it complements CS329Z: [08 Reliability](lessons/08_reliability/README.en.md), [10 Observability](lessons/10_observability/README.en.md), [12 Production architecture](lessons/12_production_architecture/README.en.md), [13 Distributed execution](lessons/13_distributed_concurrency/README.en.md), [14 Cost](lessons/14_cost_latency/README.en.md), [16 Release ops](lessons/16_release_ops/README.en.md), plus multi-tenancy, permissions, and auditing throughout.
 
@@ -209,13 +225,13 @@ Other Stanford agent courses: [CS 329A: Self-Improving AI Agents](https://cs329a
 
 | Doc | What's inside |
 |---|---|
-| [🩺 Failure-mode catalog](docs/failure-modes.en.md) | 67 failure modes seen in production: symptom → root cause → detection → fix |
-| [✅ Design review checklist](docs/design-review-checklist.en.md) | 163 pre-launch checks, graded P0 / P1 / P2 |
-| [🎤 System-design interview questions](docs/interview-questions.en.md) | 61 questions + 3 fully worked system-design answers |
+| [🩺 Failure-mode catalog](docs/failure-modes.en.md) | 79 failure modes seen in production: symptom → root cause → detection → fix |
+| [✅ Design review checklist](docs/design-review-checklist.en.md) | 199 pre-launch checks, graded P0 / P1 / P2 |
+| [🎤 System-design interview questions](docs/interview-questions.en.md) | 76 questions + 3 fully worked system-design answers |
 | [🔁 Framework comparison](docs/framework-comparison.en.md) | agentkit concepts ↔ LangGraph / OpenAI Agents SDK / Claude Agent SDK / ADK … |
 | [📄 Cheatsheet](docs/cheatsheet.en.md) | Principles, default parameters, decision trees; printable |
-| [📖 Glossary](docs/glossary.en.md) | 192 terms, English ↔ Chinese, explained in plain words |
-| [📚 Reading list](docs/reading-list.en.md) | 71 curated and verified papers, posts, and specs, with reading paths by role |
+| [📖 Glossary](docs/glossary.en.md) | 246 terms, English ↔ Chinese, explained in plain words |
+| [📚 Reading list](docs/reading-list.en.md) | 135 curated and verified papers, posts, and specs, with reading paths by role |
 
 ## 🧱 Repository layout
 
@@ -233,7 +249,7 @@ hello-agent-system/
 │   ├── tracing.py       #   tracing (OpenTelemetry GenAI style)
 │   ├── viewer.py        #   self-contained HTML trace viewer
 │   └── evals.py         #   eval framework
-├── lessons/NN_topic/    # 17 lessons: README.md + README.en.md / demo.py / exercise.py / solution.py / test_exercise.py
+├── lessons/NN_topic/    # 26 lessons: README.md + README.en.md / demo.py / exercise.py / solution.py / test_exercise.py
 ├── capstone/            # ITBuddy (CLI + HTTP API + design doc + eval set)
 ├── docs/                # reference docs (bilingual)
 ├── scripts/             # progress board, link checker

@@ -5,7 +5,7 @@
 > 📖 Part of the "domain reference" handbook that accompanies the course.
 > Related: [Failure Modes](failure-modes.en.md) · [Cheatsheet](cheatsheet.en.md) · [Interview Questions](interview-questions.en.md) · [Glossary](glossary.en.md)
 
-This checklist is designed to be pasted straight into a PR description, a design doc, or review meeting notes. It has **17 sections and 163 items** (53 of them P0). Every item explains why it matters and, where possible, links to the relevant failure mode (e.g., [T5](failure-modes.en.md#t5-duplicate-side-effects)) and lesson.
+This checklist is designed to be pasted straight into a PR description, a design doc, or review meeting notes. It has **19 sections and 199 items** (62 of them P0). Every item explains why it matters and, where possible, links to the relevant failure mode (e.g., [T5](failure-modes.en.md#t5-duplicate-side-effects)) and lesson.
 
 ## How to Use It
 
@@ -19,9 +19,9 @@ This checklist is designed to be pasted straight into a PR description, a design
 
 **Suggested process**
 
-1. **Design phase** (before writing code): go through "Requirements and Scope," "Orchestration," "Security," "Permissions and Approval," and "Distributed Systems and Concurrency." Decisions in these sections are the hardest to change later.
+1. **Design phase** (before writing code): go through "Requirements and Scope," "Orchestration," "Security," "Permissions and Approval," and "Distributed Systems and Concurrency." Decisions in these sections are the hardest to change later. If you use long-term memory, MCP, code execution, coding agents, or proactive notifications, add Section 19, "Extended Capabilities."
 2. **Pre-launch review**: go through the whole list, and back every P0 with evidence (links to code, config, eval reports, trace screenshots), not a verbal "yes, we have that."
-3. **Quarterly re-review**: models, tools, and user bases all change, so the checklist needs another pass, especially the "Evals" and "Cost" sections.
+3. **Quarterly re-review**: models, tools, and user bases all change, so the checklist needs another pass, especially the "Evals," "Cost," and Section 18 "Data, Eval Methodology, and Optimization" sections.
 
 > 💡 A quick test of review quality: for each P0, ask, "**If this stopped working, how long would it take us to notice?**" If the answer is "after users complain," you're still missing a way to detect it.
 
@@ -46,7 +46,9 @@ This checklist is designed to be pasted straight into a PR description, a design
 | 15 | Documentation and Handoff | 7 | 1 | [Lesson 12](../lessons/12_production_architecture/README.en.md) |
 | 16 | Distributed Systems and Concurrency | 12 | 4 | [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) |
 | 17 | Enterprise Knowledge and RAG | 9 | 2 | [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
-| | **Total** | **163** | **53** | |
+| 18 | Data, Eval Methodology, and Optimization | 16 | 3 | [Lesson 21](../lessons/21_agent_data/README.en.md) · [Lesson 22](../lessons/22_eval_methodology/README.en.md) · [Lesson 23](../lessons/23_optimization/README.en.md) |
+| 19 | Extended Capabilities (Retrieval / Memory / MCP / Code Execution / Coding Agents / Proactive) | 20 | 6 | [Lesson 17](../lessons/17_retrieval_quality/README.en.md) · [Lesson 18](../lessons/18_memory_systems/README.en.md) · [Lesson 19](../lessons/19_mcp_and_sandbox/README.en.md) · [Lesson 20](../lessons/20_frameworks_bridge/README.en.md) · [Lesson 24](../lessons/24_coding_agents/README.en.md) · [Lesson 25](../lessons/25_proactive_and_frontier/README.en.md) |
+| | **Total** | **199** | **62** | |
 
 ---
 
@@ -426,6 +428,84 @@ This checklist is designed to be pasted straight into a PR description, a design
   — Chunking determines whether the context the model sees is complete ([C9](failure-modes.en.md#c9-citation-hallucination)).
 - [ ] 🟢 **P2** Monitor knowledge freshness: the share of stale documents in retrieval results.
   — Knowledge bases decay over time, and without a metric, nobody notices ([C8](failure-modes.en.md#c8-deletion-not-propagated)).
+
+## 18. Data, Eval Methodology, and Optimization
+
+- [ ] 🔴 **P0** Eval data is split into train / dev / test by group (user, session, seed, near-duplicate cluster; by time when time matters), and the test set is frozen and used only once, for the final report.
+  — Changing the system while looking at data is "training"; leakage inflates scores that then drop after launch ([A1](failure-modes.en.md#a1-eval-set-leakage)).
+- [ ] 🔴 **P0** The test set is mostly real data, with human-reviewed labels; synthetic data and LLM labels only extend coverage.
+  — Otherwise all you measure is "an LLM agreeing with an LLM" ([A3](failure-modes.en.md#a3-synthetic-data-distribution-shift), [A4](failure-modes.en.md#a4-uncalibrated-llm-judge)).
+- [ ] 🔴 **P0** Conclusions like "B beats A" or "ready to ship" rest on a paired test on the same tasks (paired bootstrap or McNemar), reported with a confidence interval on the difference, not just two averages.
+  — 45/50 vs. 43/50 says almost nothing statistically; if the interval contains 0, you can't claim an improvement ([A2](failure-modes.en.md#a2-optimizer-winners-curse), [E2](failure-modes.en.md#e2-flaky-single-run-evals)).
+- [ ] 🟠 **P1** The benchmark passes a probe audit: probe agents that do nothing, give canned replies, or peek at hidden fields score near 0, the reference solution passes every task, and the report states the trivial-agent baseline.
+  — On a benchmark that can be gamed, you're only measuring who games it better ([A12](failure-modes.en.md#a12-leaky-benchmark)).
+- [ ] 🟠 **P1** The statistical unit is the task, not the run: run each task 3–5 times, average within each task, and compute intervals over tasks; estimate how many tasks you need before you start.
+  — Treating repeated runs as independent samples gives falsely narrow intervals; pinning a pass rate to ±5 points at p ≈ 0.8 already takes about 246 tasks.
+- [ ] 🟠 **P1** Every trial starts from a clean environment; the scorer checks the final environment state, not what the agent said; infrastructure errors (such as a 503 from the model API) are marked separately and retried, never recorded as agent failures.
+  — Shared state causes correlated failures and can even be exploited by the agent; counting a 503 as an agent failure pollutes the conclusion ([A12](failure-modes.en.md#a12-leaky-benchmark)).
+- [ ] 🟠 **P1** LLM judges are calibrated on held-out human-labeled samples, reporting agreement, Cohen's kappa, TPR, and TNR with intervals; pairwise comparisons are judged twice with the order swapped.
+  — A judge with 67% agreement can have a kappa of just 0.23; ask only once and position bias turns straight into fake winners ([A4](failure-modes.en.md#a4-uncalibrated-llm-judge), [E3](failure-modes.en.md#e3-llm-as-judge-bias)).
+- [ ] 🟠 **P1** Rubrics and annotation guidelines have version numbers and change logs, and every label records the version it used; after revising the rubric against a calibration set, re-test on fresh samples.
+  — Grading outputs changes the criteria themselves (criteria drift); reporting accuracy on the data used to revise the rubric inflates it ([A1](failure-modes.en.md#a1-eval-set-leakage), [A4](failure-modes.en.md#a4-uncalibrated-llm-judge)).
+- [ ] 🟠 **P1** Samples sent for labeling are stratified (problem signals first, rare paths, high cost, a little pure random), with sampling weights recorded and used to reweight overall metrics.
+  — In Lesson 21's demo, the failure-first sample had a 33% problem rate against a true rate of 10%.
+- [ ] 🟠 **P1** Error analysis comes before choosing an optimization lever: consistently wrong → change prompts, examples, or add retrieval; sometimes right and verifiable → test-time compute; stable format, high volume, and plenty of data → fine-tuning or distillation.
+  — On a rule the model doesn't know, 5 samples all vote for the same wrong answer; more test-time compute doesn't help.
+- [ ] 🟠 **P1** Prompt optimization selects only on dev, with the tie-break rule and the number of candidates fixed before looking at test; optimizer outputs (instructions, examples, scores, data versions) are checked in, instruction diffs are reviewed by a person, and outputs are automatically checked for verbatim copies of dataset text.
+  — Winner's curse and memorization; optimizers also write rules that contradict business policy ([A2](failure-modes.en.md#a2-optimizer-winners-curse), [A1](failure-modes.en.md#a1-eval-set-leakage)).
+- [ ] 🟠 **P1** Before a grader goes live, someone has asked "what does the laziest perfect-scoring output look like?"; output formats and safety rules are off-limits to the optimizer; rule checks + LLM judges + human spot checks are combined.
+  — Optimizers only care about the score, and they will find any hole in the grader ([A9](failure-modes.en.md#a9-coding-agent-test-gaming)).
+- [ ] 🟢 **P2** Optimization reports include the optimization spend (number of calls) and the change in tokens and cost per call after optimization.
+  — In Lesson 23, GEPA raised input per call from 127 to 811 tokens, which every production call then pays for.
+- [ ] 🟢 **P2** Claims of "no regression" use a non-inferiority test (lower bound of the paired difference interval > −δ); when comparing many variants at once, correct for multiple comparisons or confirm the winner on a held-out set.
+  — "Not significantly worse" usually just means too few samples; try 20 variants that all do nothing, and on average 1 will look "significantly better."
+- [ ] 🟢 **P2** When choosing models from public benchmarks, check the benchmark's validity (what a trivial agent scores, whether the tests are sufficient, possible contamination, saturation); launch decisions rest only on your own eval set.
+  — A benchmark score measures ability on that benchmark, not in your scenario ([A12](failure-modes.en.md#a12-leaky-benchmark)).
+- [ ] 🟢 **P2** After a model upgrade or a shift in the data distribution, re-run optimized prompts and the eval set; eval sets and benchmarks themselves carry version numbers.
+  — An optimized prompt can end up holding you back; change the tasks, the scorer, or the environment, and scores are no longer comparable.
+
+## 19. Extended Capabilities (Retrieval / Memory / MCP / Code Execution / Coding Agents / Proactive)
+
+- [ ] 🟠 **P1** There's a retrieval eval set: queries from real logs, hard cases tagged by category, graded labels with evidence sentences; report Recall@k (k = the number of chunks actually injected), MRR, and nDCG by category, plus latency and cost.
+  — Without an eval set, retrieval "optimization" is guesswork, and a single overall score hides one category getting worse ([A11](failure-modes.en.md#a11-fusion-crowds-out-good-results)).
+- [ ] 🟠 **P1** Hybrid search combines sparse and dense retrieval and fuses them with RRF (or weighted RRF tuned on the eval set), never by adding raw scores; vector results have a similarity floor.
+  — Model numbers and error codes need BM25, colloquial questions need vectors; vector search always "returns something," and that noise crowds out good documents ([A11](failure-modes.en.md#a11-fusion-crowds-out-good-results)).
+- [ ] 🟠 **P1** ANN index parameters have been checked for recall against brute-force search as ground truth, rather than shipped with the defaults.
+  — pgvector's `ivfflat.probes` defaults to 1, which on Lesson 17's data found fewer than 30% of the true nearest neighbors.
+- [ ] 🟢 **P2** Chunk sizes are compared at a fixed context budget; switching embedding models means rebuilding the whole index; hypothetical documents such as HyDE's are used only for retrieval, never in answers.
+  — Judged by Recall@k alone, big chunks "cheat"; old and new vectors live in different spaces and can't be mixed ([C9](failure-modes.en.md#c9-citation-hallucination)).
+- [ ] 🔴 **P0** Long-term memory is written only from what the user themselves explicitly said; tool output, web pages, and emails are never written to memory automatically; every write to core memory (which goes into the system prompt) passes injection and sensitive-data checks and is audited.
+  — Memory poisoning is written once and takes effect in every later session; MINJA injected malicious records through ordinary queries alone, with an average success rate of 98.2% ([C6](failure-modes.en.md#c6-memory-poisoning-and-staleness)).
+- [ ] 🔴 **P0** "Delete my data" triggers a hard delete that cascades along lineage to derived memories (insights, merged entries, summaries) and to copies in indexes and caches.
+  — A soft delete is not the right to erasure; deleted information "comes back to life" through derived data ([A5](failure-modes.en.md#a5-lingering-contradictory-memory), [C8](failure-modes.en.md#c8-deletion-not-propagated)).
+- [ ] 🟠 **P1** Memory writes reconcile conflicts, either at write time (ADD / UPDATE / DELETE / NOOP + rule-based guards for single-valued slots) or at read time (full dated history + a strong model), with the choice recorded in the design doc; UPDATE / DELETE keep history, and temporary facts have a TTL.
+  — Append-only memory duplicates, contradicts itself, goes stale, and bloats ([A6](failure-modes.en.md#a6-append-only-memory-rot), [A5](failure-modes.en.md#a5-lingering-contradictory-memory)).
+- [ ] 🟠 **P1** The memory eval set covers updates, corrections, deletions, and indirect invalidation, stating "what session N should and shouldn't recall."
+  — Most memory-benchmark numbers are self-reported; only your own eval set is trustworthy ([A5](failure-modes.en.md#a5-lingering-contradictory-memory)).
+- [ ] 🔴 **P0** Risk tiers for MCP tools come from your own review: annotations from untrusted servers are ignored, unreviewed tools default to dangerous and require approval, and only the tools you need are imported.
+  — `readOnlyHint: true` is just the server describing itself ([A7](failure-modes.en.md#a7-mcp-rug-pull), [S5](failure-modes.en.md#s5-excessive-agency)).
+- [ ] 🔴 **P0** MCP server versions and tool-definition fingerprints (a hash of name + description + parameters + annotations) are pinned and compared on every connection; any change means refusing to load and re-reviewing.
+  — The review happens once, but an update can change the definitions at any time ([A7](failure-modes.en.md#a7-mcp-rug-pull), [S6](failure-modes.en.md#s6-tool-poisoning)).
+- [ ] 🟠 **P1** MCP servers are started with only the environment variables they need, not the parent process's full environment.
+  — Otherwise your API key goes to every server you launch ([A7](failure-modes.en.md#a7-mcp-rug-pull)).
+- [ ] 🔴 **P0** Model-generated code runs only in a sandbox: no network by default, no secrets inside, a fresh environment every time, and the whole process tree killed on timeout; for external users or multiple tenants, at least gVisor or a microVM.
+  — A process-level sandbox controls time and resources, not identity or the network ([A8](failure-modes.en.md#a8-ineffective-sandbox-limits), [S3](failure-modes.en.md#s3-lethal-trifecta-exfiltration)).
+- [ ] 🟠 **P1** Every sandbox resource limit has been verified to take effect on the target platform (probed and recorded at startup), and CI includes "bad code" cases: a memory bomb, grandchild processes, out-of-bounds file reads, and network access.
+  — On macOS, `RLIMIT_AS` can't be set, RSS shrinks, and `RLIMIT_CPU` kills too early ([A8](failure-modes.en.md#a8-ineffective-sandbox-limits)).
+- [ ] 🔴 **P0** Coding agents work on a copy, in a container, or on their own branch, and their only output is a diff; tests and test configuration are read-only to the agent (refused at the tool layer + hash-verified before runs or mounted read-only).
+  — Agents break things, and they edit tests to "pass" ([A9](failure-modes.en.md#a9-coding-agent-test-gaming), [S5](failure-modes.en.md#s5-excessive-agency)).
+- [ ] 🟠 **P1** Before merging: diff review (specific test values, skipped tests, `sys.exit`, overridden `__eq__`) + full CI + human review; the agent has a way to report contradictory requirements.
+  — In ImpossibleBench, offering that way out cut GPT-5's cheating rate from 54% to 9% ([A9](failure-modes.en.md#a9-coding-agent-test-gaming)).
+- [ ] 🟠 **P1** For long tasks, "done" is marked and committed only after the harness verifies it itself (the new feature + regressions); the feature list and progress file are managed by the harness, or the agent may change only specific fields.
+  — Let the one being checked do the checking, and it declares victory early ([M2](failure-modes.en.md#m2-premature-completion)).
+- [ ] 🟠 **P1** Before adopting an agent framework, check its defaults and write contract tests: where tracing data goes, response caching, and rerun semantics on pause/resume; pin the framework version.
+  — LangGraph reruns a node from the top on resume, OpenAI Agents SDK tracing uploads to OpenAI by default, and DSPy caches responses by default; none of these raise errors ([T5](failure-modes.en.md#t5-duplicate-side-effects), [S7](failure-modes.en.md#s7-sensitive-information-disclosure)).
+- [ ] 🟠 **P1** Proactive features decide whether to interrupt in testable code: speak only when benefit × confidence − context cost clears a threshold, with three outcomes (now / defer to a digest / drop), quiet hours, and a rate limit; the urgent channel requires a trusted source and a minimum confidence.
+  — A few useless interruptions and users turn the whole feature off ([A10](failure-modes.en.md#a10-over-interrupting-proactive-agent)).
+- [ ] 🟠 **P1** Every inference in the user model can be viewed, corrected, and deleted (deletion also blocks it from being relearned); sensitive inferences are off by default; only inferences relevant to the current event are sent to the model.
+  — A proactive agent that keeps reading email and calendars is a textbook lethal-trifecta setup ([S3](failure-modes.en.md#s3-lethal-trifecta-exfiltration), [C6](failure-modes.en.md#c6-memory-poisoning-and-staleness)).
+- [ ] 🟢 **P2** Online metrics for proactive features go beyond adoption rate to interruptions per user per day, the "don't remind me again" rate, and the share of users who turn the feature off.
+  — Optimize adoption rate alone and you get clickbait notifications ([A10](failure-modes.en.md#a10-over-interrupting-proactive-agent)).
 
 ---
 

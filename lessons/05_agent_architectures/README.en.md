@@ -3,6 +3,8 @@
 # Lesson 05: Common agent architectures — from ReAct to deep-research systems
 
 > 🕐 Time: 20 minutes ｜ 🎯 You'll be able to: explain, for 7 single-agent architectures and 5 multi-agent topologies, *where the model thinks, where state lives, and who holds control*; take apart five kinds of real products (deep research, coding agents, computer use, customer support, agentic RAG); pick an architecture for a new requirement and defend the choice ｜ 📦 Source: `agentkit/agent.py` (ReAct), `agentkit/workflows.py` (Reflection, supervisor–expert), `agentkit/permissions.py` (human checkpoints), and this lesson's [demo.py](demo.py)
+>
+> 📖 Primary reading: [Cognitive Architectures for Language Agents](https://arxiv.org/abs/2309.02427) (Sumers et al., 2024) — the CoALA paper describes any language agent along three axes (memory modules, action space, decision-making procedure), in the same spirit as the "four questions" in §1.2 of this lesson; focus on the framework in §4 and Table 2 in §5, which puts ReAct, Voyager, Generative Agents, Tree of Thoughts, and others side by side.
 
 > 📍 Part 1: Foundations. Lessons 02–04 built the parts (the loop, tools, context and memory). This lesson covers the common ways to **assemble** them. The next one, [Lesson 06: Orchestration](../06_orchestration/README.en.md), covers workflow patterns and how to implement multi-agent orchestration. The two lessons complement each other; §1.3 explains the split.
 >
@@ -569,6 +571,8 @@ def handle(event: dict) -> None:                        # called by the queue co
 
 In production the checkpoints have to live in shared storage (replace `FileCheckpointer` with a database) so every worker can see which events have been handled. There's still a race between "check" and "run"; strict deduplication needs a database unique constraint or a distributed lock (Lesson 13).
 
+Event-driven design only answers "when does the agent wake up?" A proactive agent also has to answer "once awake, should it interrupt anyone?" For user models, interruption decisions, and privacy boundaries, see [Lesson 25](../25_proactive_and_frontier/README.en.md).
+
 ### 3.7 Topologies compared
 
 | Topology | Communication | State sharing | Control | Who talks to the user | Good for | Main risks |
@@ -659,6 +663,8 @@ flowchart TB
 7. **Closing the loop with verification**: run tests, builds and linters, and feed the output back. That's reflection in its most effective form (§2.4), and the key defense against "claimed it was done."
 
 **Architecture in one line**: ReAct + a to-do tool (lightweight planning) + subagents (supervisor–expert) + test feedback (reflection) + permission modes (HITL) + a sandbox (a CodeAct-style execution environment).
+
+To build one yourself, see [Lesson 24](../24_coding_agents/README.en.md): it implements a coding agent's ACI tools, path boundaries, and test protection from scratch, plus a harness that lets it hand a long task off across sessions.
 
 ### 4.3 Computer-use and browser agents
 
@@ -787,6 +793,8 @@ Architectural points worth remembering:
 3. **Changes to procedural memory carry the most risk**: one edited line in a system prompt or rule file affects every future action, so it should go through the same review and release process as code ([Lesson 16](../16_release_ops/README.en.md)).
 4. **Every long-term memory must be isolated, deletable and poisoning-resistant**: the three hard requirements for enterprise memory in Lesson 04 apply equally to episodic, semantic and procedural memory. Designs that let the agent rewrite its own procedural memory (say, automatically updating a rule file) are especially exposed to poisoning.
 5. [MemGPT](https://arxiv.org/abs/2310.08560) (Packer et al., 2023) borrows tiered memory from operating systems and lets the agent itself move data between the small, fast context and large, slow external storage — in effect, handing memory management to the agent as well.
+
+For from-scratch implementations of these mechanisms (Mem0-style write decisions, Generative Agents-style retrieval scoring, MemGPT-style tiered memory), and how to meet the enterprise requirements of viewing, correcting, deleting, and poisoning defense, see [Lesson 18](../18_memory_systems/README.en.md).
 
 ## 6. Summary table and decision tree
 

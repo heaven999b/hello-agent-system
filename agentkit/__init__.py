@@ -10,6 +10,10 @@
     guardrails / permissions / audit  安全与治理     （第 09 课）
     tracing / viewer   可观测性                      （第 10 课）
     evals              评估                          （第 11 课）
+
+第三部分（17–25 课）在 agentkit 之上构建进阶能力，代码在各课目录中：
+    检索质量（17）、记忆系统（18）、MCP 与沙箱（19）、框架对照（20）、
+    Agent 的数据（21）、评估方法论（22）、优化（23）、编码 Agent（24）、主动式 Agent（25）
 """
 
 from .agent import Agent, RunResult

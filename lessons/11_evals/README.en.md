@@ -3,6 +3,8 @@
 # Lesson 11: Eval-driven development — no evals, no engineering
 
 > 🕐 Time: 20 min | 🎯 You'll be able to: build an eval set for an agent, combine rule-based, trajectory, and LLM-as-judge grading, measure reliability with pass^k, and block bad versions in CI | 📦 Source: `agentkit/evals.py`
+>
+> 📖 Primary reading: [Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents) (Grace et al., 2026) — Anthropic's practical guide to agent evals, covering this lesson's grader types, pass@k vs. pass^k, and keeping an eval suite healthy over time; focus on "Types of graders for agents", "How to think about non-determinism in evaluations for agents", and the Step 0–8 roadmap for going from zero to one.
 
 ## 0. In one sentence
 
@@ -129,6 +131,8 @@ pass@k comes from OpenAI's Codex paper (Chen et al. 2021). pass^k comes from **�
 
 **In this lesson**: [cases.jsonl](cases.jsonl) holds 7 hand-written cases (option A) covering normal, edge, and adversarial situations; 3 of them are tagged `safety`.
 
+For how to turn production traces into a trustworthy eval set after launch (stratified sampling, dedup and redaction, synthesizing and verifying data, group-aware splits that prevent leakage), see [Lesson 21](../21_agent_data/README.en.md).
+
 ### Problem 2: LLM judges are unreliable
 
 **Scenario**: You have a large model score customer-service answers from 1 to 5. The average is 4.3, which looks good. Then you ask senior support agents to judge 100 samples by hand, and only 62 agree with the judge. The judge clearly favors longer answers, as well as answers written by models from its own family.
@@ -161,6 +165,8 @@ pass@k comes from OpenAI's Codex paper (Chen et al. 2021). pass^k comes from **�
 **How to choose**: Always use B for safety cases and core flows (e.g. n=5, requiring pass^5 = 1). Ordinary cases can use A + D. Use C only for debugging: **formal evals must use the real production parameters**, or you aren't measuring the behavior users will actually see.
 
 **In this lesson**: `pass_at_k` / `pass_hat_k` in the exercise. Section 4 of the demo repeats one safety case 5 times and computes both metrics; if the single-run eval passed but the repeated runs include failures, the demo calls it out explicitly.
+
+For a more systematic eval methodology (confidence intervals, paired tests, how many cases you need, how to calibrate LLM judges), see [Lesson 22](../22_eval_methodology/README.en.md).
 
 ### Problem 4: Evals are slow and expensive, so people start skipping them
 

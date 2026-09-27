@@ -3,6 +3,8 @@
 # 第 03 课：工具设计 —— Agent 与世界的接口
 
 > 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：设计出模型用得对、攻击者用不歪、出错能自愈的企业级工具 ｜ 📦 对应源码：[`agentkit/tools.py`](../../agentkit/tools.py)
+>
+> 📖 必读：[SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering](https://arxiv.org/abs/2405.15793)（Yang 等, 2024）—— 提出 ACI 概念、并用消融实验证明"只改接口设计就能明显改变 Agent 成功率"的论文；重点读 §2 的四条 ACI 设计原则和 §5.1 的消融分析（Table 3，例如模仿 IDE 逐条翻看结果的搜索接口，反而比不给搜索工具还差），再对照本课的工具描述、返回值和错误信息设计。
 
 ## 0. 一句话讲清楚
 
@@ -37,6 +39,8 @@ HCI（人机交互）研究怎么让界面对人友好。2024 年的 [SWE-agent 
 | 会不会被"骗" | 偶尔 | 输入里的任何文字都可能被当成指令 |
 
 所以一个好工具要同时做到三件事：**让模型容易用对**（说明书）、**让模型用错时能自愈**（错误即观察）、**让模型被骗时也闯不了大祸**（身份与权限）。
+
+ACI 在编码 Agent 上体现得最彻底：[第 24 课](../24_coding_agents/README.md#12-aci为什么不直接给它一个-bash)按 SWE-agent 的原则亲手实现了一套编码工具（窗口化查看、带语法检查的编辑、摘要化的测试结果），并对照论文的消融实验看每个设计各贡献了多少。
 
 ### 1.2 一次工具调用的完整生命周期
 
@@ -379,15 +383,17 @@ sequenceDiagram
     C->>M: 结果作为 tool 消息
 ```
 
-| agentkit | MCP（[规范](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)） |
+| agentkit | MCP（[规范 2026-07-28 版](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)） |
 |---|---|
 | `Tool.name` / `Tool.description` | `name` / `description` |
 | `Tool.schema()["function"]["parameters"]` | `inputSchema` |
 | `ToolRegistry.names()` + `schemas()` | `tools/list` |
 | `ToolRegistry.execute(call, ctx)` | `tools/call` |
-| `ToolResult(ok=False, error_type="tool_error")` | 结果里 `isError: true`（工具执行错误） |
-| `error_type="not_found"` / 参数错误 | JSON-RPC 协议错误（如未知工具） |
+| `ToolResult(ok=False)`，`error_type` 为 `"invalid_args"`（参数校验失败）/ `"tool_error"` / `"timeout"` / `"exception"` | 结果里 `isError: true`（工具执行错误：**参数校验错误**、业务错误、下游 API 失败） |
+| `error_type="not_found"`（未知工具） | JSON-RPC 协议错误（未知工具用 `-32602`；请求本身不合法也属于这一类） |
 | `risk="read"` / `"write"` / `"dangerous"` | 工具注解 `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint` |
+
+**参数错误属于工具执行错误，不是协议错误。** [2025-06-18 版规范](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)的界线是含糊的：它把 "Invalid arguments" 列在协议错误下，又把 "Invalid input data" 列在工具执行错误下。[2025-11-25 版](https://modelcontextprotocol.io/specification/2025-11-25/changelog)（[SEP-1303](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1303)）明确了：**参数校验错误**（日期格式不对、数值超出范围……）应当以 `isError: true` 返回，理由正是本课的"错误即观察"：模型看到这类错误能自己改参数重试。只有模型基本修不好的问题才走 JSON-RPC 协议错误：未知工具、不满足 `tools/call` 请求结构的畸形请求、服务器内部错误。最新的 [2026-07-28 版](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)沿用了这个划分。MCP 的两代协议、一个能和官方 SDK 互通的手写服务器和客户端，以及这张对应表在代码里怎么落地，见[第 19 课](../19_mcp_and_sandbox/README.md#21-服务器一条-json-rpc-消息进一条出)。
 
 MCP 规范本身也强调了本课的原则：服务器**必须**校验所有输入、实施访问控制；客户端**应该**对敏感操作请求用户确认、为工具调用设置超时、记录审计日志。
 

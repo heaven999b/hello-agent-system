@@ -3,6 +3,8 @@
 # Lesson 04: Context engineering and memory — managing an agent's scarcest resource
 
 > 🕐 Suggested time: 15 min · 🎯 You'll learn to: break down what goes into the context of a model call and what each part costs; design truncation, clearing, and compaction strategies for long tasks without orphaning tool messages; design long-term memory that meets isolation, deletion, and anti-poisoning requirements · 📦 Source: `agentkit/context.py`, `agentkit/memory.py`
+>
+> 📖 Primary reading: [MemGPT: Towards LLMs as Operating Systems](https://arxiv.org/abs/2310.08560) (Packer et al., 2023) — the paper that turns "context window = main memory, external storage = disk" into a working system, with a counterpart for this lesson's truncation, compaction, and long-term memory; focus on §2: the split between main and external context, and the queue manager's memory-pressure warning and evict-plus-recursive-summary mechanism.
 
 > 📍 This lesson is part of **Part 1: Building Blocks** (concepts → build from scratch → exercises).
 >
@@ -412,6 +414,8 @@ flowchart LR
 - **Injection**: retrieved content is **external data** and may contain malicious instructions. Wrap it in untrusted-data tags as in Lesson 09, tag every chunk with its source ID, and place it toward the end of the context (close to the question, and clear of the prefix cache).
 - **Citation**: require the model to cite source IDs in its answer, then check in code that every cited ID was actually in this retrieval's results. It's a nearly free check that catches a lot of fabrication. If retrieval finds nothing, have the model say "I don't know" instead of making something up from general knowledge.
 
+For how to measure and improve the retrieval step itself (Recall@k / MRR / nDCG; sparse / dense / hybrid retrieval; RRF fusion; reranking; query rewriting), see [Lesson 17](../17_retrieval_quality/README.en.md).
+
 ### 2.8 Three hard requirements for enterprise memory
 
 **① Isolation: Company A's data showing up in Company B's answer is a major incident.**
@@ -583,6 +587,8 @@ No. The research in §1.3 shows that longer input degrades quality, and the bill
 ### 5.6 Updating memories and resolving conflicts
 
 `MemoryStore.add` only appends. If a user said "I use Java" last month and "our team switched to Go" this month, retrieval returns both, and the model has to guess which one is newer. In production, a memory write usually goes "retrieve similar memories first → let the model or rules decide whether to **add, update, delete, or ignore**," and retrieval takes time into account (newer wins). MemGPT (Packer et al., 2023) systematizes this as managing context the way an operating system manages memory: paging between the window (RAM) and external storage (disk).
+
+[Lesson 18](../18_memory_systems/README.en.md) builds all of this from scratch: Mem0-style write decisions (ADD / UPDATE / DELETE / NOOP), Generative Agents-style retrieval scoring (recency, importance, relevance), and MemGPT-style tiered memory.
 
 ### 5.7 What changes at scale
 

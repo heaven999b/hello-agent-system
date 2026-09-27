@@ -3,6 +3,8 @@
 # 第 01 课：LLM 与 Agent 开发必备知识
 
 > 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：说清 token、消息、采样、工具调用、结构化输出、流式、向量检索、推理模型这些概念**在 Agent 里意味着什么**，并避开新手最常踩的十几个坑 ｜ 📦 对应源码：[`agentkit/llm.py`](../../agentkit/llm.py)、[`agentkit/types.py`](../../agentkit/types.py)、[`agentkit/context.py`](../../agentkit/context.py)（`estimate_tokens`）、[`agentkit/pricing.py`](../../agentkit/pricing.py)、[`agentkit/workflows.py`](../../agentkit/workflows.py)（`complete_json`）
+>
+> 📖 必读：[Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
 
 ## 0. 一句话讲清楚
 
@@ -53,6 +55,8 @@ flowchart LR
 | 1.10 | 提示词工程 | system prompt 是 Agent 的"岗位说明书"，要当代码管理 | 把提示词当安全边界 |
 | 1.11 | 模型选型 | 能力、工具调用、延迟、价格、合规、可用性一起看 | 只看排行榜 |
 | 1.12 | API 错误 | 400/401 别重试，429/5xx/超时才重试 | 什么错误都重试 |
+
+有余力的话，深入篇的 [5.1 节](#51-约束生成与解码策略)把 1.3 和 1.5 背后的原理讲透：解码策略（greedy、top-k、beam search）、logprobs 置信度，以及约束解码为什么只保证格式、不保证内容。
 
 ## 1. 核心概念
 
@@ -195,6 +199,8 @@ temperature=1 × 3：['楼下咖啡', '楼下有啡', '楼下咖啡']    → 2 �
 
 **常见坑：** 断言模型输出的精确字符串；把 `seed` 当作可复现的保证；跑通一次就当作"功能完成"。
 
+greedy、top-k、beam search 这几种解码策略各自适合什么，以及怎么用 logprobs 看出模型"有多确定"，见 [5.1 节](#51-约束生成与解码策略)。
+
 ### 1.4 Function calling 的真实机制：模型只会"提议"
 
 **是什么。** 你在请求里附上工具定义（名称、描述、参数的 JSON Schema），模型如果认为需要，就在回复里输出一段结构化的"调用意图"：
@@ -277,6 +283,8 @@ OpenAI 的文档原话是：两者都保证输出合法 JSON，[只有 Structure
 ```
 
 这个修复循环的设计细节在[第 06 课 1.3 节](../06_orchestration/README.md)展开。一个实用技巧：把"想要的结构"定义成一个工具的参数，再用 `tool_choice` 强制调用它，也能得到结构化输出。在不支持 `response_format` 的模型上，这很常用。
+
+原生约束（③）和修复循环不是二选一：前者在生成**过程中**屏蔽不合法的 token，后者在生成**之后**校验业务规则。约束解码的原理、局限和两者的对比表见 [5.1 节](#51-约束生成与解码策略)。
 
 **常见坑：** 以为 JSON mode 保证了字段；用正则从自由文本里"抠"字段；修复循环没有次数上限；要求"输出 JSON"的同时又要求"解释你的理由"（理由请放进 Schema 里的一个字段）。
 
@@ -530,11 +538,11 @@ if resp.usage:
 ## 3. 动手：运行 Demo
 
 ```bash
-.venv/bin/python lessons/01_llm_essentials/demo.py            # 真实模型（约 18 次调用，1 分钟左右）
+.venv/bin/python lessons/01_llm_essentials/demo.py            # 真实模型（约 19 次调用，1 分钟左右）
 .venv/bin/python lessons/01_llm_essentials/demo.py --offline  # 离线：剧本 + 模拟数据，无需 API key
 ```
 
-Demo 分 5 节，每节验证本课的一个知识点。两种模式走的是**同一套代码**：离线模式只是把 OpenAI 客户端换成了一个按剧本返回的假客户端（`FakeOpenAIClient`），这本身也说明了"业务代码只依赖接口"的好处。
+Demo 分 6 节，每节验证本课的一个知识点。两种模式走的是**同一套代码**：离线模式只是把 OpenAI 客户端换成了一个按剧本返回的假客户端（`FakeOpenAIClient`），这本身也说明了"业务代码只依赖接口"的好处。
 
 真实模型的输出节选：
 
@@ -570,6 +578,12 @@ Demo 分 5 节，每节验证本课的一个知识点。两种模式走的是**�
 第 5 节  结构化输出：让下游代码拿到"可靠的数据结构"，而不是一段话
   5a. 原始输出：{"category":"account","priority":"P2","summary":"OA登录提示密码错误","needs_human":true}
   5b. 第 1 次输出：{"category":"account","priority":"P1",...}  ✅ 通过校验
+
+第 6 节  约束解码与 logprobs："只许说合法的话"，以及"它有多确定"
+  6a. 不加约束，贪心选最高分：'紧急' → 不在枚举里，校验失败
+      约束解码：把不合法的候选概率置零、剩下的重新归一化 → 选出 'P2'，格式一定合法
+  6b. 模型输出：'account'
+     ⚠️  请求成功（HTTP 200），但返回里没有 logprobs：这个网关 / 模型静默忽略了它，不报错，只是不生效。
 ```
 
 该观察什么：
@@ -579,6 +593,7 @@ Demo 分 5 节，每节验证本课的一个知识点。两种模式走的是**�
 3. **第 3 节的"执行了 0 次"**：模型返回的只是一个 `str` 类型的 JSON 提议。
 4. **第 4 节 4b 和 4c 的分片数对比**：同一个网关，单个调用切成 59 片，并行调用每个只有 2 片。拼接代码必须对这两种情况都成立。
 5. **第 5 节 5a 和 5b 的结果不一样**（`P2` 和 `P1`）：同一封邮件分了两次，优先级不同。结构化输出保证的是**格式**，不是**判断的一致性**。这又回到了第 2 节。
+6. **第 6 节**：6a 用 5 个编造的候选演示约束解码怎样把"想说的"挤成"合法的"；6b 在真实网关上拿不到 logprobs，Demo 打印了降级方案。离线模式模拟了一个支持 logprobs 的接口：`account` 的概率是 88.7%，低于 90% 的阈值，于是转人工复核（离线数值是示意用的）。
 
 ## 4. 练习
 
@@ -607,8 +622,6 @@ Demo 分 5 节，每节验证本课的一个知识点。两种模式走的是**�
 
 **tokenizer 为什么各不相同。** 主流 tokenizer 大多基于 BPE（Byte Pair Encoding）一类的子词算法（[Sennrich 等，2016](https://arxiv.org/abs/1508.07909)）：从单个字节或字符出发，反复把训练语料里最常一起出现的片段合并成新的 token。所以一个 tokenizer 对哪种语言"省"，取决于它的训练语料里这种语言有多少。同一家厂商换一代 tokenizer，中文的 token 数就可能明显变化。这也是为什么 token 数只能在具体的模型上测。
 
-**约束解码是怎么保证 Schema 的。** 严格模式的原理是在生成的每一步，把"会导致输出不再符合 Schema"的候选 token 的概率直接置零，只在合法的候选里采样。所以它保证的是**格式**：模型仍然可能在合法的格式里填上错误的值。它也解释了严格模式为什么对 Schema 有限制：复杂的 Schema 很难高效地转换成每一步的约束。
-
 **同一个概念，三种接口形状。** 学会一种，另外两种只是换了名字：
 
 | 概念 | OpenAI Chat Completions | OpenAI Responses API | Anthropic Messages API |
@@ -620,9 +633,81 @@ Demo 分 5 节，每节验证本课的一个知识点。两种模式走的是**�
 | 强制调用工具 | `tool_choice: "required"` 或指定函数 | 同左 | `tool_choice: {"type": "any"}` / `{"type": "tool"}` |
 | 流式工具参数 | `delta.tool_calls[].function.arguments` | `response.function_call_arguments.delta` | `input_json_delta` 的 `partial_json` |
 
-**兼容层会"悄悄"和官方不一样。** 本课程用的是一个 OpenAI 兼容网关。实测中，我们发现了它和官方接口的至少三处差异：静默忽略 `max_tokens`；静默忽略 `parallel_tool_calls=false`；一条前面没有 `assistant(tool_calls)` 的孤立 `tool` 消息没有报错（官方接口会返回 400）。另外它不提供 `/embeddings`。这类差异不会报错，只会让你的假设悄悄失效。对策是给你依赖的**每一个**参数写一个针对真实接口的小测试（契约测试），换网关或升级版本时跑一遍。
+**兼容层会"悄悄"和官方不一样。** 本课程用的是一个 OpenAI 兼容网关。实测中，我们发现了它和官方接口的至少四处差异：静默忽略 `max_tokens`；静默忽略 `parallel_tool_calls=false`；静默忽略 `logprobs`（5.1 节）；一条前面没有 `assistant(tool_calls)` 的孤立 `tool` 消息没有报错（官方接口会返回 400）。另外它不提供 `/embeddings`。这类差异不会报错，只会让你的假设悄悄失效。对策是给你依赖的**每一个**参数写一个针对真实接口的小测试（契约测试），换网关或升级版本时跑一遍。
 
-**logprobs：让模型告诉你它有多确定。** 部分模型和接口可以返回每个输出 token 的对数概率（logprobs）。在分类、路由这类"答案只有几个 token"的步骤里，它可以作为置信度信号：置信度低就转人工，或者升级到更强的模型。推理模型通常不支持这个参数。
+### 5.1 约束生成与解码策略
+
+一句话：**解码策略决定"从概率里怎么挑"，logprobs 让你看见"挑的时候有多犹豫"，约束解码决定"哪些候选有资格被挑"。** 这三件事都发生在 1.3 节那张"每一步给所有候选打分"的图里。
+
+**解码策略：同一份概率分布，几种挑法。** 解码（decoding）就是"每一步从概率分布里选出下一个 token"的规则：
+
+| 策略 | 怎么挑 | 直觉 | 在哪里能用 | 对 Agent 意味着什么 |
+|---|---|---|---|---|
+| 贪心（greedy） | 每一步都选概率最高的 token | 只看眼前一步，不回头 | 本地推理库的默认策略（如 Hugging Face transformers，在生成配置没有另行指定时）；API 上 temperature 接近 0 时近似它 | 适合分类、抽取、填工具参数；transformers 文档指出它生成长序列时会开始重复自己 |
+| 温度采样（temperature） | 先用温度把分布变尖或变平，再按概率抽 | 温度越低越接近贪心 | 几乎所有 API | 工具调用、抽取用低温，创作类任务可以高一些（1.3 节） |
+| top-k | 只在概率最高的 k 个候选里抽 | 固定砍掉长尾 | 开源推理框架常见；OpenAI 接口不提供；Anthropic 的 API 文档已把 `top_k` 标为弃用，Claude Opus 4.6 之后发布的模型不再接受 | 很少需要手调 |
+| top-p（nucleus） | 只在累计概率刚好达到 p 的最小候选集合里抽 | 按分布的形状自适应地砍长尾 | 大多数 API | 和 temperature 只调一个（1.3 节） |
+| beam search（束搜索） | 同时保留 k 条候选序列，最后选**整条序列**概率最高的那条 | 多看几步再决定 | 本地推理框架（transformers 的 `num_beams`）；主流聊天 API 一般不提供 | transformers 文档说它最适合"以输入为依据"的任务（看图说话、语音识别）；Holtzman 等（ICLR 2020）发现，以概率最大化为目标的解码在开放式生成里容易写出乏味、重复的文本 |
+
+对 Agent 来说，两个结论最有用：
+
+- **大多数步骤要的是"最可能的那一个"**：选工具、填参数、分类，都用低温。但"最可能"不等于"对"，第一步贪心选错了，后面没有回头路（1.3 节说的轨迹放大）。
+- **"多看几条路再选"通常在应用层做，而不是在 token 层做**：采样几条完整答案再投票（self-consistency），或者生成几个候选再让评估器挑（best-of-N），这就是[第 06 课](../06_orchestration/README.md)的并行投票和评估-优化模式。它们用的是托管 API 也支持的普通采样，比较的是整条答案，而 beam search 比较的是 token 序列的概率。
+
+**logprobs：把"有多确定"变成一个数字。** logprob 是概率的自然对数：0 表示 100%，越负越不可能，`exp(logprob)` 就是概率。OpenAI 的 Chat Completions 接口设 `logprobs=true` 会返回每个输出 token 的 logprob，再设 `top_logprobs`（0～20）还会给出每个位置概率最高的几个候选。在 Agent 里它有三个用处：
+
+1. **分类和路由的置信度**：答案只有一个 token 时，P(标签) 就是置信度。低于阈值就转人工，或者升级到更强的模型（[第 06 课](../06_orchestration/README.md)的级联路由）。技巧：让各个标签**第一个 token 就不同**（比如用 A / B / C 做选项），否则你看到的只是第一个片段的概率。
+2. **看犹豫程度**：第一名和第二名的概率差（margin）很小，说明模型在两个答案之间摇摆，这比只看第一名更有信息量。
+3. **挑出最值得人工看的样本**：按置信度从低到高抽样复核、补进评估集。OpenAI 的 [Using logprobs](https://developers.openai.com/cookbook/examples/using_logprobs) 还演示了用它判断检索到的内容够不够回答问题、决定什么时候触发自动补全。
+
+两个前提要记住：
+
+- **logprob 不等于"答对的概率"**。"说有 90% 把握时，真的有 90% 答对"叫作**校准**（calibration）。[GPT-4 技术报告](https://arxiv.org/abs/2303.08774)显示：预训练模型校准得很好，经过后训练（RLHF）之后校准明显变差。所以 logprobs 可以用来排序，阈值却必须用你自己的标注数据来定：把样本按置信度分桶，看每一桶的真实准确率（可靠性图）；需要时再做后处理校准，比如温度缩放（temperature scaling，Guo 等，ICML 2017）。
+- **不一定拿得到**。不是所有厂商和模型都提供它；推理模型常常不支持 logprobs 或 temperature 这类参数，或者只在关闭推理时才支持（例如 [Azure OpenAI 的推理模型文档](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning)），以官方文档为准。我们在本课程的网关上用 `gpt-5.5` 和 `gpt-5.6-luna` 各试了一次：请求返回 HTTP 200，`logprobs` 字段却是 `None`。这两个都是推理模型，上面那份 Azure 文档正好把 logprobs 列为推理模型不支持的参数；可网关没有报错，而是把参数**静默丢掉**了。Demo 第 6 节遇到这种情况会打印降级方案，而不是崩掉。
+
+**约束生成：只许模型说"合法的话"。** 约束生成（constrained / structured generation，也叫约束解码）把"什么算合法输出"写成一个形式语言（JSON Schema、正则表达式、上下文无关文法 CFG），然后在生成的**每一步**把"会让输出不再合法"的 token 的概率置零，只在剩下的候选里挑：
+
+```mermaid
+flowchart LR
+    S["语法状态<br/>比如：刚写完 priority 的引号"] --> V["算出合法 token 集合<br/>只剩 P1 / P2 / P3 / P4"]
+    M["模型给所有候选打分<br/>logits"] --> K["掩码<br/>不合法的概率置零"]
+    V --> K
+    K --> R["在合法候选里<br/>重新归一化、采样"]
+    R --> A["推进语法状态"]
+    A -->|"下一个 token"| S
+```
+
+难点在"每一步都要快"：词表通常有几万到二十万个 token，不能每一步都逐个检查。几种代表性的实现：
+
+| 实现 | 思路 | 在哪里用 |
+|---|---|---|
+| [Outlines](https://github.com/dottxt-ai/outlines)（Willard & Louf，2023） | 把正则和 JSON Schema 编译成有限状态机，事先建好"状态 → 合法 token"的索引，生成时查表，开销很小 | 开源 Python 库，接本地或自托管模型 |
+| [XGrammar](https://github.com/mlc-ai/xgrammar)（Dong 等，MLSys 2025） | 面向上下文无关文法（能表达任意嵌套的 JSON）；把词表分成可以预先检查的"上下文无关 token"和只能在运行时判断的"上下文相关 token"，并和推理引擎协同设计。论文报告相对已有方案最高约 100 倍加速，端到端几乎零开销 | 据其 README，是 vLLM、SGLang、TensorRT-LLM、MLC-LLM 等推理引擎的默认结构化生成后端 |
+| 托管 API | OpenAI 的 Structured Outputs 和严格模式属于这一类。它的文档写明：第一次使用某个 Schema 的请求会有额外延迟，因为要先处理这个 Schema，之后同一个 Schema 就没有了。GPT-5 的自定义工具还能用 Lark 文法或正则约束输出，OpenAI 的 [cookbook](https://developers.openai.com/cookbook/examples/gpt-5/gpt-5_new_params_and_tools) 写明底层用的是 [LLGuidance](https://github.com/guidance-ai/llguidance) | 你控制不了解码过程，只能用厂商开放的那几种约束 |
+
+**局限：约束了格式，不等于内容正确。**
+
+1. **只管语法，不管语义**。订单号是不是真的、金额对不对、结束日期是不是晚于开始日期，约束一概不管。OpenAI 在上面那篇 cookbook 里也提醒：模型偏离分布时，输出可能"语法正确但语义错误"。
+2. **会扭曲模型的分布**。Park 等（[Grammar-Aligned Decoding](https://arxiv.org/abs/2405.21047)，NeurIPS 2024）指出，约束解码得到的输出合乎语法，但出现的概率和模型本身给出的概率不成比例。直观的例子是 Demo 第 6a 节：模型最想说的是"紧急"（不在枚举里），被屏蔽之后，剩下的概率重新归一化，选中的是 `P2` 而不是意思更接近的 `P1`。格式合法，判断却错了。
+3. **可能拖累推理**。Tam 等（[Let Me Speak Freely?](https://arxiv.org/abs/2408.02442)，2024）发现，在格式限制下模型的推理能力明显下降，而且限制越严格，下降越多。常见的缓解办法：在 Schema 里放一个靠前的"推理"字段让模型先写理由，或者先自由作答，再用第二次调用转成结构化格式。
+4. **Schema 能力有限**。托管服务只支持 JSON Schema 的一个子集（OpenAI 文档说有些特性出于性能或技术原因不可用），"摘要不超过 30 字"这类规则可能写不进去。
+5. **拒答和截断照样会发生**（1.5 节）：约束管不了模型拒答，输出撞上 `max_tokens` 时 JSON 仍然是半截的。
+6. **要在你控制解码的地方才能用**。任意文法约束需要自己部署推理引擎（vLLM、SGLang 等）；用托管 API，就只有厂商开放的那几种。
+
+**和 `complete_json` 修复循环比一比：**
+
+| 维度 | 约束解码（原生 Structured Outputs、严格模式、Outlines、XGrammar） | `complete_json`：提示词 + 校验 + 修复 |
+|---|---|---|
+| 在哪一步起作用 | 生成**过程中**：每一步屏蔽不合法的 token | 生成**之后**：校验整段输出，不合格就把错误发回去重来 |
+| 格式保证 | 语法层面有保证（限于支持的 Schema 子集） | 没有保证：修了 `max_repairs` 次还不行就抛异常 |
+| 能检查什么 | 只有写得进 Schema 或文法的约束 | Pydantic 能写的都行：长度、跨字段规则、自定义校验函数，甚至去查数据库 |
+| 额外调用 | 0（新 Schema 首次请求有处理延迟） | 每修复一次多 1 次调用 |
+| 模型能不能"改主意" | 不能：不合法的候选直接被删掉，可能被挤到次优的合法值上 | 能：看到错误信息后重新生成（Demo 第 5 节离线模式） |
+| 依赖什么 | 模型、网关或推理引擎支持 | 任何能输出文本的模型 |
+| 失败时长什么样 | 合法但可能错误的值；拒答；截断 | 超过修复次数后抛异常（大声失败） |
+| 适合 | 下游代码要解析的每一步、工具参数、高吞吐场景 | 不支持原生能力的模型；Schema 表达不了的业务规则 |
+
+**怎么搭配：两道关，而不是二选一。** 能用原生约束就用，它消灭了绝大多数格式错误和修复调用；约束之后照样用 Pydantic 校验业务规则，校验失败再走修复循环，修不好就大声失败。agentkit 选择只实现后一道关，是因为它不依赖任何厂商能力（第 2 节表格）。
 
 ## 6. 常见坑与反模式
 
@@ -640,6 +725,8 @@ Demo 分 5 节，每节验证本课的一个知识点。两种模式走的是**�
 12. **什么错误都重试**：400 和 401 重试一万次也是同样的结果；额度用完的 429 也一样。
 13. **只看排行榜选模型**，不在自己的任务上评估，也不算完成一个任务的总成本。
 14. **假设兼容网关和官方接口行为一致**。你依赖的每个参数都要实测。
+15. **以为约束解码或严格模式保证了内容正确**。它只保证格式，业务规则照样要校验（5.1 节）。
+16. **把 logprobs 当成校准过的"答对概率"**，或者默认网关一定会返回它。阈值要用标注数据定，拿不到时要有降级方案。
 
 ## 7. 面试 & 设计评审问题
 
@@ -709,6 +796,16 @@ Demo 分 5 节，每节验证本课的一个知识点。两种模式走的是**�
 - 注意事项：思考 token 按输出计费、占上下文；`max_tokens` 要预留足够空间；很多采样参数不支持；和工具一起用时，有的厂商要求原样回传思考内容。
 </details>
 
+<details>
+<summary>Q8：同事说"我们开了严格模式，JSON 百分之百合法，校验和修复循环可以删了"。你怎么回应？</summary>
+
+- 约束解码保证的是**语法**：输出能被解析、字段齐全、枚举值合法；它不保证值是对的（订单号是否存在、日期先后、金额是否匹配）；
+- 它还会扭曲模型的分布：模型最想说的候选不合法时，会被挤到次优的合法值上，结果"合法但错误"；格式限制也可能拖累推理质量；
+- 拒答和截断照样会发生；托管服务只支持 JSON Schema 的一个子集，有些业务规则写不进去；
+- 结论：原生约束和校验是两道关。保留 Pydantic 业务校验，失败时走修复循环（有次数上限），修不好就大声失败；
+- 需要置信度时可以看 logprobs，但先确认接口真的返回它，并用标注数据校准阈值。
+</details>
+
 ## 8. 必备知识自测
 
 先自己回答，再展开看答案。
@@ -773,6 +870,18 @@ id 和 name 只在每个调用的第一片出现，后续分片里是 None，拼
 先区分是哪种 429：如果是请求太快触发了限流，就用指数退避加抖动重试，优先遵守 `Retry-After` 头；如果是额度或预算用完，重试没有意义，应该告警并处理额度。无论哪种，都要有全局的重试预算，避免重试风暴（第 08 课）。
 </details>
 
+<details>
+<summary>11. 约束解码是怎么保证输出符合 Schema 的？它不保证什么？</summary>
+
+把 Schema 或文法编译成状态机，生成时每一步算出"哪些 token 还能让输出保持合法"，把其余 token 的概率置零，只在合法的里面挑。它保证格式，不保证内容：值可能是错的，分布可能被扭曲，模型也可能拒答或被截断，所以业务校验不能省。
+</details>
+
+<details>
+<summary>12. 模型对一个分类给出的 logprob 是 -0.1（约 90%），能说明它有 90% 的把握答对吗？</summary>
+
+不能直接这么说。logprob 是模型自己的概率，要经过校准才等于"答对的概率"，而后训练可能让校准变差（GPT-4 技术报告里的预训练模型和后训练模型就是这样）。先用标注数据按置信度分桶，看每桶的真实准确率，再定转人工的阈值。另外要确认接口真的返回了 logprobs：本课程的网关会静默忽略它。
+</details>
+
 **自测清单：**
 
 - [ ] 我能解释为什么工具定义和隐藏指令也要花钱，并能估算一次请求的成本
@@ -782,6 +891,8 @@ id 和 name 只在每个调用的第一片出现，后续分片里是 None，拼
 - [ ] 我能解释 temperature 和 top_p 的作用，以及为什么 temperature=0 也不确定
 - [ ] 我能画出 function calling 的完整往返，并说出参数 JSON 不合法的至少 3 个原因
 - [ ] 我能说清 JSON mode 和 Structured Outputs 的区别，以及为什么仍然需要校验
+- [ ] 我能说清约束解码的原理和局限，以及它和 `complete_json` 修复循环怎么搭配
+- [ ] 我知道 logprobs 能做什么、为什么要校准，以及拿不到时怎么降级
 - [ ] 我能说出流式工具调用拼接的三条规则
 - [ ] 我能说出向量检索的至少 3 个局限
 - [ ] 我能判断什么时候值得用推理模型
@@ -799,6 +910,12 @@ id 和 name 只在每个调用的第一片出现，后续分片里是 None，拼
 - [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) —— Horace He，Thinking Machines Lab，2025-09。为什么 temperature 0 仍然不确定。
 - [Why Language Models Hallucinate](https://arxiv.org/abs/2509.04664) —— Kalai、Nachum、Vempala、Zhang，2025-09。幻觉的统计学根源，以及评测方式为什么在奖励"猜"。
 - [The Curious Case of Neural Text Degeneration](https://arxiv.org/abs/1904.09751) —— Holtzman 等，ICLR 2020。提出 nucleus sampling（top_p）。
+- [Efficient Guided Generation for Large Language Models](https://arxiv.org/abs/2307.09702) —— Willard & Louf，2023。用有限状态机做正则和 JSON Schema 约束生成，开源库 Outlines 的论文。
+- [XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models](https://arxiv.org/abs/2411.15100) —— Dong 等，MLSys 2025。面向上下文无关文法的高效约束解码引擎。
+- [Grammar-Aligned Decoding](https://arxiv.org/abs/2405.21047) —— Park 等，NeurIPS 2024。约束解码为什么会扭曲模型的分布。
+- [Let Me Speak Freely? A Study on the Impact of Format Restrictions on Performance of Large Language Models](https://arxiv.org/abs/2408.02442) —— Tam 等，2024。格式限制对推理能力的影响。
+- [Using logprobs](https://developers.openai.com/cookbook/examples/using_logprobs) —— OpenAI Cookbook。用 logprobs 做分类置信度、检索问答评估和自动补全。
+- [On Calibration of Modern Neural Networks](https://arxiv.org/abs/1706.04599) —— Guo 等，ICML 2017。什么是校准，以及温度缩放。
 - [Neural Machine Translation of Rare Words with Subword Units](https://arxiv.org/abs/1508.07909) —— Sennrich 等，ACL 2016。把 BPE 引入 NLP 的子词切分，现代 tokenizer 的源头之一。
 - [Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) —— Anthropic，2025-09。system prompt 的"合适高度"、分段组织与迭代方法。
 - [tiktoken](https://github.com/openai/tiktoken) —— OpenAI 开源的 tokenizer 库，可以在本地精确计算 OpenAI 模型的 token 数。

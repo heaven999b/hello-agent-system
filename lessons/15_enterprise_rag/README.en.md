@@ -3,6 +3,8 @@
 # Lesson 15: Enterprise knowledge and data — permission-aware RAG
 
 > 🕐 Suggested time: 15 minutes ｜ 🎯 After this lesson you can: design an enterprise knowledge retrieval system that doesn't overshare, doesn't go stale, shows its sources, and resists poisoning — and make reasoned trade-offs between ACL filtering, multi-tenant isolation, sync strategies, citation checking, and chunking ｜ 📦 Source: [`acl_index.py`](acl_index.py), [`grounding.py`](grounding.py), reusing `tokenize` from [`agentkit/memory.py`](../../agentkit/memory.py) and `ToolOutputGuard` from [`agentkit/guardrails.py`](../../agentkit/guardrails.py)
+>
+> 📖 Primary reading: [LLM08:2025 Vector and Embedding Weaknesses](https://genai.owasp.org/llmrisk/llm082025-vector-and-embedding-weaknesses/) (OWASP GenAI Security Project, 2025) — the entry in the OWASP Top 10 for LLM Applications that covers vector stores and embeddings — unauthorized access, cross-tenant leakage, embedding inversion, and poisoning — which together form the threat model behind this lesson's problem cards; focus on "Common Examples of Risks" and "Example Attack Scenarios", then check each one against this lesson's defenses.
 
 > Code comments and demo output are in Chinese; the identifiers and the logic are what matter.
 
@@ -287,6 +289,8 @@ Note that C isn't an alternative to A and B; it's a switch you add to them. In t
 **How to choose**: **B by default, add C only where you're forced to cut, and handle tables and code specially.** Don't pick `max_chars` by gut feeling: build a question set and compare, across settings, whether the right chunk appears in the top-k (recall@k, Lesson 11). More advanced: prepend a sentence to each chunk saying what it's about within the whole document before indexing (Anthropic's Contextual Retrieval, Lesson 04), or "retrieve small chunks, hand the model the larger chunk they belong to" (parent–child chunks).
 
 **In this lesson**: exercise (b)'s `chunk_markdown`: headings → sections, blank lines → paragraphs, code blocks as single paragraphs, greedy merging within a section, oversized paragraphs split by length with overlap; `fixed_size_chunks` is the baseline. Demo scenario 5 shows both applied to the same document.
+
+This lesson is about retrieval that doesn't cross permission boundaries. For how to measure and improve whether retrieval finds the right chunks at all (Recall@k / MRR / nDCG, sparse / dense / hybrid retrieval, RRF fusion, reranking, how chunk size affects recall), see [Lesson 17](../17_retrieval_quality/README.en.md).
 
 ---
 

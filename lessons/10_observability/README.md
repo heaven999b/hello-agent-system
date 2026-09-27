@@ -3,6 +3,8 @@
 # 第 10 课：可观测性 —— 看见 Agent 在想什么
 
 > 🕐 建议用时：15 分钟 ｜ 🎯 学完你能：给 Agent 装上链路追踪，用指标发现问题、用 trace 定位根因，并对采样、隐私、选型、告警做出合理取舍 ｜ 📦 对应源码：`agentkit/tracing.py`、`agentkit/agent.py`、`agentkit/viewer.py`
+>
+> 📖 必读：[Dapper, a Large-Scale Distributed Systems Tracing Infrastructure](https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/)（Sigelman 等, 2010）—— Google 分布式追踪系统的技术报告，后来的 Zipkin、OpenTelemetry 等都沿用了它的 trace 树 / span 模型；重点读 §2（trace 树与 span、采样、安全与隐私）和 §4（追踪开销与自适应采样），对照本课在采样和隐私上的取舍。
 
 ## 0. 一句话讲清楚
 

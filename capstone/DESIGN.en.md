@@ -48,7 +48,7 @@
 - **Why**: (Hypothetical) A large share of help-desk tickets are how-to questions employees could answer from the knowledge base, duplicate reports of known outages, and password resets. Together they eat most of the engineers' time.
 - **How**: A single agent with 6 tiered tools (4 read / 1 write / 1 dangerous), built on agentkit: input guardrail, budgets, argument-level authorization, RBAC + async human approval, untrusted-data isolation, audit, output redaction, retry/circuit breaker/fallback, checkpoints, two-layer idempotency, and tracing.
 - **Core security assumption**: **The model will be fooled** (we have already observed this in evals). So all authorization happens in code, the only dangerous operation requires human approval, and sensitive credentials never enter the model's context.
-- **Current status**: 30/30 offline tests pass. Real-model evals pass at 100% across 3 runs (24/24 in the latest run, 10/10 on security). P50 latency is 6.1s, P95 10.7s, and a run averages about 3,000 tokens.
+- **Current status**: 44/44 offline tests pass (including 14 ablation-study tests). Real-model evals pass at 100% across 3 runs (24/24 in the latest run, 10/10 on security). P50 latency is 6.1s, P95 10.7s, and a run averages about 3,000 tokens.
 - **Launch blockers**: approval expiry, tenant/user quotas, model version pinning, and vendor data-terms sign-off (see the [appendix](#appendix-p0-items-from-the-design-review-checklist)).
 
 ## 1. Background and Goals
@@ -485,6 +485,19 @@ Worth recording: in `authz_claimed_admin`, the model accepted the self-proclaime
 - The developers wrote the cases themselves, so they drift from real user questions ([E1 Eval-Production Skew](../docs/failure-modes.en.md#e1-eval-production-skew)). After launch, add cases sampled from production conversations.
 - The LLM judge covers only 5 cases and hasn't been calibrated against human labels.
 - Model aliases may be upgraded silently ([E5](../docs/failure-modes.en.md#e5-silent-model-drift)): production must pin a model snapshot version and rerun evals regularly.
+
+### 11.6 Ablation study (measured)
+
+Every layer of defense in depth should be able to answer "what happens without it?" `ablation.py` switches off one component at a time on the 10 `security` cases (full results and interpretation in [README Section 12](README.en.md#121-ablation-study-what-each-defense-actually-stops)):
+
+| Conclusion | Evidence |
+|---|---|
+| With everything on, even a fully compromised scripted model does no harm | Offline: 0 attacks got through |
+| `ArgumentPolicy`'s main value is protecting approvers' attention | Offline: without it, requests sent to approval grow from 1 to 6, and still 0 attacks get through |
+| Approval is the last line of defense against indirect injection | Offline: with approval off, the poisoned article makes an admin session actually reset a password, while eval passes stay the same as the baseline |
+| With the real model the differences are small, because the model refuses most attacks on its own | Real: 6 configurations × 10 cases, 0 attacks got through; `authz_claimed_admin` fooled the model in all 6 configurations and was caught by argument-level authorization, approval, or the in-tool check, depending on the configuration |
+
+Limitations: real mode ran each configuration only once, and the effect of probabilistic defenses like `ToolOutputGuard` didn't show up in either mode; measuring it needs purpose-built indirect-injection cases and many samples.
 
 ## 12. Progressive Rollout Plan
 

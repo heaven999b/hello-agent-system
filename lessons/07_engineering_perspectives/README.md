@@ -3,6 +3,8 @@
 # 第 07 课：工程考量全景 —— 做 Agent 工程要从哪些角度想
 
 > 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：拿到任何一个 Agent 需求，说出要从哪 20 个角度审视它、其中哪些点是任何项目都必须做的、哪些点因为这个项目的特点被"触发"了，并排出先后顺序、查出设计文档的缺口 ｜ 📦 对应源码：[`perspectives.py`](perspectives.py)（维度目录，301 个考量点）、[`demo.py`](demo.py)、[`exercise.py`](exercise.py)
+>
+> 📖 必读：[Hidden Technical Debt in Machine Learning Systems](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html)（Sculley 等, 2015）—— Google 工程师的经典论文：真实系统里模型代码只占一小块，风险藏在它周围的数据依赖、配置、反馈回路和外部变化里，这正是本课要从多个角度审视系统的原因；重点看图 1 和第 9 节列出的自查问题，并试着把论文里的每类技术债对应到本课的某个维度。
 
 ## 0. 一句话讲清楚
 

@@ -63,12 +63,15 @@ To run: `python lessons/NN_topic/demo.py [--offline]`, `make lesson N=NN`, `make
 4. **Don't make things up**: cited papers, blog posts, and incidents must be real; if you're not sure, leave it out.
 5. **Code must run**: every command and code snippet in the docs must actually have been run.
 
-## The course has two parts
+## The course has three parts
 
 | Part | Lessons | Share | Approach |
 |---|---|---|---|
-| Part 1: Building Blocks | 00–07 | ~47% (~140 min) | Concepts → build from scratch → exercises |
-| Part 2: Enterprise Problems and Solutions | 08–16 | ~53% (~160 min) | **Problem-driven**: a real problem → compare several solutions → when each one fits → recommended choice → code |
+| Part 1: Building Blocks | 00–07 | ~27% (~140 min) | Concepts → build from scratch → exercises |
+| Part 2: Enterprise Problems and Solutions | 08–16 | ~31% (~160 min) | **Problem-driven**: a real problem → compare several solutions → when each one fits → recommended choice → code |
+| Part 3: Advanced — Building Blocks in Depth, the ML Loop, and the Application Frontier | 17–25 | ~41% (~210 min) | Concepts → build from scratch → exercises + trade-off comparison |
+
+Part 3 is advanced, optional material for learners who have finished the first two parts and the capstone. Each lesson keeps the README structure above, implements the core mechanisms from scratch (they can live in lesson-local modules such as `xxx_kit.py`), and compares the trade-offs between industry solutions (in the relevant section or in "Going deeper") rather than presenting just one approach.
 
 ## Enterprise problem cards (the main format of every Part 2 lesson)
 

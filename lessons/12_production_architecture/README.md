@@ -3,6 +3,8 @@
 # 第 12 课：生产架构 —— 从脚本到服务
 
 > 🕐 建议用时：15 分钟 ｜ 🎯 学完你能：画出企业级 Agent 平台的参考架构，说清每个组件解决什么问题；在同步 / 异步、有状态 / 无状态、租户隔离、框架选型、模型网关这几个架构决策上做出合理选择 ｜ 📦 对应源码：本课练习（多租户限流、模型路由）、`agentkit/state.py`、`agentkit/llm.py`，完整的服务示例见 `capstone/server.py`
+>
+> 📖 必读：[12-Factor Agents - Principles for building reliable LLM applications](https://github.com/humanlayer/12-factor-agents)（Dex Horthy, 2025）—— HumanLayer 总结的"把 Agent 做成能交给客户的软件"的 12 条原则，和本课异步任务、无状态 worker、框架选型这几张问题卡片直接对应；重点读 Factor 5（统一执行状态与业务状态）、Factor 6（用简单的 API 启动 / 暂停 / 恢复）和 Factor 8（掌握自己的控制流）。
 
 ## 0. 一句话讲清楚
 

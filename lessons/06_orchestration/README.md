@@ -3,6 +3,8 @@
 # 第 06 课：编排模式 —— Workflow、Agent 与多 Agent
 
 > 🕐 建议用时：15 分钟 ｜ 🎯 学完你能：面对一个业务需求，选出"能解决问题的最简单"编排方案，并说清它在成本、延迟、可靠性上的代价；知道多 Agent 什么时候值得、什么时候是坑 ｜ 📦 对应源码：`agentkit/workflows.py`
+>
+> 📖 必读：[Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
 
 > 📍 本课属于**第一部分：基础构建**（概念 → 从零实现 → 练习）。上一课 [第 05 课 常见 Agent 架构](../05_agent_architectures/README.md) 讲的是 Agent 内部的推理架构和多 Agent 拓扑，本课讲 Workflow 编排模式，两课互补（分工见第 05 课 §1.3）；下一课 [第 07 课 工程考量全景](../07_engineering_perspectives/README.md) 是第一部分的收尾。
 >
@@ -354,6 +356,8 @@ def agent_as_tool(agent, name: str, description: str) -> Tool:
 
 Cognition 的文章把教训总结为两条原则：**共享上下文，而且要共享完整的 Agent 轨迹，而不只是单条消息；行动隐含着决策，相互冲突的决策会带来糟糕的结果。**
 
+这些代价在实证研究里是什么样子？UC Berkeley 等人分析了 7 个多 Agent 框架的运行轨迹，归纳出 14 种失败模式；OpenHands 的 Graham Neubig 则专门为单 Agent 辩护。两者的内容，以及每类失败怎么检测、怎么缓解，见 §5.7。
+
 #### 什么时候值得
 
 Anthropic 的经验是：多 Agent 擅长**可以大量并行**、信息量**超出单个上下文窗口**、需要对接**大量复杂工具**的高价值任务。他们的研究系统（Claude Opus 4 做主导、Claude Sonnet 4 做子 Agent）在内部研究评估上比单 Agent 的 Claude Opus 4 高出 90.2%；而在他们的 BrowseComp 分析里，**token 用量本身就解释了 80% 的性能差异**——多 Agent 的收益很大一部分来自"花了更多 token"。
@@ -516,6 +520,49 @@ Anthropic 的建议是先直接用 LLM API：很多模式几行代码就能实�
 
 主管-专家模式里，专家只返回最终答案（摘要），主管的上下文干净，但丢失了专家的推理过程——主管无法判断专家是否可靠。Cognition 主张共享完整轨迹，Anthropic 的上下文工程文章则建议子 Agent 返回浓缩的摘要。两者并不矛盾：**任务之间依赖强、需要一致决策时，偏向共享更多上下文（甚至不拆）；任务独立、主要为了广度时，偏向返回精炼摘要**。一个折中是专家返回"结论 + 依据（引用的事实、调用过的工具）"，既控制长度又便于核查。
 
+### 5.7 多 Agent 系统为什么失败
+
+§2.7 讲了多 Agent 的代价，这一节看实证研究：多 Agent 系统到底是**怎么**失败的，失败了怎么发现、怎么修。
+
+**MAST：多 Agent 系统失败分类法。** Cemri 等人（UC Berkeley 等）的 [Why Do Multi-Agent LLM Systems Fail?](https://arxiv.org/abs/2503.13657)（NeurIPS 2025 数据集与基准赛道）的出发点是：多 Agent 系统在流行基准上的提升往往很小，相对单 Agent 框架或 best-of-N 采样这样的简单基线都是如此。他们请专家细读 150 条多 Agent 运行轨迹，归纳出 **MAST**（Multi-Agent System Failure Taxonomy）。标注者之间的一致性 κ = 0.88（Cohen's kappa：扣除"碰巧一致"之后两个人意见一致的程度，1 表示完全一致）。之后他们用 LLM 评委扩大标注，最新版本（arXiv v3，2025 年 10 月）发布了覆盖 7 个框架、1600 多条标注轨迹的数据集 MAST-Data。
+
+MAST 共 **14 种失败模式，分 3 大类**。括号里的比例来自论文 v3 的图 1，只看量级就好：不同框架、不同版本的分布差别很大。
+
+| 大类 | 失败模式 |
+|---|---|
+| **FC1 系统设计问题**（44.2%）：失败发生在运行时，根源却是事先的设计：架构、提示词、状态管理 | FM-1.1 违反任务规格（11.8%）· FM-1.2 违反角色规格（1.5%）· FM-1.3 步骤重复（15.7%）· FM-1.4 丢失对话历史（2.8%）· FM-1.5 不知道何时该终止（12.4%） |
+| **FC2 智能体间失配**（32.3%）：Agent 之间的关键信息流断了 | FM-2.1 对话重置（2.2%）· FM-2.2 该问不问、带着错误假设往下做（6.8%）· FM-2.3 任务偏离（7.4%）· FM-2.4 信息隐瞒（0.85%）· FM-2.5 忽视其他 Agent 的输入（1.9%）· FM-2.6 推理与行动不一致（13.2%） |
+| **FC3 任务验证**（23.5%）：没发现或没纠正错误，或者提前收工 | FM-3.1 过早终止（6.2%）· FM-3.2 没有验证或验证不完整（8.2%）· FM-3.3 验证出错（9.1%） |
+
+论文的三条洞察，对做系统的人最有用：
+
+1. **失败不只是模型的锅。** 同一个底层模型，系统设计得好就能提升效果。他们的干预实验里，只改进 ChatDev 的角色规格，用户提示词和模型（GPT-4o）都不变，成功率就提升了 9.4%。
+2. **只统一消息格式解决不了"失配"。** MCP、A2A 这类协议统一了消息格式，但 FC2 类失败在同一个框架内、用自然语言交流时照样发生。作者认为根子在于 Agent 推断不出别的 Agent 需要什么信息，要靠更好的系统结构和模型能力一起解决。
+3. **需要多层验证。** 很多验证器只做表面检查，比如代码能不能编译、有没有遗留的 TODO。ChatDev 生成的国际象棋程序通过了编译，却违反棋规。给 ChatDev 加上一步"对照高层任务目标"的验证，在 ProgramDev 上任务成功率提升了 15.6%。
+
+**反方视角：别小看单 Agent。** Graham Neubig 在 OpenHands 博客的 [Don't Sleep on Single-agent Systems](https://www.openhands.dev/blog/dont-sleep-on-single-agent-systems)（2024-09）里以编程 Agent CodeR 为例（规划、复现问题、定位、编辑、验证各由一个 Agent 负责），承认这种结构在任务恰好符合预设流程时效果很好，但指出三个问题：
+
+- **结构脆弱**：验证 Agent 想自己定位一下文件、确认答案对不对，却没有那个工具，因为工具分给了别的 Agent；
+- **信息丢失**：Agent 之间交接时只传摘要，下游拿不到完整信息；
+- **维护负担**：每个 Agent 一套提示词，甚至一套代码。
+
+他的替代方案是**一个**强大的通用模型，加上合并后的工具集（OpenHands 给 Agent 的是写代码、运行代码、浏览网页三类工具），提示词要么全部拼在一起，要么按需检索相关的那部分。这之所以可行，是因为通用模型的能力足够广、上下文足够长（当时 Claude 是 200K token），提示词缓存又降低了长提示词的成本。他也明确承认多 Agent 的正当场景：某个 Agent 持有其他 Agent 不该看到的特权信息，或者不同的 Agent 代表不同的人行事。他的结论不是"多 Agent 没用"，而是提醒大家对"不断增加复杂度"的趋势保持批判：有时候简单就是最好。这和 Cognition 的《Don't Build Multi-Agents》、Anthropic 的"先找最简单的方案"是同一个方向（§2.7）。
+
+**每类失败怎么检测、怎么缓解：** 把 MAST 的 14 种模式和本仓库[失败模式图鉴](../../docs/failure-modes.md)的条目对上，就能直接落到 agentkit 的工具上：
+
+| MAST 失败模式 | 在 agentkit 里长什么样 | 怎么检测 | 怎么缓解 | 图鉴条目 |
+|---|---|---|---|---|
+| FM-1.1 违反任务规格 · FM-1.2 违反角色规格 | 汇总结果漏了用户的约束；专家做了主管没让它做的事 | 评估用例对照用户原始需求打分（`must_contain`、rubric）；按 Agent 统计工具调用，发现"越界"的调用 | 委派写成自包含的任务契约：目标、约束、验收标准；角色边界靠**工具权限**实现，每个 Agent 只拿到本职需要的工具，而不是靠提示词里的一句"你只负责……" | [O2](../../docs/failure-modes.md#o2-委派上下文饥饿delegation-context-starvation)、[S5](../../docs/failure-modes.md#s5-过度授权excessive-agency) |
+| FM-1.3 步骤重复 · FM-1.5 不知道何时该终止 | 同一个工具、几乎同样的参数调用了 8 次；主管反复委派同一个专家；运行以 `max_steps` 结束 | trace 里统计 `(工具, 规范化参数)` 的重复次数；监控 `max_steps` 结束的比例；统计一次请求里的委派深度和 Agent 调用次数 | 每个 Agent 的 `max_steps` 加上整个请求的总预算（`BudgetHook`）；限制委派深度；完成条件写成代码能判断的结构化清单 | [M3](../../docs/failure-modes.md#m3-循环与重复调用tool-call-loop)、[O4](../../docs/failure-modes.md#o4-无界委派unbounded-delegation) |
+| FM-1.4 丢失对话历史 · FM-2.1 对话重置 | 专家不知道之前做过的决定；上下文压缩后丢了"已经退过款" | 看子 Agent 的第一步是不是在问主管早就知道的信息；做"压缩点之前已有写操作"的专项评估 | 委派任务自包含；"已完成的操作"存成结构化状态（数据库字段），不只放在对话历史里 | [O2](../../docs/failure-modes.md#o2-委派上下文饥饿delegation-context-starvation)、[C3](../../docs/failure-modes.md#c3-有损压缩lossy-compaction) |
+| FM-2.2 该问不问 · FM-2.3 任务偏离 | 专家在信息不全时自己编了个假设；答非所问 | 评估集里放信息不全的请求，看系统会不会追问；LLM 评委对照原始目标打分 | 允许子 Agent 返回结构化的"需要澄清"，由主管去问用户，而不是让子 Agent 猜；委派契约里写明验收标准 | [M4](../../docs/failure-modes.md#m4-参数幻觉hallucinated-arguments) |
+| FM-2.4 信息隐瞒 · FM-2.5 忽视其他 Agent 的输入 | 专家查到了关键事实，主管的最终回答里却没用上；两个并行专家的结论互相矛盾 | 汇总步骤做一致性检查；对比专家返回的事实和最终回答 | 专家返回"结论 + 依据"（§5.6）；写操作串行，由一个决策者执行；汇总时显式处理冲突，而不是简单拼接 | [O3](../../docs/failure-modes.md#o3-并行决策冲突conflicting-parallel-decisions)、[O2](../../docs/failure-modes.md#o2-委派上下文饥饿delegation-context-starvation) |
+| FM-2.6 推理与行动不一致 | 说"我先查订单"，调用的却是别的工具；说"已提交工单"，其实没有调用 | 在 `on_final` 钩子里做"声明-证据核对"：回答里声称做了的事，`tools_called()` 里必须有对应的成功调用 | 关键结果（工单号、退款流水号）直接用工具返回值填进回答模板，不让模型自己写 | [M1](../../docs/failure-modes.md#m1-编造行动phantom-action) |
+| FM-3.1 过早终止 | "5 项检查都做完了"，实际只做了 2 项 | 对比结构化清单和实际执行的工具调用；`completed` 但步数明显低于同类任务的中位数 | 由**代码**判断是否全部完成，没完成就把剩余项反馈给模型继续 | [M2](../../docs/failure-modes.md#m2-过早宣布完成premature-completion) |
+| FM-3.2 没有验证或验证不完整 · FM-3.3 验证出错 | 评审 Agent 几乎总说"通过"；代码能编译就算过 | 统计评审的通过率（接近 100% 本身就是危险信号）；给评审注入已知错误，看它能不能发现 | 能用确定性检查的优先（跑测试、校验 Schema、对账、查数据库终态）；多层验证：既查低层正确性，也对照高层目标；LLM 评审用具体的评分细则，最好换一个模型 | [O5](../../docs/failure-modes.md#o5-无人验收missing-verification)、[E3](../../docs/failure-modes.md#e3-评委偏差llm-judge-bias) |
+
+**怎么用这套分类法。** 上多 Agent 之前，先做一个单 Agent 基线，在同一个评估集上比（Neubig 和 Anthropic 都这么建议）。上线之后做**错误分析**：抽一批失败的轨迹，按上面 14 类逐条标注，统计哪一类最多，先修最大的那一块。修完再跑评估，确认没有修一坏三。这也是[项目报告模板](../../capstone/REPORT_TEMPLATE.md)里"失败模式错误分析"一节要你做的事。
+
 ## 6. 常见坑与反模式（📖 选读）
 
 | 坑 | 后果 | 正确做法 |
@@ -531,6 +578,7 @@ Anthropic 的建议是先直接用 LLM API：很多模式几行代码就能实�
 | gate 名字拼错被静默忽略 | 一道安全检查被悄悄跳过 | 配置错误在启动时大声失败 |
 | 委派给专家的 task 不自包含 | 专家看不到用户原话，答非所问 | 工具描述和主管提示词里明确要求写全上下文 |
 | 让模型通过参数传用户身份 | 提示词注入即可冒充他人 | 身份只通过 ctx 透传 |
+| 验证只做表面检查（能编译、有输出就算过） | 错误结果通过"评审"流到用户手里 | 多层验证：确定性检查优先，再对照高层目标（§5.7） |
 
 ## 7. 面试 & 设计评审问题（📖 选读）
 
@@ -604,6 +652,16 @@ Anthropic 的建议是先直接用 LLM API：很多模式几行代码就能实�
 - 设整体截止时间，超时返回已完成部分或转人工（第 08 课）。
 </details>
 
+<details>
+<summary>Q9：你们的多 Agent 系统上线后任务成功率不理想。你会怎么定位问题？要不要换成单 Agent？</summary>
+
+- 先做错误分析，而不是凭感觉改：抽样失败轨迹，按 MAST 的三大类（系统设计、智能体间失配、任务验证）14 种模式逐条标注，统计哪类最多；
+- 系统设计类（违反规格、步骤重复、不知道何时终止）：改委派契约、角色的工具权限、终止条件和分层预算；
+- 失配类（该问不问、信息隐瞒、推理与行动不一致）：委派任务自包含，专家返回"结论 + 依据"，写操作由一个决策者串行执行，做声明-证据核对；
+- 验证类：确定性检查优先，多层验证，LLM 评审换模型并用注入已知错误的方式测它；
+- 同时在同一评估集上跑一个单 Agent 基线。MAST 论文开篇就指出，多 Agent 相对简单基线的提升常常很小；如果单 Agent 差不多甚至更好，就换回去（Neubig 的观点）。只有在权限隔离、代表不同的人、可大量并行这类场景下，多 Agent 才明显值得。
+</details>
+
 ## 8. 自测清单
 
 - [ ] 我能用一句话说清 Workflow 和 Agent 的区别，并画出复杂度阶梯
@@ -614,6 +672,7 @@ Anthropic 的建议是先直接用 LLM API：很多模式几行代码就能实�
 - [ ] 我知道评估-优化里"代码检查优先"和"max_rounds 兜底"的原因
 - [ ] 我能比较主管-专家、交接、去中心化三种多 Agent 拓扑
 - [ ] 我能说出多 Agent 的至少四种代价，以及它什么时候值得
+- [ ] 我能说出 MAST 的三大类失败，并为每一类给出一种检测方法和一种缓解方法
 - [ ] 我能用决策树为一个新需求选出编排方案，并回答"为什么上一级不够用"
 - [ ] 我完成了练习，`make lesson N=06` 全部通过
 
@@ -621,6 +680,8 @@ Anthropic 的建议是先直接用 LLM API：很多模式几行代码就能实�
 
 - Anthropic, [Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents)（2024）—— 本课的主线：Workflow 与 Agent 的区分、5 种模式、何时用框架
 - Anthropic, [How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system)（2025）—— 多 Agent 的真实收益与代价：15 倍 token、何时适合、工程上的坑
+- Cemri et al., [Why Do Multi-Agent LLM Systems Fail?](https://arxiv.org/abs/2503.13657)（NeurIPS 2025 数据集与基准赛道）—— MAST 失败分类法：14 种失败模式、3 大类，附数据集和 LLM 标注器
+- Graham Neubig, [Don't Sleep on Single-agent Systems](https://www.openhands.dev/blog/dont-sleep-on-single-agent-systems)（OpenHands 博客，2024）—— 为单 Agent 辩护：结构脆弱、信息丢失、维护负担
 - Cognition（Walden Yan）, [Don't Build Multi-Agents](https://cognition.com/blog/dont-build-multi-agents)（2025）—— 反方观点：上下文割裂与冲突决策
 - OpenAI, [A practical guide to building agents](https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf)（2025）—— 何时拆分 Agent、Manager 与 Decentralized 两种模式
 - OpenAI Agents SDK, [Handoffs](https://openai.github.io/openai-agents-python/handoffs/) —— 交接模式的一个具体实现

@@ -13,6 +13,15 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 server = ["fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
+# 第 20 课：同一任务的 DSPy / LangGraph / OpenAI Agents SDK 实现（版本已实测；0.x 的包锁小版本）
+frameworks = [
+    "dspy>=3.4,<3.5",
+    "langgraph>=1.2,<2",
+    "langchain-openai>=1.6,<2",
+    "openai-agents>=0.22,<0.23",
+]
+# 第 19 课：官方 MCP SDK 对照（可选，手写协议不依赖它）
+mcp = ["mcp>=2.2"]
 
 [build-system]
 requires = ["setuptools>=61"]

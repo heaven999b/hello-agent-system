@@ -3,6 +3,8 @@
 # 第 14 课：成本与延迟优化 —— 让 Agent 又省钱又快
 
 > 🕐 建议用时：15 分钟 ｜ 🎯 学完你能：拿到一份 Agent 账单和延迟分布，说清钱和时间花在了哪里，为每一项选出合适的优化手段，并讲清它的代价 ｜ 📦 对应源码：[costkit.py](costkit.py)（本课）、[`agentkit/pricing.py`](../../agentkit/pricing.py)、[`agentkit/tracing.py`](../../agentkit/tracing.py)
+>
+> 📖 必读：[FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance](https://arxiv.org/abs/2305.05176)（Chen 等, 2023）—— LLM 级联的代表性论文，它的三类手段（提示词适配、模型近似（含补全缓存）、级联）对应本课四个问题中的前三个；重点读 §3 的三类策略和级联里"打分函数 + 阈值"的设计，再对照本课 `CascadeLLM` 的 validator。
 
 ## 0. 一句话讲清楚
 
@@ -62,6 +64,8 @@ $$\text{延迟} \approx \text{排队} + \sum_{\text{每一步}} \left( \text{TTF
 1. **先测量再优化**：从 trace（第 10 课）里找出成本和延迟的大头，别凭感觉优化；
 2. **每个优化都要过评估集**（第 11 课）：质量不降，才算优化；
 3. **看分布，不看平均**：成本看 p95 单次成本（少数失控的运行往往占了大头），延迟看 p95 / p99。
+
+本课的"优化"指的是在质量不降的前提下省钱、提速。反过来的问题——质量本身不够好时，该改提示词、加测试时计算还是微调——见[第 23 课](../23_optimization/README.md)。
 
 ## 2. 企业问题与解决方案
 

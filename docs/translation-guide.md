@@ -51,3 +51,79 @@ This repository is bilingual. Every Markdown document has a Chinese version (`xx
 | 止血 / 回滚 / 紧急开关 | mitigation / rollback / kill switch |
 | 复盘 | postmortem |
 | 设计文档 / 架构决策记录 | design doc / ADR (architecture decision record) |
+
+### Part 3 terms (Lessons 17–25) / 第三部分术语（第 17–25 课）
+
+| 中文 | English |
+|---|---|
+| 稠密检索 / 稀疏检索 | dense retrieval / sparse retrieval |
+| 混合检索 / 倒数排名融合 | hybrid search / reciprocal rank fusion (RRF) |
+| 召回 / 重排 | retrieval (first stage) / reranking |
+| 双塔 / 交叉编码器 / 晚交互 | bi-encoder / cross-encoder / late interaction |
+| 近似最近邻 / 暴力检索 | approximate nearest neighbor (ANN) / brute-force (flat) search |
+| 查询改写 / 多查询 / 假设文档 | query rewriting / multi-query / HyDE (hypothetical document) |
+| 词汇鸿沟 | vocabulary gap |
+| 分级标注 / 未标注 ≠ 不相关 | graded relevance labels / unlabeled ≠ irrelevant |
+| 固定上下文预算 | fixed context budget |
+| Mem0 式写入 / 抽取 → 比对 → 决策 | Mem0-style write path / extract → compare → decide |
+| 规则兜底 | rule-based guard |
+| 单值槽位 | single-valued slot |
+| 软删除 / 物理删除 | soft delete / hard delete |
+| 写时消解 / 读时消解 | resolve at write time / resolve at read time |
+| 分层记忆 / 核心记忆 / 归档记忆 / 回忆记忆 | tiered memory / core memory / archival memory / recall memory |
+| 记忆巩固 / 反思 / 血缘 / 级联删除 | memory consolidation / reflection / lineage / cascading deletion |
+| 近期性 / 重要性 / 相关性 | recency / importance / relevance |
+| 双代兼容 / 旧版 / 现代版 | dual-era / legacy / modern (MCP protocol generations) |
+| 能力协商 | capability negotiation |
+| 协议错误 / 工具执行错误 | protocol error / tool execution error |
+| 工具注解 / 工具定义指纹 | tool annotations / tool-definition fingerprint |
+| 工具投毒 / 事后变脸 / 工具遮蔽 | tool poisoning / rug pull / tool shadowing |
+| 进程级沙箱 / OS 级沙箱 | process-level sandbox / OS-level sandbox |
+| Seatbelt（macOS 沙箱）/ bubblewrap | Seatbelt (`sandbox-exec`) / bubblewrap (keep the names) |
+| 用户态内核 / 微虚拟机 | user-space kernel (gVisor) / microVM |
+| 签名 / 模块 / 优化器 | signature / module / optimizer (DSPy) |
+| 超步 / reducer | super-step / reducer (LangGraph) |
+| 中断与恢复 | interrupt / resume |
+| 数据飞轮 | data flywheel |
+| 示范 / 反馈 / 人工标注 | demonstration / feedback / human label |
+| 分层抽样 / 逆概率权重 | stratified sampling / inverse probability weight |
+| 近重复 / 工具序列签名 | near-duplicate / tool signature |
+| 合成数据 / 种子 × 维度 / 分布偏移 | synthetic data / seeds × dimensions / distribution shift |
+| 模型崩溃 | model collapse |
+| 数据泄漏 / 按组划分 | data leakage / split by group |
+| 训练集 / 开发集 / 测试集 | train / dev / test set |
+| 一致率 / Cohen's kappa / kappa 悖论 | percent agreement / Cohen's kappa / kappa paradox |
+| 标准漂移 / 标注指南 | criteria drift / annotation guidelines |
+| 评估四元组（请求、环境、停止条件、评分器） | four-tuple (request, environment, stopping criteria, scorer) |
+| 基准有效性 / 数据污染 / 基准饱和 | benchmark validity / data contamination / benchmark saturation |
+| 成对评委 / 位置偏差 | pairwise judge / position bias |
+| 置信区间 / 配对检验 / 配对 bootstrap | confidence interval / paired test / paired bootstrap |
+| 任务有效性 / 结果有效性 | task validity / outcome validity |
+| ABC 清单 | ABC checklist (Agentic Benchmark Checklist) |
+| 探针 Agent / 参考解 / 平凡 Agent | probe agent / reference solution (oracle solver) / trivial agent |
+| 单点评分 / 成对比较 / 参考答案引导 | pointwise (single-answer) grading / pairwise comparison / reference-guided grading |
+| 交换顺序去偏（保守做法） | swap the order to debias (the conservative approach) |
+| Wilson 区间 / Wald 区间 | Wilson interval / Wald interval |
+| McNemar 检验 / 精确二项检验 / 卡方近似 | McNemar's test / exact binomial test / chi-square approximation |
+| 聚类标准误 / 功效 | clustered standard errors / power |
+| 非劣效检验 / 多重比较 | non-inferiority / multiple comparisons |
+| 评估 harness / Agent harness | evaluation harness / agent harness |
+| 基础设施错误 | infrastructure error (`infra_error`) |
+| 提示词优化 / 提议器 | prompt optimization / proposer |
+| 测试时计算 / 自一致性 / 验证器 | test-time compute / self-consistency / verifier |
+| 帕累托前沿 / 两级接受 | Pareto front / two-stage acceptance |
+| 赢家诅咒 / 背题 | winner's curse / memorization |
+| 蒸馏 / 监督微调 / 偏好优化 | distillation / supervised fine-tuning (SFT) / preference optimization (DPO) |
+| 钻评分器空子 / 奖励投机 / 特判 | gaming the grader (specification gaming) / reward hacking / special-casing |
+| 智能体-计算机接口 | agent-computer interface (ACI) |
+| 运行框架（挽具） | harness |
+| 功能清单 / 进度文件 / 接班 / 接班简报 | feature list / progress file / taking over / handover briefing |
+| 测试保护 / diff 审查 | test protection / diff review |
+| 主动式 / 被动式 | proactive / reactive |
+| 混合主动 | mixed-initiative |
+| 用户模型 / 推断 / 置信度 | user model / inference (belief) / confidence |
+| 打扰成本 / 打扰决策器 | interruption cost / interruption decider |
+| 现在说 / 攒着说（摘要）/ 不说 | interrupt now / defer (digest) / drop |
+| 勿扰时段 / 频率上限 / 紧急通道 | quiet hours / rate limit / urgent override |
+| 50% 时间跨度 | 50% time horizon |
+| 可扩展的监督 | scalable oversight |

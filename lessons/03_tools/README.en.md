@@ -3,6 +3,8 @@
 # Lesson 03: Tool design — the agent's interface to the world
 
 > 🕐 Time: 20 minutes | 🎯 You'll be able to: design enterprise-grade tools that the model uses correctly, that attackers can't misuse, and that recover on their own when things go wrong | 📦 Source: [`agentkit/tools.py`](../../agentkit/tools.py)
+>
+> 📖 Primary reading: [SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering](https://arxiv.org/abs/2405.15793) (Yang et al., 2024) — the paper that introduced the ACI idea and showed with ablations that changing only the interface clearly changes how often an agent succeeds; focus on the four ACI design principles in §2 and the ablations in §5.1 (Table 3 — e.g., an IDE-style search that pages through results one by one did worse than no search tool at all), then compare them with this lesson's tool descriptions, return values, and error messages.
 
 ## 0. In one sentence
 
@@ -37,6 +39,8 @@ People and models use interfaces very differently:
 | Can it be "tricked"? | Occasionally | Any text in its input may be taken as an instruction |
 
 So a good tool has to do three things at once: **make it easy for the model to use correctly** (the manual), **let the model recover when it gets it wrong** (errors as observations), and **limit the damage when the model is tricked** (identity and permissions).
+
+ACI shows up most fully in coding agents: [Lesson 24](../24_coding_agents/README.en.md#12-aci-why-not-just-give-it-bash) follows SWE-agent's principles to build a coding toolset by hand (windowed file viewing, syntax-checked edits, summarized test results), and uses the paper's ablations to show what each design choice contributes.
 
 ### 1.2 The full lifecycle of a tool call
 
@@ -379,15 +383,17 @@ sequenceDiagram
     C->>M: result as a tool message
 ```
 
-| agentkit | MCP ([spec](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)) |
+| agentkit | MCP ([spec, 2026-07-28 revision](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)) |
 |---|---|
 | `Tool.name` / `Tool.description` | `name` / `description` |
 | `Tool.schema()["function"]["parameters"]` | `inputSchema` |
 | `ToolRegistry.names()` + `schemas()` | `tools/list` |
 | `ToolRegistry.execute(call, ctx)` | `tools/call` |
-| `ToolResult(ok=False, error_type="tool_error")` | `isError: true` in the result (tool execution error) |
-| `error_type="not_found"` / argument errors | JSON-RPC protocol errors (e.g. unknown tool) |
+| `ToolResult(ok=False)` with `error_type` `"invalid_args"` (argument validation failed) / `"tool_error"` / `"timeout"` / `"exception"` | `isError: true` in the result (tool execution error: **input validation errors**, business errors, downstream API failures) |
+| `error_type="not_found"` (unknown tool) | JSON-RPC protocol error (`-32602` for an unknown tool; malformed requests also belong here) |
 | `risk="read"` / `"write"` / `"dangerous"` | Tool annotations `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint` |
+
+**Argument errors are tool execution errors, not protocol errors.** The [2025-06-18 spec](https://modelcontextprotocol.io/specification/2025-06-18/server/tools) drew a fuzzy line: it listed "Invalid arguments" under protocol errors and "Invalid input data" under tool execution errors. The [2025-11-25 revision](https://modelcontextprotocol.io/specification/2025-11-25/changelog) ([SEP-1303](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1303)) settled it: **input validation errors** (a date in the wrong format, a value out of range, …) should come back with `isError: true`, for exactly the reason this lesson calls "errors as observations" — the model can read them, fix its arguments, and retry. Only problems the model is unlikely to fix go out as JSON-RPC protocol errors: unknown tools, malformed requests that don't satisfy the `tools/call` request schema, and server errors. The latest [2026-07-28 revision](https://modelcontextprotocol.io/specification/2026-07-28/server/tools) keeps this split. For both generations of the protocol, a hand-written server and client that interoperate with the official SDK, and how this mapping table becomes code, see [Lesson 19](../19_mcp_and_sandbox/README.en.md#21-the-server-one-json-rpc-message-in-one-out).
 
 The MCP spec itself stresses the principles from this lesson: servers **must** validate all inputs and implement access controls; clients **should** ask the user to confirm sensitive operations, set timeouts on tool calls, and keep audit logs.
 

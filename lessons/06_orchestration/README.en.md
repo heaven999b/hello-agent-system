@@ -3,6 +3,8 @@
 # Lesson 06: Orchestration patterns — workflows, agents, and multi-agent systems
 
 > 🕐 Suggested time: 15 min · 🎯 You'll learn to: pick the simplest orchestration that solves a given business need, and explain what it costs in money, latency, and reliability; tell when multi-agent is worth it and when it's a trap · 📦 Source: `agentkit/workflows.py`
+>
+> 📖 Primary reading: [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
 
 > 📍 This lesson is part of **Part 1: Building Blocks** (concepts → build from scratch → exercises). The previous lesson, [Lesson 05: Common agent architectures](../05_agent_architectures/README.en.md), covers the reasoning architectures inside an agent and multi-agent topologies; this lesson covers workflow orchestration patterns. The two complement each other (see Lesson 05, §1.3, for how they divide the work). The next lesson, [Lesson 07: Engineering perspectives](../07_engineering_perspectives/README.en.md), wraps up Part 1.
 >
@@ -354,6 +356,8 @@ Three design choices worth noting:
 
 Cognition's article distills the lesson into two principles: **share context — full agent traces, not just individual messages; and actions carry implicit decisions, so conflicting decisions lead to bad results.**
 
+What do these costs look like in empirical research? Researchers at UC Berkeley and elsewhere analyzed traces from 7 multi-agent frameworks and identified 14 failure modes, while OpenHands' Graham Neubig made a case for single agents. Both, along with how to detect and mitigate each kind of failure, are in §5.7.
+
 #### When it's worth it
 
 In Anthropic's experience, multi-agent systems excel at high-value tasks that **parallelize heavily**, involve information that **exceeds a single context window**, and interface with **many complex tools**. Their research system (Claude Opus 4 as the lead agent, Claude Sonnet 4 as sub-agents) outperformed single-agent Claude Opus 4 by 90.2% on their internal research eval. And in their BrowseComp analysis, **token usage by itself explained 80% of the performance variance** — much of the multi-agent gain comes simply from spending more tokens.
@@ -516,6 +520,49 @@ Condition 2 is a real bug we hit while writing this lesson. The first implementa
 
 In the supervisor-specialist pattern, specialists return only their final answer (a summary). The supervisor's context stays clean, but it loses the specialists' reasoning and can't judge whether a specialist is reliable. Cognition argues for sharing full traces; Anthropic's context engineering article recommends that sub-agents return condensed summaries. The two views aren't contradictory: **when tasks are tightly coupled and need consistent decisions, lean toward sharing more context (or don't split at all); when tasks are independent and mainly about breadth, lean toward concise summaries**. A middle ground is for specialists to return "conclusion + evidence (the facts cited and the tools called)," which keeps the output short and easy to verify.
 
+### 5.7 Why multi-agent systems fail
+
+§2.7 covered what multi-agent systems cost. This section looks at the empirical research: **how** multi-agent systems actually fail, and how to detect and fix each kind of failure.
+
+**MAST: a taxonomy of multi-agent failures.** Cemri et al. (UC Berkeley and others), [Why Do Multi-Agent LLM Systems Fail?](https://arxiv.org/abs/2503.13657) (NeurIPS 2025 Datasets and Benchmarks track), start from an uncomfortable observation: multi-agent systems often gain very little on popular benchmarks, compared with single-agent frameworks or simple baselines like best-of-N sampling. Expert annotators studied 150 multi-agent traces in depth and derived **MAST** (Multi-Agent System Failure Taxonomy), with inter-annotator agreement of κ = 0.88 (Cohen's kappa: how often two annotators agree after discounting agreement by chance; 1 means perfect agreement). They then scaled up annotation with an LLM judge; the latest version (arXiv v3, October 2025) releases MAST-Data, more than 1,600 annotated traces across 7 frameworks.
+
+MAST has **14 failure modes in 3 categories**. The percentages come from Figure 1 of the paper's v3; treat them as orders of magnitude, since the distribution varies a lot across frameworks and versions.
+
+| Category | Failure modes |
+|---|---|
+| **FC1 System design issues** (44.2%): the failure shows up at run time, but its root is an earlier design decision about architecture, prompts or state management | FM-1.1 Disobey task specification (11.8%) · FM-1.2 Disobey role specification (1.5%) · FM-1.3 Step repetition (15.7%) · FM-1.4 Loss of conversation history (2.8%) · FM-1.5 Unaware of termination conditions (12.4%) |
+| **FC2 Inter-agent misalignment** (32.3%): critical information stops flowing between agents | FM-2.1 Conversation reset (2.2%) · FM-2.2 Fail to ask for clarification, proceeding on wrong assumptions (6.8%) · FM-2.3 Task derailment (7.4%) · FM-2.4 Information withholding (0.85%) · FM-2.5 Ignored other agent's input (1.9%) · FM-2.6 Reasoning-action mismatch (13.2%) |
+| **FC3 Task verification** (23.5%): errors go undetected or uncorrected, or the task ends too early | FM-3.1 Premature termination (6.2%) · FM-3.2 No or incomplete verification (8.2%) · FM-3.3 Incorrect verification (9.1%) |
+
+Three of the paper's insights matter most to system builders:
+
+1. **It's not just the model's fault.** With the same underlying model, a better-designed system does better. In their intervention study, improving only ChatDev's role specifications, with the same user prompt and the same model (GPT-4o), raised the success rate by 9.4%.
+2. **Standard message formats don't fix misalignment.** Protocols like MCP and A2A standardize message formats, but FC2 failures happen even between agents in the same framework talking in natural language. The authors trace the root cause to agents failing to infer what information other agents need, which calls for better system structure and better models together.
+3. **Verification has to be multi-level.** Many verifiers only do superficial checks, such as whether the code compiles or whether TODO comments are left. A chess program generated by ChatDev compiled fine but broke the rules of chess. Adding a verification step against the high-level task objective to ChatDev improved task success on ProgramDev by 15.6%.
+
+**The counterpoint: don't sleep on single agents.** In [Don't Sleep on Single-agent Systems](https://www.openhands.dev/blog/dont-sleep-on-single-agent-systems) (OpenHands blog, September 2024), Graham Neubig uses the coding agent CodeR as an example (one agent each for planning, reproducing the issue, localization, editing and verification). He grants that this structure works well when the task fits the predefined flow, but points out three problems:
+
+- **Brittle structure**: the verifier wants to localize a file itself to make sure the answer is right, but it doesn't have that tool, because the tool belongs to another agent;
+- **Information loss**: agents hand off only summaries, so downstream agents never see the full picture;
+- **Maintenance burden**: every agent has its own prompt, and sometimes its own codebase.
+
+His alternative is **one** strong general-purpose model with the tools merged into a single action space (OpenHands gives its agent tools to write code, run code and browse the web), and the prompts either concatenated or retrieved as needed. That's feasible because general models are broadly capable, contexts are long (200K tokens for Claude at the time), and prompt caching makes long prompts affordable. He is explicit about where multi-agent is the right call: when one agent holds privileged information the others shouldn't see, or when different agents act on behalf of different people. His conclusion isn't "multi-agent is useless" but a push to think critically about the trend of adding complexity: sometimes simple is best. That points the same way as Cognition's "Don't Build Multi-Agents" and Anthropic's "find the simplest solution" (§2.7).
+
+**Detecting and mitigating each kind of failure.** Map MAST's 14 modes onto this repository's [failure-mode field guide](../../docs/failure-modes.en.md) and they land directly on agentkit's tools:
+
+| MAST failure modes | What it looks like in agentkit | How to detect it | How to mitigate it | Field guide |
+|---|---|---|---|---|
+| FM-1.1 Disobey task specification · FM-1.2 Disobey role specification | The synthesis drops one of the user's constraints; a specialist does something the supervisor never asked for | Score eval cases against the user's original request (`must_contain`, rubrics); count tool calls per agent to spot out-of-role calls | Write delegation as a self-contained task contract: goal, constraints, acceptance criteria. Enforce role boundaries with **tool permissions**, giving each agent only the tools its job needs, rather than a line in the prompt saying "you only handle…" | [O2](../../docs/failure-modes.en.md#o2-delegation-context-starvation), [S5](../../docs/failure-modes.en.md#s5-excessive-agency) |
+| FM-1.3 Step repetition · FM-1.5 Unaware of termination conditions | The same tool called 8 times with nearly identical arguments; the supervisor delegates to the same specialist again and again; runs end at `max_steps` | Count repeated `(tool, normalized arguments)` pairs in traces; monitor the share of runs ending at `max_steps`; track delegation depth and agent calls per request | `max_steps` per agent plus a total budget for the whole request (`BudgetHook`); a cap on delegation depth; completion conditions as a structured checklist that code can evaluate | [M3](../../docs/failure-modes.en.md#m3-tool-call-loop), [O4](../../docs/failure-modes.en.md#o4-unbounded-delegation) |
+| FM-1.4 Loss of conversation history · FM-2.1 Conversation reset | A specialist doesn't know about earlier decisions; after compaction the agent forgets it already issued a refund | Check whether a sub-agent's first step asks for information the supervisor already had; run a dedicated eval where a write happens before the compaction point | Self-contained delegation; store completed actions as structured state (a database field), not only in the conversation | [O2](../../docs/failure-modes.en.md#o2-delegation-context-starvation), [C3](../../docs/failure-modes.en.md#c3-lossy-compaction) |
+| FM-2.2 Fail to ask for clarification · FM-2.3 Task derailment | A specialist fills a gap with its own assumption; the answer misses the question | Put underspecified requests in the eval set and see whether the system asks; have an LLM judge score against the original goal | Let sub-agents return a structured "needs clarification" result so the supervisor asks the user instead of the sub-agent guessing; state acceptance criteria in the task contract | [M4](../../docs/failure-modes.en.md#m4-hallucinated-arguments) |
+| FM-2.4 Information withholding · FM-2.5 Ignored other agent's input | A specialist found the key fact, but the supervisor's final answer doesn't use it; two parallel specialists reach contradictory conclusions | Check consistency in the synthesis step; compare the facts specialists returned with the final answer | Specialists return "conclusion + evidence" (§5.6); writes happen serially, by a single decision-maker; resolve conflicts explicitly during synthesis instead of just concatenating | [O3](../../docs/failure-modes.en.md#o3-conflicting-parallel-decisions), [O2](../../docs/failure-modes.en.md#o2-delegation-context-starvation) |
+| FM-2.6 Reasoning-action mismatch | It says "let me look up the order" and then calls a different tool; it says "ticket submitted" without calling anything | A claim-evidence check in an `on_final` hook: every action the answer claims must have a matching successful call in `tools_called()` | Fill key results (ticket IDs, refund reference numbers) into the answer from tool return values instead of letting the model write them | [M1](../../docs/failure-modes.en.md#m1-phantom-action) |
+| FM-3.1 Premature termination | "All 5 checks are done" when only 2 ran | Compare the structured checklist with the tool calls that actually ran; flag `completed` runs with far fewer steps than the median for similar tasks | Let **code** decide whether everything is done, and feed remaining items back to the model if not | [M2](../../docs/failure-modes.en.md#m2-premature-completion) |
+| FM-3.2 No or incomplete verification · FM-3.3 Incorrect verification | The reviewer agent almost always says "pass"; compiling counts as correct | Track the reviewer's pass rate (close to 100% is itself a warning sign); inject known errors and see whether the reviewer catches them | Prefer deterministic checks (run tests, validate schemas, reconcile, check final database state); verify at multiple levels, both low-level correctness and the high-level goal; give LLM reviewers a specific rubric, ideally on a different model | [O5](../../docs/failure-modes.en.md#o5-missing-verification), [E3](../../docs/failure-modes.en.md#e3-llm-as-judge-bias) |
+
+**How to use the taxonomy.** Before going multi-agent, build a single-agent baseline and compare on the same eval set (both Neubig and Anthropic recommend this). After launch, do **error analysis**: sample failed traces, label each one with the 14 modes above, count which category dominates, and fix the biggest one first. Then rerun the evals to make sure fixing one thing didn't break three others. This is exactly what the "failure-mode error analysis" section of the [project report template](../../capstone/REPORT_TEMPLATE.en.md) asks you to do.
+
 ## 6. Common pitfalls and anti-patterns (📖 Optional)
 
 | Pitfall | Consequence | Do this instead |
@@ -531,6 +578,7 @@ In the supervisor-specialist pattern, specialists return only their final answer
 | A misspelled gate name that's silently ignored | A security check is quietly skipped | Fail loudly on configuration errors at startup |
 | Delegating tasks that aren't self-contained | The specialist can't see the user's original words and answers the wrong question | Require full context in the tool description and the supervisor prompt |
 | Letting the model pass the user's identity as an argument | A prompt injection is all it takes to impersonate someone else | Propagate identity only through ctx |
+| Verification that only checks the surface (it compiles, it produced output) | Wrong results pass "review" and reach the user | Multi-level verification: deterministic checks first, then check against the high-level goal (§5.7) |
 
 ## 7. Interview & design review questions (📖 Optional)
 
@@ -604,6 +652,16 @@ In the supervisor-specialist pattern, specialists return only their final answer
 - Set an overall deadline; on timeout, return what's been completed or escalate to a human (Lesson 08).
 </details>
 
+<details>
+<summary>Q9: Your multi-agent system is live and its task success rate is disappointing. How do you find the problem? Should you switch to a single agent?</summary>
+
+- Do error analysis instead of tweaking by feel: sample failed traces, label each with MAST's 14 modes across its three categories (system design, inter-agent misalignment, task verification), and count which category dominates;
+- System design (disobeyed specs, step repetition, not knowing when to stop): fix the task contracts, per-role tool permissions, termination conditions and layered budgets;
+- Misalignment (not asking for clarification, withholding information, reasoning-action mismatch): make delegation self-contained, have specialists return "conclusion + evidence," have a single decision-maker perform writes serially, and add a claim-evidence check;
+- Verification: deterministic checks first, multiple levels of verification, and an LLM reviewer on a different model, tested by injecting known errors;
+- At the same time, run a single-agent baseline on the same eval set. The MAST paper opens by pointing out that multi-agent gains over simple baselines are often small; if a single agent does about as well or better, switch back (Neubig's point). Multi-agent clearly pays off only in cases like permission isolation, agents acting for different people, or heavily parallel work.
+</details>
+
 ## 8. Self-check
 
 - [ ] I can explain the difference between a workflow and an agent in one sentence, and draw the complexity ladder
@@ -614,6 +672,7 @@ In the supervisor-specialist pattern, specialists return only their final answer
 - [ ] I know why evaluator-optimizer should check with code first and use max_rounds as a backstop
 - [ ] I can compare the supervisor-specialists, handoff, and decentralized multi-agent topologies
 - [ ] I can name at least four costs of multi-agent systems, and say when they're worth it
+- [ ] I can name MAST's three failure categories and give one detection method and one mitigation for each
 - [ ] I can use the decision tree to pick an orchestration approach for a new requirement, and answer "why isn't the previous rung enough?"
 - [ ] I've finished the exercises, and `make lesson N=06` passes
 
@@ -621,6 +680,8 @@ In the supervisor-specialist pattern, specialists return only their final answer
 
 - Anthropic, [Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) (2024) — the backbone of this lesson: the workflow vs. agent distinction, the 5 patterns, when to use frameworks
 - Anthropic, [How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system) (2025) — the real benefits and costs of multi-agent systems: 15× the tokens, when it fits, engineering pitfalls
+- Cemri et al., [Why Do Multi-Agent LLM Systems Fail?](https://arxiv.org/abs/2503.13657) (NeurIPS 2025 Datasets and Benchmarks track) — the MAST taxonomy: 14 failure modes in 3 categories, with a dataset and an LLM annotator
+- Graham Neubig, [Don't Sleep on Single-agent Systems](https://www.openhands.dev/blog/dont-sleep-on-single-agent-systems) (OpenHands blog, 2024) — the case for single agents: brittle structure, information loss, maintenance burden
 - Cognition (Walden Yan), [Don't Build Multi-Agents](https://cognition.com/blog/dont-build-multi-agents) (2025) — the opposing view: fragmented context and conflicting decisions
 - OpenAI, [A practical guide to building agents](https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf) (2025) — when to split into multiple agents; the Manager and Decentralized patterns
 - OpenAI Agents SDK, [Handoffs](https://openai.github.io/openai-agents-python/handoffs/) — one concrete implementation of the handoff pattern

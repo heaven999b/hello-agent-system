@@ -3,6 +3,8 @@
 # Lesson 01: LLM essentials for agent developers
 
 > 🕐 Suggested time: 20 minutes ｜ 🎯 After this lesson you can: explain what tokens, messages, sampling, tool calling, structured output, streaming, vector search and reasoning models **mean for an agent**, and avoid the dozen or so traps that catch most newcomers ｜ 📦 Source: [`agentkit/llm.py`](../../agentkit/llm.py), [`agentkit/types.py`](../../agentkit/types.py), [`agentkit/context.py`](../../agentkit/context.py) (`estimate_tokens`), [`agentkit/pricing.py`](../../agentkit/pricing.py), [`agentkit/workflows.py`](../../agentkit/workflows.py) (`complete_json`)
+>
+> 📖 Primary reading: [Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
 
 > Code comments and demo output are in Chinese. Demo excerpts below are translated; the numbers, identifiers and JSON are exactly as printed.
 
@@ -55,6 +57,8 @@ The next lesson ([Lesson 02: The Agent Loop](../02_agent_loop/README.en.md)) tur
 | 1.10 | Prompt engineering | The system prompt is the agent's job description; manage it like code | Treating the prompt as a security boundary |
 | 1.11 | Choosing a model | Weigh capability, tool calling, latency, price, compliance and availability together | Picking from a leaderboard |
 | 1.12 | API errors | Don't retry 400/401; retry 429, 5xx and timeouts | Retrying everything |
+
+If you have time, [§5.1](#51-constrained-generation-and-decoding-strategies) in Going deeper explains what sits underneath §1.3 and §1.5: decoding strategies (greedy, top-k, beam search), logprobs as confidence, and why constrained decoding guarantees format but not content.
 
 ## 1. Core concepts
 
@@ -197,6 +201,8 @@ temperature=1 × 3: ['楼下咖啡', '楼下有啡', '楼下咖啡']    → 2 di
 
 **Common traps:** asserting the exact string a model returns; treating `seed` as a reproducibility guarantee; calling a feature "done" because it worked once.
 
+What greedy decoding, top-k and beam search are each good for, and how logprobs show how sure the model is, are covered in [§5.1](#51-constrained-generation-and-decoding-strategies).
+
 ### 1.4 How function calling really works: the model only *proposes*
 
 **What it is.** You attach tool definitions to the request (name, description, and a JSON Schema for the parameters). If the model decides a tool is needed, its reply contains a structured "call intent":
@@ -279,6 +285,8 @@ Attempt 2: {"category": "account", "priority": "P1", "summary": "OA 登录提示
 ```
 
 (Attempt 1 used Chinese words for "account" and "urgent" instead of the allowed enum values.) The design of this repair loop is covered in [Lesson 06, §1.3](../06_orchestration/README.en.md). A practical trick: define the structure you want as a tool's parameters and force that tool with `tool_choice`. On models without `response_format`, this is the standard way to get structured output.
+
+Native constraints (③) and the repair loop aren't alternatives: the first masks invalid tokens **during** generation, the second checks business rules **after** it. How constrained decoding works, where it falls short, and a side-by-side comparison of the two are in [§5.1](#51-constrained-generation-and-decoding-strategies).
 
 **Common traps:** assuming JSON mode guarantees fields; regex-scraping fields out of free text; a repair loop without a retry limit; asking for JSON *and* "explain your reasoning" (put the reasoning in a schema field).
 
@@ -534,11 +542,11 @@ if resp.usage:
 ## 3. Hands-on: run the demo
 
 ```bash
-.venv/bin/python lessons/01_llm_essentials/demo.py            # real model (about 18 calls, roughly a minute)
+.venv/bin/python lessons/01_llm_essentials/demo.py            # real model (about 19 calls, roughly a minute)
 .venv/bin/python lessons/01_llm_essentials/demo.py --offline  # offline: scripts + simulated data, no API key needed
 ```
 
-The demo has five sections, each checking one idea from this lesson against reality. Both modes run **the same code**: offline mode just swaps the OpenAI client for a fake one that replays a script (`FakeOpenAIClient`), which is itself a small demonstration of why business code should depend only on an interface.
+The demo has six sections, each checking one idea from this lesson against reality. Both modes run **the same code**: offline mode just swaps the OpenAI client for a fake one that replays a script (`FakeOpenAIClient`), which is itself a small demonstration of why business code should depend only on an interface.
 
 Excerpts from a real-model run (translated):
 
@@ -574,6 +582,12 @@ Section 4  Streaming: TTFT, and tool-call arguments arriving in fragments
 Section 5  Structured output: reliable data structures for downstream code, not prose
   5a. raw output: {"category":"account","priority":"P2","summary":"OA登录提示密码错误","needs_human":true}
   5b. attempt 1: {"category":"account","priority":"P1",...}  ✅ passed validation
+
+Section 6  Constrained decoding and logprobs: "only valid output allowed", and "how sure is it"
+  6a. Unconstrained greedy picks the top score: '紧急' → not in the enum, validation fails
+      Constrained decoding: zero out invalid candidates and renormalize the rest → picks 'P2'; the format is guaranteed valid
+  6b. model output: 'account'
+     ⚠️  The request succeeded (HTTP 200), but there are no logprobs in the response: this gateway/model silently ignored the parameter. No error, just no effect.
 ```
 
 What to look for:
@@ -583,6 +597,7 @@ What to look for:
 3. **"Executed 0 times" in Section 3**: what the model returns is just a JSON proposal, typed as `str`.
 4. **Fragment counts in 4b vs. 4c**: on the same gateway, a single call was cut into 59 fragments while each parallel call came in 2. Your accumulator has to be correct for both.
 5. **5a and 5b disagree** (`P2` vs. `P1`): the same email, classified twice, got two priorities. Structured output guarantees the **format**, not **consistent judgment**. Which brings us back to Section 2.
+6. **Section 6**: 6a uses five made-up candidates to show how constrained decoding squeezes "what the model wants to say" into "what's allowed"; 6b gets no logprobs from the real gateway, so the demo prints fallback options. Offline mode simulates an API that does return logprobs: `account` gets 88.7%, below the 90% threshold, so the case goes to human review (the offline numbers are illustrative).
 
 ## 4. Exercises
 
@@ -611,8 +626,6 @@ You're done when all 22 tests pass. Then compare with [`solution.py`](solution.p
 
 **Why tokenizers differ.** Most mainstream tokenizers use a subword algorithm from the BPE (Byte Pair Encoding) family ([Sennrich et al., 2016](https://arxiv.org/abs/1508.07909)): start from single bytes or characters and repeatedly merge the pieces that most often appear together in the training corpus into new tokens. So how efficiently a tokenizer handles a language depends on how much of that language was in its training data, and a new generation of tokenizer from the same vendor can change Chinese token counts noticeably. That's why token counts can only be measured on a specific model.
 
-**How constrained decoding guarantees a schema.** Strict mode works by setting the probability of any candidate token that would make the output invalid under the schema to zero at every step, so the model only samples from valid continuations. What it guarantees is the **format**: the model can still put wrong values into a perfectly valid structure. It also explains why strict mode restricts which schemas you can use: complex schemas are hard to turn into efficient per-step constraints.
-
 **One concept, three API shapes.** Learn one and the others are mostly renaming:
 
 | Concept | OpenAI Chat Completions | OpenAI Responses API | Anthropic Messages API |
@@ -624,9 +637,81 @@ You're done when all 22 tests pass. Then compare with [`solution.py`](solution.p
 | Forcing a tool | `tool_choice: "required"` or a named function | same | `tool_choice: {"type": "any"}` / `{"type": "tool"}` |
 | Streaming tool arguments | `delta.tool_calls[].function.arguments` | `response.function_call_arguments.delta` | `partial_json` in `input_json_delta` |
 
-**Compatibility layers quietly differ from the official API.** This course uses an OpenAI-compatible gateway, and in testing we found at least three differences from the official API: it silently ignores `max_tokens`; it silently ignores `parallel_tool_calls=false`; and it accepted an orphaned `tool` message with no preceding `assistant(tool_calls)`, which the official API rejects with a 400. It also doesn't offer `/embeddings`. None of these raise errors; they just make your assumptions quietly false. The remedy is a small test against the real endpoint for **every** parameter you depend on (a contract test), run whenever you change gateways or upgrade.
+**Compatibility layers quietly differ from the official API.** This course uses an OpenAI-compatible gateway, and in testing we found at least four differences from the official API: it silently ignores `max_tokens`; it silently ignores `parallel_tool_calls=false`; it silently ignores `logprobs` (§5.1); and it accepted an orphaned `tool` message with no preceding `assistant(tool_calls)`, which the official API rejects with a 400. It also doesn't offer `/embeddings`. None of these raise errors; they just make your assumptions quietly false. The remedy is a small test against the real endpoint for **every** parameter you depend on (a contract test), run whenever you change gateways or upgrade.
 
-**logprobs: letting the model tell you how sure it is.** Some models and APIs can return the log probability of each output token. For steps whose answer is only a few tokens long, such as classification or routing, this is a useful confidence signal: route low-confidence cases to a human or to a stronger model. Reasoning models generally don't support it.
+### 5.1 Constrained generation and decoding strategies
+
+In one sentence: **the decoding strategy decides how to pick from the probabilities, logprobs show you how hesitant that pick was, and constrained decoding decides which candidates are allowed to be picked at all.** All three happen inside the picture from §1.3, where the model scores every candidate at every step.
+
+**Decoding strategies: one distribution, several ways to pick.** Decoding is the rule for choosing the next token from the probability distribution at each step:
+
+| Strategy | How it picks | Intuition | Where you can use it | What it means for an agent |
+|---|---|---|---|---|
+| Greedy | Always the most probable token | Looks one step ahead and never back | The default in local inference libraries such as Hugging Face transformers (unless the generation config says otherwise); temperature near 0 on an API approximates it | Good for classification, extraction and tool arguments; the transformers docs note it starts repeating itself on longer sequences |
+| Temperature sampling | Sharpen or flatten the distribution with the temperature, then draw from it | The lower the temperature, the closer to greedy | Almost every API | Low for tool calls and extraction, higher for creative work (§1.3) |
+| top-k | Draw only from the k most probable candidates | Cut the long tail at a fixed size | Common in open-source inference stacks; not offered by the OpenAI API; Anthropic's API docs mark `top_k` as deprecated, and models released after Claude Opus 4.6 don't accept it | Rarely worth tuning |
+| top-p (nucleus) | Draw only from the smallest set whose cumulative probability reaches p | Cut the long tail adaptively, based on the shape of the distribution | Most APIs | Tune this or temperature, not both (§1.3) |
+| Beam search | Keep k candidate sequences in parallel and return the one with the highest probability **as a whole** | Look a few steps ahead before committing | Local inference libraries (`num_beams` in transformers); mainstream chat APIs generally don't offer it | The transformers docs say it suits input-grounded tasks (image captioning, speech recognition); Holtzman et al. (ICLR 2020) found that likelihood-maximizing decoding tends to produce bland, repetitive text in open-ended generation |
+
+Two takeaways matter most for agents:
+
+- **Most steps want the single most likely answer**: choosing a tool, filling arguments, classifying. Use a low temperature. But "most likely" isn't "correct", and a greedy mistake at step one has no way back (the trajectory amplification from §1.3).
+- **"Explore several paths, then choose" usually happens at the application level, not the token level**: sample several complete answers and vote (self-consistency), or generate candidates and let an evaluator pick (best-of-N). Those are the parallel-voting and evaluator-optimizer patterns in [Lesson 06](../06_orchestration/README.en.md). They use ordinary sampling that hosted APIs support and compare whole answers, while beam search compares the probability of token sequences.
+
+**logprobs: turning "how sure" into a number.** A logprob is the natural log of a probability: 0 means 100%, more negative means less likely, and `exp(logprob)` gives the probability back. In OpenAI's Chat Completions API, `logprobs=true` returns the logprob of every output token, and `top_logprobs` (0–20) adds the most likely alternatives at each position. In an agent it has three uses:
+
+1. **Confidence for classification and routing**: when the answer is a single token, P(label) is the confidence. Below a threshold, hand off to a human or escalate to a stronger model (the cascade routing in [Lesson 06](../06_orchestration/README.en.md)). Tip: make the labels **differ in their first token** (for example, options A / B / C); otherwise you only see the probability of the first fragment.
+2. **Seeing hesitation**: a small gap (margin) between the first and second candidates means the model is torn between two answers, which tells you more than the top probability alone.
+3. **Finding the samples most worth a human's time**: review low-confidence cases first and add them to your eval set. OpenAI's [Using logprobs](https://developers.openai.com/cookbook/examples/using_logprobs) also shows how to use them to judge whether retrieved context is enough to answer a question, and when to trigger autocomplete.
+
+Two caveats:
+
+- **A logprob is not "the probability of being right."** A model that is right 90% of the time when it says 90% is called **calibrated**. The [GPT-4 technical report](https://arxiv.org/abs/2303.08774) shows the pre-trained model was well calibrated and that post-training (RLHF) made calibration noticeably worse. So logprobs are good for ranking, but thresholds must come from your own labeled data: bucket samples by confidence and check the real accuracy in each bucket (a reliability diagram); if needed, apply post-hoc calibration such as temperature scaling (Guo et al., ICML 2017).
+- **You may not get them at all.** Not every vendor or model offers them; reasoning models often don't support logprobs or temperature, or support them only with reasoning turned off (see, for example, [Azure OpenAI's reasoning-model docs](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning)). Check the official docs. We tried it once each with `gpt-5.5` and `gpt-5.6-luna` on this course's gateway: HTTP 200, but the `logprobs` field was `None`. Both are reasoning models, and the Azure doc above lists logprobs among the parameters reasoning models don't support; yet the gateway returned no error and **silently dropped** the parameter. Section 6 of the demo prints fallback options in that case instead of crashing.
+
+**Constrained generation: only valid output allowed.** Constrained generation (also called structured generation or constrained decoding) writes down what counts as valid output in a formal language (JSON Schema, a regular expression, a context-free grammar), and at **every step** sets the probability of any token that would make the output invalid to zero, then picks from what's left:
+
+```mermaid
+flowchart LR
+    S["Grammar state<br/>e.g. just opened the priority string"] --> V["Compute the valid token set<br/>only P1 / P2 / P3 / P4 left"]
+    M["Model scores every candidate<br/>logits"] --> K["Mask<br/>zero out invalid tokens"]
+    V --> K
+    K --> R["Renormalize and sample<br/>among valid candidates"]
+    R --> A["Advance the grammar state"]
+    A -->|"next token"| S
+```
+
+The hard part is doing this fast at every step: vocabularies typically hold tens of thousands to a couple of hundred thousand tokens, and you can't check each one on every step. Some representative implementations:
+
+| Implementation | Approach | Where it's used |
+|---|---|---|
+| [Outlines](https://github.com/dottxt-ai/outlines) (Willard & Louf, 2023) | Compiles regular expressions and JSON Schema into a finite-state machine and precomputes an index from each state to its valid tokens, so generation is a table lookup with little overhead | Open-source Python library, for local or self-hosted models |
+| [XGrammar](https://github.com/mlc-ai/xgrammar) (Dong et al., MLSys 2025) | Targets context-free grammars (which can express arbitrarily nested JSON); splits the vocabulary into context-independent tokens that can be prechecked and context-dependent tokens that must be checked at runtime, and is co-designed with the inference engine. The paper reports up to about 100× speedup over existing solutions and near-zero end-to-end overhead | Per its README, the default structured-generation backend of vLLM, SGLang, TensorRT-LLM, MLC-LLM and other engines |
+| Hosted APIs | OpenAI's Structured Outputs and strict mode belong here. Its docs say the first request with a new schema has extra latency while the API processes the schema, and later requests with the same schema don't. GPT-5 custom tools can also constrain output with a Lark grammar or a regex, and OpenAI's [cookbook](https://developers.openai.com/cookbook/examples/gpt-5/gpt-5_new_params_and_tools) says it uses [LLGuidance](https://github.com/guidance-ai/llguidance) under the hood | You don't control decoding; you get only the kinds of constraint the vendor exposes |
+
+**Limitations: a constrained format is not correct content.**
+
+1. **Syntax, not semantics.** Whether an order ID exists, whether an amount is right, whether the end date is after the start date: constraints don't care. OpenAI's cookbook above warns that when the model drifts out of distribution, output can be "syntactically valid but semantically wrong."
+2. **It distorts the model's distribution.** Park et al. ([Grammar-Aligned Decoding](https://arxiv.org/abs/2405.21047), NeurIPS 2024) show that constrained decoding produces grammatical outputs whose likelihoods aren't proportional to what the model itself assigns. Section 6a of the demo is the intuitive version: the model most wants to say "紧急" ("urgent", not in the enum); once it's masked and the rest is renormalized, `P2` wins instead of `P1`, which is closer in meaning. Valid format, wrong judgment.
+3. **It can hurt reasoning.** Tam et al. ([Let Me Speak Freely?](https://arxiv.org/abs/2408.02442), 2024) found that format restrictions significantly degrade reasoning, and stricter formats degrade it more. Common mitigations: put a "reasoning" field early in the schema so the model writes its rationale first, or answer freely and convert to the structured format with a second call.
+4. **Limited schema support.** Hosted services support only a subset of JSON Schema (OpenAI's docs say some features are unavailable for performance or technical reasons), so a rule like "summary under 30 characters" may not be expressible.
+5. **Refusals and truncation still happen** (§1.5): constraints can't stop a refusal, and output that hits `max_tokens` is still half a JSON document.
+6. **Only where you control decoding.** Arbitrary grammar constraints require running your own inference engine (vLLM, SGLang and so on); with a hosted API you get only what the vendor exposes.
+
+**Compared with the `complete_json` repair loop:**
+
+| Dimension | Constrained decoding (native Structured Outputs, strict mode, Outlines, XGrammar) | `complete_json`: prompt + validate + repair |
+|---|---|---|
+| When it acts | **During** generation: masks invalid tokens at every step | **After** generation: validates the whole output and sends errors back for another try |
+| Format guarantee | Guaranteed at the syntax level (within the supported schema subset) | None: raises after `max_repairs` failed attempts |
+| What it can check | Only constraints you can write into a schema or grammar | Anything Pydantic can express: lengths, cross-field rules, custom validators, even database lookups |
+| Extra calls | 0 (the first request with a new schema has processing latency) | 1 more call per repair |
+| Can the model change its mind? | No: invalid candidates are deleted, and it may be pushed onto a second-best valid value | Yes: it sees the error and regenerates (offline mode of demo Section 5) |
+| Depends on | Support from the model, gateway or inference engine | Any model that outputs text |
+| What failure looks like | Valid but possibly wrong values; refusals; truncation | An exception after too many repairs (fail loudly) |
+| Best for | Every step whose output code parses, tool arguments, high-throughput paths | Models without native support; business rules a schema can't express |
+
+**How to combine them: two gates, not a choice.** Use native constraints whenever you can; they eliminate most format errors and repair calls. After that, still validate business rules with Pydantic, fall back to the repair loop when validation fails, and fail loudly when repairs run out. agentkit implements only the second gate because it doesn't depend on any vendor feature (see the table in §2).
 
 ## 6. Common pitfalls and anti-patterns
 
@@ -644,6 +729,8 @@ You're done when all 22 tests pass. Then compare with [`solution.py`](solution.p
 12. **Retrying every error**: 400s and 401s return the same result no matter how often you retry; so does an out-of-quota 429.
 13. **Choosing models from leaderboards** without evaluating on your own tasks or computing the total cost per task.
 14. **Assuming a compatible gateway behaves exactly like the official API.** Test every parameter you rely on.
+15. **Believing constrained decoding or strict mode guarantees correct content.** It guarantees format only; business rules still need validation (§5.1).
+16. **Treating logprobs as a calibrated "probability of being right"**, or assuming the gateway always returns them. Set thresholds from labeled data, and have a fallback when they're missing.
 
 ## 7. Interview & design review questions
 
@@ -713,6 +800,16 @@ You're done when all 22 tests pass. Then compare with [`solution.py`](solution.p
 - Watch out for: reasoning tokens billed as output and occupying context; leaving enough room in `max_tokens`; many sampling parameters being unsupported; some providers requiring thinking to be passed back unchanged during tool use.
 </details>
 
+<details>
+<summary>Q8: A colleague says "we turned on strict mode, the JSON is 100% valid, so we can delete the validation and the repair loop." How do you respond?</summary>
+
+- Constrained decoding guarantees **syntax**: the output parses, required fields are there, enum values are legal. It doesn't guarantee the values are right (does the order ID exist, are the dates in order, does the amount match);
+- It also distorts the model's distribution: when the model's favorite candidate is invalid, it gets pushed onto a second-best valid value, giving "valid but wrong." Format restrictions can also hurt reasoning quality;
+- Refusals and truncation still happen, and hosted services support only a subset of JSON Schema, so some business rules can't be expressed;
+- Conclusion: native constraints and validation are two separate gates. Keep Pydantic business validation, fall back to the repair loop on failure (with a limit), and fail loudly when repairs run out;
+- If you need confidence, look at logprobs, but first confirm the API actually returns them, and calibrate the threshold on labeled data.
+</details>
+
 ## 8. Essentials self-check
 
 Answer each one yourself first, then expand it.
@@ -777,6 +874,18 @@ Vector similarity measures whether two texts are about the same kind of thing, n
 First work out which 429 it is. If you're sending too fast and hit a rate limit, retry with exponential backoff and jitter, honoring `Retry-After` when present. If you've run out of quota or budget, retrying is pointless: alert and sort out the quota. Either way, keep a global retry budget to avoid retry storms (Lesson 08).
 </details>
 
+<details>
+<summary>11. How does constrained decoding guarantee the output matches a schema? What doesn't it guarantee?</summary>
+
+It compiles the schema or grammar into a state machine. At each step of generation it computes which tokens keep the output valid, sets every other token's probability to zero, and picks only among the valid ones. It guarantees the format, not the content: values can be wrong, the distribution can be distorted, and the model can still refuse or be truncated, so business validation stays.
+</details>
+
+<details>
+<summary>12. A model gives a classification a logprob of -0.1 (about 90%). Does that mean it has a 90% chance of being right?</summary>
+
+Not on its own. A logprob is the model's own probability; it equals "probability of being right" only if the model is calibrated, and post-training can make calibration worse (as the GPT-4 technical report showed for its pre-trained vs. post-trained models). Bucket labeled samples by confidence, check each bucket's real accuracy, and only then set the hand-off threshold. Also confirm the API actually returned logprobs: this course's gateway silently ignores them.
+</details>
+
 **Checklist:**
 
 - [ ] I can explain why tool definitions and hidden instructions cost money, and estimate what a request will cost
@@ -786,6 +895,8 @@ First work out which 429 it is. If you're sending too fast and hit a rate limit,
 - [ ] I can explain what temperature and top_p do, and why temperature=0 still isn't deterministic
 - [ ] I can draw the full function-calling round trip and give at least 3 reasons arguments JSON can be invalid
 - [ ] I can explain the difference between JSON mode and Structured Outputs, and why validation is still needed
+- [ ] I can explain how constrained decoding works, where it falls short, and how it combines with the `complete_json` repair loop
+- [ ] I know what logprobs are good for, why they need calibration, and how to fall back when they're unavailable
 - [ ] I can state the three rules for assembling streamed tool calls
 - [ ] I can name at least 3 limitations of vector search
 - [ ] I can judge when a reasoning model is worth it
@@ -803,6 +914,12 @@ First work out which 429 it is. If you're sending too fast and hit a rate limit,
 - [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) — Horace He, Thinking Machines Lab, September 2025. Why temperature 0 still isn't deterministic.
 - [Why Language Models Hallucinate](https://arxiv.org/abs/2509.04664) — Kalai, Nachum, Vempala, Zhang, September 2025. The statistical roots of hallucination, and why evaluations reward guessing.
 - [The Curious Case of Neural Text Degeneration](https://arxiv.org/abs/1904.09751) — Holtzman et al., ICLR 2020. Introduces nucleus sampling (top_p).
+- [Efficient Guided Generation for Large Language Models](https://arxiv.org/abs/2307.09702) — Willard & Louf, 2023. Regex and JSON Schema constrained generation with finite-state machines; the paper behind the Outlines library.
+- [XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models](https://arxiv.org/abs/2411.15100) — Dong et al., MLSys 2025. An efficient constrained-decoding engine for context-free grammars.
+- [Grammar-Aligned Decoding](https://arxiv.org/abs/2405.21047) — Park et al., NeurIPS 2024. Why constrained decoding distorts the model's distribution.
+- [Let Me Speak Freely? A Study on the Impact of Format Restrictions on Performance of Large Language Models](https://arxiv.org/abs/2408.02442) — Tam et al., 2024. How format restrictions affect reasoning.
+- [Using logprobs](https://developers.openai.com/cookbook/examples/using_logprobs) — OpenAI Cookbook. logprobs for classification confidence, retrieval Q&A evaluation and autocomplete.
+- [On Calibration of Modern Neural Networks](https://arxiv.org/abs/1706.04599) — Guo et al., ICML 2017. What calibration means, and temperature scaling.
 - [Neural Machine Translation of Rare Words with Subword Units](https://arxiv.org/abs/1508.07909) — Sennrich et al., ACL 2016. Brought BPE subword segmentation to NLP; one of the roots of modern tokenizers.
 - [Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) — Anthropic, September 2025. The "right altitude" for system prompts, organizing them into sections, and iterating from failures.
 - [tiktoken](https://github.com/openai/tiktoken) — OpenAI's open-source tokenizer library for counting OpenAI-model tokens locally.

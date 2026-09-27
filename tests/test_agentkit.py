@@ -674,3 +674,26 @@ def test_retry_respects_retry_after_header():
 def test_usage_adds_reasoning_tokens():
     from agentkit.types import Usage
     assert (Usage(1, 2, 0, 1) + Usage(1, 3, 0, 2)).reasoning_tokens == 3
+
+
+def test_rule_grader_normalizes_chinese_punctuation_and_spaces():
+    case = EvalCase("n", "x", expect={"must_contain": ["1-3 个工作日"]})
+    fake = type("R", (), {"output": "预计1～3个工作日到账", "tools_called": lambda self: [], "status": "completed", "steps": 1})()
+    assert all(c.passed for c in rule_grader(case, fake))
+
+
+def test_load_sibling_namespaces_modules(tmp_path):
+    from agentkit.testing import load_sibling
+    for d in ("a_lesson", "b_lesson"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "helper.py").write_text(f"NAME = '{d}'")
+    a = load_sibling(str(tmp_path / "a_lesson" / "x.py"), "helper")
+    b = load_sibling(str(tmp_path / "b_lesson" / "x.py"), "helper")
+    assert (a.NAME, b.NAME) == ("a_lesson", "b_lesson")
+
+
+def test_eval_flags_infrastructure_errors_separately():
+    cases = [EvalCase("ok", "1+2", expect={"must_contain": ["3"]}), EvalCase("down", "x", expect={"must_contain": ["y"]})]
+    scripts = iter([[reply("3")], [LLMError("503 gateway", retryable=False)]])
+    report = run_eval(lambda: Agent(ScriptedLLM(next(scripts)), []), cases)
+    assert report.infra_errors == ["down"] and "网关故障" in report.summary()

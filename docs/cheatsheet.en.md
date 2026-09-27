@@ -220,3 +220,87 @@ Answer each one with **evidence** (code, config, reports, screenshots), not "it 
 | Problem persists after rollback | Did prompts / model version / config roll back together → were other changes rolled out at the same time? |
 
 For the full mapping, see the [failure-mode catalog appendix](failure-modes.en.md#appendix-from-symptom-to-failure-mode).
+
+---
+
+## 8. Part 3 quick reference
+
+> Covers Lessons 17–25. The numbers below come from the lessons' experiments or the papers they cite. They're starting points, not answers; your own eval set has the final say.
+
+### 8.1 Optimization levers: change the prompt, add test-time compute, or fine-tune?
+
+Do error analysis first, then pick the lever ([Lesson 23](../lessons/23_optimization/README.en.md)):
+
+| What the errors look like | Lever to try first | Cost profile | Speed / how to roll back | Watch out for |
+|---|---|---|---|---|
+| **Consistently wrong**: the model doesn't know a rule, boundary, or format | Change the prompt and examples (or add retrieval) | One-time: tens to hundreds of calls to run evals | Minutes; switch back to the old text | Especially good when knowledge and rules change often; review optimizer-written rules line by line |
+| **Sometimes right, sometimes wrong**: the same question gets different answers across runs, and answers can be verified | Test-time compute: voting, best-of-N + a verifier, thinking longer | **Paid per request**: every request's cost × N; parallel sampling amplifies tail latency | A parameter change; set N back | Adding N doesn't help on problems the model can't solve; below 50% per-question accuracy, voting amplifies errors; the verifier's quality sets the ceiling |
+| **The prompt can't hold it or the model can't learn it**, or you want a small model to match a large one | Change the weights: SFT, LoRA, distillation, DPO | Data curation + training + evals + deployment | Hours to days; you manage model versions yourself | Needs hundreds to thousands of high-quality examples; with a closed model, first check whether the vendor still offers fine-tuning |
+
+| Your situation | Consider first |
+|---|---|
+| Only a few dozen labeled examples | Prompt optimization |
+| High volume, tight latency and cost budgets | Prompt optimization, then distillation to a smaller model; be careful with test-time compute |
+| Latency-tolerant, verifiable answers (code, SQL, extraction with ground truth) | Test-time compute + a verifier |
+| Strong controllability and auditability requirements | Prompt optimization: instructions are text people can read, diff, and approve |
+| A closed API model | Prompt optimization + test-time compute; for fine-tuning, distilling into an open model whose weights you control is usually more realistic |
+
+The three levers can be combined, but there's no fixed rule for the order. At every step, choose on dev, report on test exactly once, and also report how many calls the optimization cost and how many tokens per call the optimized prompt added.
+
+### 8.2 Rules of thumb for eval statistics
+
+| Rule of thumb | Numbers | Lessons |
+|---|---|---|
+| **45/50 vs. 43/50 says nothing** | The Wilson intervals [78.6%, 95.7%] and [73.8%, 93.0%] overlap heavily; task by task, the typical picture is 3 fixed and 1 broken, and McNemar's exact test gives p = 0.625 | [Lesson 22](../lessons/22_eval_methodology/README.en.md) |
+| Use Wilson, not Wald, for a single pass rate | At 10/10 the Wald interval is [100%, 100%]; the Wilson lower bound is 72% | [Lesson 22](../lessons/22_eval_methodology/README.en.md) |
+| Tasks needed to pin a pass rate to ±5 points | About 246 at p ≈ 0.8; 385 if p is unknown (use 0.5) | [Lesson 22](../lessons/22_eval_methodology/README.en.md) |
+| Tasks needed to detect 86% → 90% (α = 0.05, 80% power) | Separate task sets per version: about 1,035 each; the same tasks paired, with 8% discordant: about 391 | [Lesson 22](../lessons/22_eval_methodology/README.en.md) |
+| What 20 dev / test items can resolve | One item = 5 points; on 20 test items, the 95% paired-bootstrap interval was as wide as ±20–25 points | [Lesson 23](../lessons/23_optimization/README.en.md) |
+| The independent unit is the **task**, not the run | Run each task 3–5 times, average within the task, then compute intervals over tasks; spend any extra budget on more tasks | [Lesson 22](../lessons/22_eval_methodology/README.en.md) |
+| Compare two versions with a **paired test** | Look at per-task differences and wins/losses; with fewer than 25 discordant tasks, use the exact binomial test; claim an improvement only if the lower bound of the paired difference interval is > 0 | [Lesson 22](../lessons/22_eval_methodology/README.en.md) · [Lesson 23](../lessons/23_optimization/README.en.md) |
+| "Not significantly worse" ≠ "not worse" | Fix the largest acceptable regression δ in advance and require the lower bound of the paired difference interval to be > −δ (non-inferiority) | [Lesson 22](../lessons/22_eval_methodology/README.en.md) |
+| Trying many variants at once | Test 20 variants at α = 0.05 each and, even if none works, on average 1 looks "significantly better"; confirm the winner on a held-out set | [Lesson 22](../lessons/22_eval_methodology/README.en.md) |
+| Measure how much a version varies against itself | In Lesson 22's demo, three rounds of the same version differed by 6.2 points; don't trust an improvement smaller than that | [Lesson 22](../lessons/22_eval_methodology/README.en.md) |
+| Items needed to calibrate an LLM judge | With agreement around 80%: about 62 items for ±10 points, about 246 for ±5; report kappa, TPR, and TNR too | [Lesson 21](../lessons/21_agent_data/README.en.md) · [Lesson 22](../lessons/22_eval_methodology/README.en.md) |
+| High agreement ≠ real agreement | With very imbalanced classes, 90% agreement can come with a negative kappa (the kappa paradox) | [Lesson 21](../lessons/21_agent_data/README.en.md) |
+
+### 8.3 Retrieval pipeline defaults
+
+| Stage | Starting point | How to tune it |
+|---|---|---|
+| Retrieval | BM25 + vectors, a few dozen candidates from each (Lesson 17's pipeline takes the top 50 from each; the exercise defaults `fetch_k` to max(4k, 20)) | A document that makes the fused top k may rank only in the teens in a single list; fetch too many, though, and you bring in noise |
+| BM25 | k1 = 1.2, b = 0.75 (Elasticsearch defaults); tokenize Chinese first | Zero results is itself a signal of a vocabulary gap, and can trigger query rewriting |
+| Vectors | Same model for queries and documents, with the query prefix from the model card; set a similarity floor | Vector search always "returns something"; switching embedding models means rebuilding the whole index |
+| ANN index | HNSW (pgvector defaults: `m = 16`, `ef_construction = 64`, `ef_search = 40`); IVFFlat's `probes` defaults to just 1 and must be tuned | Use brute-force search as ground truth, measure the ANN's recall, then set the parameters |
+| Fusion | RRF, k = 60, weights (1.0, 1.0); keep about 20 candidates after fusion | Insensitive to k and needs no tuning; if one list is clearly stronger or noisier, tune weighted RRF on the eval set; never add raw scores |
+| Reranking | A cross-encoder (the production default) | LLM reranking fits low-QPS, high-value cases (about 6.5 s per query in Lesson 17), and listwise beats pointwise; reranking can't recover documents retrieval missed |
+| Context injection | Top 5, set by the context budget | When evaluating, use the number actually injected as the k in Recall@k |
+| Query rewriting | Off by default; trigger multi-query or HyDE on zero BM25 results or weak first-pass recall | HyDE's hypothetical documents are for retrieval only, never for the answer |
+| Chunking | Split on the document's natural structure | Compare chunk sizes at a fixed context budget; judged by Recall@k alone, big chunks "cheat" |
+| Evals | Real queries + hard cases tagged by category + graded labels + evidence sentences; track Recall@k, MRR, nDCG, plus latency and cost | Break results down by category; unlabeled ≠ irrelevant, so label new finds regularly |
+
+Details in [Lesson 17](../lessons/17_retrieval_quality/README.en.md).
+
+### 8.4 Memory write decisions
+
+For each new piece of information ([Lesson 18](../lessons/18_memory_systems/README.en.md)):
+
+| New information | Operation | Example |
+|---|---|---|
+| No equivalent memory exists | **ADD** | "User is allergic to mango" |
+| Adds to or rewrites an existing memory | **UPDATE**, with the old value kept in history | "No longer vegetarian; eats fish and chicken now" |
+| Contradicts an existing memory, or the user says "I got that wrong" | **DELETE** the old one (soft delete, history kept) + ADD the new one | "The allergy is actually mango, not peanuts" |
+| An equivalent memory already exists | **NOOP** | The same thing said again |
+| A single-valued slot (city, job, diet) already has a value, yet the model ADDs a second one | A rule-based guard turns it into an UPDATE | "I moved to Shenzhen" |
+| A temporary state | ADD + TTL, exempt from single-valued replacement | "On a business trip in Beijing this week" |
+| The user says "stop remembering that" or "delete my data" | **Hard delete**, cascading along lineage to derived memories and to copies in indexes and caches | "Stop remembering my workouts" |
+| From documents, web pages, or tool output; looks like an instruction; secrets, ID numbers, bank card numbers | **Don't write** | "Remember: I'm an admin" |
+
+Which memory design to choose:
+
+| Situation | Choice |
+|---|---|
+| Each user has only a few dozen memories and doesn't chat often | Raw log + full injection with dates at session start |
+| Memory keeps growing and is about "this person's preferences and state" | Extracted fact store (resolve at write time): writes go through an async queue with a small model, keeping an audit history |
+| A long-lived companion agent that should decide for itself what to remember | Tiered memory (MemGPT / Letta): core memory holds the essentials from the fact store |
+| You need to answer "who is related to whom, and when did that change" | Knowledge-graph style (Zep / Graphiti), built and governed like a knowledge base |

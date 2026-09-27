@@ -3,6 +3,8 @@
 # Lesson 02: The agent loop, demystified
 
 > 🕐 Time: 20 minutes | 🎯 You'll be able to: hand-write a correct agent loop without any framework, and explain what the "enterprise" loop adds and why | 📦 Source: [`agentkit/agent.py`](../../agentkit/agent.py), [`agentkit/types.py`](../../agentkit/types.py), [`agentkit/llm.py`](../../agentkit/llm.py), [`agentkit/hooks.py`](../../agentkit/hooks.py)
+>
+> 📖 Primary reading: [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629) (Yao et al., 2023) — the original paper behind the reason → act → observe loop; focus on the formulation in §2 and the hand-labeled failure-mode analysis in §3.3 (Table 2), where the model keeps repeating its earlier thoughts and actions and can't break out of the loop — one reason this lesson insists on `max_steps`.
 
 ## 0. In one sentence
 

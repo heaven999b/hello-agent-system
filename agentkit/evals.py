@@ -50,16 +50,29 @@ def is_subsequence(expected: list[str], actual: list[str]) -> bool:
     return all(any(a == e for a in it) for e in expected)
 
 
+def normalize_text(text: str) -> str:
+    """评分用的宽松归一化：全角转半角、去空白、统一连接符、小写。
+    否则 "1-3 个工作日" 和 "1～3个工作日" 会被判成不同。"""
+    import unicodedata
+
+    text = unicodedata.normalize("NFKC", text or "").lower()
+    for dash in ("～", "~", "—", "–", "至", "到"):
+        text = text.replace(dash, "-")
+    return "".join(text.split())
+
+
 def rule_grader(case: EvalCase, result: RunResult) -> list[Check]:
     """根据 case.expect 里的规则打分。支持的键：
     status, must_contain, must_not_contain, must_call, must_not_call, tool_order, max_steps
     """
     e, out, called = case.expect, (result.output or ""), result.tools_called()
+    norm_out = normalize_text(out)
     checks: list[Check] = []
     if "status" in e:
         checks.append(Check("status", result.status == e["status"], f"期望 {e['status']}，实际 {result.status}"))
     for s in e.get("must_contain", []):
-        checks.append(Check(f"contains:{s}", s.lower() in out.lower(), "" if s.lower() in out.lower() else f"输出中缺少 {s!r}"))
+        hit = normalize_text(s) in norm_out
+        checks.append(Check(f"contains:{s}", hit, "" if hit else f"输出中缺少 {s!r}"))
     for s in e.get("must_not_contain", []):
         checks.append(Check(f"not_contains:{s}", s.lower() not in out.lower(), f"输出中出现了禁止内容 {s!r}" if s.lower() in out.lower() else ""))
     for t in e.get("must_call", []):
@@ -111,6 +124,7 @@ class CaseResult:
     cost_usd: float
     latency_ms: float
     tags: list[str] = field(default_factory=list)
+    infra_error: bool = False  # 模型 API / 网关故障导致的失败：不代表 Agent 能力，不应和"答错"混在一起
 
 
 @dataclass
@@ -121,6 +135,11 @@ class EvalReport:
     def pass_rate(self) -> float:
         return sum(r.passed for r in self.results) / len(self.results) if self.results else 0.0
 
+    @property
+    def infra_errors(self) -> list[str]:
+        """因基础设施故障（而非 Agent 行为）失败的用例。它们存在时，通过率不可信，应重跑而不是下结论。"""
+        return [r.id for r in self.results if r.infra_error]
+
     def summary(self) -> str:
         n = len(self.results)
         lines = [
@@ -129,6 +148,8 @@ class EvalReport:
             f"平均耗时：{sum(r.latency_ms for r in self.results) / max(n, 1):.0f}ms   "
             f"总成本：${sum(r.cost_usd for r in self.results):.4f}",
         ]
+        if self.infra_errors:
+            lines.append(f"⚠️ {len(self.infra_errors)} 个用例因模型 API / 网关故障失败（{self.infra_errors}），通过率不可信，请重跑")
         for r in self.results:
             mark = "✅" if r.passed else "❌"
             lines.append(f"{mark} {r.id}  status={r.status}  tools={r.tools}")
@@ -143,7 +164,7 @@ class EvalReport:
     @classmethod
     def load(cls, path: str | Path) -> "EvalReport":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls([CaseResult(**{**d, "checks": [Check(**c) for c in d["checks"]]}) for d in data])
+        return cls([CaseResult(**{**d, "checks": [Check(**c) for c in d["checks"]]}) for d in data])  # 旧报告没有 infra_error 字段也能加载
 
     def regressions(self, baseline: "EvalReport") -> list[str]:
         """以前通过、现在失败的 case —— 上线前必须为零（或逐个确认）。"""
@@ -187,6 +208,7 @@ def run_eval(
                 cost_usd=res.cost_usd,
                 latency_ms=latency,
                 tags=case.tags,
+                infra_error=res.status == "failed" and (res.stop_reason or "").startswith("llm_error"),
             )
         )
     return EvalReport(results)

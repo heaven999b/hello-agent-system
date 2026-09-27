@@ -2,7 +2,7 @@
 
 # Lesson 00 quiz
 
-13 questions, about 7 minutes. Answer on your own first, then expand the answers to check. For any you get wrong, go back and reread the relevant section of the [README](README.en.md).
+15 questions, about 8 minutes. Answer on your own first, then expand the answers to check. For any you get wrong, go back and reread the relevant section of the [README](README.en.md).
 
 ---
 
@@ -205,6 +205,47 @@ None of these is always best: conflict frequency, latency requirements, and your
 <summary>Answer</summary>
 
 **B.** "Situational" is about *whether it applies*, not *whether it's optional*. "Every tool has a timeout" and "the model never supplies identity" are general checks, whatever the scenario. "When the agent can send information out, consider data exfiltration" is a situational check — if you ever give ITBuddy a tool that sends email, it gets triggered (think back to the lethal trifecta in question 8). A mistakes "situational" for "optional". C is wrong: every scenario, from internal tools to offline batch jobs, triggers its own set of checks. D is wrong: every item carries its own P0 / P1 / P2 severity, and both kinds include all three levels. ([Lesson 07 §1.3](../07_engineering_perspectives/README.en.md#13-general-checks-vs-situational-checks))
+</details>
+
+---
+
+### 14. (Single choice) Which statement about Part 3 of the course (17–25) is correct?
+
+- A. It's part of the core path, and the 4-hour fast track covers every lesson in it
+- B. It's advanced and optional material that returns to the "concept → build from scratch → exercise" rhythm and adds a comparison of industry trade-offs to every lesson
+- C. It only surveys papers and has no code
+- D. Once you finish Lesson 20 and switch to a framework, you no longer need the layers from the first two parts
+
+<details>
+<summary>Answer</summary>
+
+**B.** The first two parts plus the capstone take about 5.5 hours, and by the end you can build and ship an enterprise agent. Part 3 takes about 3.5 hours and comes in three groups — building blocks in depth (17–20), the ML loop (21–23), and the application frontier (24–25) — so you pick lessons to match your project. A is wrong: the fast track skips Part 3 entirely. C is wrong: every lesson has a from-scratch implementation and exercises. D is wrong: Lesson 20's conclusion is exactly that a framework saves you the work of *writing* the loop, not the responsibility of *understanding* it; every layer from the first two parts is still there inside the framework. (README 1.6)
+</details>
+
+---
+
+### 15. (Matching) Three months after launch, ITBuddy runs into the problems below. Which Part 3 lesson should you turn to for each?
+
+1. Employees report that "the article is right there in the knowledge base, but the agent says it can't find it"
+2. Last month an employee said they work in the Beijing office; this month they moved to Shanghai, but the agent still answers with Beijing's IT policies
+3. Another team wants to plug ITBuddy's ticketing tools into their IDE assistant without writing the integration again
+4. You want to turn production conversations that got a thumbs-down or were escalated to a human into an eval set, but you're worried about private data and about the same conversation ending up in both the training set and the eval set
+5. A new prompt goes from 43 to 45 passing cases out of 50, and the product manager asks "is it really better?"
+6. Evals say quality still isn't good enough, and the team is arguing over whether to edit the prompt, let the model think several times, or fine-tune
+
+<details>
+<summary>Answer</summary>
+
+| Problem | Lesson | Key idea |
+|---|---|---|
+| 1 | [17 Retrieval quality](../17_retrieval_quality/README.en.md) | First use metrics like Recall@k to tell whether recall or ranking is failing, then consider hybrid search, reranking, and chunking |
+| 2 | [18 Advanced memory systems](../18_memory_systems/README.en.md) | Append-only memory rots: writes must be able to update and delete old memories, and retrieval must weigh recency |
+| 3 | [19 MCP and code-execution sandboxes](../19_mcp_and_sandbox/README.en.md) | Use MCP so a tool is "written once, used everywhere" — and remember that tool descriptions are themselves an attack surface |
+| 4 | [21 Agent data](../21_agent_data/README.en.md) | Stratified sampling, deduplication, redaction, and group-aware splits that prevent leakage |
+| 5 | [22 Advanced eval methodology](../22_eval_methodology/README.en.md) | A 2-case difference: check the confidence interval and a paired test before you call noise an improvement |
+| 6 | [23 Optimization](../23_optimization/README.en.md) | Three levers — edit prompts, add test-time compute, change weights — starting with the cheap, reversible ones |
+
+(README 1.6)
 </details>
 
 ---

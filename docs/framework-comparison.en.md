@@ -7,6 +7,8 @@
 
 > ⚠️ **Verification note**: every framework concept name in this doc was checked item by item against each framework's official docs in **September 2026** (official links are at the end). Agent frameworks move fast, and API renames and deprecations are common (this doc records several of them), so **check the current official docs before you write code**. Anything we couldn't confirm is marked "to be verified"; where we found no corresponding mechanism, the cell says "—" (no direct equivalent).
 
+> 🧪 **Want to see framework code actually running?** [Lesson 20: From agentkit to frameworks](../lessons/20_frameworks_bridge/README.en.md) implements the same task four ways — agentkit, DSPy, LangGraph, and the OpenAI Agents SDK (the same IT help-desk question, the same tools, the same operation that needs human approval) — compares them section by section, and measures several differences you wouldn't guess from the docs alone, such as LangGraph re-running the approval node from the top when it resumes after an approval. This doc is the lookup table for "what is this concept called in that framework"; Lesson 20 is the runnable side-by-side. Read them together.
+
 ---
 
 ## 0. Core Insight: Every Framework Solves the Same Problems

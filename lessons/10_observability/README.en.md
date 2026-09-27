@@ -3,6 +3,8 @@
 # Lesson 10: Observability — seeing what your agent is thinking
 
 > 🕐 Time: 15 min | 🎯 You'll be able to: add tracing to an agent, use metrics to spot problems and traces to find root causes, and make sound trade-offs on sampling, privacy, tooling, and alerting | 📦 Source: `agentkit/tracing.py`, `agentkit/agent.py`, `agentkit/viewer.py`
+>
+> 📖 Primary reading: [Dapper, a Large-Scale Distributed Systems Tracing Infrastructure](https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/) (Sigelman et al., 2010) — Google's technical report on its distributed tracing system, whose trace-tree/span model was carried on by Zipkin, OpenTelemetry, and others; focus on §2 (trace trees and spans, sampling, security and privacy) and §4 (tracing overhead and adaptive sampling), and compare them with this lesson's sampling and privacy trade-offs.
 
 ## 0. In one sentence
 

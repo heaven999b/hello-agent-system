@@ -1,0 +1,881 @@
+{
+ "trials": {
+  "source": "constructed",
+  "note": "构造的教学数据（不是录制）：通过/失败的分布是为演示'点估计 → 置信区间 → 配对检验'设计的，失败时的决定取自真实运行里出现过的错误类型。真实运行的结果见讲义第 3 节。",
+  "model": "（构造数据）",
+  "runs": 3,
+  "rows": [
+   {
+    "version": "A",
+    "task_id": "YS-1001",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 239.20"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1001",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 239.20"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1001",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 239.20"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1002",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 159.00"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1002",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 159.00"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1002",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 159.00"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1003",
+    "trial": 0,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "refund 3999.00"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1003",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1003",
+    "trial": 2,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "refund 3999.00"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1004",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1004",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1004",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1005",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1280.00"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1005",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1280.00"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1005",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1280.00"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1006",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1006",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1006",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1007",
+    "trial": 0,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1007",
+    "trial": 1,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1007",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 367.20"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1008",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1008",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1008",
+    "trial": 2,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "refund 2599.00"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1009",
+    "trial": 0,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1009",
+    "trial": 1,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1009",
+    "trial": 2,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1010",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1010",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1010",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1011",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1011",
+    "trial": 1,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "refund 239.20"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1011",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1012",
+    "trial": 0,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1012",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1680.00"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1012",
+    "trial": 2,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1013",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1013",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1013",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1014",
+    "trial": 0,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1014",
+    "trial": 1,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1014",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1880.00"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1015",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1015",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1015",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1016",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 36.40"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1016",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 36.40"
+   },
+   {
+    "version": "A",
+    "task_id": "YS-1016",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 36.40"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1001",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 239.20"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1001",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 239.20"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1001",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 239.20"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1002",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 159.00"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1002",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 159.00"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1002",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 159.00"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1003",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1003",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1003",
+    "trial": 2,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "refund 3999.00"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1004",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1004",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1004",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1005",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1280.00"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1005",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1280.00"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1005",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1280.00"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1006",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1006",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1006",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1007",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 367.20"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1007",
+    "trial": 1,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1007",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 367.20"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1008",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1008",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1008",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1009",
+    "trial": 0,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1009",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1920.00"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1009",
+    "trial": 2,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1010",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1010",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1010",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1011",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1011",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1011",
+    "trial": 2,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "refund 239.20"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1012",
+    "trial": 0,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1012",
+    "trial": 1,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1012",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1680.00"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1013",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1013",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1013",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "reject"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1014",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1880.00"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1014",
+    "trial": 1,
+    "passed": false,
+    "reason": "wrong_decision",
+    "decision": "reject R5"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1014",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 1880.00"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1015",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1015",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1015",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "escalate"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1016",
+    "trial": 0,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 36.40"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1016",
+    "trial": 1,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 36.40"
+   },
+   {
+    "version": "B",
+    "task_id": "YS-1016",
+    "trial": 2,
+    "passed": true,
+    "reason": "ok",
+    "decision": "refund 36.40"
+   }
+  ]
+ },
+ "judge": {
+  "source": "recorded",
+  "note": "评委判决录制自一次真实运行（评委 claude-haiku-4-5-20251001，JUDGE_PROMPT 见 demo.py）。",
+  "model": "claude-haiku-4-5-20251001",
+  "verdicts": [
+   {
+    "pair": "P1",
+    "order": "xy",
+    "verdict": "A",
+    "reason": "回复A的处理结论和金额（239.20元）与正确处理一致，同时清楚说明了退款原因和到账时间，而回复B的全额退款299.00元违反了政策规定。"
+   },
+   {
+    "pair": "P1",
+    "order": "yx",
+    "verdict": "B",
+    "reason": "回复A的退款金额（299.00元）与正确处理（239.20元）不符，违反了最重要的评判标准，而回复B金额正确、说清原因和下一步、表述规范。"
+   },
+   {
+    "pair": "P2",
+    "order": "xy",
+    "verdict": "B",
+    "reason": "回复B正确执行了R7拒绝重复退款的处理方案，并清楚说明了原因和解决途径，而回复A违反政策错误地承诺重复退款。"
+   },
+   {
+    "pair": "P2",
+    "order": "yx",
+    "verdict": "A",
+    "reason": "回复A正确处理了工单（按R7拒绝重复退款），而回复B违反政策进行了重复退款，处理结论错误是最严重的问题。"
+   },
+   {
+    "pair": "P3",
+    "order": "xy",
+    "verdict": "B",
+    "reason": "回复B更清楚地说明了退款理由和条件，让客户明白为什么符合退款资格，增强了透明度和专业度。"
+   },
+   {
+    "pair": "P3",
+    "order": "yx",
+    "verdict": "A",
+    "reason": "回复A更清楚地说明了退款原因（未拆封、签收4天、符合7天内退款条件），让客户明确了解退款的政策依据，而B的表述过于简洁，缺少必要的政策解释。"
+   },
+   {
+    "pair": "P4",
+    "order": "xy",
+    "verdict": "B",
+    "reason": "两条回复的处理结论和金额都正确，但B在表述上更简洁清晰，通过'暂时不能退款'和'若发现质量问题，欢迎上传照片再次申请'的措辞更具同理心和礼貌性。"
+   },
+   {
+    "pair": "P4",
+    "order": "yx",
+    "verdict": "B",
+    "reason": "表述更清晰准确，'超过了7天的退款期限'比'超出7天退款时限'的用词更规范，且逻辑连贯性更强，同时保持了礼貌简洁的风格。"
+   },
+   {
+    "pair": "P5",
+    "order": "xy",
+    "verdict": "B",
+    "reason": "B回复简洁清晰，直接说明问题性质和处理流程，符合质检标准；A冗余啰嗦且重复表述不必要的感谢，违反简洁原则。"
+   },
+   {
+    "pair": "P5",
+    "order": "yx",
+    "verdict": "A",
+    "reason": "回复A简洁清晰地传达了处理结论和下一步，符合评判标准，而回复B冗余堆砌，包含多条不必要的重复表述，违反了简洁原则。"
+   },
+   {
+    "pair": "P6",
+    "order": "xy",
+    "verdict": "B",
+    "reason": "B更清晰地说明了退款规则的适用原因（拆封商品），使客户更容易理解为什么按80%退款，信息层次更清晰。"
+   },
+   {
+    "pair": "P6",
+    "order": "yx",
+    "verdict": "A",
+    "reason": "回复A清楚解释了退款规则（拆封商品80%），而回复B的表述已原路退回可能造成理解偏差，因为实际退款还需要一定时间处理。"
+   },
+   {
+    "pair": "P7",
+    "order": "xy",
+    "verdict": "B",
+    "reason": "B既符合正确处理结论（按R4拒绝），又向客户清楚说明了拒绝原因（客户自填尺寸、定制商品政策）和态度诚恳，而A过于生硬且缺乏必要说明。"
+   },
+   {
+    "pair": "P7",
+    "order": "yx",
+    "verdict": "A",
+    "reason": "回复A完整说明了拒绝原因（客户填错尺寸、非质量问题、按政策不退），态度也更礼貌专业，而回复B过于生硬且未向客户解释原因。"
+   },
+   {
+    "pair": "P8",
+    "order": "xy",
+    "verdict": "B",
+    "reason": "B回复更清晰地说明了退款计算方式和到账时间，让客户对处理过程有完整理解，而A的表述不够具体。"
+   },
+   {
+    "pair": "P8",
+    "order": "yx",
+    "verdict": "A",
+    "reason": "回复A明确说明了退款金额计算方式、扣款比例和到账时间，让客户对整个流程有清晰了解；而回复B虽然简洁，但缺少到账时间等重要信息，不利于客户了解下一步。"
+   }
+  ]
+ }
+}

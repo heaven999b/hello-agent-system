@@ -3,6 +3,8 @@
 # Lesson 08: Reliability engineering — keeping agents alive through failure
 
 > 🕐 Suggested time: 20 minutes | 🎯 After this lesson you can: take the six failures enterprises hit most often — rate limits, outages, runaway loops, crashes, duplicate side effects, and approvals that take hours — weigh 2–4 solutions for each, and pick the right one | 📦 Source code: `agentkit/reliability.py`, `agentkit/budget.py`, `agentkit/state.py`, `agentkit/tools.py` (idempotency), `agentkit/agent.py` (recovery)
+>
+> 📖 Primary reading: [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) (Mike Ulrich, 2016) — Chapter 22 of Google's SRE book explains how failures amplify along a call chain, and the "retries multiply across layers" example in Problem 1 of this lesson comes from it; focus on the "Retries" and "Latency and Deadlines" sections to see why retries need a budget and deadlines need to propagate down the chain.
 
 ## 0. In one sentence
 
@@ -293,6 +295,8 @@ This is the core idea behind **durable execution**. How it compares with industr
 Note the last row: **every approach requires side-effecting operations to be idempotent.** Why? See the next card.
 
 > Production upgrades: swap files for Postgres / Redis; have a background job find runs whose status is running but whose heartbeat has expired and trigger recovery, with a lease guaranteeing that only one instance recovers a given run at a time ([Lesson 13](../13_distributed_concurrency/README.en.md)); drain before shutting down during a deploy ([Lesson 16: Release and operations](../16_release_ops/README.en.md)).
+
+> Checkpoints handle "the same task gets interrupted within minutes to hours." When a task is too long to fit in one context window (hours to days), you need a different kind of durability: a feature list, a progress file, and git, so that a brand-new session can read the handoff notes and take over. See [Lesson 24's long-running harness](../24_coding_agents/README.en.md#13-long-running-work-the-agent-wakes-up-with-amnesia-every-time).
 
 ### Problem 5: After recovery, the customer got two refunds
 

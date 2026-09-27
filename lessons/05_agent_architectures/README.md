@@ -3,6 +3,8 @@
 # 第 05 课：常见 Agent 架构 —— 从 ReAct 到深度研究系统
 
 > 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：说清 7 种单 Agent 架构和 5 种多 Agent 拓扑里，"模型在哪里思考、状态放在哪里、控制权在谁手里"；拆解深度研究、编码、Computer-Use、客服、Agentic RAG 五类真实产品；为一个新需求选出架构并说出理由 ｜ 📦 对应源码：`agentkit/agent.py`（ReAct）、`agentkit/workflows.py`（Reflection、主管-专家）、`agentkit/permissions.py`（人工检查点）、本课 [demo.py](demo.py)
+>
+> 📖 必读：[Cognitive Architectures for Language Agents](https://arxiv.org/abs/2309.02427)（Sumers 等, 2024）—— CoALA 框架论文，用"记忆模块、行动空间、决策过程"三个维度统一描述各种语言 Agent，和本课 §1.2 "只问四个问题"的思路一致；重点读 §4 的框架定义和 §5 的 Table 2（把 ReAct、Voyager、Generative Agents、Tree of Thoughts 等放进同一张表对比）。
 
 > 📍 本课属于**第一部分：基础构建**。第 02~04 课造好了零件（循环、工具、上下文与记忆），本课讲这些零件常见的**组装方式**；下一课 [第 06 课 编排模式](../06_orchestration/README.md) 讲 Workflow 模式和多 Agent 编排的实现细节。两课互为补充，分工见 §1.3。
 >
@@ -569,6 +571,8 @@ def handle(event: dict) -> None:                        # 由队列消费者调�
 
 生产中检查点要放在共享存储里（`FileCheckpointer` 换成数据库），多个工作进程才能看到彼此处理过哪些事件。"先查再跑"之间还有并发窗口，严格的去重需要数据库唯一约束或分布式锁（第 13 课）。
 
+事件驱动只回答了"什么时候醒来"；主动式 Agent 还要回答"醒来之后该不该打扰人"。用户模型、打扰决策和隐私边界，见[第 25 课](../25_proactive_and_frontier/README.md)。
+
 ### 3.7 拓扑对比
 
 | 拓扑 | 通信方式 | 状态共享 | 控制权 | 谁面对用户 | 适合 | 主要风险 |
@@ -659,6 +663,8 @@ flowchart TB
 7. **验证闭环**：跑测试、构建、lint，把输出作为外部反馈。这是 Reflection 最有效的形态（§2.4），也是防止"谎称完成"的关键。
 
 **架构拆解**：ReAct + 待办工具（轻量规划）+ 子 Agent（主管-专家）+ 测试反馈（Reflection）+ 权限模式（HITL）+ 沙箱（CodeAct 式的执行环境）。
+
+想亲手搭一个：[第 24 课](../24_coding_agents/README.md)从零实现了编码 Agent 的 ACI 工具、路径边界和测试保护，以及让它跨会话接力干长任务的 harness。
 
 ### 4.3 Computer-Use / 浏览器 Agent
 
@@ -787,6 +793,8 @@ flowchart LR
 3. **程序性记忆的变更风险最大**：改一行系统提示词或规则文件，会影响之后所有的行为，应该走和代码一样的评审和发布流程（[第 16 课](../16_release_ops/README.md)）。
 4. **所有长期记忆都要隔离、可删除、防投毒**：第 04 课"企业级记忆的三条硬要求"对情景、语义、程序性记忆同样适用。能让 Agent 自己改写程序性记忆（比如自动更新规则文件）的设计，投毒风险尤其大。
 5. [MemGPT](https://arxiv.org/abs/2310.08560)（Packer 等，2023）借鉴操作系统的分层内存，让 Agent 自己在"快而小"的上下文和"慢而大"的外部存储之间搬运数据，可以看作把记忆管理本身也交给了 Agent。
+
+这些机制的从零实现（Mem0 式的写入决策、Generative Agents 式的检索打分、MemGPT 式的分层记忆），以及查看、纠正、删除、防投毒这些企业要求怎么落地，见[第 18 课](../18_memory_systems/README.md)。
 
 ## 6. 总对比表与选型决策树
 

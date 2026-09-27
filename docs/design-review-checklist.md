@@ -5,7 +5,7 @@
 > 📖 本文是"领域参考手册"的一部分，配合课程使用。
 > 相关文档：[失败模式图鉴](failure-modes.md) · [速查表](cheatsheet.md) · [面试题](interview-questions.md) · [术语表](glossary.md)
 
-这是一份可以直接复制到 PR 描述、设计文档或评审会议纪要里的清单，共 **17 个分组、163 项**（其中 P0 53 项）。每一项都附了"为什么要查"，并尽量链接到对应的失败模式（如 [T5](failure-modes.md#t5-重复副作用duplicate-side-effects)）和课程。
+这是一份可以直接复制到 PR 描述、设计文档或评审会议纪要里的清单，共 **19 个分组、199 项**（其中 P0 62 项）。每一项都附了"为什么要查"，并尽量链接到对应的失败模式（如 [T5](failure-modes.md#t5-重复副作用duplicate-side-effects)）和课程。
 
 ## 怎么用
 
@@ -19,9 +19,9 @@
 
 **建议流程**
 
-1. **设计阶段**（写代码前）：过一遍"需求与范围""编排""安全""权限与审批""分布式与高并发"，这几组的决策最难事后修改；
+1. **设计阶段**（写代码前）：过一遍"需求与范围""编排""安全""权限与审批""分布式与高并发"，这几组的决策最难事后修改；用到长期记忆、MCP、代码执行、编码 Agent 或主动提醒时，再加上第 19 组"扩展能力"；
 2. **上线前评审**：全量过一遍，P0 逐条给出证据（链接到代码、配置、eval 报告、trace 截图），而不是口头说"有的"；
-3. **季度复查**：模型、工具、用户群都会变，清单也要重新过——尤其是"评估"和"成本"两组。
+3. **季度复查**：模型、工具、用户群都会变，清单也要重新过——尤其是"评估""成本"和第 18 组"数据、评估方法论与优化"。
 
 > 💡 一个判断评审质量的小技巧：对每个 P0，问"**如果它失效了，我们多久会发现？**"。如果答案是"用户投诉之后"，说明还缺检测手段。
 
@@ -46,7 +46,9 @@
 | 15 | 文档与交接 | 7 | 1 | [第 12 课](../lessons/12_production_architecture/README.md) |
 | 16 | 分布式与高并发 | 12 | 4 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 17 | 企业知识与 RAG | 9 | 2 | [第 15 课](../lessons/15_enterprise_rag/README.md) |
-| | **合计** | **163** | **53** | |
+| 18 | 数据、评估方法论与优化 | 16 | 3 | [第 21 课](../lessons/21_agent_data/README.md) · [第 22 课](../lessons/22_eval_methodology/README.md) · [第 23 课](../lessons/23_optimization/README.md) |
+| 19 | 扩展能力（检索 / 记忆 / MCP / 代码执行 / 编码 Agent / 主动式） | 20 | 6 | [第 17 课](../lessons/17_retrieval_quality/README.md) · [第 18 课](../lessons/18_memory_systems/README.md) · [第 19 课](../lessons/19_mcp_and_sandbox/README.md) · [第 20 课](../lessons/20_frameworks_bridge/README.md) · [第 24 课](../lessons/24_coding_agents/README.md) · [第 25 课](../lessons/25_proactive_and_frontier/README.md) |
+| | **合计** | **199** | **62** | |
 
 ---
 
@@ -426,6 +428,84 @@
   —— 切块决定了模型能看到的上下文是否完整（[C9](failure-modes.md#c9-引用失真citation-hallucination)）。
 - [ ] 🟢 **P2** 监控知识新鲜度：检索结果中陈旧文档的比例。
   —— 知识库会随时间腐烂，没有指标就不会有人注意到（[C8](failure-modes.md#c8-删除未传播deletion-not-propagated)）。
+
+## 18. 数据、评估方法论与优化
+
+- [ ] 🔴 **P0** 评估数据按组划分 train / dev / test（用户、会话、种子、近重复组；对时间敏感的场景按时间切），test 冻结，只在最终报告时用一次。
+  —— 看着数据改系统都算"训练"；泄漏会让分数虚高、上线就掉（[A1](failure-modes.md#a1-评估集泄漏eval-set-leakage)）。
+- [ ] 🔴 **P0** 测试集以真实数据为主，标签经过人工；合成数据和 LLM 标注只用来补覆盖面。
+  —— 否则测出来的只是"LLM 同意 LLM"（[A3](failure-modes.md#a3-合成数据分布偏移synthetic-data-distribution-shift)、[A4](failure-modes.md#a4-llm-评委未校准uncalibrated-llm-judge)）。
+- [ ] 🔴 **P0** "B 比 A 好""可以上线"的结论，基于同一批任务上的配对检验（配对 bootstrap 或 McNemar），报告差值的置信区间，而不只是两个平均分。
+  —— 45/50 对 43/50 在统计上几乎说明不了问题；区间含 0 就不能宣称提升（[A2](failure-modes.md#a2-优化器的赢家诅咒optimizer-winners-curse)、[E2](failure-modes.md#e2-单次运行的假象flaky-single-run-evals)）。
+- [ ] 🟠 **P1** benchmark 过一遍探针审查：什么都不做、固定话术、偷看隐藏字段的探针 Agent 得分接近 0，参考解能通过全部任务，报告里写明平凡 Agent 的基线。
+  —— 能被钻空子的评估，比出来的只是"谁更会钻空子"（[A12](failure-modes.md#a12-benchmark-漏洞leaky-benchmark)）。
+- [ ] 🟠 **P1** 统计的独立单元是"任务"而不是"运行"：每个任务跑 3–5 次，先在任务内求平均，再以任务为单位算区间；动手之前先估算需要多少任务。
+  —— 把多次运行当成独立样本，区间会窄得虚假；把通过率估到 ±5 个点，p ≈ 0.8 时就要约 246 个任务。
+- [ ] 🟠 **P1** 每次试验从干净的环境开始；评分器看环境终态，而不是 Agent 说了什么；基础设施错误（如模型 API 返回 503）单独标记、重试，不记成 Agent 失败。
+  —— 共享状态会造成相关的失败，甚至被 Agent 利用；把 503 算成 Agent 失败会污染结论（[A12](failure-modes.md#a12-benchmark-漏洞leaky-benchmark)）。
+- [ ] 🟠 **P1** LLM 评委在留出的人工标注样本上校准，同时报告一致率、Cohen's kappa、TPR、TNR 及其区间；成对比较时交换顺序各评一次。
+  —— 一致率 67% 的评委，kappa 可能只有 0.23；只问一次，位置偏差会直接变成假赢家（[A4](failure-modes.md#a4-llm-评委未校准uncalibrated-llm-judge)、[E3](failure-modes.md#e3-评委偏差llm-judge-bias)）。
+- [ ] 🟠 **P1** 评分标准和标注指南有版本号和变更记录，每条标签记下所用版本；看着校准集改过 rubric 之后，换一批新样本复测。
+  —— 给输出打分的过程本身会改变标准（标准漂移）；在改标准用过的数据上报告准确率会虚高（[A1](failure-modes.md#a1-评估集泄漏eval-set-leakage)、[A4](failure-modes.md#a4-llm-评委未校准uncalibrated-llm-judge)）。
+- [ ] 🟠 **P1** 送标样本分层抽样（问题信号优先、稀有路径、高成本、少量纯随机），记录抽样权重，算整体指标时加权还原。
+  —— 第 21 课的 Demo 里，"失败优先"样本的问题率是 33%，真实值只有 10%。
+- [ ] 🟠 **P1** 选优化杠杆之前先做错误分析：稳定地错 → 改提示词、示例或补检索；时对时错且答案能验证 → 测试时计算；格式稳定、调用量大、数据充足 → 微调或蒸馏。
+  —— 模型不知道的规则，采样 5 次会全票答错，加测试时计算没有用。
+- [ ] 🟠 **P1** 提示词优化只在 dev 上挑选，平局规则和候选数在看 test 之前定好；优化产物（指令、示例、分数、数据版本）入库，指令 diff 人工审阅，并自动检查有没有逐字抄进数据原文。
+  —— 赢家诅咒和背题；优化器还会写出和业务规定相反的规则（[A2](failure-modes.md#a2-优化器的赢家诅咒optimizer-winners-curse)、[A1](failure-modes.md#a1-评估集泄漏eval-set-leakage)）。
+- [ ] 🟠 **P1** 评分器上线前想清楚"最偷懒的满分输出长什么样"；输出格式、安全规则不交给优化器改；规则检查 + LLM 评委 + 人工抽查组合使用。
+  —— 优化器只认分数，评分器有漏洞它就会找到（[A9](failure-modes.md#a9-编码-agent-钻测试空子coding-agent-test-gaming)）。
+- [ ] 🟢 **P2** 优化报告同时给出优化花费（调用次数）和优化后每次调用的 token 与成本变化。
+  —— 第 23 课的 GEPA 把每次调用的输入从 127 token 涨到 811 token，上线后每次调用都要为此付钱。
+- [ ] 🟢 **P2** 宣称"没有变差"时做非劣效检验（配对差值区间的下界 > −δ）；同时比较多个变体时，做多重比较校正或在留出集上验证最好的那个。
+  —— "没有显著变差"通常只说明样本不够；试 20 个变体，就算都没效果，平均也会有 1 个"显著更好"。
+- [ ] 🟢 **P2** 用公开基准选型时检查它的有效性（平凡 Agent 能拿多少分、测试是否充分、是否可能被污染、是否已经饱和）；上线决策只看自己的评估集。
+  —— 基准成绩衡量的是模型在基准上的能力，不是你的场景（[A12](failure-modes.md#a12-benchmark-漏洞leaky-benchmark)）。
+- [ ] 🟢 **P2** 模型升级或数据分布变化后，重跑优化过的提示词和评估集；评估集和 benchmark 本身带版本号。
+  —— 优化出来的提示词可能反而拖后腿；任务、评分器、环境任何一个变了，分数就不再可比。
+
+## 19. 扩展能力（检索 / 记忆 / MCP / 代码执行 / 编码 Agent / 主动式）
+
+- [ ] 🟠 **P1** 有检索评估集：查询来自真实日志，难例按类别打标签，分级标注并记下证据句；按类别报告 Recall@k（k = 实际注入的条数）、MRR、nDCG，以及延迟和成本。
+  —— 没有评估集，检索"优化"全凭感觉；只看总分会掩盖某一类查询变差（[A11](failure-modes.md#a11-融合挤掉好结果fusion-crowds-out-good-results)）。
+- [ ] 🟠 **P1** 稀疏 + 稠密两路混合检索，用 RRF（或在评估集上调过权重的加权 RRF）融合，不直接相加原始分数；向量结果设相似度下限。
+  —— 型号、错误码靠 BM25，口语化问题靠向量；向量检索永远"有结果"，噪声会挤掉好文档（[A11](failure-modes.md#a11-融合挤掉好结果fusion-crowds-out-good-results)）。
+- [ ] 🟠 **P1** ANN 索引参数用暴力检索当标准答案测过召回，而不是用默认值直接上线。
+  —— pgvector 的 `ivfflat.probes` 默认是 1，在第 17 课的数据上只找回不到三成的真正近邻。
+- [ ] 🟢 **P2** 比较切块大小时固定上下文预算；换 embedding 模型时全量重建索引；HyDE 这类假文档只用于检索，不进回答。
+  —— 只看 Recall@k，大块会"作弊"；新旧向量不在同一个空间，不能混用（[C9](failure-modes.md#c9-引用失真citation-hallucination)）。
+- [ ] 🔴 **P0** 长期记忆只从用户本人明确表达的内容写入，工具输出、网页、邮件不自动写入；进入 system prompt 的核心记忆，每次写入都过注入和敏感信息检查并留审计。
+  —— 记忆投毒一次写入、每次会话都生效；MINJA 只靠正常提问就能往记忆里注入恶意记录，平均成功率 98.2%（[C6](failure-modes.md#c6-记忆投毒与过期memory-poisoning--staleness)）。
+- [ ] 🔴 **P0** "删掉我的数据"走物理删除，并沿血缘级联删除派生记忆（洞察、合并结果、摘要）以及索引和缓存里的副本。
+  —— 软删除不等于被遗忘权；被删的信息会通过派生数据"复活"（[A5](failure-modes.md#a5-记忆矛盾残留lingering-contradictory-memory)、[C8](failure-modes.md#c8-删除未传播deletion-not-propagated)）。
+- [ ] 🟠 **P1** 记忆写入有冲突消解：写时消解（ADD / UPDATE / DELETE / NOOP + 单值槽位规则兜底）或读时消解（带日期的完整历史 + 强模型），二选一并写进设计文档；UPDATE / DELETE 保留历史，临时信息带 TTL。
+  —— 只追加的记忆会重复、矛盾、过期、膨胀（[A6](failure-modes.md#a6-只追加记忆腐化append-only-memory-rot)、[A5](failure-modes.md#a5-记忆矛盾残留lingering-contradictory-memory)）。
+- [ ] 🟠 **P1** 记忆评估集覆盖更新、更正、删除和间接失效，写明"第 N 次会话应该想起什么、不应该想起什么"。
+  —— 各家记忆基准的数字大多是自报的，只有自己的评估集靠得住（[A5](failure-modes.md#a5-记忆矛盾残留lingering-contradictory-memory)）。
+- [ ] 🔴 **P0** MCP 工具的风险等级由自己的审查决定：不可信服务器的注解一律不作数，未审查的工具默认 dangerous、调用前审批；只导入需要的工具。
+  —— `readOnlyHint: true` 只是服务器的自我介绍（[A7](failure-modes.md#a7-mcp-事后变脸mcp-rug-pull)、[S5](failure-modes.md#s5-过度授权excessive-agency)）。
+- [ ] 🔴 **P0** 锁定 MCP 服务器版本和工具定义指纹（名字 + 描述 + 参数 + 注解的哈希），每次连接都比对，变化时拒绝加载并重新审查。
+  —— 审查是一次性的，服务器更新却随时可以改定义（[A7](failure-modes.md#a7-mcp-事后变脸mcp-rug-pull)、[S6](failure-modes.md#s6-工具投毒与供应链tool-poisoning)）。
+- [ ] 🟠 **P1** 启动 MCP 服务器时只传必需的环境变量，不继承父进程的全部环境。
+  —— 否则你的 API key 会交给你启动的每一个服务器（[A7](failure-modes.md#a7-mcp-事后变脸mcp-rug-pull)）。
+- [ ] 🔴 **P0** 模型生成的代码必须在沙箱里执行：默认无网络、沙箱里没有密钥、每次全新环境、超时后杀掉整棵进程树；面向外部用户或多租户时至少用 gVisor 或 microVM。
+  —— 进程级沙箱管得住时间和资源，管不住身份和网络（[A8](failure-modes.md#a8-沙箱限制失效ineffective-sandbox-limits)、[S3](failure-modes.md#s3-致命三要素外泄lethal-trifecta-exfiltration)）。
+- [ ] 🟠 **P1** 沙箱的每项资源限制都在目标平台上实测生效（启动时探测并记录）；CI 里有内存炸弹、孙进程、越界读文件、联网这类"坏代码"用例。
+  —— macOS 上 `RLIMIT_AS` 设不上、RSS 会缩水、`RLIMIT_CPU` 会误杀（[A8](failure-modes.md#a8-沙箱限制失效ineffective-sandbox-limits)）。
+- [ ] 🔴 **P0** 编码 Agent 在副本、容器或独立分支上工作，产出只有 diff；测试和测试配置对 Agent 只读（工具层拒绝 + 运行前哈希校验或只读挂载）。
+  —— Agent 会改坏东西，也会改测试来"通过"（[A9](failure-modes.md#a9-编码-agent-钻测试空子coding-agent-test-gaming)、[S5](failure-modes.md#s5-过度授权excessive-agency)）。
+- [ ] 🟠 **P1** 合并前做 diff 审查（测试里的具体数值、跳过测试、`sys.exit`、重载 `__eq__`）+ 完整 CI + 人工评审；Agent 有"报告需求矛盾"的出口。
+  —— ImpossibleBench 里，给出这个出口后 GPT-5 的作弊率从 54% 降到 9%（[A9](failure-modes.md#a9-编码-agent-钻测试空子coding-agent-test-gaming)）。
+- [ ] 🟠 **P1** 长任务的"完成"由 harness 亲自验证（新功能 + 回归）后才标记和提交；功能清单和进度文件由 harness 管理，或只允许 Agent 改特定字段。
+  —— 把验收交给被验收的人，就会过早宣布完成（[M2](failure-modes.md#m2-过早宣布完成premature-completion)）。
+- [ ] 🟠 **P1** 用 Agent 框架之前核对它的默认值并写合同测试：追踪数据的去向、响应缓存、暂停恢复时的重跑语义；锁定框架版本。
+  —— LangGraph 恢复时节点从头重跑，OpenAI Agents SDK 的追踪默认上传到 OpenAI，DSPy 默认缓存响应，这些都不会报错（[T5](failure-modes.md#t5-重复副作用duplicate-side-effects)、[S7](failure-modes.md#s7-敏感信息泄露sensitive-information-disclosure)）。
+- [ ] 🟠 **P1** 主动式功能的打扰决策用可测试的代码：收益 × 置信度 − 情境成本过了阈值才说，三档输出（现在说 / 攒进摘要 / 不说），加勿扰时段和频率上限；紧急通道要求可信来源和最低置信度。
+  —— 几次无用的打扰，用户就会关掉整个功能（[A10](failure-modes.md#a10-主动式-agent-过度打扰over-interrupting-proactive-agent)）。
+- [ ] 🟠 **P1** 用户模型的每条推断都能查看、纠正、删除（删除要拉黑，防止被重新学回来）；敏感推断默认不用；只把和当前事件相关的推断发给模型。
+  —— 主动式 Agent 持续读邮件和日历，是致命三要素的典型场景（[S3](failure-modes.md#s3-致命三要素外泄lethal-trifecta-exfiltration)、[C6](failure-modes.md#c6-记忆投毒与过期memory-poisoning--staleness)）。
+- [ ] 🟢 **P2** 主动式功能的线上指标不只看采纳率，还看每人每天的打扰次数、"别再提醒"率和关闭功能的比例。
+  —— 只优化采纳率，会学出"标题党"式的提醒（[A10](failure-modes.md#a10-主动式-agent-过度打扰over-interrupting-proactive-agent)）。
 
 ---
 

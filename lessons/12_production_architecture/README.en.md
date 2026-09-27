@@ -3,6 +3,8 @@
 # Lesson 12: Production architecture — from script to service
 
 > 🕐 Time: 15 min | 🎯 You'll be able to: draw a reference architecture for an enterprise agent platform and explain what problem each component solves, and make sound calls on the key architectural decisions: sync vs async, stateful vs stateless, tenant isolation, framework choice, and model gateways | 📦 Source: this lesson's exercise (multi-tenant rate limiting, model routing), `agentkit/state.py`, `agentkit/llm.py`; for a complete service example, see `capstone/server.py`
+>
+> 📖 Primary reading: [12-Factor Agents - Principles for building reliable LLM applications](https://github.com/humanlayer/12-factor-agents) (Dex Horthy, 2025) — HumanLayer's twelve principles for turning an agent into software you can put in front of customers, mapping directly onto this lesson's problem cards on async tasks, stateless workers, and framework choice; focus on Factor 5 (unify execution state and business state), Factor 6 (launch/pause/resume with simple APIs), and Factor 8 (own your control flow).
 
 ## 0. In one sentence
 

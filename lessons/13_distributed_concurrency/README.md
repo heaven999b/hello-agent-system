@@ -3,6 +3,8 @@
 # 第 13 课：高并发与分布式执行 —— 一台机器不够用之后
 
 > 🕐 建议用时：25 分钟 ｜ 🎯 学完你能：把单进程 Agent 扩展成多 worker 集群，让任务"不丢、不重、不乱、不被压垮"，并为每一项在多种方案里做出有依据的选择 ｜ 📦 对应源码：[`jobqueue.py`](jobqueue.py)（租约队列）、[`session_store.py`](session_store.py)（乐观并发）、[`agentkit/state.py`](../../agentkit/state.py)（检查点）、[`agentkit/tools.py`](../../agentkit/tools.py)（幂等键）
+>
+> 📖 必读：[How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)（Martin Kleppmann, 2016）—— 本课 fencing token 时间线的出处；重点读 "Protecting a resource with a lock" 和 "Making the lock safe with fencing" 两节，理解为什么进程暂停和网络延迟会让"拿到过锁"不等于"现在还持有锁"。
 
 ## 0. 一句话讲清楚
 

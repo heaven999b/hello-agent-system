@@ -3,6 +3,8 @@
 # Lesson 07: Engineering perspectives — the angles you must think through
 
 > 🕐 Time: 20 min | 🎯 You'll be able to: take any agent requirement and name the 20 angles to examine it from, tell which checks every project needs and which ones this particular project has "triggered", put them in order, and find the gaps in a design doc | 📦 Source: [`perspectives.py`](perspectives.py) (the catalog: 301 considerations), [`demo.py`](demo.py), [`exercise.py`](exercise.py)
+>
+> 📖 Primary reading: [Hidden Technical Debt in Machine Learning Systems](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) (Sculley et al., 2015) — a classic paper by Google engineers: in a real system the model code is a small box, and the risk lives in the data dependencies, configuration, feedback loops, and external changes around it, which is exactly why this lesson reviews a system from many angles; focus on Figure 1 and the self-check questions in Section 9, and try mapping each kind of debt in the paper to one of this lesson's dimensions.
 
 ## 0. In one sentence
 

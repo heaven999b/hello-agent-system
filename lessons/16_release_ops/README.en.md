@@ -3,6 +3,8 @@
 # Lesson 16: Release, change, and operations — treat a one-line prompt change like a code release
 
 > 🕐 Time: 15 min | 🎯 You'll be able to: design a complete release and operations process for an agent ("versioning → eval gate → shadow comparison → canary rollout → automatic rollback → kill switch → incident postmortem → feedback loop"), and explain what each stage protects against | 📦 Source: [registry.py](registry.py), [rollout.py](rollout.py), [shadow.py](shadow.py), [killswitch.py](killswitch.py), [flywheel.py](flywheel.py) (this lesson), [`agentkit/permissions.py`](../../agentkit/permissions.py), [`agentkit/evals.py`](../../agentkit/evals.py)
+>
+> 📖 Primary reading: [Expanding on what we missed with sycophancy](https://openai.com/index/expanding-on-sycophancy/) (OpenAI, 2025) — the full postmortem of the GPT-4o rollback that opens this lesson; focus on "How we currently review models before deployment" and "Why did we not catch this in our review process?" to see why offline evals and A/B tests didn't catch it, and why expert testers' concerns were outweighed by the positive metrics.
 
 ## 0. In one sentence
 
@@ -332,6 +334,8 @@ One thing calls for special care: **use feedback to find problems and generate t
 **In this lesson**: [`flywheel.py`](flywheel.py). `bad_case_to_inbox` turns a poorly rated run into a record awaiting labeling. Inputs and outputs are redacted first (`redact_pii`). `metadata` keeps only the tenant and role and drops `user_id` (to reproduce a problem, you need to know "someone with what permissions," not "which person"). The record carries the prompt version, `run_id`, and `trace_id`, so the labeler can go back to the scene. `to_eval_case` rejects records with no `expect` filled in: **putting unlabeled bad cases straight into the eval set only creates noise.**
 
 In production: the inbox is a queue with a labeling UI (a labeling platform or an internal tool) that supports filtering by reason, tenant, and version. Labels go through a second review before being merged into the eval-set repo. Clean out obsolete cases regularly: when policy changes, the old "correct answers" need updating too.
+
+For the full data flywheel — stratified sampling from a flood of traces, dedup and redaction, synthesizing and verifying data, checking labeling agreement with kappa, and group-aware splits that keep eval data from leaking into training data — see [Lesson 21](../21_agent_data/README.en.md#13-the-data-flywheel-the-full-loop).
 
 ## 3. Hands-on: run the demo
 

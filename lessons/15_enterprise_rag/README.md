@@ -3,6 +3,8 @@
 # 第 15 课：企业知识与数据 —— 权限感知 RAG
 
 > 🕐 建议用时：15 分钟 ｜ 🎯 学完你能：设计一个"不越权、不过期、有出处、防投毒"的企业知识检索系统，并在 ACL 过滤、多租户隔离、同步策略、引用校验、切块方式之间做出有依据的选择 ｜ 📦 对应源码：[`acl_index.py`](acl_index.py)、[`grounding.py`](grounding.py)，复用 [`agentkit/memory.py`](../../agentkit/memory.py) 的 `tokenize` 与 [`agentkit/guardrails.py`](../../agentkit/guardrails.py) 的 `ToolOutputGuard`
+>
+> 📖 必读：[LLM08:2025 Vector and Embedding Weaknesses](https://genai.owasp.org/llmrisk/llm082025-vector-and-embedding-weaknesses/)（OWASP GenAI Security Project, 2025）—— OWASP LLM 应用十大风险中专讲向量库与嵌入的一条，越权访问、跨租户泄露、嵌入反演、投毒都在其中，正好构成本课问题卡片背后的威胁模型；重点读 "Common Examples of Risks" 和 "Example Attack Scenarios"，再逐条对照本课的防御手段。
 
 ## 0. 一句话讲清楚
 
@@ -285,6 +287,8 @@ sequenceDiagram
 **怎么选**：**B 为默认，只在被迫切断的地方加 C，表格和代码走专门处理**。`max_chars` 取多少不要拍脑袋：准备一个问题集，比较几种设置下"正确的块是否出现在 top-k 里"（recall@k，第 11 课）。进阶做法：给每个块补一句"这个块在全文中讲的是什么"再建索引（Anthropic 的 Contextual Retrieval，第 04 课），或者"用小块检索、把它所在的大块交给模型"（父子块）。
 
 **本课实现**：练习 (b) 的 `chunk_markdown`：标题分小节 → 空行分段落 → 代码块整体成段 → 小节内贪心合并 → 超长段落按长度切并重叠；`fixed_size_chunks` 作为对照。Demo 场景 5 展示两者对同一篇文档的切法。
+
+本课关心的是"检索不越权"；"检索得准不准"怎么量化和优化（Recall@k / MRR / nDCG、稀疏 / 稠密 / 混合检索、RRF 融合、重排、切块大小对召回的影响），见[第 17 课](../17_retrieval_quality/README.md)。
 
 ---
 

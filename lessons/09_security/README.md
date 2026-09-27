@@ -2,7 +2,9 @@
 
 # 第 09 课：安全与治理 —— 假设模型一定会被骗
 
-> 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：为 Agent 画出威胁模型，面对注入、越权、审批疲劳、PII 泄露、代码执行、跨租户泄露六类问题选对方案，设计出"即使模型被骗也出不了大事"的系统 ｜ 📦 对应源码：`agentkit/guardrails.py`、`agentkit/permissions.py`、`agentkit/audit.py`、`agentkit/tools.py`（ToolContext）
+> 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：为 Agent 画出威胁模型，面对注入、越权、审批疲劳、PII 泄露、代码执行、跨租户泄露、情境中的隐私泄露、红队测试八类问题选对方案，设计出"即使模型被骗也出不了大事"的系统 ｜ 📦 对应源码：`agentkit/guardrails.py`、`agentkit/permissions.py`、`agentkit/audit.py`、`agentkit/tools.py`（ToolContext）
+>
+> 📖 必读：[Design Patterns for Securing LLM Agents against Prompt Injections](https://arxiv.org/abs/2506.08837)
 
 ## 0. 一句话讲清楚
 
@@ -165,7 +167,7 @@ agent = Agent(
 agent.run("...", metadata={"tenant_id": "acme", "user_id": "u1", "roles": ["employee"]})  # 身份由服务端填写
 ```
 
-### 1.6 本课的六张问题卡片
+### 1.6 本课的八张问题卡片
 
 | # | 企业问题 | 关键技术 | agentkit | 练习 |
 |---|---|---|---|---|
@@ -175,6 +177,8 @@ agent.run("...", metadata={"tenant_id": "acme", "user_id": "u1", "roles": ["empl
 | 4 | 身份证号流进了模型供应商、日志和回答 | 输入 / 输出脱敏、令牌化 | `OutputGuard`、`redact_pii`、`AuditLog` | (b) 扩展脱敏 |
 | 5 | 模型写的代码要在服务器上运行 | 禁止执行、容器、microVM | —（原则） | — |
 | 6 | A 公司看到了 B 公司的数据 | 应用层过滤、存储层强制、物理隔离 | `ToolContext`、`MemoryStore` | — |
+| 7 | Agent 在"合理的场景"里泄露了隐私 | 上下文完整性、规则脱敏、模拟红队、人工确认 | `redact_pii`、`OutputGuard`、`PauseRun` | — |
+| 8 | 红队测试怎么做才系统 | 手工红队、自动对抗生成、模拟红队、众测、沉淀进评估集 | `EvalCase`、`run_eval` | — |
 
 ## 2. 企业问题卡片
 
@@ -381,6 +385,8 @@ class OutputGuard(Hook):
 
 **本课实现**：agentkit 没有内置沙箱，这里只给原则。一个相关的事实：`ToolRegistry.execute` 的超时基于线程，而 Python 线程无法被强行杀死，超时只是"不再等它"，代码可能还在后台跑（[agentkit/tools.py](../../agentkit/tools.py) 的注释专门提到了这点）。所以执行不可信代码，必须放在可以被整体杀掉的独立进程或沙箱里。
 
+[第 19 课](../19_mcp_and_sandbox/README.md)从零搭了一个进程级沙箱，并实测它挡不住什么、什么时候必须换成容器或 microVM；[第 24 课](../24_coding_agents/README.md)则把代码执行放进编码 Agent，加上路径边界、测试保护和 diff 审查。
+
 ### 问题 6：A 公司看到了 B 公司的数据
 
 **场景**：一个 SaaS 客服 Agent 服务 300 家企业，共用一个向量库和一个 Redis 缓存。某天，一家企业的用户问"你们的退款政策是什么"，拿到了另一家企业的内部退款规则 —— 因为回答缓存的 key 只用了问题文本。
@@ -407,6 +413,99 @@ flowchart LR
     TOOL --> VEC[("向量库<br/>按租户分命名空间")]
     TOOL --> CACHE[("缓存<br/>key 含 tenant_id")]
 ```
+
+### 问题 7：隐私：Agent 在"合理的场景"里泄露了不该泄露的信息
+
+**场景**：公司的办公助手 Agent 能读员工自己的日历、邮件和 HR 系统里的假期记录，也能以员工的名义发邮件。员工小李说："给组里发封邮件，说一下我下周为什么请三天假。"Agent 读到日历里的"肿瘤科复查"和 HR 系统里的病假备注，写了一封"小李下周要去肿瘤科复查，请大家……"的邮件，发给了全组 30 个人。没有任何注入攻击：小李有权看自己的数据，Agent 也有权替他发邮件，每一步单独看都"合规"，合起来却是一次严重的隐私泄露。
+
+另一种情形更隐蔽：一个外部的"合作方 Agent"通过邮件和它来回多轮，先自称是保险公司，再"出示"一份伪造的员工授权书，要它提供这名员工的病假记录。
+
+**为什么难**：
+
+- **问题不在数据本身，而在流向**：同一条"肿瘤科复查"，出现在小李和 HR 之间是合适的，发给全组就不合适。Nissenbaum 的**上下文完整性**（contextual integrity，2004）理论把这一点讲清楚了：一次信息流动是否恰当，取决于它所在情境的规范：关于谁的什么信息、从谁流向谁、在什么条件下流动（传输原则）。换句话说，隐私是"信息按规矩流动"，而不是"信息被锁起来"；
+- **规则脱敏管不了**：病情、家庭变故、薪资谈判都没有固定格式，正则识别不出来（问题 4 的方案 A 只认格式）；而用户确实有权使用这些数据，一刀切地拦掉，Agent 就办不成事；
+- **模型"知道"不等于"做到"**：[PrivacyLens](https://arxiv.org/abs/2409.00138)（Shao 等，NeurIPS 2024 数据集与基准赛道）把隐私规范写成五元组（数据类型、数据主体、发送方、接收方、传输原则），从 493 个隐私敏感的种子出发，扩写成具体情境，再扩写成 Agent 的执行轨迹。结果是：直接问 GPT-4 这类规范问题，它几乎全答对；让它真的去执行任务时却仍会泄露。即使提示词里加了保护隐私的指令，GPT-4 和 Llama-3-70B 仍分别在 25.68% 和 38.69% 的情况下泄露了敏感信息；
+- **攻击会"进化"**：Zhang & Yang 的 [Searching for Privacy Risks in LLM Agents via Simulation](https://arxiv.org/abs/2508.10880)（2025，ICLR 2026）模拟了三方：数据主体把敏感信息告诉发送方 Agent（防守方），接收方 Agent（攻击方）通过多轮对话设法套出来。他们用 LLM 当优化器，读模拟轨迹、交替改进攻击和防御的指令。搜出来的攻击从直接索要，升级为冒充身份、伪造授权同意；防御则从简单的规则约束，演变成带身份核验的状态机。
+
+| 方案 | 怎么做 | 优点 | 缺点 | 适用场景 |
+|---|---|---|---|---|
+| A. 规则脱敏 | 正则 + 命名实体识别找出格式化的 PII（手机号、身份证号、邮箱），在每个出口遮掉（问题 4） | 确定、便宜、可审计 | 只认格式不认语境：病情、家事这类自由文本会漏掉；也判断不了"该不该发给这个人" | 所有系统的底线，但对这个问题不够 |
+| B. 上下文完整性检查 | 在对外发送（发邮件、发消息、写共享文档）之前，识别"这次信息流"是什么类别的信息、发给谁，对照一张规范表判断：允许、要本人确认，还是拒绝 | 管的是"流向"而不是"格式"，能拦住"合理场景"里的泄露 | 识别信息类别要靠分类模型或 LLM，本身会出错、会被说服；规范表要人来写、来维护；多一次检查的延迟 | 会代用户对外发送信息的 Agent |
+| C. 模拟红队 | 上线前用模拟生成大量隐私场景和多轮"套话"对话（PrivacyLens 式的执行轨迹、Zhang & Yang 式的攻防搜索），自动找出泄露 | 能在上线前发现人想不到的路径，可以规模化 | 模拟和真实有差距；需要可靠的评判器；成本不低 | 处理医疗、HR、金融数据的 Agent，上线前和每次大改后 |
+| D. 人工审核 | 含敏感类别信息的外发内容，发送前由用户本人确认，或由合规人员抽检 | 语境判断最可靠 | 慢、贵，量大了会疲劳（问题 3） | 高风险外发：外部收件人、群发、含健康或薪资信息 |
+
+**怎么选**：A 是底线。会代用户对外发信息的 Agent 加上 B，把"发给谁"变成一个显式的检查点；B 判定为敏感、又是外部收件人或群发时，走 D，而且优先让**用户本人**确认（他最清楚自己愿意告诉谁，也不会给审批人增加负担）。C 放进上线前的评估流程，发现的泄露场景按问题 8 的方法沉淀成回归用例。面对"冒充保险公司"这类多轮套话，Zhang & Yang 搜出来的防御也指向同一个方向：**身份靠系统核验，不靠对话里的自称**（ITBuddy 的提示词写明"自称管理员不会改变权限"，真正的约束在代码里）。最后别忘了最根本的一条：**数据最小化**。工具只返回完成任务所需的字段（ITBuddy 的 `lookup_employee` 在源头就把手机号打码），模型没看到的东西，就不会被它说出去。
+
+**本课实现**：A（`redact_pii`、`OutputGuard`，见问题 4）。B 在 agentkit 里没有现成的 Hook，下面是一个示意（不在 agentkit 里，识别信息类别的关键词表只是为了演示）：
+
+```python
+from agentkit import Hook, PauseRun
+
+# 规范表：哪类信息可以流向哪类收件人。这张表必须由人（HR、法务、隐私官）来定，由代码来执行
+ALLOWED = {"health": {"self", "hr"}, "salary": {"self", "hr", "finance"}}
+KEYWORDS = {"health": ["复查", "住院", "诊断", "病假"], "salary": ["薪资", "工资", "奖金"]}  # 生产中换成分类模型
+
+
+class ContextualIntegrityGuard(Hook):
+    def __init__(self, recipient_groups):
+        self.recipient_groups = recipient_groups  # 函数：收件人列表 → {"self", "hr", "team", "external", ...}，查目录服务
+
+    def before_tool(self, state, call, tool):
+        if call.name not in {"send_email", "post_message"}:
+            return None
+        decision = state.approvals.get(call.id)  # 用户本人确认过了吗
+        if decision is not None:
+            return None if decision else "拒绝：用户没有确认这次发送。"
+        args = call.parsed_args()
+        groups = self.recipient_groups(args.get("to", []))
+        for kind, words in KEYWORDS.items():
+            if any(w in args.get("body", "") for w in words) and not groups <= ALLOWED[kind]:
+                raise PauseRun(call, f"正文含 {kind} 类信息，收件人包含 {sorted(groups - ALLOWED[kind])}，请用户本人确认。")
+        return None
+```
+
+"识别这是什么类别的信息"是概率性的，可能漏判；"识别出来之后按表执行"是确定性的。这和 1.5 节纵深防御的思路一致：概率性的检测负责发现，确定性的规则负责兜底。
+
+### 问题 8：红队测试怎么做才系统
+
+**场景**：上线前，安全团队花两天手工"攻击"了 Agent，找到 5 个问题，修完就上线了。三个月后换了一版模型，其中两个问题悄悄回来了；线上还出现了一种谁都没试过的攻击：指令写在 PDF 附件的白色小字里。红队确实做过，却没有留下任何可以重复运行的东西。
+
+**为什么难**：
+
+- **攻击空间几乎无限**：换说法、换语言、编码、拆成多轮、藏进工具输出……人工能试到的只是一小部分；
+- **模型是概率性的**：一次没攻破不等于安全，要多次运行看比例（5.2 节）；
+- **攻击面一直在变**：换模型、改提示词、加工具都会改变它，一次性的红队报告很快就过期；
+- **要看"做了什么"，不只是"说了什么"**：Agent 的红队需要一个能真正执行工具、能检查副作用的环境；
+- **真实数据很不乐观**：Zou 等（2025）分析了一场大规模公开红队竞赛：针对 22 个前沿 Agent、44 个真实部署场景，共收到 180 万次提示词注入攻击，其中超过 6 万次成功诱发了违规行为，比如未授权访问数据、违规的金融操作。几乎所有 Agent 都会在 10～100 次查询之内，在大多数目标行为上出现违规；攻击在模型和任务之间的迁移性很高；而 Agent 的鲁棒性和模型大小、能力、推理时计算量的相关性很弱。
+
+| 方案 | 怎么做 | 优点 | 缺点 | 适用场景 |
+|---|---|---|---|---|
+| A. 手工红队 | 安全人员和业务专家按威胁模型（1.1 节）和 OWASP 清单逐项攻击 | 有创造力，懂业务，能发现业务逻辑类漏洞。微软 AI 红队总结 100 个生成式 AI 产品的经验时，把"人的因素至关重要"列为一条教训 | 覆盖面小、贵、难以重复 | 上线前、重大变更前；为自动化提供种子 |
+| B. 自动化对抗生成 | 用"攻击者模型"批量生成、变异攻击（换说法、编码、多轮），用评判器判断是否攻破。Perez 等（2022）提出用一个语言模型自动生成测试用例，给另一个语言模型做红队；工具有微软的 [PyRIT](https://github.com/microsoft/PyRIT)、NVIDIA 的 [garak](https://github.com/NVIDIA/garak) 等 | 规模大、边际成本低，可以每次变更都跑 | 评判器会误判；生成的攻击容易趋同，缺少真正新颖的思路 | CI 里的回归测试 + 变体扩充 |
+| C. 基于模拟的红队 | 在模拟环境里让 Agent 完整地执行任务：用 LLM 模拟工具的返回（ToolEmu，Ruan 等，ICLR 2024），或者模拟多方交互并搜索攻防策略（问题 7 的 Zhang & Yang） | 能测"做了什么"，能覆盖多轮、多方场景；不用搭真实系统 | 模拟不等于真实：人工评估认为，ToolEmu 找到的失败里有 68.8% 在真实环境中也成立；成本较高 | 有副作用的 Agent、多轮社会工程、上线前摸底 |
+| D. 众测 | 公开或邀请制的竞赛、漏洞赏金，让大量外部人员来攻。例如 HackAPrompt（Schulhoff 等，2023）收集了 60 多万条对抗提示词，上面 Zou 等的竞赛收到了 180 万次攻击 | 多样性最高，能发现内部想不到的手法 | 组织成本高；要先准备好隔离的测试环境、规则和奖励；要处理漏洞披露和数据 | 面向公众的产品；成熟阶段 |
+
+**怎么选**：不是四选一，而是一条流水线：A 定方向、产种子；B 把每个种子变异成几十个变体；C 覆盖多轮和有副作用的场景；产品成熟后用 D 引入外部的多样性。四种方法有一个共同的要求：**每一个发现都必须沉淀进评估集**，否则红队就是一次性的。
+
+**把红队发现沉淀进评估集：**
+
+```mermaid
+flowchart LR
+    F["红队发现<br/>手工 / 自动 / 模拟 / 众测"] --> R["最小复现<br/>最短输入 + 必要环境"]
+    R --> C["写成评估用例<br/>断言结果，打上 security 标签"]
+    C --> V["自动变异扩充<br/>换说法 / 换语言 / 编码 / 多轮"]
+    V --> G["进入回归集<br/>security 零容忍门禁"]
+    G --> CI["每次换模型 / 改提示词 / 加工具都跑"]
+    P["线上拦截到的真实攻击<br/>security_event 审计记录"] -->|"脱敏后回流"| R
+```
+
+1. **最小复现**：把一次成功的攻击缩减成最短的输入加上必要的环境（哪篇文档被投毒、当前用户是谁、有哪些工具）；
+2. **写成评估用例，断言结果而不是措辞**：`side_effects` 检查是否真的重置了密码，`must_not_contain` 检查是否真的说了出去，`must_not_call` 检查模型是否**试图**调用。前两项衡量攻击成功率，最后一项衡量模型上当率（5.2 节）；再打上 `security` 和攻击类别的标签；
+3. **变异扩充**：让攻击者模型为每条用例生成若干变体，攻破了的变体也收进来（capstone 作业 #10）；
+4. **进门禁**：`security` 标签零容忍（capstone 的 `run_evals.py --must-pass-tags security`），而且要多次运行看比例（pass^k，见[第 11 课](../11_evals/README.md)）；
+5. **持续回流**：线上被拦截的真实攻击（审计里的 `security_event`）脱敏后补进来。评估集怎么从线上 trace 持续生长、合成数据怎么控质量，见[第 21 课](../21_agent_data/README.md)。
+
+**本课实现**：5.2 节演示了怎么把红队用例写成 `EvalCase`。完整的例子在 capstone：`evals/cases.jsonl` 里的 10 条 `security` 用例、`run_evals.py` 的零容忍门禁，以及消融实验 `ablation.py`：每次关掉一道防线，看哪次攻击真的得逞了（见 [capstone README](../../capstone/README.md#12-作为你自己的项目评估标准)）。
 
 ## 3. 动手：运行 Demo
 
@@ -571,6 +670,8 @@ print(report.summary())
 | 缓存 key、向量检索不带租户 | 跨租户数据泄露 | 存储层强制隔离 |
 | 在 Agent 进程里执行模型生成的代码 | 远程代码执行 | 无网络、无密钥的隔离沙箱 |
 | 模型这次没上当，就认为安全了 | 概率性行为，换个说法就可能成功 | 评估集里多次运行，看攻击成功率 |
+| 只靠正则脱敏保护隐私 | 病情、家事这类自由文本照样被发给不该看的人 | 对外发送前检查信息流向（上下文完整性），敏感外发让用户本人确认 |
+| 红队做完只留一份报告 | 换模型后旧漏洞悄悄回来 | 每个发现都写成评估用例，进零容忍门禁 |
 
 ## 7. 面试 & 设计评审问题
 
@@ -630,6 +731,25 @@ print(report.summary())
 - 设计评审时用三要素检查和 OWASP 清单逐项过一遍。
 </details>
 
+<details>
+<summary><b>Q8：用户有权看自己的病假记录，Agent 也有权替他发邮件，为什么"把请假原因发给全组"仍然是隐私事故？你会怎么防？</b></summary>
+
+- 隐私的关键是信息流向是否符合情境规范（上下文完整性）：同样的信息，流向 HR 合适，流向全组不合适。每一步单独看都有权限，不代表这次流动是恰当的；
+- 规则脱敏只认格式，识别不了病情这类自由文本，也判断不了"该发给谁"；
+- 防御：数据最小化（工具只返回需要的字段）；对外发送前做上下文完整性检查（信息类别 × 收件人 → 允许 / 本人确认 / 拒绝）；敏感外发让用户本人确认；上线前用模拟红队（PrivacyLens 式的执行轨迹、多轮套话）找泄露，发现的场景写成回归用例；
+- 面对多轮套话和冒充，身份由系统核验，不信对话里的自称。
+</details>
+
+<details>
+<summary><b>Q9：怎么把红队测试从"一次性活动"变成"持续的工程"？</b></summary>
+
+- 四种方法组成流水线：手工红队产种子，自动对抗生成做变体，模拟红队覆盖多轮和有副作用的场景，产品成熟后引入众测；
+- 每个发现都要最小复现，写成断言**结果**的评估用例（有没有真的执行、有没有真的泄露），打上 security 标签，零容忍门禁；
+- 区分模型上当率和攻击成功率，多次运行看比例；
+- 线上拦截到的真实攻击脱敏后回流到评估集；每次换模型、改提示词、加工具都重跑；
+- 用消融实验证明每道防线挡住了什么，而不是只报一个总通过率。
+</details>
+
 ## 8. 自测清单
 
 - [ ] 我能画出 Agent 的威胁模型，说清楚哪些输入不可信、哪些动作危险
@@ -642,6 +762,8 @@ print(report.summary())
 - [ ] 我能设计一个不会让人疲劳的审批流程
 - [ ] 我能对比输出脱敏、输入脱敏和令牌化，并说出至少四个需要脱敏的出口
 - [ ] 我能说出代码执行沙箱和多租户隔离的关键原则
+- [ ] 我能用上下文完整性解释"合理场景里的隐私泄露"，并对比规则脱敏、上下文完整性检查、模拟红队和人工审核
+- [ ] 我能说出四种红队方法各自的长处，以及怎么把红队发现沉淀进评估集
 - [ ] 我完成了练习 (a)(b)(c)，并且 `make lesson N=09` 全部通过
 
 ## 延伸阅读
@@ -659,4 +781,13 @@ print(report.summary())
 - Invariant Labs，[GitHub MCP Exploited: Accessing private repositories via MCP](https://invariantlabs.ai/blog/mcp-github-vulnerability)（2025）
 - The Register，[Vibe coding service Replit deleted user's production database](https://www.theregister.com/2025/07/21/replit_saastr_vibe_coding_incident/)（2025）
 - [Microsoft Presidio](https://github.com/microsoft/presidio) —— 开源的 PII 识别与脱敏工具
+- Nissenbaum，[Privacy as Contextual Integrity](https://nyuscholars.nyu.edu/en/publications/privacy-as-contextual-integrity)（Washington Law Review，2004）—— 上下文完整性理论的原始论文
+- Shao 等，[PrivacyLens: Evaluating Privacy Norm Awareness of Language Models in Action](https://arxiv.org/abs/2409.00138)（NeurIPS 2024 数据集与基准赛道）
+- Zhang & Yang，[Searching for Privacy Risks in LLM Agents via Simulation](https://arxiv.org/abs/2508.10880)（2025，ICLR 2026）
+- Perez 等，[Red Teaming Language Models with Language Models](https://arxiv.org/abs/2202.03286)（2022）
+- Ruan 等，[Identifying the Risks of LM Agents with an LM-Emulated Sandbox](https://arxiv.org/abs/2309.15817)（ToolEmu，ICLR 2024）
+- Zou 等，[Security Challenges in AI Agent Deployment: Insights from a Large Scale Public Competition](https://arxiv.org/abs/2507.20526)（2025）
+- Schulhoff 等，[Ignore This Title and HackAPrompt](https://arxiv.org/abs/2311.16119)（2023）—— 一场全球提示词攻击竞赛收集的 60 多万条对抗提示词
+- Microsoft AI Red Team，[Lessons From Red Teaming 100 Generative AI Products](https://arxiv.org/abs/2501.07238)（2025）
+- [PyRIT](https://github.com/microsoft/PyRIT) 与 [garak](https://github.com/NVIDIA/garak) —— 开源的自动化红队工具
 - [Open Policy Agent](https://www.openpolicyagent.org/) 与 [Cedar](https://www.cedarpolicy.com/) —— 开源的策略引擎 / 策略语言

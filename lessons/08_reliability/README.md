@@ -3,6 +3,8 @@
 # 第 08 课：可靠性工程 —— 让 Agent 在失败中存活
 
 > 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：面对限流、宕机、死循环、崩溃、重复副作用、长时间审批这六类企业常见故障，说出 2-4 种方案的取舍并选对方案 ｜ 📦 对应源码：`agentkit/reliability.py`、`agentkit/budget.py`、`agentkit/state.py`、`agentkit/tools.py`（幂等）、`agentkit/agent.py`（恢复）
+>
+> 📖 必读：[Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/)（Mike Ulrich, 2016）—— Google SRE Book 第 22 章，讲清故障如何沿调用链层层放大，本课问题 1 里"多层重试相乘"的例子就出自这里；重点读 "Retries" 和 "Latency and Deadlines" 两节，理解为什么重试要有预算、截止时间要沿调用链传递。
 
 ## 0. 一句话讲清楚
 
@@ -293,6 +295,8 @@ def save(self, state: RunState) -> None:
 注意最后一行：**所有方案都要求有副作用的操作是幂等的。** 为什么？见下一张卡片。
 
 > 生产级升级：文件换成 Postgres / Redis；用一个后台任务扫描"状态为 running 但心跳过期"的运行来触发恢复，并用租约保证同一时刻只有一个实例在恢复它（[第 13 课](../13_distributed_concurrency/README.md)）；发布时先"排空"再停机（[第 16 课：发布与运维](../16_release_ops/README.md)）。
+
+> 检查点解决的是"同一个任务在几分钟到几小时内被打断"。如果任务长到一个上下文窗口都装不下（几小时到几天），就需要另一种持久化：用功能清单、进度文件和 git 让一个全新的会话读交接文档后接班，见[第 24 课的长时运行 harness](../24_coding_agents/README.md#13-长时运行agent-每次醒来都失忆)。
 
 ### 问题 5：恢复之后，客户收到了两笔退款
 

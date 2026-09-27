@@ -3,6 +3,8 @@
 # Lesson 13: High concurrency and distributed execution — when one machine isn't enough
 
 > 🕐 Time: 25 min | 🎯 You'll be able to: scale a single-process agent into a cluster of workers, keep tasks from being lost, duplicated, reordered, or overwhelmed, and pick among several solutions for each problem with clear reasoning | 📦 Source: [`jobqueue.py`](jobqueue.py) (lease queue), [`session_store.py`](session_store.py) (optimistic concurrency), [`agentkit/state.py`](../../agentkit/state.py) (checkpoints), [`agentkit/tools.py`](../../agentkit/tools.py) (idempotency keys)
+>
+> 📖 Primary reading: [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) (Martin Kleppmann, 2016) — the source of this lesson's fencing-token timeline; focus on "Protecting a resource with a lock" and "Making the lock safe with fencing" to see why process pauses and network delays mean that having acquired a lock is not the same as still holding it.
 
 ## 0. In one sentence
 

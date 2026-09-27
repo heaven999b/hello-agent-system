@@ -3,6 +3,8 @@
 # 第 16 课：发布、变更与运维 —— 改一行 prompt，也要像发布代码一样严肃
 
 > 🕐 建议用时：15 分钟 ｜ 🎯 学完你能：为 Agent 设计一条"版本化 → 评估门禁 → 影子对比 → 金丝雀灰度 → 自动回滚 → 紧急开关 → 事故复盘 → 反馈闭环"的完整发布与运维流程，并说清每一环防的是什么 ｜ 📦 对应源码：[registry.py](registry.py)、[rollout.py](rollout.py)、[shadow.py](shadow.py)、[killswitch.py](killswitch.py)、[flywheel.py](flywheel.py)（本课）、[`agentkit/permissions.py`](../../agentkit/permissions.py)、[`agentkit/evals.py`](../../agentkit/evals.py)
+>
+> 📖 必读：[Expanding on what we missed with sycophancy](https://openai.com/index/expanding-on-sycophancy/)（OpenAI, 2025）—— 本课开头 GPT-4o 回滚事件的完整复盘；重点读 "How we currently review models before deployment" 和 "Why did we not catch this in our review process?" 两节，看离线评估和 A/B 测试为什么没拦住，专家的疑虑又为什么被正面的量化信号压过。
 
 ## 0. 一句话讲清楚
 
@@ -332,6 +334,8 @@ flowchart LR
 **本课实现**：[`flywheel.py`](flywheel.py)。`bad_case_to_inbox` 把差评运行变成待标注记录：输入和输出先脱敏（`redact_pii`）；`metadata` 只保留租户和角色、去掉 `user_id`（复现问题需要的是"什么权限的人"，不是"哪个人"）；带上 prompt 版本、`run_id`、`trace_id`，方便标注的人回到现场。`to_eval_case` 拒绝没有填 `expect` 的记录：**没有标注的 bad case 直接进评估集，只会制造噪声。**
 
 生产级替换：收件箱是一个带标注界面的队列（标注平台或内部工具），支持按原因、租户、版本筛选；标注结果经过二次审核后合入评估集仓库；定期清理过时的用例（政策变了，旧的"正确答案"也要更新）。
+
+数据飞轮的完整做法——从海量 trace 里分层抽样、去重脱敏、合成并验证数据、用 kappa 检查标注一致性、按组划分防止评估集泄漏进训练集——见[第 21 课](../21_agent_data/README.md#13-数据飞轮完整闭环)。
 
 ## 3. 动手：运行 Demo
 

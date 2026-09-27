@@ -4,8 +4,8 @@
 
 ### 企业级 Agent 系统设计训练营
 
-**从"会调 LLM API"到"能设计生产级 Agent 系统"：17 节课 · 中英双语 · 每课都有带测试的练习。**
-不依赖任何 Agent 框架，从零手写企业级 Agent 的每一层：工具、上下文、架构、编排、可靠性、安全、可观测、评估、并发、成本、发布。
+**从"会调 LLM API"到"能设计生产级 Agent 系统"：26 节课 · 中英双语 · 每课都有带测试的练习。**
+不依赖任何 Agent 框架，从零手写企业级 Agent 的每一层：工具、上下文、架构、编排、可靠性、安全、可观测、评估、并发、成本、发布；再到检索、记忆、MCP、数据、评估方法论、优化、编码 Agent 与主动式 Agent。
 
 [![CI](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml/badge.svg)](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -36,7 +36,7 @@
 |---|---|---|
 | 目标 | 让 Agent 跑起来 | 让 Agent **在生产中可靠、安全、可控地**跑起来 |
 | 方式 | 调用框架 API（黑盒） | **从零手写每一层**（核心约 2500 行，每行都能看懂） |
-| 覆盖 | 循环 + 工具 | LLM 必备知识、循环、工具、上下文、常见架构、编排、**工程考量全景**；重试熔断降级、检查点恢复、提示词注入防御、RBAC、人工审批、审计、追踪、评估；高并发与分布式执行、成本优化、权限感知 RAG、灰度发布与事故响应 |
+| 覆盖 | 循环 + 工具 | LLM 必备知识、循环、工具、上下文、常见架构、编排、**工程考量全景**；重试熔断降级、检查点恢复、提示词注入防御、RBAC、人工审批、审计、追踪、评估；高并发与分布式执行、成本优化、权限感知 RAG、灰度发布与事故响应；检索质量、记忆系统、MCP 与沙箱、主流框架对照、Agent 数据、评估方法论、提示词优化与测试时计算、编码 Agent、主动式 Agent |
 | 讲法 | 一种做法 | 企业问题卡片：**每个问题 2–4 种方案对比**，讲清怎么选 |
 | 验证 | 看起来能用 | 每课都有**带自动化测试的练习**，离线、确定性、零成本 |
 | 模型 | 绑定某家厂商 | 任何 OpenAI 兼容接口（OpenAI / DeepSeek / Qwen / vLLM / 各类模型网关） |
@@ -134,12 +134,13 @@ make check-env                                  # 检查模型连通性与工具
 
 ## 📚 学习路线
 
-课程分两部分：**第一部分学会"怎么造"，第二部分学会"企业里出了问题怎么选方案"**。完整学习约 5.5 小时；赶时间可以走 [4 小时速通路线](lessons/00_overview/README.md)（每课只读开头的"核心路径"）。
+课程分三部分：**第一部分学会"怎么造"，第二部分学会"企业里出了问题怎么选方案"，第三部分学会"怎么让 Agent 持续变好"**。前两部分加综合实战约 5.5 小时；第三部分约 3.5 小时，适合学完前两部分后进阶。赶时间可以走 [4 小时速通路线](lessons/00_overview/README.md)（每课只读开头的"核心路径"）。
 
 - **第一部分**：概念 → 从零实现 → 练习。以第 07 课"工程考量全景"收尾：20 个工程维度，每个维度都分成**通用必查点**（任何项目都要做）和**情境触发点**（"当……时，要考虑……"），作为进入第二部分的地图。
 - **第二部分**：每节课由若干张**企业问题卡片**组成：真实场景（带具体数字）→ 为什么直觉方案会翻车 → 2–5 种方案对比（优点 / 缺点 / 适用规模）→ 怎么选 → 代码实现。
+- **第三部分**：进阶的构建块（检索、记忆、MCP、框架），以及让 Agent 持续变好的 ML 闭环（数据 → 评估 → 优化），最后是编码 Agent 与主动式 Agent 等应用前沿。
 
-每节课的流程都一样：**读讲义 → 跑 demo → 写练习 → `make lesson N=xx` 让测试变绿 → 过自测清单**。
+每节课的流程都一样：**读讲义 → 跑 demo → 写练习 → `make lesson N=xx` 让测试变绿 → 过自测清单**。每课开头都标注了一篇 📖 必读论文或文章。
 
 ### 第一部分：基础构建（约 140 分钟）
 
@@ -168,9 +169,23 @@ make check-env                                  # 检查模型连通性与工具
 | 15 | [企业知识与权限感知 RAG](lessons/15_enterprise_rag/README.md) | 15m | ACL 泄露、多租户索引隔离、知识过期、幻觉引用 | ACL 前过滤检索、切块、引用校验 |
 | 16 | [发布、变更与运维](lessons/16_release_ops/README.md) | 15m | prompt 改出事故、模型静默升级、如何止血与回滚 | 金丝雀分桶、自动回滚决策、kill switch |
 
+### 第三部分：进阶——构建块深入、ML 闭环与应用前沿（约 210 分钟）
+
+| # | 课程 | 时长 | 你会学到 / 亲手实现 |
+|---|---|---|---|
+| 17 | [检索质量：向量、混合检索与重排](lessons/17_retrieval_quality/README.md) | 20m | 教学版 embedding、BM25、RRF 融合、LLM 重排、Recall@k / MRR / nDCG，在带标注的评估集上逐项对比 |
+| 18 | [记忆系统进阶：从笔记本到 MemGPT / Mem0](lessons/18_memory_systems/README.md) | 20m | ADD / UPDATE / DELETE 记忆写入、三因子检索打分、MemGPT 式分层记忆、记忆巩固 |
+| 19 | [MCP 协议与代码执行沙箱](lessons/19_mcp_and_sandbox/README.md) | 25m | **手写 MCP 服务器与客户端**（兼容新旧两代规范，与官方 SDK 互通）、进程级沙箱 |
+| 20 | [从 agentkit 到框架](lessons/20_frameworks_bridge/README.md) | 25m | 同一任务的 DSPy / LangGraph / OpenAI Agents SDK 实现对照、迷你 StateGraph |
+| 21 | [Agent 的数据](lessons/21_agent_data/README.md) | 25m | trace 挖掘、去重聚类、分层抽样、合成数据与过滤、Cohen's kappa、防泄漏划分 |
+| 22 | [评估方法论进阶](lessons/22_eval_methodology/README.md) | 25m | Benchmark 设计规范、成对评委去位置偏差、置信区间与配对检验 |
+| 23 | [优化：提示词优化、测试时计算与微调选型](lessons/23_optimization/README.md) | 25m | OPRO 式指令优化、BootstrapFewShot、GEPA 式反思变异、best-of-N、帕累托前沿 |
+| 24 | [编码 Agent 与长时运行 harness](lessons/24_coding_agents/README.md) | 25m | **亲手造一个能修 bug 的编码 Agent**：ACI 工具、测试保护、diff 审查、跨会话接力 |
+| 25 | [主动式 Agent 与前沿方向](lessons/25_proactive_and_frontier/README.md) | 20m | 用户模型、何时打扰的决策器、前沿方向与开放问题、全课回顾 |
+
 ### 🎓 综合实战（30 分钟）
 
-[**ITBuddy：企业 IT 服务台 Agent**](capstone/README.md)：把所有能力组装成一个完整系统，包含命令行应用、支持异步审批的 HTTP API、一份真实风格的设计文档（含威胁模型和 ADR），以及 24 条评估用例（其中 10 条安全用例）。
+[**ITBuddy：企业 IT 服务台 Agent**](capstone/README.md)：把所有能力组装成一个完整系统，包含命令行应用、支持异步审批的 HTTP API、一份真实风格的设计文档（含威胁模型和 ADR）、24 条评估用例（其中 10 条安全用例）、组件消融实验，以及做你自己项目时可以直接套用的[报告模板](capstone/REPORT_TEMPLATE.md)（要求基线对比、消融与错误分析）。
 
 查看学习进度：
 
@@ -180,24 +195,25 @@ make check-env                                  # 检查模型连通性与工具
 
 ## 🎓 与斯坦福 CS329Z 对照学习
 
-斯坦福大学 2026 年秋季开设的 [CS 329Z: Engineering AI Agents](https://cs329z.stanford.edu/) 讲的是"如何工程化构建 Agent 系统"，和本项目的目标高度一致。下表把它公开课表中的每周主题对应到本项目的课程，方便两边对照着学：
+斯坦福大学 2026 年秋季开设的 [CS 329Z: Engineering AI Agents](https://cs329z.stanford.edu/) 讲的是"如何工程化构建 Agent 系统"。下表把它公开课表中的每周主题对应到本项目的课程，方便两边对照着学：
 
 | CS329Z 周次与主题 | 本项目对应 |
 |---|---|
-| W1 Foundations & Landscape · Agentic Systems Spectrum | [00 全景图](lessons/00_overview/README.md)（自主性光谱） |
-| W2 LLMs for Builders | [01 LLM 与 Agent 开发必备知识](lessons/01_llm_essentials/README.md) |
-| W2 Building Blocks: Retrieval-Augmented Generation | [04 上下文与记忆](lessons/04_context_memory/README.md) · [15 权限感知 RAG](lessons/15_enterprise_rag/README.md) |
-| W3 Tool Use & Function Calling | [01](lessons/01_llm_essentials/README.md) · [03 工具设计](lessons/03_tools/README.md) |
-| W3 Frameworks & Agent Design | [02 Agent 循环](lessons/02_agent_loop/README.md) · [框架对照表](docs/framework-comparison.md) |
+| W1 Foundations & Landscape · Agentic Systems Spectrum | [00 全景图](lessons/00_overview/README.md) |
+| W2 LLMs for Builders | [01 LLM 与 Agent 开发必备知识](lessons/01_llm_essentials/README.md)（含约束生成与解码策略） |
+| W2 Building Blocks: Retrieval-Augmented Generation | [04](lessons/04_context_memory/README.md) · [15 权限感知 RAG](lessons/15_enterprise_rag/README.md) · [17 检索质量](lessons/17_retrieval_quality/README.md) |
+| W3 Tool Use & Function Calling | [03 工具设计](lessons/03_tools/README.md) · [19 MCP 与沙箱](lessons/19_mcp_and_sandbox/README.md) |
+| W3 Frameworks & Agent Design | [02 Agent 循环](lessons/02_agent_loop/README.md) · [20 从 agentkit 到框架](lessons/20_frameworks_bridge/README.md) |
 | W4 Agent Design Patterns & Scaffolds | [05 常见 Agent 架构](lessons/05_agent_architectures/README.md) · [06 编排模式](lessons/06_orchestration/README.md) |
-| W4–W5 Memory & Multi-Agent Systems | [04](lessons/04_context_memory/README.md) · [05](lessons/05_agent_architectures/README.md) · [06](lessons/06_orchestration/README.md) |
-| W5 Optimization | 部分对应 [14 成本与延迟](lessons/14_cost_latency/README.md)（侧重成本与延迟；自动化的提示词 / 流水线优化本项目未覆盖） |
-| W6–W7 Data for Agentic Systems · Data Selection & Quality | 本项目未覆盖（仅 [11 评估](lessons/11_evals/README.md) 讲了评估集的构建） |
-| W7 Evaluation Fundamentals & Benchmark Design | [11 评估驱动开发](lessons/11_evals/README.md) |
-| W8 LLM-as-Judge & Evaluation Infrastructure | [11 评估驱动开发](lessons/11_evals/README.md) |
-| W8 Agent Safety & Guardrails | [09 安全与治理](lessons/09_security/README.md) |
-| W9 Coding Agents & Software Agents | [05 常见 Agent 架构](lessons/05_agent_architectures/README.md)（编码 Agent 架构拆解） |
-| W11 Proactive Agents | [05 常见 Agent 架构](lessons/05_agent_architectures/README.md)（事件驱动 / 环境 Agent） |
+| W4–W5 Memory & Multi-Agent Systems | [18 记忆系统进阶](lessons/18_memory_systems/README.md) · [06 编排模式](lessons/06_orchestration/README.md)（含多 Agent 失败分类） |
+| W5 Optimization | [23 优化](lessons/23_optimization/README.md) |
+| W6–W7 Data for Agentic Systems · Data Selection & Quality | [21 Agent 的数据](lessons/21_agent_data/README.md) |
+| W7 Evaluation Fundamentals & Benchmark Design | [11 评估驱动开发](lessons/11_evals/README.md) · [22 评估方法论进阶](lessons/22_eval_methodology/README.md) |
+| W8 LLM-as-Judge & Evaluation Infrastructure | [11](lessons/11_evals/README.md) · [21](lessons/21_agent_data/README.md) · [22](lessons/22_eval_methodology/README.md) |
+| W8 Agent Safety & Guardrails | [09 安全与治理](lessons/09_security/README.md)（含隐私与红队） |
+| W9 Coding Agents & Software Agents | [24 编码 Agent](lessons/24_coding_agents/README.md) |
+| W11 Proactive Agents · Open Problems | [25 主动式 Agent 与前沿方向](lessons/25_proactive_and_frontier/README.md) |
+| 项目：基线、消融、错误分析、可复现 | [综合实战](capstone/README.md) · [报告模板](capstone/REPORT_TEMPLATE.md) |
 
 反过来，本项目**更侧重把 Agent 放进企业生产环境**的工程问题，这部分可以看作对 CS329Z 的补充：[08 可靠性](lessons/08_reliability/README.md)、[10 可观测性](lessons/10_observability/README.md)、[12 生产架构](lessons/12_production_architecture/README.md)、[13 高并发与分布式](lessons/13_distributed_concurrency/README.md)、[14 成本](lessons/14_cost_latency/README.md)、[16 发布运维](lessons/16_release_ops/README.md)，以及贯穿全课的多租户、权限与审计。
 
@@ -209,13 +225,13 @@ make check-env                                  # 检查模型连通性与工具
 
 | 文档 | 内容 |
 |---|---|
-| [🩺 Agent 失败模式图鉴](docs/failure-modes.md) | 67 种生产中真实会遇到的失败模式：症状 → 根因 → 检测 → 修复 |
-| [✅ 设计评审清单](docs/design-review-checklist.md) | 163 条上线前检查项，按 P0/P1/P2 分级 |
-| [🎤 系统设计面试题](docs/interview-questions.md) | 61 道题 + 3 道完整系统设计作答示范 |
+| [🩺 Agent 失败模式图鉴](docs/failure-modes.md) | 79 种生产中真实会遇到的失败模式：症状 → 根因 → 检测 → 修复 |
+| [✅ 设计评审清单](docs/design-review-checklist.md) | 199 条上线前检查项，按 P0/P1/P2 分级 |
+| [🎤 系统设计面试题](docs/interview-questions.md) | 76 道题 + 3 道完整系统设计作答示范 |
 | [🔁 框架对照表](docs/framework-comparison.md) | agentkit 概念 ↔ LangGraph / OpenAI Agents SDK / Claude Agent SDK / ADK … |
 | [📄 一页纸速查](docs/cheatsheet.md) | 原则、默认参数、决策树，适合打印 |
-| [📖 术语表](docs/glossary.md) | 192 条术语，中英对照 + 大白话解释 |
-| [📚 延伸阅读](docs/reading-list.md) | 71 条精选并核实过的论文、博客、规范，按角色给出阅读路线 |
+| [📖 术语表](docs/glossary.md) | 246 条术语，中英对照 + 大白话解释 |
+| [📚 延伸阅读](docs/reading-list.md) | 135 条精选并核实过的论文、博客、规范，按角色给出阅读路线 |
 
 ## 🧱 项目结构
 
@@ -233,7 +249,7 @@ hello-agent-system/
 │   ├── tracing.py       #   链路追踪（OpenTelemetry GenAI 风格）
 │   ├── viewer.py        #   追踪 HTML 查看器
 │   └── evals.py         #   评估框架
-├── lessons/NN_topic/    # 17 节课：README.md + README.en.md 讲义 / demo.py / exercise.py / solution.py / test_exercise.py
+├── lessons/NN_topic/    # 26 节课：README.md + README.en.md 讲义 / demo.py / exercise.py / solution.py / test_exercise.py
 ├── capstone/            # 综合实战：ITBuddy（CLI + HTTP API + 设计文档 + 评估集）
 ├── docs/                # 深度资料（中英双语）
 ├── scripts/             # 学习进度看板、链接检查

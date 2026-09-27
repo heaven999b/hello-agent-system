@@ -3,6 +3,8 @@
 # Lesson 14: Cost and latency optimization — making agents cheaper and faster
 
 > 🕐 Time: 15 min | 🎯 You'll be able to: take an agent's bill and latency distribution, explain where the money and the time go, pick the right optimization for each item, and explain what that optimization costs you | 📦 Source: [costkit.py](costkit.py) (this lesson), [`agentkit/pricing.py`](../../agentkit/pricing.py), [`agentkit/tracing.py`](../../agentkit/tracing.py)
+>
+> 📖 Primary reading: [FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance](https://arxiv.org/abs/2305.05176) (Chen et al., 2023) — the go-to paper on LLM cascades, whose three strategies (prompt adaptation, LLM approximation including a completion cache, and the LLM cascade) line up with the first three of this lesson's four questions; focus on §3 and the cascade's scoring-function-plus-threshold design, and compare it with the validator in this lesson's `CascadeLLM`.
 
 ## 0. In one sentence
 
@@ -62,6 +64,8 @@ Every way of saving money or speeding things up carries the same risk: **quietly
 1. **Measure before you optimize**: find the biggest cost and latency items in your traces (Lesson 10). Don't optimize on gut feeling.
 2. **Every optimization must pass the eval set** (Lesson 11): it only counts as an optimization if quality doesn't drop.
 3. **Look at distributions, not averages**: for cost, look at p95 cost per run (a handful of runaway runs often account for most of the spend); for latency, look at p95 / p99.
+
+In this lesson, "optimization" means saving money and time without losing quality. For the opposite problem — quality itself isn't good enough, so should you edit prompts, add test-time compute, or fine-tune? — see [Lesson 23](../23_optimization/README.en.md).
 
 ## 2. Enterprise problem cards
 
