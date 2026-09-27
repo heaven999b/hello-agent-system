@@ -12,9 +12,11 @@
 
 from __future__ import annotations
 
+import contextvars
 import inspect
 import json
 import typing
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
@@ -57,6 +59,7 @@ class ToolResult:
     ok: bool
     content: str
     error_type: str | None = None  # not_found / invalid_args / timeout / tool_error / exception / denied
+    detail: str | None = None  # 只给工程师看的内部细节（异常原文），写进追踪/日志，不给模型
 
 
 class Tool:
@@ -93,6 +96,21 @@ class Tool:
             "type": "function",
             "function": {"name": self.name, "description": self.description, "parameters": params},
         }
+
+    def parse_arguments(self, arguments: str) -> tuple[dict | None, str | None]:
+        """解析并校验模型给的参数 JSON。返回 (参数 dict, None) 或 (None, 给模型看的错误说明)。"""
+        try:
+            raw = json.loads(arguments or "{}")
+            if not isinstance(raw, dict):
+                raise ValueError("参数必须是 JSON 对象")
+        except (json.JSONDecodeError, ValueError) as e:
+            return None, f"错误：参数不是合法的 JSON 对象（{e}）。请重新生成参数。"
+        try:
+            args = self.args_model.model_validate(raw)
+        except ValidationError as e:
+            problems = "\n".join(f"- {'.'.join(map(str, err['loc'])) or '参数'}: {err['msg']}" for err in e.errors())
+            return None, f"错误：参数校验失败：\n{problems}\n请修正后重试。"
+        return dict(args), None
 
     def __call__(self, *args, **kwargs):  # 允许像普通函数一样直接调用，方便单元测试
         return self.fn(*args, **kwargs)
@@ -173,21 +191,10 @@ class ToolRegistry:
         if t is None:
             return ToolResult(False, f"错误：不存在名为 {call.name!r} 的工具。可用工具：{', '.join(self._tools)}", "not_found")
 
-        # 1) 解析 JSON —— 模型可能输出不合法的 JSON
-        try:
-            raw = json.loads(call.arguments or "{}")
-            if not isinstance(raw, dict):
-                raise ValueError("参数必须是 JSON 对象")
-        except (json.JSONDecodeError, ValueError) as e:
-            return ToolResult(False, f"错误：参数不是合法的 JSON 对象（{e}）。请重新生成参数。", "invalid_args")
-
-        # 2) 按 Schema 校验 —— 缺字段、类型错、越界、多余字段都在这里拦下
-        try:
-            args = t.args_model.model_validate(raw)
-        except ValidationError as e:
-            problems = "\n".join(f"- {'.'.join(map(str, err['loc'])) or '参数'}: {err['msg']}" for err in e.errors())
-            return ToolResult(False, f"错误：参数校验失败：\n{problems}\n请修正后重试。", "invalid_args")
-        kwargs = dict(args)
+        # 1) 解析 JSON（模型可能输出不合法的 JSON）+ 2) 按 Schema 校验（缺字段、类型错、越界、多余字段）
+        kwargs, error = t.parse_arguments(call.arguments)
+        if error is not None:
+            return ToolResult(False, error, "invalid_args")
         if t.wants_ctx:
             kwargs["ctx"] = ctx
 
@@ -200,8 +207,10 @@ class ToolRegistry:
 
         # 4) 带超时执行。注意：Python 线程无法被强杀，超时后线程可能仍在后台跑，
         #    生产中高风险/不可信的工具应放到独立进程或沙箱（容器、gVisor、Firecracker）里执行。
+        #    copy_context：把当前的 contextvars（如追踪的 Span 栈）带进工具线程，
+        #    否则工具内部再调用子 Agent 时，子 Agent 的 trace 会"断链"，无法嵌套在父 Span 下。
         pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(t.fn, **kwargs)
+        future = pool.submit(contextvars.copy_context().run, t.fn, **kwargs)
         try:
             output = future.result(timeout=t.timeout_s)
         except FutureTimeout:
@@ -209,7 +218,16 @@ class ToolRegistry:
         except ToolError as e:
             return ToolResult(False, f"错误：{e}", "tool_error")
         except Exception as e:  # noqa: BLE001 —— 任何异常都要变成观察，不能让 Agent 崩溃
-            return ToolResult(False, f"错误：工具执行异常 {type(e).__name__}: {e}", "exception")
+            # 意外异常的原文（SQL、内网地址、堆栈……）不能给模型：模型可能把它转述给用户。
+            # 给模型一句可行动的提示 + 错误编号；原文放进 detail，由追踪/日志记录，工程师用编号关联排查。
+            error_id = uuid.uuid4().hex[:8]
+            return ToolResult(
+                False,
+                f"错误：工具 {t.name} 内部出错（错误编号 {error_id}）。这不是参数问题，可以稍后重试一次；"
+                f"如果仍然失败，请告诉用户该功能暂时不可用，并提供错误编号。不要猜测或透露内部技术细节。",
+                "exception",
+                detail=f"[{error_id}] {type(e).__name__}: {e}",
+            )
         finally:
             pool.shutdown(wait=False)
 

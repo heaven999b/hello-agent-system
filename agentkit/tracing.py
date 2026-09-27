@@ -15,6 +15,7 @@ OpenTelemetry SDK，导出到 Jaeger / Langfuse / Phoenix / Datadog 等后端即
 
 from __future__ import annotations
 
+import collections
 import contextvars
 import json
 import time
@@ -66,12 +67,13 @@ class Span:
 class Tracer:
     """最小 Tracer。exporter 在每个根 Span 结束时被调用（写文件 / 发到后端）。"""
 
-    def __init__(self, exporter: Callable[[Span], None] | None = None):
+    def __init__(self, exporter: Callable[[Span], None] | None = None, keep_last: int = 1000):
         self._stack: contextvars.ContextVar[tuple[Span, ...]] = contextvars.ContextVar(
             f"span_stack_{id(self)}", default=()
         )
         self.exporter = exporter
-        self.traces: list[Span] = []  # 已完成的根 Span（内存保留，方便测试和打印）
+        # 已完成的根 Span：内存里只保留最近 keep_last 条（方便测试和打印），长期运行的服务也不会内存泄漏
+        self.traces: collections.deque[Span] = collections.deque(maxlen=keep_last)
 
     @contextmanager
     def span(self, name: str, **attrs) -> Iterator[Span]:

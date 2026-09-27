@@ -8,13 +8,18 @@ from __future__ import annotations
 
 from .types import Usage
 
-# model -> (输入价格, 输出价格)，单位：美元 / 1M tokens
-PRICES: dict[str, tuple[float, float]] = {
+# model -> (输入价格, 输出价格[, 缓存命中的输入价格])，单位：美元 / 1M tokens
+# 第三项可选：命中提示词缓存的输入通常有折扣（折扣幅度因厂商和模型而异，请查官方价格页后填写）；
+# 不填则按普通输入价计算（偏保守）。
+PRICES: dict[str, tuple[float, ...]] = {
     "default": (1.25, 10.0),
     "scripted": (1.0, 4.0),
 }
 
 
 def estimate_cost(usage: Usage, model: str) -> float:
-    price_in, price_out = PRICES.get(model, PRICES["default"])
-    return usage.input_tokens / 1e6 * price_in + usage.output_tokens / 1e6 * price_out
+    price = PRICES.get(model, PRICES["default"])
+    price_in, price_out = price[0], price[1]
+    price_cached = price[2] if len(price) > 2 else price_in
+    cached = min(usage.cached_input_tokens, usage.input_tokens)
+    return ((usage.input_tokens - cached) * price_in + cached * price_cached + usage.output_tokens * price_out) / 1e6

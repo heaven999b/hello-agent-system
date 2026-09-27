@@ -54,6 +54,10 @@ def retry_call(
             if attempt == max_attempts or not retry_if(e):
                 raise
             delay = backoff_delay(attempt, base_delay, max_delay)
+            # 服务端明确说了"请 N 秒后再试"（Retry-After）就听它的：比自己猜的退避更准
+            server_hint = getattr(e, "retry_after", None)
+            if server_hint is not None:
+                delay = max(delay, min(server_hint, max_delay * 4))
             if on_retry:
                 on_retry(attempt, e, delay)
             sleep(delay)
@@ -73,7 +77,17 @@ class CircuitBreaker:
           └────────────── 试探请求成功 ◄──────────────────────┘（试探失败则回到 open）
     """
 
-    def __init__(self, name: str = "llm", failure_threshold: int = 5, reset_timeout: float = 30.0, clock=time.monotonic):
+    def __init__(
+        self,
+        name: str = "llm",
+        failure_threshold: int = 5,
+        reset_timeout: float = 30.0,
+        clock=time.monotonic,
+        record_if: Callable[[Exception], bool] | None = None,
+    ):
+        """record_if：哪些异常计入熔断。默认全部计入（简单）；生产中建议只统计反映"下游不健康"的错误
+        （如 is_retryable：429/5xx/超时），否则一个请求自己的 400（比如上下文超长）也会把所有用户切到备用模型。"""
+        self.record_if = record_if
         self.name = name
         self.failure_threshold = failure_threshold
         self.reset_timeout = reset_timeout
@@ -94,7 +108,9 @@ class CircuitBreaker:
             raise CircuitOpenError(self.name)
         try:
             result = fn()
-        except Exception:
+        except Exception as e:
+            if self.record_if is not None and not self.record_if(e):
+                raise  # 请求自身的问题，不代表下游不健康：不计入熔断
             self.failures += 1
             if self.state == "half_open" or self.failures >= self.failure_threshold:
                 self.opened_at = self.clock()  # 打开（或重新打开）熔断器

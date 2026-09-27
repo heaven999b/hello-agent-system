@@ -41,6 +41,7 @@ class AuditLog(Hook):
                 "ok": result.ok,
                 "error_type": result.error_type,
                 "approved": state.approvals.get(call.id),
+                "approved_by": next((a["by"] for a in reversed(state.approval_log) if a["call_id"] == call.id), None),
             }
         )
         return None
@@ -58,5 +59,6 @@ class AuditLog(Hook):
                 "steps": state.step,
                 "tokens": state.usage.total,
                 "cost_usd": round(state.cost_usd, 6),
+                "pending_approval": state.pending,  # 暂停时：在等谁批什么
             }
         )

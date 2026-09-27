@@ -25,10 +25,13 @@ class LLM(Protocol):
 class LLMError(Exception):
     """统一的模型调用异常。retryable 标记这个错误"重试是否可能成功"（第 05 课）。"""
 
-    def __init__(self, message: str, *, status_code: int | None = None, retryable: bool = False):
+    def __init__(
+        self, message: str, *, status_code: int | None = None, retryable: bool = False, retry_after: float | None = None
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
+        self.retry_after = retry_after  # 服务端通过 Retry-After 头建议的等待秒数（如果有）
 
 
 class OpenAICompatLLM:
@@ -68,8 +71,17 @@ class OpenAICompatLLM:
             resp = self._client.chat.completions.create(**params)
         except self._openai.APIStatusError as e:
             code = e.status_code
-            # 429 限流、408 超时、5xx 服务端错误：重试可能成功；400/401/403/404：重试没用
-            raise LLMError(str(e), status_code=code, retryable=code in (408, 409, 429) or code >= 500) from e
+            # 429 限流、408 超时、5xx 服务端错误：重试可能成功；400/401/403/404：重试没用。
+            # 但 429 有两种：限流（等一等就好）和额度用完（insufficient_quota，重试一万次也没用）。
+            retryable = code in (408, 409, 429) or code >= 500
+            if code == 429 and "insufficient_quota" in str(e):
+                retryable = False
+            retry_after = None
+            try:
+                retry_after = float(e.response.headers.get("retry-after"))
+            except (TypeError, ValueError, AttributeError):
+                pass
+            raise LLMError(str(e), status_code=code, retryable=retryable, retry_after=retry_after) from e
         except self._openai.APIConnectionError as e:  # 包含超时
             raise LLMError(f"连接模型失败：{e}", retryable=True) from e
 
@@ -79,7 +91,13 @@ class OpenAICompatLLM:
             ToolCall(id=tc.id or new_call_id(), name=tc.function.name, arguments=tc.function.arguments or "{}")
             for tc in (msg.tool_calls or [])
         ]
-        usage = Usage(resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0) if resp.usage else Usage()
+        usage = Usage()
+        if resp.usage:
+            details = getattr(resp.usage, "prompt_tokens_details", None)
+            cached = (getattr(details, "cached_tokens", 0) or 0) if details else 0
+            out_details = getattr(resp.usage, "completion_tokens_details", None)
+            reasoning = (getattr(out_details, "reasoning_tokens", 0) or 0) if out_details else 0
+            usage = Usage(resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0, cached, reasoning)
         return LLMResponse(
             content=msg.content,
             tool_calls=calls,

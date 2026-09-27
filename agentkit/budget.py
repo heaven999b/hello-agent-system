@@ -26,7 +26,9 @@ class BudgetHook(Hook):
         self.max_seconds = max_seconds
 
     def before_llm(self, state, messages) -> None:
-        if self.max_seconds is not None and time.time() - state.started_at > self.max_seconds:
+        # 只统计"实际执行"的时间：暂停等待人工审批的几个小时不算，否则审批一恢复就会被判超时
+        elapsed = state.active_seconds + (time.time() - state.segment_started_at)
+        if self.max_seconds is not None and elapsed > self.max_seconds:
             raise StopRun("budget_exceeded", f"已超过时长预算 {self.max_seconds}s，任务中止。")
 
     def after_llm(self, state, response) -> None:

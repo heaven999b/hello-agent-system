@@ -10,3 +10,5 @@ runs/
 traces/
 *.jsonl.tmp
 .DS_Store
+trace.html
+traces.html

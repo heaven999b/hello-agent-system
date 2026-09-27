@@ -66,7 +66,7 @@ def main() -> None:
         if not text:
             continue
         result = agent.run(text, history=history)
-        history = [m for m in result.messages if m["role"] != "system"]
+        history = result.history
         print(f"\n助手> {result.output}")
         if show_trace and result.trace:
             print("\n" + render_tree(result.trace))

@@ -11,8 +11,8 @@ assistant 消息可能带 tool_calls；tool 消息必须带 tool_call_id，指�
 
 from __future__ import annotations
 
-import itertools
 import json
+import uuid
 from dataclasses import dataclass, field
 
 Message = dict  # 一条 OpenAI 格式消息
@@ -42,13 +42,20 @@ class ToolCall:
 class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_input_tokens: int = 0  # 输入中命中提示词缓存的部分（通常更便宜、更快；网关不支持时为 0）
+    reasoning_tokens: int = 0  # 输出中推理模型"思考"用掉的部分（已包含在 output_tokens 里，按输出价计费）
 
     @property
     def total(self) -> int:
         return self.input_tokens + self.output_tokens
 
     def __add__(self, other: "Usage") -> "Usage":
-        return Usage(self.input_tokens + other.input_tokens, self.output_tokens + other.output_tokens)
+        return Usage(
+            self.input_tokens + other.input_tokens,
+            self.output_tokens + other.output_tokens,
+            self.cached_input_tokens + other.cached_input_tokens,
+            self.reasoning_tokens + other.reasoning_tokens,
+        )
 
 
 @dataclass
@@ -98,8 +105,7 @@ def calls_in(message: Message) -> list[ToolCall]:
     ]
 
 
-_ids = itertools.count(1)
-
-
 def new_call_id() -> str:
-    return f"call_{next(_ids)}"
+    """随机的工具调用 ID。不要用进程内自增计数器：多进程 / 多 worker 时各自从 call_1 开始，
+    会让 idempotency_key = run_id:call_id 在崩溃恢复时撞车。"""
+    return f"call_{uuid.uuid4().hex[:12]}"

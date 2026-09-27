@@ -56,6 +56,8 @@ class PermissionPolicy(Hook):
         if not self.allowed(state, call.name):
             return f"拒绝：当前用户（角色 {state.metadata.get('roles', [])}）无权使用工具 {call.name}。"
         if tool.risk in self.ask_risks:
+            if tool.parse_arguments(call.arguments)[1] is not None:
+                return None  # 参数不合法：不打扰审批人，交给 registry 返回校验错误让模型自己改
             decision = state.approvals.get(call.id)
             if decision is None and self.approver is not None:
                 decision = bool(self.approver(call, state))

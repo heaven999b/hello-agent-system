@@ -20,6 +20,7 @@ Agent 的本质只有一句话：**让模型在循环里调用工具，直到它
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Iterable, Protocol
 
@@ -27,6 +28,7 @@ from .hooks import Hook, PauseRun, StopRun
 from .llm import LLM, LLMError
 from .pricing import estimate_cost
 from .state import Checkpointer, InMemoryCheckpointer, RunState
+from .guardrails import redact_pii
 from .tools import IdempotencyStore, Tool, ToolContext, ToolRegistry, ToolResult
 from .tracing import Span, Tracer
 from .types import LLMResponse, Message, ToolCall, Usage, calls_in, system, tool_message, user
@@ -53,14 +55,26 @@ class RunResult:
     pending_approval: ToolCall | None = None
     trace: Span | None = None
     metadata: dict = field(default_factory=dict)
+    tool_log: list[dict] | None = None  # Agent 产生的结果总会填充；手工构造 RunResult（如测试）时可省略
 
     @property
     def ok(self) -> bool:
         return self.status == "completed"
 
+    @property
+    def history(self) -> list[Message]:
+        """传给下一轮 run(history=...) 的对话历史（去掉 system 消息）。
+
+        多轮对话请用它，而不是自己过滤 messages：输入被拦截时它保留之前的历史，
+        运行中止时未执行的工具调用也已补上"未执行"结果，保证下一轮消息协议合法。
+        """
+        return [m for m in self.messages if m.get("role") != "system"]
+
     def tools_called(self) -> list[str]:
-        """按顺序列出本次运行中模型调用过的工具名（评估时常用）。"""
-        return [c.name for m in self.messages if m.get("role") == "assistant" for c in calls_in(m)]
+        """按顺序列出**本次运行**中模型请求过的工具名（含被拒绝的；不含传入的历史消息里的调用）。评估时常用。"""
+        if self.tool_log is None:  # 手工构造的结果：退回从消息里推断
+            return [c.name for m in self.messages if m.get("role") == "assistant" for c in calls_in(m)]
+        return [t["name"] for t in self.tool_log]
 
 
 class Agent:
@@ -104,19 +118,20 @@ class Agent:
         state = RunState(metadata=dict(metadata or {}))
         if run_id:
             state.run_id = run_id
+        state.messages = self._initial_messages(history)  # 先放历史：即使输入被拦截，历史也不会丢
 
         def prepare() -> None:
             text = user_input
             for h in self.hooks:
-                new = h.on_run_start(state, text)
+                new = h.on_run_start(state, text)  # 可能抛 StopRun（如注入检测）
                 if new is not None:
                     text = new
-            state.messages = self._initial_messages(history, text)
+            state.messages.append(user(text))
             self._save(state)
 
-        with self.tracer.span("agent.run", **{"agent.name": self.name, "run_id": state.run_id}) as span:
+        with self.tracer.span("agent.run", **self._root_attrs(state)) as span:
             pending = self._drive(state, prepare)
-            self._annotate(span, state)
+            self._annotate(span, state, cost_before=0.0)
         return self._result(state, pending, span)
 
     def resume(self, run_id: str, approvals: dict[str, bool] | None = None) -> RunResult:
@@ -131,29 +146,40 @@ class Agent:
             return self._result(state, None, None)
         state.approvals.update(approvals or {})
         state.status, state.stop_reason, state.pending = "running", None, None
-        with self.tracer.span("agent.resume", **{"agent.name": self.name, "run_id": run_id}) as span:
+        cost_before = state.cost_usd
+        with self.tracer.span("agent.resume", **self._root_attrs(state)) as span:
             pending = self._drive(state, None)
-            self._annotate(span, state)
+            self._annotate(span, state, cost_before=cost_before)
         return self._result(state, pending, span)
 
-    def approve(self, run_id: str, approved: bool = True) -> RunResult:
-        """便捷方法：对当前等待审批的那次工具调用给出决定并继续运行。"""
+    def approve(self, run_id: str, approved: bool = True, *, by: str | None = None, comment: str = "") -> RunResult:
+        """对当前等待审批的那次工具调用给出决定并继续运行。
+
+        by / comment 会写入 state.approval_log（审计要求记录"谁、何时、为什么"批准）。
+        """
         state = self.checkpointer.load(run_id)
         if state is None or not state.pending:
             raise ValueError(f"run {run_id} 没有等待审批的操作")
-        return self.resume(run_id, {state.pending["id"]: approved})
+        call_id = state.pending["id"]
+        state.approval_log.append(
+            {"call_id": call_id, "tool": state.pending["name"], "approved": approved, "by": by, "comment": comment, "at": time.time()}
+        )
+        self._save(state)
+        return self.resume(run_id, {call_id: approved})
 
     # ------------------------------------------------------------------ 主循环
 
     def _drive(self, state: RunState, prepare) -> ToolCall | None:
         """执行主循环并把各种"非正常结束"统一收敛为状态。返回等待审批的调用（如果有）。"""
         pending: ToolCall | None = None
+        state.segment_started_at = time.time()
         try:
             if prepare:
                 prepare()
             self._loop(state)
         except StopRun as e:
             state.status, state.stop_reason, state.output = "stopped", e.reason, e.message
+            self._close_dangling_calls(state, f"未执行：运行已中止（{e.reason}）")
         except PauseRun as e:
             pending = e.call
             state.status, state.stop_reason, state.output = "paused", "needs_approval", e.message
@@ -162,6 +188,7 @@ class Agent:
             state.status, state.stop_reason = "failed", f"llm_error: {e}"
             state.output = "抱歉，服务暂时不可用，请稍后再试。"
         finally:
+            state.active_seconds += time.time() - state.segment_started_at
             for h in self.hooks:
                 h.on_run_end(state)
             self._save(state)
@@ -183,7 +210,10 @@ class Agent:
                     if new is not None:
                         output = new
                 state.messages[-1]["content"] = output  # 历史里也存处理后的版本（如已脱敏）
-                state.status, state.stop_reason, state.output = "completed", "final_answer", output
+                # finish_reason == "length"：输出被 max_tokens 截断了。仍然返回，但打上标记，
+                # 让调用方/评估/告警能区分"完整答案"和"说到一半的答案"。
+                reason = "output_truncated" if response.finish_reason == "length" else "final_answer"
+                state.status, state.stop_reason, state.output = "completed", reason, output
                 return
 
             self._run_pending_tools(state)
@@ -212,6 +242,8 @@ class Agent:
                     "gen_ai.response.model": response.model,
                     "gen_ai.usage.input_tokens": response.usage.input_tokens,
                     "gen_ai.usage.output_tokens": response.usage.output_tokens,
+                    "gen_ai.usage.cache_read.input_tokens": response.usage.cached_input_tokens,
+                    "gen_ai.usage.reasoning_tokens": response.usage.reasoning_tokens,
                     "finish_reason": response.finish_reason,
                     "result": ("tool_calls: " + ", ".join(c.name for c in response.tool_calls))
                     if response.tool_calls
@@ -225,24 +257,40 @@ class Agent:
             h.after_llm(state, response)
         return response
 
-    def _run_pending_tools(self, state: RunState) -> None:
-        """执行最后一条 assistant 消息里、还没有结果的工具调用。"""
+    @staticmethod
+    def _unanswered_calls(state: RunState) -> list[ToolCall]:
+        """最后一条 assistant 消息里、还没有 tool 结果的工具调用。"""
         idx = next((i for i in range(len(state.messages) - 1, -1, -1) if state.messages[i]["role"] == "assistant"), None)
         if idx is None:
-            return
+            return []
         done = {m.get("tool_call_id") for m in state.messages[idx + 1 :] if m["role"] == "tool"}
-        for call in calls_in(state.messages[idx]):
-            if call.id in done:
-                continue
+        return [c for c in calls_in(state.messages[idx]) if c.id not in done]
+
+    def _run_pending_tools(self, state: RunState) -> None:
+        """执行最后一条 assistant 消息里、还没有结果的工具调用。"""
+        for call in self._unanswered_calls(state):
             result = self._execute_tool(state, call)
             state.messages.append(tool_message(call.id, result.content))
             self._save(state)  # 每个工具执行完都存盘，缩小"执行了但没记录"的窗口
 
+    def _close_dangling_calls(self, state: RunState, note: str) -> None:
+        """运行中止时，给没执行的工具调用补一条结果。
+
+        OpenAI 协议要求每个 tool_call 都有对应的 tool 消息，否则下一轮带着这段历史调用模型会直接 400。
+        （暂停等审批时不补：那些调用在 resume 时还要真正执行。）
+        """
+        for call in self._unanswered_calls(state):
+            state.messages.append(tool_message(call.id, note))
+
     def _execute_tool(self, state: RunState, call: ToolCall) -> ToolResult:
         t = self.registry.get(call.name)
+        if all(entry["id"] != call.id for entry in state.tool_log):  # resume 时同一调用不重复记录
+            state.tool_log.append({"id": call.id, "name": call.name})
+        # 追踪系统通常比业务库有更多人能访问，所以参数和结果预览都先脱敏再记录。
+        # 注意顺序：必须先脱敏再截断 —— 先截断可能把手机号切成半截，正则匹配不到，漏出部分数字。
         with self.tracer.span(
             f"tool.{call.name}",
-            **{"tool.name": call.name, "tool.arguments": call.arguments[:500], "tool.risk": t.risk if t else None},
+            **{"tool.name": call.name, "tool.arguments": redact_pii(call.arguments)[:500], "tool.risk": t.risk if t else None},
         ) as span:
             denial = None
             for h in self.hooks:
@@ -258,6 +306,8 @@ class Agent:
                     tenant_id=state.metadata.get("tenant_id"),
                     user_id=state.metadata.get("user_id"),
                     roles=tuple(state.metadata.get("roles", ())),
+                    # 其余可信属性（部门、用户组、数据区域……）原样透传给工具
+                    extra={k: v for k, v in state.metadata.items() if k not in ("tenant_id", "user_id", "roles")},
                 )
                 result = self.registry.execute(call, ctx)
                 state.tool_calls_count += 1
@@ -265,27 +315,39 @@ class Agent:
                 new = h.after_tool(state, call, result)
                 if new is not None:
                     result = new
-            span.set(**{"tool.ok": result.ok, "tool.error_type": result.error_type})
+            # 结果预览只截取前 200 字符：足够排查问题，又避免把大段数据/敏感信息灌进追踪系统
+            span.set(**{"tool.ok": result.ok, "tool.error_type": result.error_type, "tool.result_preview": redact_pii(result.content)[:200]})
+            if result.detail:
+                span.set(**{"tool.error_detail": redact_pii(result.detail)[:500]})
         return result
 
     # ------------------------------------------------------------------ 辅助
 
-    def _initial_messages(self, history: list[Message] | None, text: str) -> list[Message]:
+    def _initial_messages(self, history: list[Message] | None) -> list[Message]:
         msgs: list[Message] = [system(self.system_prompt)] if self.system_prompt else []
-        msgs += [m for m in (history or []) if m.get("role") != "system"]
-        msgs.append(user(text))
+        msgs += [dict(m) for m in (history or []) if m.get("role") != "system"]
         return msgs
 
     def _save(self, state: RunState) -> None:
         self.checkpointer.save(state)
 
+    def _root_attrs(self, state: RunState) -> dict:
+        # 租户 / 用户写在根 Span 上：按租户做成本归因、按用户排查问题都靠它
+        return {
+            "agent.name": self.name,
+            "run_id": state.run_id,
+            "tenant.id": state.metadata.get("tenant_id"),
+            "user.id": state.metadata.get("user_id"),
+        }
+
     @staticmethod
-    def _annotate(span: Span, state: RunState) -> None:
+    def _annotate(span: Span, state: RunState, cost_before: float) -> None:
         span.set(
             **{
                 "agent.status": state.status,
                 "agent.steps": state.step,
-                "agent.cost_usd": round(state.cost_usd, 6),
+                "agent.cost_usd": round(state.cost_usd, 6),  # 整个 run 的累计值
+                "agent.segment_cost_usd": round(state.cost_usd - cost_before, 6),  # 本段（run 或某次 resume）新增的成本
                 "gen_ai.usage.input_tokens": state.usage.input_tokens,
                 "gen_ai.usage.output_tokens": state.usage.output_tokens,
             }
@@ -305,4 +367,5 @@ class Agent:
             pending_approval=pending,
             trace=span,
             metadata=state.metadata,
+            tool_log=list(state.tool_log),
         )

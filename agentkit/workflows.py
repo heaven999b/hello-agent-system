@@ -107,7 +107,9 @@ def parallel(fns: Sequence[Callable[[], str]], max_workers: int = 4) -> list[str
 
 
 def majority_vote(answers: Sequence[str]) -> str:
-    """投票：取出现次数最多的答案（并列时取最先出现的）。"""
+    """投票：取出现次数最多的答案（并列时取最先出现的）。只做首尾空白归一化。"""
+    if not answers:
+        raise ValueError("没有可投票的答案")
     counts: dict[str, int] = {}
     for a in answers:
         key = a.strip()

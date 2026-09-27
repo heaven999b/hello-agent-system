@@ -38,6 +38,10 @@ class RunState:
     output: str | None = None
     stop_reason: str | None = None
     pending: dict | None = None  # 暂停时等待审批的工具调用 {"id","name","arguments"}
+    tool_log: list[dict] = field(default_factory=list)  # 本次运行中模型请求过的工具调用 {"id","name"}（含被拒绝的）
+    approval_log: list[dict] = field(default_factory=list)  # 审批记录：谁、何时、批没批、意见
+    active_seconds: float = 0.0  # 实际执行耗时（不含暂停等待审批的时间），供时长预算使用
+    segment_started_at: float = field(default_factory=time.time)  # 本段执行（run 或某次 resume）的开始时间
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -86,7 +90,9 @@ class FileCheckpointer:
 
     def save(self, state: RunState) -> None:
         path = self._path(state.run_id)
-        tmp = path.with_suffix(".json.tmp")
+        # 临时文件名必须唯一：两个进程同时保存同一个 run 时，固定的 .tmp 会互相踩。
+        # （更根本的问题——旧持有者覆盖新检查点——需要 fencing token，见第 13 课。）
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         tmp.write_text(json.dumps(state.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)
 

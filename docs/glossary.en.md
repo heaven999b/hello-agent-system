@@ -1,0 +1,287 @@
+[中文](glossary.md) | [English](glossary.en.md)
+
+# Glossary (English–Chinese)
+
+> 📖 Part of the "domain reference handbook". Terms are grouped by topic rather than alphabetically, because related terms are easier to connect when you read them together.
+> Related docs: [Cheatsheet](cheatsheet.en.md) · [Framework comparison](framework-comparison.en.md) · [Failure-mode catalog](failure-modes.en.md)
+
+**How to use it**: each term gets a one-sentence plain-language explanation. Names in `code font` are the matching agentkit classes or functions, so you can look them up in the source. The Chinese column gives the term used in the Chinese lessons and code comments. Stuck on a word? `Ctrl+F` works for both English and Chinese.
+
+**185** terms in 13 groups, plus 17 commonly confused pairs.
+
+---
+
+## 1. Core Concepts
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| Agent | 智能体 | A program where the model decides, in a loop, which tools to call and how many times, until it thinks the task is done. `Agent` | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
+| Workflow | 工作流 | A program whose steps and order are hard-coded, with the model handling only some of the steps. More predictable, cheaper, and easier to test than an agent. | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Agent Loop | Agent 循环 | The "call the model → run the tools it asked for → feed the results back → call the model again" loop. It is the heart of every agent. | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
+| Augmented LLM | 增强型 LLM | A model call equipped with retrieval, tools, and memory; the basic building block of workflows and agents (the term comes from Anthropic's "Building Effective Agents"). | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| System Prompt | 系统提示词 | The "job description" the model gets at the start of every conversation, defining who it is and how it should behave. Assume users can extract it. | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
+| Token | 词元 | The smallest unit of text a model processes; billing and context length are both measured in tokens. In Chinese, one character is roughly one token (varies by model). `estimate_tokens` | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
+| Context Window | 上下文窗口 | The maximum number of tokens the model can "see" at once, including the system prompt, history, tool definitions, and tool results. | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+| Tool Calling / Function Calling | 工具调用 / 函数调用 | Instead of answering directly, the model outputs a structured request ("call this function with these arguments") that your program executes. | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
+| ReAct (Reasoning + Acting) | ReAct | A paradigm where the model alternates between "thinking" and "acting" (calling tools). It comes from Yao et al.'s 2022 paper and is the intellectual origin of the modern agent loop. | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
+| Max Steps / Max Turns | 步数上限 | The maximum number of model-call rounds allowed in one run; the last hard line of defense against runaway loops burning money. `Agent(max_steps=...)` | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
+| Stop Reason / Finish Reason | 结束原因 | Why a run or a model call ended: it answered, hit a limit, got blocked, is awaiting approval, and so on. One of the most important monitoring dimensions. `RunResult.stop_reason` | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
+| Non-determinism | 非确定性 | The same input can produce different outputs and take different steps, so "it worked once" doesn't mean it works. | [Lesson 08](../lessons/08_evals/README.en.md) |
+| Temperature | 温度 | A sampling parameter that controls output randomness. Lower is more stable, but even 0 doesn't guarantee full reproducibility. | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
+| Streaming | 流式输出 | The model returns output as it generates it, so users don't wait for the whole response. Crucial to the experience on long tasks. | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+| Test Double / Scripted LLM | 测试替身（剧本模型） | A "fake model" that returns results from a pre-written script, making agent tests zero-cost and reproducible. `ScriptedLLM` | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
+| LLM Abstraction | 模型抽象层 | Business code depends on one small `chat()` interface instead of a vendor SDK, which makes it easy to swap models and layer on capabilities. `LLM` protocol | [Lesson 01](../lessons/01_agent_loop/README.en.md) |
+
+## 2. Tools
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| Tool | 工具 | The agent's only channel to the outside world: query a database, call an API, send an email. Essentially a function that comes with a manual. `@tool` | [Lesson 02](../lessons/02_tools/README.en.md) |
+| Tool Description | 工具描述 | The tool's manual, written for the model: what it does, when to use it, and when not to. The model picks tools based entirely on it. | [Lesson 02](../lessons/02_tools/README.en.md) |
+| JSON Schema | JSON Schema | The standard format for describing what arguments look like: which fields exist, their types, which are required, and the allowed values. | [Lesson 02](../lessons/02_tools/README.en.md) |
+| Argument Validation | 参数校验 | Checking that the model's arguments are valid before running the tool. Model-supplied arguments are just generated text and must be treated as untrusted input. | [Lesson 02](../lessons/02_tools/README.en.md) |
+| Errors as Observations | 错误即观察 | When a tool fails, don't crash the agent with an exception. Turn the error into text the model can understand and feed it back so the model can correct itself. `ToolResult` | [Lesson 02](../lessons/02_tools/README.en.md) |
+| Risk Tiering | 风险分级 | Labeling every tool read / write / dangerous; permissions and approvals use the tier to decide whether to allow a call. `Tool(risk=...)` | [Lesson 02](../lessons/02_tools/README.en.md) |
+| Idempotency | 幂等 | Running an operation once or many times has the same effect. Retries and crash recovery depend on it; without it you get double charges and duplicate tickets. | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Idempotency Key | 幂等键 | A unique key that identifies "this is the same operation", used to deduplicate replays. agentkit uses `run_id:call_id`. `ToolContext.idempotency_key` | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Trusted Context | 可信上下文 | Information the system (not the model) injects into tools, such as user ID, tenant ID, and roles. The model can neither see nor change it. `ToolContext` | [Lesson 02](../lessons/02_tools/README.en.md) |
+| Output Truncation | 输出截断 | When a tool returns too much, keep only the first N characters and tell the model the output was truncated, so it doesn't blow up the context. `Tool(max_output_chars=...)` | [Lesson 02](../lessons/02_tools/README.en.md) |
+| ACI (Agent-Computer Interface) | Agent-计算机接口 | By analogy with HCI (human-computer interaction): a tool's name, parameters, description, and return format are the agent's user interface, and they deserve the same design care. | [Lesson 02](../lessons/02_tools/README.en.md) |
+| Poka-yoke | 防呆设计 | A manufacturing idea: design things so mistakes are impossible. Applied to tools, it means reshaping parameters so the model is less likely to misuse them. | [Lesson 02](../lessons/02_tools/README.en.md) |
+| Structured Output | 结构化输出 | Making the model output JSON that conforms to a given schema, instead of free text, so downstream code can rely on it. `complete_json` | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| MCP (Model Context Protocol) | 模型上下文协议 | An open protocol that connects AI applications to external tools and data sources, a kind of "USB port for AI". Servers can provide tools, resources, and prompt templates. | [Lesson 02](../lessons/02_tools/README.en.md) |
+| Sandbox | 沙箱 | An isolated execution environment (container, VM, etc.), so untrusted code or risky tools can't affect anything outside it when they misbehave. | [Lesson 02](../lessons/02_tools/README.en.md) |
+| Tool Poisoning | 工具投毒 | Hiding malicious instructions in a tool description. Because descriptions enter the model's context, this amounts to injecting content into the prompt. | [Lesson 06](../lessons/06_security/README.en.md) |
+
+## 3. Context and Memory
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| Context Engineering | 上下文工程 | The whole practice of deciding what the model sees on each call: what to include, what to drop, what to compress, and when to retrieve. | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+| Short-term Memory | 短期记忆 | The message history of the current conversation. It's gone when the session ends. | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+| Long-term Memory | 长期记忆 | Information stored externally and kept across sessions (e.g., user preferences), retrieved into the context when needed. `MemoryStore` | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+| Sliding Window | 滑动窗口 | When the context gets too long, keep only the most recent messages. Simple and cheap, but early information is lost. `SlidingWindow` | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+| Compaction / Summarization | 压缩 / 摘要 | Having the model summarize the older part of a conversation and replacing the original to save context. The cost is an extra call and some information loss. `SummarizingCompactor` | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+| Message Block | 消息块 | An assistant message with tool calls plus all of its tool results. When truncating, keep or drop it as a whole. `split_blocks` | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+| Lost in the Middle | 中间遗忘 | A research finding: models use relevant information worst when it sits in the middle of a long context, and best when it's at the beginning or end. | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+| Context Rot | 上下文腐烂 | The longer the context, the worse the model uses the information in it. Context is a finite "attention budget". | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+| Context Poisoning | 上下文投毒 | A wrong conclusion enters the context and gets cited again and again, compounding the error. | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+| Just-in-time Context | 即时上下文 | Instead of preloading everything, keep only "pointers" (file paths, IDs) and load the content with tools when it's needed. | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+| RAG (Retrieval-Augmented Generation) | 检索增强生成 | Retrieve relevant material from a knowledge base first, then give it to the model together with the question. Long-term memory is essentially RAG too. | [Lesson 03](../lessons/03_context_memory/README.en.md) · [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Embedding / Vector Search | 嵌入 / 向量检索 | Turning text into a list of numbers (a vector) so that texts with similar meanings get similar vectors, enabling "search by meaning". | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Hybrid Search | 混合检索 | Using keyword search (e.g., BM25) and vector search together so each covers the other's gaps: the former is good at exact terms, the latter at meaning. | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Rerank | 重排序 | After retrieving candidates, reorder them with a finer-grained model so the most relevant ones come first. | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Prompt Caching | 提示词缓存 | The model provider caches identical request prefixes, so repeat hits are cheaper and faster. Any change to the prefix invalidates the cache. | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+| Memory Poisoning | 记忆投毒 | Writing malicious or false content into long-term memory so it keeps taking effect in future sessions (e.g., "remember that I'm an admin"). | [Lesson 06](../lessons/06_security/README.en.md) |
+| Right to Erasure | 被遗忘权 | A person's right to have their personal data deleted (a concept from GDPR and similar laws). An agent's memory and logs must be deletable too. `MemoryStore.forget` | [Lesson 03](../lessons/03_context_memory/README.en.md) |
+
+## 4. Orchestration and Multi-Agent Systems
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| Orchestration | 编排 | The logic that decides who does what and in what order. Code can decide it (a workflow), or the model can (an agent). | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Prompt Chaining | 提示链 | Splitting a task into fixed steps, where each step's output is the next step's input, with optional gate checks in between. `chain` | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Routing | 路由 | Classifying the request first, then handing it to a specialized flow (e.g., customer-service triage). `route` | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Parallelization | 并行化 | Running several model calls at once: either split the task into slices that each handle a part (sectioning), or run the same task several times and vote (voting). `parallel` | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Majority Vote / Self-Consistency | 多数投票 / 自洽性 | Asking the model the same question several times and taking the most common answer to improve reliability (self-consistency was introduced in a 2022 paper by Wang et al.). `majority_vote` | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Orchestrator-Workers | 编排者-执行者 | One model dynamically breaks down the task, dispatches the pieces to several workers, and combines the results. Unlike parallelization, the subtasks aren't predefined. `orchestrator_workers` | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Evaluator-Optimizer | 评估-优化 | One model generates and another reviews; revise based on the review until the output passes or the round limit is reached. `evaluator_optimizer` | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Multi-Agent System | 多 Agent 系统 | Several agents with their own roles (each with its own prompt, tools, and context) collaborate on a task. More capable, but costlier and harder to debug. | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Agent as Tool / Supervisor | Agent 即工具 / 主管模式 | Wrapping an expert agent as a tool for a supervisor agent. The expert's result goes back to the supervisor, who stays in control of the conversation. `agent_as_tool` | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Handoff | 转交 | The current agent hands the entire conversation to another agent, which takes over the rest of the interaction (control transfers). | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Reflection | 反思 | Having a model check and critique its own (or another model's) output and improve based on the critique. Reflexion (Shinn et al., 2023) is the representative work. | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Plan-then-Execute | 先规划后执行 | Generating a complete plan first and then executing it step by step, instead of deciding one step at a time. More predictable, and also a design pattern for defending against injection. | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+| Delegation Contract | 委派契约 | The checklist of what you must give a subagent when delegating a task: the goal, known facts, constraints, and the expected output format. | [Lesson 04](../lessons/04_orchestration/README.en.md) |
+
+## 5. Reliability and Cost
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| Retryable Error | 可重试错误 | An error that might succeed on retry (429 rate limits, 5xx server errors, timeouts). Retrying a 400 or 401 is pointless. `LLMError.retryable` | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Retry | 重试 | Trying again after a failure: only for retryable errors, at only one layer, and with backoff. `retry_call` | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Exponential Backoff | 指数退避 | The wait before each retry grows exponentially (0.5s, 1s, 2s, ...), giving the downstream service time to recover. `backoff_delay` | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Jitter | 抖动 | Adding randomness to the backoff so thousands of clients don't retry in lockstep. | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Thundering Herd | 惊群效应 | Many clients send requests at the same moment (e.g., all retrying at once) and knock over a service that just recovered. | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Retry Storm | 重试风暴 | Retries multiplied across layers without jitter, amplifying request volume several-fold or even dozens-fold during an outage. | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Circuit Breaker | 熔断器 | When a downstream service keeps failing, "trip" and fail fast for a while, then let a few requests through to probe. Three states: closed, open, and half-open. `CircuitBreaker` | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Fallback / Graceful Degradation | 降级 | When the primary option is unavailable, switch to a backup (fallback model, cache, rules, hand-off to a human). Worse is better than unavailable. `ResilientLLM` | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Checkpoint | 检查点 | Saving the full run state after every step so the run can continue where it left off after a crash or pause. `Checkpointer` | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Durable Execution | 持久化执行 | An execution model that guarantees a program runs to completion from its last checkpoint even through crashes and restarts. Temporal and LangGraph checkpoints both follow this idea. | [Lesson 05](../lessons/05_reliability/README.en.md) · [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Atomic Write | 原子写入 | A file write either fully succeeds or never happened, so you never end up with a half-written, corrupted file (write to a temp file, then rename it). `FileCheckpointer` | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Saga / Compensation | Saga / 补偿事务 | Splitting a long transaction into steps, each paired with an "undo" action. If it fails midway, the completed steps are undone in turn. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Budget | 预算 | Caps on a run's steps, tokens, dollars, tool calls, and duration. When one is exceeded, the run stops gracefully. `BudgetHook` | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Denial of Wallet | 钱包拒绝服务 | An attacker deliberately makes your agent burn tokens to run up your bill, rather than to take the service down. | [Lesson 05](../lessons/05_reliability/README.en.md) |
+| Rainbow Deployment | 彩虹部署 | Several old and new versions run side by side while traffic shifts over gradually, so long-running tasks aren't interrupted by a release. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| Cost Attribution | 成本归因 | Assigning every cent of model cost to a specific tenant, user, feature, and model. The foundation of FinOps (cloud cost governance) and of pricing. | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+
+## 6. Security and Governance
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| Prompt Injection | 提示词注入 | Using text in the input to hijack the model's behavior ("ignore previous instructions..."). Because models can't tell instructions from data, there is no 100% defense today. | [Lesson 06](../lessons/06_security/README.en.md) |
+| Indirect Prompt Injection | 间接提示词注入 | The attack instructions aren't typed by the user. They hide in web pages, emails, documents, or tickets the agent reads. More dangerous than direct injection. | [Lesson 06](../lessons/06_security/README.en.md) |
+| Jailbreak | 越狱 | Using role-play, encoding, and other tricks to get around a model's safety restrictions. | [Lesson 06](../lessons/06_security/README.en.md) |
+| Defense in Depth | 纵深防御 | Stacking multiple layers of protection (input detection, data isolation, least privilege, approval, output filtering, audit), so if one layer is breached, the next one still holds. | [Lesson 06](../lessons/06_security/README.en.md) |
+| Spotlighting | 聚光灯（数据标记） | Using tags or encoding to mark external data explicitly as "data, not instructions", helping the model tell sources apart. It lowers the injection success rate but can't eliminate it. `ToolOutputGuard` | [Lesson 06](../lessons/06_security/README.en.md) |
+| Lethal Trifecta | 致命三要素 | Coined by Simon Willison: when an agent can access private data, is exposed to untrusted content, and can communicate externally, a single injection is all it takes to exfiltrate data. | [Lesson 06](../lessons/06_security/README.en.md) |
+| Data Exfiltration | 数据外泄 | Data quietly sent outside, e.g., through image links in model output or a tool that sends external email. | [Lesson 06](../lessons/06_security/README.en.md) |
+| Guardrail | 护栏 | A mechanism that checks and blocks inputs, outputs, or tool calls. It lowers the probability of harm but can't replace permission design. `InputGuard` / `OutputGuard` | [Lesson 06](../lessons/06_security/README.en.md) |
+| Least Privilege | 最小权限 | Grant only the minimum permissions the task needs. Assume the model will be fooled, then limit what it can do when it is. | [Lesson 06](../lessons/06_security/README.en.md) |
+| RBAC (Role-Based Access Control) | 基于角色的访问控制 | User roles decide which tools are available. In agentkit, unauthorized tools are both hidden from the model and blocked if called. `PermissionPolicy(role_tools=...)` | [Lesson 06](../lessons/06_security/README.en.md) |
+| HITL (Human-in-the-Loop) | 人在回路 | A human confirms or decides at critical steps; the classic case is human approval of high-risk operations. `PauseRun` / `agent.approve` | [Lesson 06](../lessons/06_security/README.en.md) |
+| Excessive Agency | 过度授权 | An agent has more functionality, permissions, or autonomy than the task requires (a risk category in the OWASP LLM Top 10). | [Lesson 06](../lessons/06_security/README.en.md) |
+| Confused Deputy | 混淆代理人 | A privileged program has its privileges "borrowed" by someone who lacks them, e.g., letting the model fill in user_id and thereby read someone else's data. | [Lesson 06](../lessons/06_security/README.en.md) |
+| PII (Personally Identifiable Information) | 个人身份信息 | Information that identifies a specific person: national ID numbers, phone numbers, email addresses, and so on. | [Lesson 06](../lessons/06_security/README.en.md) |
+| Redaction | 脱敏 | Replacing sensitive information with a placeholder (e.g., "[phone number redacted]") before outputting or storing it. `redact_pii` | [Lesson 06](../lessons/06_security/README.en.md) |
+| Audit Log | 审计日志 | A record of who had the agent do what, when, under which identity, and with what result. It serves security and compliance, and it must be complete and tamper-proof. `AuditLog` | [Lesson 06](../lessons/06_security/README.en.md) |
+| WORM (Write Once Read Many) | 一次写入多次读取存储 | Storage that can't be modified or deleted once written; commonly used for audit logs. | [Lesson 06](../lessons/06_security/README.en.md) |
+| Kill Switch | 紧急开关 | A switch that immediately disables a tool, or the whole agent, globally when a problem is found. `PermissionPolicy(deny_tools=...)` | [Lesson 06](../lessons/06_security/README.en.md) |
+| Red Teaming | 红队测试 | Attacking your own system from an attacker's point of view to find security holes. | [Lesson 06](../lessons/06_security/README.en.md) |
+| Separation of Duties | 职责分离 | The person who initiates an operation can't also be the person who approves it. | [Lesson 06](../lessons/06_security/README.en.md) |
+| OWASP Top 10 for LLM Applications | OWASP LLM Top 10 | OWASP's list of the ten most critical security risks for LLM applications. The 2025 edition includes prompt injection, sensitive information disclosure, excessive agency, and more. | [Lesson 06](../lessons/06_security/README.en.md) |
+
+## 7. Observability
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| Observability | 可观测性 | The ability to infer what's happening inside a system from external data (logs, metrics, traces). | [Lesson 07](../lessons/07_observability/README.en.md) |
+| Tracing | 链路追踪 | Breaking a request into a nested tree of steps and recording each step's input, output, and duration. The main tool for debugging agents. `Tracer` | [Lesson 07](../lessons/07_observability/README.en.md) |
+| Trace / Span | 追踪 / 跨度 | A complete run is a trace. Each step within it (a model call, a tool call) is a span, and spans can nest. `Span` | [Lesson 07](../lessons/07_observability/README.en.md) |
+| OpenTelemetry (OTel) | OpenTelemetry | The open-source observability standard and toolkit. Its GenAI semantic conventions define field names such as `gen_ai.request.model`, making it easy to plug into different backends. | [Lesson 07](../lessons/07_observability/README.en.md) |
+| Trajectory | 轨迹 | The sequence of actions an agent took in a run (which tools it called, in what order). Both evals and debugging look at it. `RunResult.tools_called()` | [Lesson 07](../lessons/07_observability/README.en.md) |
+| Metrics | 指标 | Aggregatable numbers (success rate, latency, token count, cost) used for dashboards and alerts. | [Lesson 07](../lessons/07_observability/README.en.md) |
+| Sampling | 采样 | Keeping only part of the trace data to save cost. Debug data can be sampled; audit data can't. | [Lesson 07](../lessons/07_observability/README.en.md) |
+| SLO / SLI | 服务等级目标 | An SLI is a metric of service quality (e.g., task completion rate); an SLO is the target you commit to for it (e.g., ≥ 95%). | [Lesson 09](../lessons/09_production_architecture/README.en.md) |
+| Silent Failure | 静默失败 | Everything looks fine (HTTP 200, no errors), but the task wasn't actually done. The most common way agents fail. | [Lesson 07](../lessons/07_observability/README.en.md) |
+
+## 8. Evals
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| Evals | 评估 | Systematically measuring agent performance with a set of test cases that have expected outcomes; the agent equivalent of unit tests plus regression tests. `run_eval` | [Lesson 08](../lessons/08_evals/README.en.md) |
+| Golden Dataset / Eval Set | 黄金数据集 / 评估集 | A collection of real user questions plus expected behaviors, continuously replenished with bad cases from production. `EvalCase` | [Lesson 08](../lessons/08_evals/README.en.md) |
+| Grader | 评分器 | A function that scores a run: rule-based grading (cheap and deterministic), an LLM judge (flexible but noisy), or human grading (accurate but expensive). `rule_grader` | [Lesson 08](../lessons/08_evals/README.en.md) |
+| LLM-as-a-Judge | LLM 评委 | One model scores another model's output against a rubric. It has position, verbosity, and self-preference biases, so it needs calibration against human judgment. `llm_judge` | [Lesson 08](../lessons/08_evals/README.en.md) |
+| Rubric | 评分细则 | Concrete, checkable criteria that tell the judge what "good" means, e.g., "Does it give actionable steps?" | [Lesson 08](../lessons/08_evals/README.en.md) |
+| Trajectory Evaluation | 轨迹评估 | Checking the process, not just the final answer: were the required tools called, were forbidden tools avoided, and was the order reasonable? | [Lesson 08](../lessons/08_evals/README.en.md) |
+| Regression | 回归 | A case that used to pass and now fails. Check for them after every change; there should be zero before release. `EvalReport.regressions` | [Lesson 08](../lessons/08_evals/README.en.md) |
+| pass@k | pass@k | The probability of **at least one** success in k attempts. It measures "can it do this at all?" | [Lesson 08](../lessons/08_evals/README.en.md) |
+| pass^k | pass^k | The probability that **all** k attempts succeed. It measures "is it reliably stable?" Introduced by the τ-bench paper, and the number to watch for user-facing scenarios. | [Lesson 08](../lessons/08_evals/README.en.md) |
+| Capability Eval / Regression Eval | 能力评估 / 回归评估 | The former uses hard tasks to measure the ceiling (pass rates are low by design); the latter uses mastered tasks to prevent backsliding (pass rates should be close to 100%). | [Lesson 08](../lessons/08_evals/README.en.md) |
+| Offline / Online Eval | 离线评估 / 在线评估 | Offline: run the eval set before launch. Online: after launch, sample and score real traffic and collect feedback. | [Lesson 08](../lessons/08_evals/README.en.md) |
+| CI Gate | CI 门禁 | Running evals automatically in continuous integration and blocking merges or releases when the pass rate falls short or regressions appear. | [Lesson 08](../lessons/08_evals/README.en.md) |
+| Benchmark | 基准测试 | A public, standardized test set (e.g., τ-bench, SWE-bench). Good for comparing models, but no substitute for your own business eval set. | [Lesson 08](../lessons/08_evals/README.en.md) |
+
+## 9. Production Architecture
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| LLM Gateway | 模型网关 | A single entry point for all model calls that centralizes authentication, rate limiting, metering, routing, caching, and key management. | [Lesson 09](../lessons/09_production_architecture/README.en.md) |
+| Multi-tenancy | 多租户 | One system serves multiple customers (tenants) at once, and their data and quotas must be strictly isolated. | [Lesson 09](../lessons/09_production_architecture/README.en.md) |
+| Tenant Isolation | 租户隔离 | Guaranteeing that one tenant can never see or affect another tenant's data or resources. It must be enforced at the storage/retrieval layer. | [Lesson 09](../lessons/09_production_architecture/README.en.md) |
+| Noisy Neighbor | 吵闹邻居 | One tenant's heavy traffic hogs shared resources, slowing down or rate-limiting other tenants. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Rate Limiting / Token Bucket | 限流 / 令牌桶 | Limiting the number of requests per unit of time. The token bucket is a common algorithm: tokens drip into a bucket at a fixed rate, and each request must take a token to proceed. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Quota | 配额 | A cap on total usage over a longer period (a day, a month), often set per tenant or per user. | [Lesson 09](../lessons/09_production_architecture/README.en.md) |
+| Canary Release | 灰度发布 | Shipping a new version to a small slice of traffic first, then expanding gradually once the metrics look good. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| Canary Token | 金丝雀数据 | A unique string deliberately planted in data. If it shows up anywhere it shouldn't, you know there has been a leak. | [Lesson 09](../lessons/09_production_architecture/README.en.md) · [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Model Pinning | 模型版本固定 | Using a specific model snapshot version in production instead of an auto-updating alias, so behavior doesn't change behind your back. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| Runbook | 运行手册 | Incident-handling steps for on-call staff: exactly what to do when a given alert fires. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| ADR (Architecture Decision Record) | 架构决策记录 | A short document that records the context, options, and rationale behind an important design decision, so you can revisit it later. | [Lesson 09](../lessons/09_production_architecture/README.en.md) |
+| A2A (Agent2Agent Protocol) | A2A 协议 | An open protocol that lets agents built by different teams on different frameworks discover and talk to each other. MCP connects agents to tools; A2A connects agents to agents. | [Lesson 09](../lessons/09_production_architecture/README.en.md) |
+
+
+## 10. Distributed Systems and High Concurrency
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| Horizontal Scaling | 横向扩展 | Increasing capacity by adding more machines/instances instead of bigger ones. It requires stateless workers. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Stateless Worker | 无状态 Worker | A process that keeps no session or run state in memory; all state lives in shared storage. Any worker can pick up any task, and nothing is lost if one dies. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Session Affinity / Sticky Session | 会话粘性 | Always routing requests from the same session to the same instance. Reduces concurrency conflicts, but must be able to fail over when that instance goes down. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Actor Model | Actor 模型 | Each entity (e.g., a session) is an "actor" with its own mailbox that processes messages one at a time. Messages for the same session are naturally serialized, so there are no concurrent writes. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| SSE (Server-Sent Events) | 服务器推送事件 | A standard for a server to keep pushing messages to the browser over a single long-lived connection; commonly used for streaming output and progress updates. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Async Task Queue | 异步任务队列 | Requests go into a queue and return immediately; background workers process them and notify the user when they're done. Suits long tasks that take tens of seconds or more. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Workflow Engine | 工作流引擎 | A system dedicated to reliably running multi-step, long-running processes (e.g., Temporal), with built-in retries, timeouts, and state persistence. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Delivery Semantics | 投递语义 | A messaging system's promise about how many times a message is processed: at most once, at least once, or exactly once. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| At-least-once | 至少一次 | Messages are never lost but may be delivered more than once. The most common semantics, which is why consumers must be idempotent. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Exactly-once | 恰好一次 | Each message takes effect exactly once. Hard to achieve directly end to end; in practice, "at-least-once + idempotency" gives you effectively-once. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Visibility Timeout | 可见性超时 | After a consumer takes a message, the message is invisible to other consumers for this period. If it isn't acknowledged in time, it's redelivered. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| DLQ (Dead Letter Queue) | 死信队列 | Messages that fail processing repeatedly are moved here to await human investigation, instead of being retried forever and dragging the system down. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Poison Message | 毒消息 | A message that fails no matter how many times it's retried (e.g., because it's malformed). If you don't isolate it, it keeps consuming resources. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Lease | 租约 | Time-limited ownership: a worker holds a task exclusively while its lease is valid. If it doesn't renew before the lease expires, someone else takes over. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Heartbeat | 心跳 | A periodic "I'm still alive" signal from a worker, used to renew its lease or to let the system decide whether it has gone missing. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Fencing Token | 防护令牌 | A monotonically increasing number issued with each lock or lease grant and sent along with every write. Storage rejects writes carrying a stale number, which blocks zombie workers that think they still hold the lock. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Lost Update | 丢失更新 | Two processes read-modify-write the same data at the same time. The later write overwrites the earlier one, and the earlier change is lost. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Distributed Lock | 分布式锁 | A mutex that spans multiple machines. Hard to get right; it needs leases and fencing tokens. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Optimistic Concurrency (Optimistic Locking) / CAS (Compare-And-Swap) | 乐观锁 / 比较并交换 | No lock: at write time, check that the version is still the one you read; if not, reread and retry. More efficient than locking when conflicts are rare. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Per-session Partitioning | 按会话分区串行化 | Routing messages to fixed partitions/queues by session ID so a single consumer handles each session's messages in order, eliminating concurrent writes at the root. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Backpressure | 背压 | When downstream can't keep up, propagating a "slow down" signal upstream (rejecting, queuing, throttling) instead of accepting everything until it crashes. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Admission Control / Load Shedding | 准入控制 / 负载削减 | When overloaded, proactively rejecting some requests so the rest complete normally. Better than everyone timing out together. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Weighted Fair Queuing | 加权公平排队 | When tenants share resources, serving each tenant's queue in turn according to its weight, so one big tenant can't monopolize them. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Transactional Outbox | 事务性发件箱 | Writing the "events to publish" in the same database transaction as the business data, then publishing them from a separate process. Avoids the "database written, message never sent" inconsistency. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Singleflight / Request Coalescing | 请求合并 | Of many concurrent requests for the same key, only one actually executes; the rest wait and share its result. Prevents request storms the moment a cache entry expires. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+| Global Rate Limiting | 全局限流 | Rate limiting shared across all instances (e.g., a centralized token bucket), rather than each machine enforcing its own limit. | [Lesson 10](../lessons/10_distributed_concurrency/README.en.md) |
+
+## 11. Cost and Latency Optimization
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| Model Cascade | 模型级联 | Handling a request with a cheap small model first, and escalating to an expensive large model when the result isn't good enough. | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+| Model Routing | 模型路由 | Choosing up front which model handles a request, based on its type and difficulty. | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+| Exact-match Cache | 精确缓存 | Returning a previous result only when the input is identical. Safe, but the hit rate is low. | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+| Semantic Cache | 语义缓存 | Returning a previous result when the input "means roughly the same thing". Higher hit rate, but it may return an answer that doesn't apply, and cache keys must include the tenant and permission scope. | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+| Cache Stampede | 缓存未命中风暴 | The moment a hot cache entry expires, a flood of identical requests all recompute at once, overwhelming the backend or sending costs soaring. | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+| Hedged Request | 对冲请求 | If the first request is slow to return, send an identical one and take whichever returns first. Cuts tail latency, but only suits idempotent requests. From "The Tail at Scale". | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+| Batching | 批处理 | Grouping requests together to lower unit cost, at the price of higher latency. Suits offline jobs. | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+| TTFT (Time to First Token) | 首 token 延迟 | The time from sending a request to receiving the first output token. It determines how fast the system *feels* to users. | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+| Parallel Tool Calls | 并行工具调用 | The model requests several independent tools in one turn, and the program runs them concurrently to cut total wait time. | [Lesson 11](../lessons/11_cost_latency/README.en.md) |
+
+## 12. Enterprise Knowledge and RAG
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| ACL (Access Control List) | 访问控制列表 | A list of who may access a document, used to filter retrieval results. | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Pre-filtering / Post-filtering | 前过滤 / 后过滤 | Pre-filtering: search only within what the user is allowed to access. Post-filtering: search first, then drop results the user can't access. The former is safer; the latter is prone to leaks or poor recall. | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Identity Propagation | 身份透传 | Passing the requesting user's identity all the way through retrieval, tools, and downstream services, so every layer acts with that user's permissions. | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Chunking | 切块 | Splitting long documents into retrieval-sized pieces. Bad chunking (splitting clauses or tables apart) shows the model fragmented context. | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Groundedness | 有据性 | Whether every claim in an answer is supported by the retrieved material. | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Citation Verification | 引用校验 | Checking that the sources an answer cites really exist in this retrieval's results and actually support the corresponding claims. | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Deletion Propagation | 删除传播 | When source data is deleted, propagating the deletion to every copy: indexes, caches, summaries, eval sets, and logs. | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+| Knowledge Freshness | 知识新鲜度 | How well the knowledge base stays in sync with its source systems. Stale knowledge makes the agent confidently give outdated answers. | [Lesson 12](../lessons/12_enterprise_rag/README.en.md) |
+
+## 13. Release and Operations
+
+| English | Chinese | In plain words | Lesson |
+|---|---|---|---|
+| Shadow Mode | 影子模式 | The new version receives a copy of real traffic and produces results that are never returned to users, only compared. Validates a new version with zero user risk. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| A/B Testing | A/B 测试 | Randomly splitting users into two groups that use two versions, then comparing business metrics to decide which is better. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| Sticky Bucketing | 稳定分桶 | Assigning groups by hashing the user/tenant ID, so the same user always lands in the same group instead of bouncing between old and new versions. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| Release Unit | 发布单元 | Bundling code, prompts, model version, tool schemas, and config under one version number that ships and rolls back together. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| Automated Rollback | 自动回滚 | After a release, the system automatically reverts to the previous version when key metrics (completion rate, error rate, cost) cross a threshold. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| Feature Flag | 功能开关 | A config switch that turns a feature on or off without redeploying. A kill switch is one kind of feature flag. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| Model Drift | 模型漂移 | The model's behavior changes even though you changed nothing (e.g., the model alias now points to a new version). | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| Blameless Postmortem | 无责复盘 | A post-incident review that asks "where did the system let the error through?" rather than "who made the mistake?", with the goal of preventing recurrence. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+| Data Flywheel | 数据飞轮 | Production issues → labeling → into the eval set and improvements → a better version ships → new data. The loop spins faster with every turn. | [Lesson 13](../lessons/13_release_ops/README.en.md) |
+
+---
+
+## Appendix: Commonly Confused Pairs
+
+| Pair | Difference |
+|---|---|
+| Workflow vs. agent | The flow is decided by code vs. by the model. |
+| Agent as tool vs. handoff | The result goes back to the caller, who stays in control vs. control transfers entirely to the other agent. |
+| Short-term memory vs. long-term memory | The current session's message history vs. external storage that persists across sessions. |
+| Sliding window vs. compaction | Drop old messages outright vs. summarize them. |
+| Guardrail vs. permission | Detect and block suspicious content (lowers the probability) vs. limit what can be done (limits the consequences). |
+| Direct injection vs. indirect injection | The attack comes from user input vs. hides in external content the agent reads. |
+| Audit log vs. debug log | For compliance: complete, tamper-proof, never sampled vs. for engineers: can be sampled and discarded. |
+| pass@k vs. pass^k | At least one success vs. success every time. |
+| Retry vs. fallback | Try the same approach again vs. switch to a backup option. |
+| Checkpoint vs. session history | The full state of a half-finished run (lets you resume execution) vs. the conversation record (lets you keep chatting). |
+| Rate limit vs. quota | A cap on rate per unit of time vs. a cap on total usage per period. |
+| MCP vs. A2A | Connects agents to tools and data sources vs. connects agents to other agents. |
+| At-least-once vs. exactly-once | May duplicate but never loses vs. takes effect only once (in practice, achieved with "at-least-once + idempotency"). |
+| Distributed lock vs. optimistic concurrency vs. per-session partitioning | Grab the lock, then write vs. check for version conflicts at write time vs. make concurrent messages for the same session impossible in the first place. |
+| Pre-filtering vs. post-filtering | Scope by permission at retrieval time vs. drop results afterward (prone to leaks or poor recall). |
+| Shadow mode vs. canary vs. A/B | Validates correctness (invisible to users) vs. validates stability (a small slice of real traffic) vs. validates business impact (group comparison). |
+| Exact-match cache vs. semantic cache vs. prompt cache | Hits only on identical input vs. hits on similar meaning vs. the provider reuses computation for identical prefixes. |
