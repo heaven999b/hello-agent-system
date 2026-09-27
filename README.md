@@ -12,6 +12,9 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Tests](https://img.shields.io/badge/tests-offline%20%26%20deterministic-brightgreen)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-orange)](CONTRIBUTING.md)
+[![Built with Claude Opus 5.5](https://img.shields.io/badge/built%20with-Claude%20Opus%205.5-D97757)](#-致谢)
+
+由 **heaven999b** 发起 · **Claude Opus 5.5** 协助架构设计
 
 **中文** · [English](README.en.md)
 
@@ -175,6 +178,33 @@ make check-env                                  # 检查模型连通性与工具
 .venv/bin/python scripts/progress.py
 ```
 
+## 🎓 与斯坦福 CS329Z 对照学习
+
+斯坦福大学 2026 年秋季开设的 [CS 329Z: Engineering AI Agents](https://cs329z.stanford.edu/) 讲的是"如何工程化构建 Agent 系统"，和本项目的目标高度一致。下表把它公开课表中的每周主题对应到本项目的课程，方便两边对照着学：
+
+| CS329Z 周次与主题 | 本项目对应 |
+|---|---|
+| W1 Foundations & Landscape · Agentic Systems Spectrum | [00 全景图](lessons/00_overview/README.md)（自主性光谱） |
+| W2 LLMs for Builders | [01 LLM 与 Agent 开发必备知识](lessons/01_llm_essentials/README.md) |
+| W2 Building Blocks: Retrieval-Augmented Generation | [04 上下文与记忆](lessons/04_context_memory/README.md) · [15 权限感知 RAG](lessons/15_enterprise_rag/README.md) |
+| W3 Tool Use & Function Calling | [01](lessons/01_llm_essentials/README.md) · [03 工具设计](lessons/03_tools/README.md) |
+| W3 Frameworks & Agent Design | [02 Agent 循环](lessons/02_agent_loop/README.md) · [框架对照表](docs/framework-comparison.md) |
+| W4 Agent Design Patterns & Scaffolds | [05 常见 Agent 架构](lessons/05_agent_architectures/README.md) · [06 编排模式](lessons/06_orchestration/README.md) |
+| W4–W5 Memory & Multi-Agent Systems | [04](lessons/04_context_memory/README.md) · [05](lessons/05_agent_architectures/README.md) · [06](lessons/06_orchestration/README.md) |
+| W5 Optimization | 部分对应 [14 成本与延迟](lessons/14_cost_latency/README.md)（侧重成本与延迟；自动化的提示词 / 流水线优化本项目未覆盖） |
+| W6–W7 Data for Agentic Systems · Data Selection & Quality | 本项目未覆盖（仅 [11 评估](lessons/11_evals/README.md) 讲了评估集的构建） |
+| W7 Evaluation Fundamentals & Benchmark Design | [11 评估驱动开发](lessons/11_evals/README.md) |
+| W8 LLM-as-Judge & Evaluation Infrastructure | [11 评估驱动开发](lessons/11_evals/README.md) |
+| W8 Agent Safety & Guardrails | [09 安全与治理](lessons/09_security/README.md) |
+| W9 Coding Agents & Software Agents | [05 常见 Agent 架构](lessons/05_agent_architectures/README.md)（编码 Agent 架构拆解） |
+| W11 Proactive Agents | [05 常见 Agent 架构](lessons/05_agent_architectures/README.md)（事件驱动 / 环境 Agent） |
+
+反过来，本项目**更侧重把 Agent 放进企业生产环境**的工程问题，这部分可以看作对 CS329Z 的补充：[08 可靠性](lessons/08_reliability/README.md)、[10 可观测性](lessons/10_observability/README.md)、[12 生产架构](lessons/12_production_architecture/README.md)、[13 高并发与分布式](lessons/13_distributed_concurrency/README.md)、[14 成本](lessons/14_cost_latency/README.md)、[16 发布运维](lessons/16_release_ops/README.md)，以及贯穿全课的多租户、权限与审计。
+
+斯坦福其他 Agent 相关课程：[CS 329A: Self-Improving AI Agents](https://cs329a.stanford.edu/)（自我改进的 Agent，偏研究）、CS 222: AI Agents and Simulations。
+
+> 说明：本项目与斯坦福大学及上述课程团队**没有任何关联**。对照表依据 CS329Z 公开课程主页的课表（2026 年秋季）整理，如有调整以官网为准。
+
 ## 🧰 深度资料（学完之后的"工具书"）
 
 | 文档 | 内容 |
@@ -252,7 +282,7 @@ hello-agent-system/
 
 ## 🙏 致谢
 
-本项目由 [heaven999b](https://github.com/heaven999b) 发起和主导，**Claude Opus 5.5**（Anthropic）参与了课程架构设计与材料编写。
+本项目由 [heaven999b](https://github.com/heaven999b) 发起和主导，使用 **Claude Opus 5.5**（Anthropic）协助完成课程架构设计与材料编写：从 `agentkit` 框架、17 节课的结构，到用真实模型逐课验证 demo、发现并修复框架缺陷，Claude Opus 5.5 全程参与。
 
 ## 📜 License
 

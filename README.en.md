@@ -12,6 +12,9 @@ No agent framework. You build every layer of an enterprise agent yourself: tools
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Tests](https://img.shields.io/badge/tests-offline%20%26%20deterministic-brightgreen)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-orange)](CONTRIBUTING.en.md)
+[![Built with Claude Opus 5.5](https://img.shields.io/badge/built%20with-Claude%20Opus%205.5-D97757)](#-acknowledgements)
+
+Created by **heaven999b** · architecture co-designed with **Claude Opus 5.5**
 
 [中文](README.md) · **English**
 
@@ -175,6 +178,33 @@ Check your progress:
 .venv/bin/python scripts/progress.py
 ```
 
+## 🎓 Studying alongside Stanford CS329Z
+
+Stanford's Fall 2026 course [CS 329Z: Engineering AI Agents](https://cs329z.stanford.edu/) is about engineering agentic systems, which lines up closely with this project's goal. The table maps each weekly topic on its public schedule to the matching lessons here, so you can study the two side by side:
+
+| CS329Z week & topic | Matching lessons here |
+|---|---|
+| W1 Foundations & Landscape · Agentic Systems Spectrum | [00 The big picture](lessons/00_overview/README.en.md) (the autonomy spectrum) |
+| W2 LLMs for Builders | [01 LLM essentials](lessons/01_llm_essentials/README.en.md) |
+| W2 Building Blocks: Retrieval-Augmented Generation | [04 Context & memory](lessons/04_context_memory/README.en.md) · [15 Permission-aware RAG](lessons/15_enterprise_rag/README.en.md) |
+| W3 Tool Use & Function Calling | [01](lessons/01_llm_essentials/README.en.md) · [03 Tool design](lessons/03_tools/README.en.md) |
+| W3 Frameworks & Agent Design | [02 The agent loop](lessons/02_agent_loop/README.en.md) · [framework comparison](docs/framework-comparison.en.md) |
+| W4 Agent Design Patterns & Scaffolds | [05 Agent architectures](lessons/05_agent_architectures/README.en.md) · [06 Orchestration](lessons/06_orchestration/README.en.md) |
+| W4–W5 Memory & Multi-Agent Systems | [04](lessons/04_context_memory/README.en.md) · [05](lessons/05_agent_architectures/README.en.md) · [06](lessons/06_orchestration/README.en.md) |
+| W5 Optimization | Partly [14 Cost & latency](lessons/14_cost_latency/README.en.md) (cost and latency; automated prompt / pipeline optimization is not covered here) |
+| W6–W7 Data for Agentic Systems · Data Selection & Quality | Not covered (only eval-set construction in [11 Evals](lessons/11_evals/README.en.md)) |
+| W7 Evaluation Fundamentals & Benchmark Design | [11 Eval-driven development](lessons/11_evals/README.en.md) |
+| W8 LLM-as-Judge & Evaluation Infrastructure | [11 Eval-driven development](lessons/11_evals/README.en.md) |
+| W8 Agent Safety & Guardrails | [09 Security & governance](lessons/09_security/README.en.md) |
+| W9 Coding Agents & Software Agents | [05 Agent architectures](lessons/05_agent_architectures/README.en.md) (coding-agent teardown) |
+| W11 Proactive Agents | [05 Agent architectures](lessons/05_agent_architectures/README.en.md) (event-driven / ambient agents) |
+
+In the other direction, this project **leans harder into running agents in enterprise production**, so it complements CS329Z: [08 Reliability](lessons/08_reliability/README.en.md), [10 Observability](lessons/10_observability/README.en.md), [12 Production architecture](lessons/12_production_architecture/README.en.md), [13 Distributed execution](lessons/13_distributed_concurrency/README.en.md), [14 Cost](lessons/14_cost_latency/README.en.md), [16 Release ops](lessons/16_release_ops/README.en.md), plus multi-tenancy, permissions, and auditing throughout.
+
+Other Stanford agent courses: [CS 329A: Self-Improving AI Agents](https://cs329a.stanford.edu/) (research-oriented) and CS 222: AI Agents and Simulations.
+
+> Note: this project is **not affiliated** with Stanford University or the teams behind these courses. The mapping is based on the public CS329Z course page (Fall 2026); check the official site for changes.
+
 ## 🧰 Reference docs (your handbook after the course)
 
 | Doc | What's inside |
@@ -252,7 +282,7 @@ If this project helps you, a ⭐ helps others find it.
 
 ## 🙏 Acknowledgements
 
-This project was initiated and is led by [heaven999b](https://github.com/heaven999b). **Claude Opus 5.5** (Anthropic) took part in designing the course architecture and writing the materials.
+This project was initiated and is led by [heaven999b](https://github.com/heaven999b), with **Claude Opus 5.5** (Anthropic) helping design the course architecture and write the materials. Claude Opus 5.5 was involved throughout: the `agentkit` framework, the structure of the 17 lessons, validating every demo against a real model, and finding and fixing framework defects along the way.
 
 ## 📜 License
 
