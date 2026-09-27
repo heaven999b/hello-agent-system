@@ -20,7 +20,7 @@
 | **G. 优化与 ML 闭环** | 负责"让 Agent 持续变好"（数据 → 评估 → 优化）的人 | R1 → R2 → S1 → S2 → Q1 → T 组 → S9 | 约一天 |
 | **H. 编码 Agent 与长任务** | 做编码 Agent、长时运行 Agent 的人 | U1 → D7 → U3 → U4 → S8 → P5 → I12 → U5 | 约半天 |
 | **I. 前沿与研究** | 做 Agent 研究、关注前沿方向的人 | V 组全部 + S1 + S7 + J5 | 约一天 |
-| **J. 生产落地** | 学完第四部分、要把 Agent 服务真正部署上线并负责运维的人 | W1 → F1 → W3 → X1 → X5 → Y1 → Y2 → Z1 → Z2 → AA1 → AA2 → AB1 → AB2 | 约一天 |
+| **J. 生产落地** | 学完第四部分、要把 Agent 服务真正部署上线并负责运维的人 | W1 → F1 → W3 → X1 → X5 → Y1 → Y2 → Z1 → Z2 → AA1 → AA2 → AB1 → AB2 → AB3 | 约一天 |
 
 > 💡 读论文的建议：先读摘要和结论，再看图表，最后才看方法细节。本清单中的论文，大多只需要理解它"提出了什么概念、为什么重要"。
 
@@ -277,7 +277,7 @@
 
 ---
 
-> 以下 W–AB 组对应课程**第四部分：生产落地**（第 26–31 课）。W–AA 组的第一条 ⭐ 是对应课程的必读；AB 组对应第 31 课和 `production/` 参考服务，⭐ 标的是它的停机流程所依据的官方文档。前面各组里被第四部分引用的资料（E2 级联故障、E5 Stripe 幂等、E6 持久化执行、F1 Kleppmann 分布式锁、F5 SSE、K1 GenAI 语义约定）也已补上第四部分的课程链接。
+> 以下 W–AB 组对应课程**第四部分：生产落地**（第 26–31 课）。W–AB 组的第一条 ⭐ 是对应课程的必读（AB 组对应第 31 课和 `production/` 参考服务）。前面各组里被第四部分引用的资料（E2 级联故障、E5 Stripe 幂等、E6 持久化执行、F1 Kleppmann 分布式锁、F5 SSE、K1 GenAI 语义约定）也已补上第四部分的课程链接。
 
 ## W. 状态、队列与分布式协调
 
@@ -350,14 +350,15 @@
 
 | 顺序 | 资料 | 作者 · 年份 | 为什么值得读 | 课程 |
 |---|---|---|---|---|
-| AB1 ⭐ | [Pod Lifecycle：Termination of Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination) | Kubernetes 文档 | 删除 Pod 时先执行 preStop，再给容器发 SIGTERM，等 `terminationGracePeriodSeconds`（默认 30 秒，preStop 的耗时也算在内）之后发 SIGKILL。worker 的优雅停机时间线就是照着它设计的。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
-| AB2 | [Configure Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) | Kubernetes 文档 | 存活探针失败会重启容器，就绪探针失败只把 Pod 从 Service 的端点里摘掉。分清两者，才不会把"数据库抖一下"变成"所有 Pod 一起重启"。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
-| AB3 | [Horizontal Pod Autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/) | Kubernetes 文档 | HPA 除了 CPU，还能按自定义指标和外部指标扩缩；缩容稳定窗口和扩缩速率策略防止副本数来回抖动。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
-| AB4 | [PostgreSQL scaler](https://keda.sh/docs/2.21/scalers/postgresql/) | KEDA 文档 | 用一条返回数字的 SQL（比如可执行的任务数）和 `targetQueryValue` 比较，来扩缩 worker。队列就在 Postgres 里时，这是按积压扩缩容最直接的做法。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
-| AB5 | [The Twelve-Factor App：IX. Disposability](https://12factor.net/disposability) | 12factor.net | 进程收到 SIGTERM 要优雅退出；对 worker 来说，优雅停机就是把手上的任务还回队列。第 31 课的 worker 正是这么做的。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
-| AB6 | [Uvicorn settings](https://uvicorn.dev/settings/) | Uvicorn 文档 | `--limit-concurrency`（超过就返回 503）、`--timeout-graceful-shutdown`、`--workers`：API 进程的最后一道闸和停机时限。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
-| AB7 | [Open and closed models](https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/) | Grafana k6 文档 | 闭环压测在系统变慢时自己也发得慢了，这就是协调遗漏；要测固定到达率下的尾延迟，用 arrival-rate 执行器（开环）。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
-| AB8 | [wrk2](https://github.com/giltene/wrk2) | Gil Tene | 以恒定吞吐发请求、按"本该发出的时刻"计算延迟的压测工具；README 讲清了协调遗漏为什么会把最坏的那段延迟藏起来。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| AB1 ⭐ | [Kubernetes best practices: terminating with grace](https://cloud.google.com/blog/products/containers-kubernetes/kubernetes-best-practices-terminating-with-grace) | Sandeep Dinesh · 2018 | 用一页讲清 Pod 被删除时的完整时间线：preStop、SIGTERM、宽限期（默认 30 秒）、SIGKILL。第 31 课把 `terminationGracePeriodSeconds`、preStop、worker 宽限期和租约对齐，依据就是这条时间线。第 31 课的必读 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| AB2 | [Pod Lifecycle：Termination of Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination) | Kubernetes 文档 | 删除 Pod 时先执行 preStop，再给容器发 SIGTERM，等 `terminationGracePeriodSeconds`（默认 30 秒，preStop 的耗时也算在内）之后发 SIGKILL。worker 的优雅停机时间线就是照着它设计的。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| AB3 | [Configure Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) | Kubernetes 文档 | 存活探针失败会重启容器，就绪探针失败只把 Pod 从 Service 的端点里摘掉。分清两者，才不会把"数据库抖一下"变成"所有 Pod 一起重启"。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| AB4 | [Horizontal Pod Autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/) | Kubernetes 文档 | HPA 除了 CPU，还能按自定义指标和外部指标扩缩；缩容稳定窗口和扩缩速率策略防止副本数来回抖动。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| AB5 | [PostgreSQL scaler](https://keda.sh/docs/2.21/scalers/postgresql/) | KEDA 文档 | 用一条返回数字的 SQL（比如可执行的任务数）和 `targetQueryValue` 比较，来扩缩 worker。队列就在 Postgres 里时，这是按积压扩缩容最直接的做法。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| AB6 | [The Twelve-Factor App：IX. Disposability](https://12factor.net/disposability) | 12factor.net | 进程收到 SIGTERM 要优雅退出；对 worker 来说，优雅停机就是把手上的任务还回队列。第 31 课的 worker 正是这么做的。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| AB7 | [Uvicorn settings](https://uvicorn.dev/settings/) | Uvicorn 文档 | `--limit-concurrency`（超过就返回 503）、`--timeout-graceful-shutdown`、`--workers`：API 进程的最后一道闸和停机时限。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| AB8 | [Open and closed models](https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/) | Grafana k6 文档 | 闭环压测在系统变慢时自己也发得慢了，这就是协调遗漏；要测固定到达率下的尾延迟，用 arrival-rate 执行器（开环）。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| AB9 | [wrk2](https://github.com/giltene/wrk2) | Gil Tene | 以恒定吞吐发请求、按"本该发出的时刻"计算延迟的压测工具；README 讲清了协调遗漏为什么会把最坏的那段延迟藏起来。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
 
 ---
 
