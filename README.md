@@ -4,8 +4,8 @@
 
 ### 企业级 Agent 系统设计训练营
 
-**从"会调 LLM API"到"能设计生产级 Agent 系统"：26 节课 · 中英双语 · 每课都有带测试的练习。**
-不依赖任何 Agent 框架，从零手写企业级 Agent 的每一层：工具、上下文、架构、编排、可靠性、安全、可观测、评估、并发、成本、发布；再到检索、记忆、MCP、数据、评估方法论、优化、编码 Agent 与主动式 Agent。
+**从"会调 LLM API"到"能设计生产级 Agent 系统"：32 节课 · 中英双语 · 每课都有带测试的练习。**
+不依赖任何 Agent 框架，从零手写企业级 Agent 的每一层：工具、上下文、架构、编排、可靠性、安全、可观测、评估、并发、成本、发布；再到检索、记忆、MCP、数据、评估方法论、优化、编码 Agent 与主动式 Agent；最后用异步运行时和成熟组件（Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar）把它真正落到生产。
 
 [![CI](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml/badge.svg)](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -36,11 +36,24 @@
 |---|---|---|
 | 目标 | 让 Agent 跑起来 | 让 Agent **在生产中可靠、安全、可控地**跑起来 |
 | 方式 | 调用框架 API（黑盒） | **从零手写每一层**（核心约 2500 行，每行都能看懂） |
-| 覆盖 | 循环 + 工具 | LLM 必备知识、循环、工具、上下文、常见架构、编排、**工程考量全景**；重试熔断降级、检查点恢复、提示词注入防御、RBAC、人工审批、审计、追踪、评估；高并发与分布式执行、成本优化、权限感知 RAG、灰度发布与事故响应；检索质量、记忆系统、MCP 与沙箱、主流框架对照、Agent 数据、评估方法论、提示词优化与测试时计算、编码 Agent、主动式 Agent |
+| 覆盖 | 循环 + 工具 | LLM 必备知识、循环、工具、上下文、常见架构、编排、**工程考量全景**；重试熔断降级、检查点恢复、提示词注入防御、RBAC、人工审批、审计、追踪、评估；高并发与分布式执行、成本优化、权限感知 RAG、灰度发布与事故响应；检索质量、记忆系统、MCP 与沙箱、主流框架对照、Agent 数据、评估方法论、提示词优化与测试时计算、编码 Agent、主动式 Agent；**异步高并发运行时、Postgres/Redis/Temporal/OpenTelemetry/LiteLLM/Cedar 生产落地、多 worker 参考服务与压测** |
 | 讲法 | 一种做法 | 企业问题卡片：**每个问题 2–4 种方案对比**，讲清怎么选 |
 | 验证 | 看起来能用 | 每课都有**带自动化测试的练习**，离线、确定性、零成本 |
 | 模型 | 绑定某家厂商 | 任何 OpenAI 兼容接口（OpenAI / DeepSeek / Qwen / vLLM / 各类模型网关） |
 | 语言 | 单语 | **中英双语**：每份讲义和文档都有等价的英文版（`*.en.md`） |
+
+## ⚖️ 先说清楚：教学框架与生产落地
+
+这个项目有四层代码，定位各不相同。**不要把教学层直接部署到生产**：
+
+| 层 | 是什么 | 适合 | 局限（实话） |
+|---|---|---|---|
+| `agentkit/` 核心 | 同步、单进程、零依赖的教学框架，约 2500 行 | 看懂每个机制；写练习和测试 | 一个进程同时只跑一个会话；线程超时杀不掉；检查点、幂等、限流都在内存或本地文件；注入检测和 PII 脱敏是正则 |
+| [`agentkit/aio/`](agentkit/aio/) | 生产级异步运行时 `AsyncAgent` | 一个进程并发几百上千个会话 | 由第 30 课实测验证；单进程内的舱壁和限流在多实例下要换成 Redis 或网关 |
+| [`agentkit/contrib/`](agentkit/contrib/) | 成熟组件适配器：Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar、护栏分类器 | 多实例、多 worker 部署 | 在本机嵌入式 Postgres、fakeredis、Temporal 开发服务器上真实测试过；主从切换、集群分片、多区域没有实测 |
+| [`production/`](production/) | 把上面串起来的参考服务：API、worker、压测、故障注入、docker-compose、Kubernetes | 照着搭自己的服务 | 参考实现，不是托管产品；部署配置在本机没用 Docker 实际启动过 |
+
+逐模块的"局限 → 生产替代 → 迁移步骤 → 常见坑"，见 [📋 生产就绪指南](docs/production-readiness.md)。
 
 ## 🗺 你将亲手造出的系统
 
@@ -109,6 +122,35 @@ agent.run  6231ms  tokens=973→106  status=completed steps=2 cost=$0.00228
 └─ llm.chat  3534ms  tokens=533→54  → final_answer
 ```
 
+上线时换成异步运行时和成熟组件，**接口不变**（这段代码在嵌入式 Postgres、fakeredis 和真实模型上跑通过）：
+
+```python
+from agentkit.aio import AsyncAgent, AsyncResilientLLM, KeyedLimiter
+from agentkit.contrib.gateway import AsyncLiteLLMRouterLLM
+from agentkit.contrib.postgres import AsyncPostgresCheckpointer
+from agentkit.contrib.redis_store import AsyncRedisIdempotencyStore, AsyncRedisTokenBucket, AsyncRateLimitHook
+from agentkit.contrib.otel import OTelTracer, PrometheusHook, setup_tracing
+from agentkit.contrib.policy import CedarPolicy
+
+checkpointer = AsyncPostgresCheckpointer(dsn)
+await checkpointer.setup()
+agent = AsyncAgent(
+    AsyncResilientLLM(AsyncLiteLLMRouterLLM.from_env(), max_concurrency=20),  # 网关：路由、降级；进程内并发上限
+    tools,
+    hooks=[
+        CedarPolicy("policies.cedar", tools=tools),                                   # 策略即代码（第 29 课）
+        AsyncRateLimitHook(AsyncRedisTokenBucket(redis, rate_per_sec=5, capacity=10)),  # 跨实例的租户限流（第 26 课）
+        PrometheusHook(),                                                             # 指标（第 28 课）
+    ],
+    checkpointer=checkpointer,                             # 多实例共享、带 CAS 的检查点（第 26 课）
+    idempotency_store=AsyncRedisIdempotencyStore(redis),   # 跨进程幂等（第 26 课）
+    tracer=OTelTracer(setup_tracing("itbuddy")),           # OpenTelemetry，GenAI 语义约定（第 28 课）
+    limiter=KeyedLimiter(per_key=5, global_limit=200),     # 每个租户最多 5 个同时在跑的运行（第 30 课）
+    run_timeout=120,
+)
+result = await agent.run("VPN 怎么连？", metadata={"tenant_id": "acme", "user_id": "alice", "roles": ["employee"]})
+```
+
 ## 🚀 快速开始
 
 ```bash
@@ -134,11 +176,12 @@ make check-env                                  # 检查模型连通性与工具
 
 ## 📚 学习路线
 
-课程分三部分：**第一部分学会"怎么造"，第二部分学会"企业里出了问题怎么选方案"，第三部分学会"怎么让 Agent 持续变好"**。前两部分加综合实战约 5.5 小时；第三部分约 3.5 小时，适合学完前两部分后进阶。赶时间可以走 [4 小时速通路线](lessons/00_overview/README.md)（每课只读开头的"核心路径"）。
+课程分四部分：**第一部分学会"怎么造"，第二部分学会"企业里出了问题怎么选方案"，第三部分学会"怎么让 Agent 持续变好"，第四部分学会"怎么用成熟组件真正上生产"**。前两部分加综合实战约 5.5 小时（主线）；第三部分约 3.5 小时、第四部分约 3 小时，是进阶路线。赶时间可以走 [4 小时速通路线](lessons/00_overview/README.md)（每课只读开头的"核心路径"）。
 
 - **第一部分**：概念 → 从零实现 → 练习。以第 07 课"工程考量全景"收尾：20 个工程维度，每个维度都分成**通用必查点**（任何项目都要做）和**情境触发点**（"当……时，要考虑……"），作为进入第二部分的地图。
 - **第二部分**：每节课由若干张**企业问题卡片**组成：真实场景（带具体数字）→ 为什么直觉方案会翻车 → 2–5 种方案对比（优点 / 缺点 / 适用规模）→ 怎么选 → 代码实现。
 - **第三部分**：进阶的构建块（检索、记忆、MCP、框架），以及让 Agent 持续变好的 ML 闭环（数据 → 评估 → 优化），最后是编码 Agent 与主动式 Agent 等应用前沿。
+- **第四部分**：把教学实现换成成熟组件，**接口不变**。每课都讲"教学版为什么不够 → 组件选型对比 → 适配器怎么接 → 运维要点与坑"，并用真实进程、真实并发、故障注入证明它扛得住。
 
 每节课的流程都一样：**读讲义 → 跑 demo → 写练习 → `make lesson N=xx` 让测试变绿 → 过自测清单**。每课开头都标注了一篇 📖 必读论文或文章。
 
@@ -183,6 +226,17 @@ make check-env                                  # 检查模型连通性与工具
 | 24 | [编码 Agent 与长时运行 harness](lessons/24_coding_agents/README.md) | 25m | **亲手造一个能修 bug 的编码 Agent**：ACI 工具、测试保护、diff 审查、跨会话接力 |
 | 25 | [主动式 Agent 与前沿方向](lessons/25_proactive_and_frontier/README.md) | 20m | 用户模型、何时打扰的决策器、前沿方向与开放问题、全课回顾 |
 
+### 第四部分：生产落地——结合成熟组件（约 175 分钟）
+
+| # | 课程 | 时长 | 你会学到 / 亲手验证 | 核心源码 |
+|---|---|---|---|---|
+| 26 | [状态、队列与分布式协调：Postgres 与 Redis](lessons/26_state_and_queues/README.md) | 30m | 带 CAS 与 fence 接管的检查点、`SKIP LOCKED` 任务队列、异步 worker 与背压、Redis 幂等 / Lua 令牌桶 / 带 fencing 的锁；多进程 kill -9 下零重复副作用 | [postgres.py](agentkit/contrib/postgres.py) · [redis_store.py](agentkit/contrib/redis_store.py) |
+| 27 | [持久化工作流：用 Temporal 运行 Agent](lessons/27_durable_workflows/README.md) | 30m | Activity 重试、Signal/Update 审批、continue-as-new、确定性与版本化；kill -9 worker 后由新 worker 接手 | [temporal.py](agentkit/contrib/temporal.py) |
+| 28 | [生产可观测性：OpenTelemetry、Prometheus 与 LLM 观测平台](lessons/28_production_observability/README.md) | 25m | GenAI 语义约定、跨队列 trace 传播、尾部采样与脱敏、燃烧率告警、Grafana 看板；50 并发运行下 trace 不串线 | [otel.py](agentkit/contrib/otel.py) |
+| 29 | [模型网关、策略即代码与护栏服务](lessons/29_gateway_and_guardrails/README.md) | 30m | LiteLLM 路由与降级、Cedar 策略（失败即拒绝）、级联护栏分类器（精确率 0.42→0.92） | [gateway.py](agentkit/contrib/gateway.py) · [policy.py](agentkit/contrib/policy.py) · [guards.py](agentkit/contrib/guards.py) |
+| 30 | [**异步运行时与高并发服务**](lessons/30_async_runtime/README.md) | 30m | 200 个会话：同步串行 83s → AsyncAgent 0.45s；真取消、硬超时、舱壁、流式；实测发现并修复运行时的多个并发 bug | [agentkit/aio/](agentkit/aio/) |
+| 31 | [部署与扩缩容：从单机到集群](lessons/31_deployment_and_scaling/README.md) | 30m | API 与 worker 分离、按队列深度扩缩、优雅停机时间线、压测与故障注入 | [production/](production/) |
+
 ### 🎓 综合实战（30 分钟）
 
 [**ITBuddy：企业 IT 服务台 Agent**](capstone/README.md)：把所有能力组装成一个完整系统，包含命令行应用、支持异步审批的 HTTP API、一份真实风格的设计文档（含威胁模型和 ADR）、24 条评估用例（其中 10 条安全用例）、组件消融实验，以及做你自己项目时可以直接套用的[报告模板](capstone/REPORT_TEMPLATE.md)（要求基线对比、消融与错误分析）。
@@ -215,7 +269,7 @@ make check-env                                  # 检查模型连通性与工具
 | W11 Proactive Agents · Open Problems | [25 主动式 Agent 与前沿方向](lessons/25_proactive_and_frontier/README.md) |
 | 项目：基线、消融、错误分析、可复现 | [综合实战](capstone/README.md) · [报告模板](capstone/REPORT_TEMPLATE.md) |
 
-反过来，本项目**更侧重把 Agent 放进企业生产环境**的工程问题，这部分可以看作对 CS329Z 的补充：[08 可靠性](lessons/08_reliability/README.md)、[10 可观测性](lessons/10_observability/README.md)、[12 生产架构](lessons/12_production_architecture/README.md)、[13 高并发与分布式](lessons/13_distributed_concurrency/README.md)、[14 成本](lessons/14_cost_latency/README.md)、[16 发布运维](lessons/16_release_ops/README.md)，以及贯穿全课的多租户、权限与审计。
+反过来，本项目**更侧重把 Agent 放进企业生产环境**的工程问题，这部分可以看作对 CS329Z 的补充：[08 可靠性](lessons/08_reliability/README.md)、[10 可观测性](lessons/10_observability/README.md)、[12 生产架构](lessons/12_production_architecture/README.md)、[13 高并发与分布式](lessons/13_distributed_concurrency/README.md)、[14 成本](lessons/14_cost_latency/README.md)、[16 发布运维](lessons/16_release_ops/README.md)，整个第四部分（[26](lessons/26_state_and_queues/README.md)–[31](lessons/31_deployment_and_scaling/README.md)：Postgres/Redis、Temporal、OpenTelemetry、网关与策略、异步运行时、部署扩缩容），以及贯穿全课的多租户、权限与审计。
 
 斯坦福其他 Agent 相关课程：[CS 329A: Self-Improving AI Agents](https://cs329a.stanford.edu/)（自我改进的 Agent，偏研究）、CS 222: AI Agents and Simulations。
 
@@ -231,6 +285,7 @@ make check-env                                  # 检查模型连通性与工具
 | [🔁 框架对照表](docs/framework-comparison.md) | agentkit 概念 ↔ LangGraph / OpenAI Agents SDK / Claude Agent SDK / ADK … |
 | [📄 一页纸速查](docs/cheatsheet.md) | 原则、默认参数、决策树，适合打印 |
 | [📖 术语表](docs/glossary.md) | 246 条术语，中英对照 + 大白话解释 |
+| [📋 生产就绪指南](docs/production-readiness.md) | 每个教学模块离生产还差什么、换成什么、怎么迁移，以及上线前的 P0 清单 |
 | [📚 延伸阅读](docs/reading-list.md) | 135 条精选并核实过的论文、博客、规范，按角色给出阅读路线 |
 
 ## 🧱 项目结构
@@ -248,9 +303,12 @@ hello-agent-system/
 │   ├── permissions.py   #   RBAC + 人工审批
 │   ├── tracing.py       #   链路追踪（OpenTelemetry GenAI 风格）
 │   ├── viewer.py        #   追踪 HTML 查看器
-│   └── evals.py         #   评估框架
-├── lessons/NN_topic/    # 26 节课：README.md + README.en.md 讲义 / demo.py / exercise.py / solution.py / test_exercise.py
+│   ├── evals.py         #   评估框架
+│   ├── aio/             #   生产级异步运行时：AsyncAgent、流式、取消、舱壁、异步重试熔断（第 30 课）
+│   └── contrib/         #   成熟组件适配器：postgres / redis_store / temporal / otel / gateway / policy / guards（第 26–29 课）
+├── lessons/NN_topic/    # 32 节课：README.md + README.en.md 讲义 / demo.py / exercise.py / solution.py / test_exercise.py
 ├── capstone/            # 综合实战：ITBuddy（CLI + HTTP API + 设计文档 + 评估集）
+├── production/          # 生产参考服务：API + 多 worker + 压测 + 故障注入 + docker-compose / Kubernetes（第 31 课）
 ├── docs/                # 深度资料（中英双语）
 ├── scripts/             # 学习进度看板、链接检查
 └── tests/               # 框架测试（全部离线）
@@ -287,7 +345,7 @@ hello-agent-system/
 <details>
 <summary><b>agentkit 能直接用于生产吗？</b></summary>
 
-它的**设计模式**是生产级的，但它是教学实现：同步、单进程、内存存储。生产中请把检查点换成数据库、追踪换成 OpenTelemetry、工具执行放进沙箱——第 12、13 课详细讲了怎么做。
+`agentkit` 核心**不能**：它是同步、单进程、内存存储的教学实现，目的是让你看懂每个机制。生产路径是 `agentkit.aio`（异步运行时）+ `agentkit.contrib`（Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar 适配器）+ `production/`（参考服务），接口与教学版一致。它们都有真实并发、真实进程和故障注入测试，但仍是参考实现，不是托管产品。哪些已经做到、哪些还要你自己补，逐项写在 [生产就绪指南](docs/production-readiness.md) 里。
 </details>
 
 ## 🤝 参与贡献

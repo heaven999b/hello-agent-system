@@ -4,8 +4,8 @@
 
 ### Design production-grade AI agent systems, from first principles
 
-**From "I can call an LLM API" to "I can design production-grade agent systems": 26 lessons · bilingual (English / 中文) · every lesson has a tested exercise.**
-No agent framework. You build every layer of an enterprise agent yourself: tools, context, architectures, orchestration, reliability, security, observability, evals, concurrency, cost, and release engineering — then retrieval, memory, MCP, data, eval methodology, optimization, coding agents, and proactive agents.
+**From "I can call an LLM API" to "I can design production-grade agent systems": 32 lessons · bilingual (English / 中文) · every lesson has a tested exercise.**
+No agent framework. You build every layer of an enterprise agent yourself: tools, context, architectures, orchestration, reliability, security, observability, evals, concurrency, cost, and release engineering — then retrieval, memory, MCP, data, eval methodology, optimization, coding agents, and proactive agents — and finally an async runtime plus mature components (Postgres, Redis, Temporal, OpenTelemetry, LiteLLM, Cedar) to take it to production for real.
 
 [![CI](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml/badge.svg)](https://github.com/heaven999b/hello-agent-system/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -36,11 +36,24 @@ A working agent loop is 20 lines of code. Put it in front of thousands of employ
 |---|---|---|
 | Goal | Get an agent running | Keep an agent running **reliably, safely, and under control in production** |
 | Approach | Call a framework API (black box) | **Build every layer from scratch** (~2,500 lines of core code you can read in one sitting) |
-| Coverage | Loop + tools | LLM essentials, the loop, tools, context, agent architectures, orchestration, an **engineering-perspectives map**; retries / circuit breakers / fallbacks, checkpoints, prompt-injection defense, RBAC, human approval, audit, tracing, evals; high concurrency and distributed execution, cost optimization, permission-aware RAG, progressive rollout and incident response; retrieval quality, memory systems, MCP and sandboxes, mainstream frameworks, agent data, eval methodology, prompt optimization and test-time compute, coding agents, proactive agents |
+| Coverage | Loop + tools | LLM essentials, the loop, tools, context, agent architectures, orchestration, an **engineering-perspectives map**; retries / circuit breakers / fallbacks, checkpoints, prompt-injection defense, RBAC, human approval, audit, tracing, evals; high concurrency and distributed execution, cost optimization, permission-aware RAG, progressive rollout and incident response; retrieval quality, memory systems, MCP and sandboxes, mainstream frameworks, agent data, eval methodology, prompt optimization and test-time compute, coding agents, proactive agents; **an async high-concurrency runtime, production adapters for Postgres/Redis/Temporal/OpenTelemetry/LiteLLM/Cedar, and a multi-worker reference service with load and failure-injection tests** |
 | Teaching style | One way to do it | Enterprise problem cards: **every problem compares 2–5 solutions** and explains how to choose |
 | Verification | "Looks like it works" | Every lesson has an **exercise with automated tests**: offline, deterministic, free |
 | Models | Locked to one vendor | Any OpenAI-compatible endpoint (OpenAI, DeepSeek, Qwen, vLLM, any model gateway) |
 | Language | Single language | **Bilingual**: every lecture and reference doc has an equivalent English version (`*.en.md`) |
+
+## ⚖️ Teaching framework vs. production path
+
+The project has four layers of code with different purposes. **Do not deploy the teaching layer to production as-is**:
+
+| Layer | What it is | Good for | Limits (honestly) |
+|---|---|---|---|
+| `agentkit/` core | Synchronous, single-process, zero-dependency teaching framework (~2,500 lines) | Understanding every mechanism; exercises and tests | One session per process at a time; thread timeouts can't kill the thread; checkpoints, idempotency, and rate limits live in memory or local files; injection detection and PII redaction are regex-based |
+| [`agentkit/aio/`](agentkit/aio/) | Production async runtime `AsyncAgent` | Hundreds to thousands of concurrent sessions per process | Verified by measurement in Lesson 30; in-process bulkheads and rate limits must move to Redis or a gateway once you run multiple instances |
+| [`agentkit/contrib/`](agentkit/contrib/) | Adapters for mature components: Postgres, Redis, Temporal, OpenTelemetry, LiteLLM, Cedar, guardrail classifiers | Multi-instance, multi-worker deployments | Tested for real against embedded Postgres, fakeredis, and the Temporal dev server; failover, cluster sharding, and multi-region were not tested |
+| [`production/`](production/) | A reference service tying it all together: API, workers, load test, failure injection, docker-compose, Kubernetes | A blueprint for your own service | A reference implementation, not a hosted product; deployment configs were not started with Docker on the author's machine |
+
+For each module — limits → production replacement → migration steps → pitfalls — see the [📋 production readiness guide](docs/production-readiness.en.md).
 
 ## 🗺 What you will build
 
@@ -109,6 +122,35 @@ agent.run  6231ms  tokens=973→106  status=completed steps=2 cost=$0.00228
 └─ llm.chat  3534ms  tokens=533→54  → final_answer
 ```
 
+To go to production, swap in the async runtime and mature components — **same interfaces** (this code was run end to end against embedded Postgres, fakeredis, and a real model):
+
+```python
+from agentkit.aio import AsyncAgent, AsyncResilientLLM, KeyedLimiter
+from agentkit.contrib.gateway import AsyncLiteLLMRouterLLM
+from agentkit.contrib.postgres import AsyncPostgresCheckpointer
+from agentkit.contrib.redis_store import AsyncRedisIdempotencyStore, AsyncRedisTokenBucket, AsyncRateLimitHook
+from agentkit.contrib.otel import OTelTracer, PrometheusHook, setup_tracing
+from agentkit.contrib.policy import CedarPolicy
+
+checkpointer = AsyncPostgresCheckpointer(dsn)
+await checkpointer.setup()
+agent = AsyncAgent(
+    AsyncResilientLLM(AsyncLiteLLMRouterLLM.from_env(), max_concurrency=20),  # gateway routing + fallback; in-process concurrency cap
+    tools,
+    hooks=[
+        CedarPolicy("policies.cedar", tools=tools),                                   # policy as code (Lesson 29)
+        AsyncRateLimitHook(AsyncRedisTokenBucket(redis, rate_per_sec=5, capacity=10)),  # cross-instance per-tenant rate limit (Lesson 26)
+        PrometheusHook(),                                                             # metrics (Lesson 28)
+    ],
+    checkpointer=checkpointer,                             # shared, CAS-protected checkpoints (Lesson 26)
+    idempotency_store=AsyncRedisIdempotencyStore(redis),   # cross-process idempotency (Lesson 26)
+    tracer=OTelTracer(setup_tracing("itbuddy")),           # OpenTelemetry with GenAI semantic conventions (Lesson 28)
+    limiter=KeyedLimiter(per_key=5, global_limit=200),     # at most 5 concurrent runs per tenant (Lesson 30)
+    run_timeout=120,
+)
+result = await agent.run("How do I connect to the VPN?", metadata={"tenant_id": "acme", "user_id": "alice", "roles": ["employee"]})
+```
+
 ## 🚀 Quick start
 
 ```bash
@@ -134,11 +176,12 @@ make check-env                                  # checks connectivity and tool-c
 
 ## 📚 Curriculum
 
-The course has three parts. **Part 1 teaches you how to build an agent. Part 2 teaches you which solution to pick when an enterprise problem shows up. Part 3 teaches you how to make an agent keep getting better.** Parts 1–2 plus the capstone take about 5.5 hours; Part 3 adds about 3.5 hours and is meant as the advanced track. If you are short on time, take the [4-hour fast track](lessons/00_overview/README.en.md) (read only the "core path" at the top of each lesson).
+The course has four parts. **Part 1 teaches you how to build an agent. Part 2 teaches you which solution to pick when an enterprise problem shows up. Part 3 teaches you how to make an agent keep getting better. Part 4 teaches you how to run it in production on mature components.** Parts 1–2 plus the capstone take about 5.5 hours (the main track); Part 3 (~3.5 hours) and Part 4 (~3 hours) are the advanced tracks. If you are short on time, take the [4-hour fast track](lessons/00_overview/README.en.md) (read only the "core path" at the top of each lesson).
 
 - **Part 1**: concept → build it from scratch → exercise. It ends with Lesson 07, the **engineering-perspectives map**: 20 engineering dimensions, each split into **universal checks** (every project needs them) and **situational triggers** ("when X, consider Y"). It is your map for Part 2.
 - **Part 2**: every lesson is a set of **enterprise problem cards**. Each card gives a concrete scenario with real numbers, explains why the obvious fix breaks, compares 2–5 solutions (pros, cons, and the scale where each fits), says how to choose, and then shows code.
 - **Part 3**: deeper building blocks (retrieval, memory, MCP, frameworks), the ML loop that keeps an agent improving (data → evaluation → optimization), and the application frontier: coding agents and proactive agents.
+- **Part 4**: replace the teaching implementations with mature components, **keeping the same interfaces**. Every lesson covers why the teaching version falls short → component options compared → how the adapter plugs in → operations and pitfalls, and proves it with real processes, real concurrency, and failure injection.
 
 Every lesson follows the same loop: **read the notes → run the demo → write the exercise → `make lesson N=xx` until the tests pass → go through the self-check list**. Each lesson opens with one 📖 primary reading.
 
@@ -183,6 +226,17 @@ Every lesson follows the same loop: **read the notes → run the demo → write 
 | 24 | [Coding agents and long-running harnesses](lessons/24_coding_agents/README.en.md) | 25m | **Build a coding agent that fixes bugs**: ACI tools, test protection, diff review, cross-session handoff |
 | 25 | [Proactive agents and the frontier](lessons/25_proactive_and_frontier/README.en.md) | 20m | User models, a when-to-interrupt decider, frontier directions and open problems, a course recap |
 
+### Part 4 — Production on mature components (~175 min)
+
+| # | Lesson | Time | What you learn / verify yourself | Core source |
+|---|---|---|---|---|
+| 26 | [State, queues, and distributed coordination: Postgres and Redis](lessons/26_state_and_queues/README.en.md) | 30m | CAS checkpoints with fence takeover, a `SKIP LOCKED` job queue, async workers with backpressure, Redis idempotency / Lua token bucket / fenced locks; zero duplicate side effects under multi-process kill -9 | [postgres.py](agentkit/contrib/postgres.py) · [redis_store.py](agentkit/contrib/redis_store.py) |
+| 27 | [Durable workflows: running agents on Temporal](lessons/27_durable_workflows/README.en.md) | 30m | Activity retries, Signal/Update approvals, continue-as-new, determinism and versioning; a new worker takes over after kill -9 | [temporal.py](agentkit/contrib/temporal.py) |
+| 28 | [Production observability: OpenTelemetry, Prometheus, and LLM observability platforms](lessons/28_production_observability/README.en.md) | 25m | GenAI semantic conventions, trace propagation across queues, tail sampling and redaction, burn-rate alerts, a Grafana dashboard; no cross-talk across 50 concurrent runs | [otel.py](agentkit/contrib/otel.py) |
+| 29 | [Model gateways, policy as code, and guardrail services](lessons/29_gateway_and_guardrails/README.en.md) | 30m | LiteLLM routing and fallback, Cedar policies (fail closed), cascaded guardrail classifiers (precision 0.42 → 0.92) | [gateway.py](agentkit/contrib/gateway.py) · [policy.py](agentkit/contrib/policy.py) · [guards.py](agentkit/contrib/guards.py) |
+| 30 | [**Async runtime and high-concurrency serving**](lessons/30_async_runtime/README.en.md) | 30m | 200 sessions: sync serial 83 s → AsyncAgent 0.45 s; real cancellation, hard timeouts, bulkheads, streaming; concurrency bugs found by measurement and fixed | [agentkit/aio/](agentkit/aio/) |
+| 31 | [Deployment and scaling: from one machine to a cluster](lessons/31_deployment_and_scaling/README.en.md) | 30m | API/worker split, queue-depth autoscaling, graceful-shutdown timelines, load tests and failure injection | [production/](production/) |
+
 ### 🎓 Capstone (30 min)
 
 [**ITBuddy, an enterprise IT help-desk agent**](capstone/README.en.md) puts everything together into one working system: a CLI, an HTTP API with asynchronous approvals, a realistic design doc with a threat model and ADRs, 24 eval cases (10 of them security cases), a component ablation study, and a [report template](capstone/REPORT_TEMPLATE.en.md) for your own project (baselines, ablations, and error analysis required).
@@ -215,7 +269,7 @@ Stanford's Fall 2026 course [CS 329Z: Engineering AI Agents](https://cs329z.stan
 | W11 Proactive Agents · Open Problems | [25 Proactive agents and the frontier](lessons/25_proactive_and_frontier/README.en.md) |
 | Project: baselines, ablations, error analysis, reproducibility | [Capstone](capstone/README.en.md) · [report template](capstone/REPORT_TEMPLATE.en.md) |
 
-In the other direction, this project **leans harder into running agents in enterprise production**, so it complements CS329Z: [08 Reliability](lessons/08_reliability/README.en.md), [10 Observability](lessons/10_observability/README.en.md), [12 Production architecture](lessons/12_production_architecture/README.en.md), [13 Distributed execution](lessons/13_distributed_concurrency/README.en.md), [14 Cost](lessons/14_cost_latency/README.en.md), [16 Release ops](lessons/16_release_ops/README.en.md), plus multi-tenancy, permissions, and auditing throughout.
+In the other direction, this project **leans harder into running agents in enterprise production**, so it complements CS329Z: [08 Reliability](lessons/08_reliability/README.en.md), [10 Observability](lessons/10_observability/README.en.md), [12 Production architecture](lessons/12_production_architecture/README.en.md), [13 Distributed execution](lessons/13_distributed_concurrency/README.en.md), [14 Cost](lessons/14_cost_latency/README.en.md), [16 Release ops](lessons/16_release_ops/README.en.md), all of Part 4 ([26](lessons/26_state_and_queues/README.en.md)–[31](lessons/31_deployment_and_scaling/README.en.md): Postgres/Redis, Temporal, OpenTelemetry, gateways and policy, async runtime, deployment and scaling), plus multi-tenancy, permissions, and auditing throughout.
 
 Other Stanford agent courses: [CS 329A: Self-Improving AI Agents](https://cs329a.stanford.edu/) (research-oriented) and CS 222: AI Agents and Simulations.
 
@@ -231,6 +285,7 @@ Other Stanford agent courses: [CS 329A: Self-Improving AI Agents](https://cs329a
 | [🔁 Framework comparison](docs/framework-comparison.en.md) | agentkit concepts ↔ LangGraph / OpenAI Agents SDK / Claude Agent SDK / ADK … |
 | [📄 Cheatsheet](docs/cheatsheet.en.md) | Principles, default parameters, decision trees; printable |
 | [📖 Glossary](docs/glossary.en.md) | 246 terms, English ↔ Chinese, explained in plain words |
+| [📋 Production readiness guide](docs/production-readiness.en.md) | What each teaching module lacks for production, what to replace it with, how to migrate, plus a P0 pre-launch list |
 | [📚 Reading list](docs/reading-list.en.md) | 135 curated and verified papers, posts, and specs, with reading paths by role |
 
 ## 🧱 Repository layout
@@ -248,9 +303,12 @@ hello-agent-system/
 │   ├── permissions.py   #   RBAC + human approval
 │   ├── tracing.py       #   tracing (OpenTelemetry GenAI style)
 │   ├── viewer.py        #   self-contained HTML trace viewer
-│   └── evals.py         #   eval framework
-├── lessons/NN_topic/    # 26 lessons: README.md + README.en.md / demo.py / exercise.py / solution.py / test_exercise.py
+│   ├── evals.py         #   eval framework
+│   ├── aio/             #   production async runtime: AsyncAgent, streaming, cancellation, bulkheads, async retry/breaker (Lesson 30)
+│   └── contrib/         #   mature-component adapters: postgres / redis_store / temporal / otel / gateway / policy / guards (Lessons 26–29)
+├── lessons/NN_topic/    # 32 lessons: README.md + README.en.md / demo.py / exercise.py / solution.py / test_exercise.py
 ├── capstone/            # ITBuddy (CLI + HTTP API + design doc + eval set)
+├── production/          # production reference service: API + multiple workers + load test + failure injection + docker-compose / Kubernetes (Lesson 31)
 ├── docs/                # reference docs (bilingual)
 ├── scripts/             # progress board, link checker
 └── tests/               # framework tests (all offline)
@@ -287,7 +345,7 @@ Any OpenAI-compatible endpoint that supports function calling. The author develo
 <details>
 <summary><b>Can I use agentkit in production?</b></summary>
 
-Its **design patterns** are production-grade, but the implementation is for teaching: synchronous, single-process, in-memory storage. In production, move checkpoints to a database, tracing to OpenTelemetry, and tool execution into a sandbox — Lesson 12 and Lesson 13 cover how.
+Not the `agentkit` core: it is a synchronous, single-process, in-memory teaching implementation meant to make every mechanism readable. The production path is `agentkit.aio` (async runtime) + `agentkit.contrib` (Postgres, Redis, Temporal, OpenTelemetry, LiteLLM, Cedar adapters) + `production/` (reference service), with the same interfaces as the teaching version. They are tested with real concurrency, real processes, and failure injection, but they are still reference implementations, not a hosted product. What is done and what you still need to add is listed item by item in the [production readiness guide](docs/production-readiness.en.md).
 </details>
 
 ## 🤝 Contributing
