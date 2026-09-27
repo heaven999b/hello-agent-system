@@ -118,8 +118,10 @@ async def run_in_subprocess(fn, kwargs: dict, timeout: float):
     finally:
         if proc.is_alive():
             proc.kill()  # 超时或被取消：直接杀掉，不给它继续消耗 CPU 的机会
-        await asyncio.shield(loop.run_in_executor(None, proc.join, 2))  # join 也可能阻塞：放进线程；被取消也要把僵尸进程收掉
-        parent.close()
+        try:
+            await asyncio.shield(loop.run_in_executor(None, proc.join, 2))  # join 也可能阻塞：放进线程；被取消也要把僵尸进程收掉
+        finally:
+            parent.close()  # 即使在等待 join 时被取消，管道也要立即关闭，不能等垃圾回收
     if kind == "ok":
         return payload
     if kind == "tool_error":

@@ -714,3 +714,51 @@ def test_half_open_breaker_lets_only_one_probe_through():
 
 def test_tool_schema_is_cached():
     assert add.schema() is add.schema()
+
+
+class CASStore:
+    """模拟带版本号 CAS 的数据库检查点：UPDATE 在数据库提交后，响应还要一段时间才回到客户端。
+    如果取消恰好打在"已提交、未收到响应"之间，本地记住的版本号就过期了。"""
+
+    def __init__(self):
+        self.db, self.local, self.conflicts = {}, {}, 0
+
+    async def save(self, state):
+        payload = state.to_json()
+        expected = self.local.get(state.run_id, 0)
+        await asyncio.sleep(0.002)  # 请求发往数据库
+        version, _ = self.db.get(state.run_id, (0, None))
+        if version != expected:
+            self.conflicts += 1
+            raise RuntimeError(f"CheckpointConflict: expected {expected}, got {version}")
+        self.db[state.run_id] = (version + 1, payload)  # 数据库已提交
+        await asyncio.sleep(0.004)  # 响应在路上 —— 取消最容易打在这里
+        self.local[state.run_id] = version + 1
+
+    async def load(self, run_id):
+        from agentkit.state import RunState
+
+        return RunState.from_dict(json.loads(self.db[run_id][1])) if run_id in self.db else None
+
+
+def test_cancel_between_db_commit_and_response_never_strands_the_run():
+    """第 30 课 R1：只保护收尾那次保存还不够，运行中途的每一次异步保存都必须 shield。"""
+
+    async def one(delay):
+        store = CASStore()
+        llm = AsyncScriptedLLM([call_tool("add", a=1, b=1), reply("晚了")], latency=lambda n: 0 if n == 1 else 30)
+        agent = AsyncAgent(llm, [add], checkpointer=store)
+        task = asyncio.create_task(agent.run("x", run_id="r"))
+        await asyncio.sleep(delay)  # 在不同时刻取消，覆盖"保存进行到一半"的各种位置
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        state = await agent._load("r")
+        return state.status, store.conflicts
+
+    async def main():
+        return [await one(d / 1000) for d in range(1, 40, 2)]
+
+    outcomes = run(main())
+    assert all(status == "cancelled" for status, _ in outcomes), outcomes
+    assert all(conflicts == 0 for _, conflicts in outcomes)

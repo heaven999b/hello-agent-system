@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import inspect
+import logging
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -37,6 +39,8 @@ from ..types import LLMResponse, Message, ToolCall, calls_in, system, tool_messa
 from .limits import KeyedLimiter, KeyedLocks, LimitExceeded
 from .llm import StreamDone, TextDelta
 from .tools import AsyncToolExecutor, maybe_await
+
+logger = logging.getLogger("agentkit.aio")
 
 
 # ------------------------------------------------------------------------------------ 流式事件
@@ -87,6 +91,20 @@ def _emit(event: AgentEvent) -> None:
 
 async def _call_hook(hook: Hook, method: str, *args):
     return await maybe_await(getattr(hook, method)(*args))
+
+
+def _snapshot(state: RunState) -> RunState:
+    """浅快照：复制各个容器（消息列表、元数据……），不深拷贝每条消息，开销很小。"""
+    return dataclasses.replace(
+        state,
+        messages=[dict(m) for m in state.messages],
+        metadata=dict(state.metadata),
+        approvals=dict(state.approvals),
+        tool_log=list(state.tool_log),
+        approval_log=list(state.approval_log),
+        pending=dict(state.pending) if state.pending else None,
+        usage=dataclasses.replace(state.usage),
+    )
 
 
 # ------------------------------------------------------------------------------------ AsyncAgent
@@ -289,19 +307,22 @@ class AsyncAgent:
             # 收尾（on_run_end 钩子 + 最后一次保存）放进一个独立任务并用 shield 保护：
             # Web 框架（例如 Starlette/AnyIO）断开连接时可能**反复**取消，第二次取消如果打断了这次保存，
             # 检查点就会永远停在 running。shield 保证收尾任务跑完；外层照样收到取消并继续向外传播。
-            finish = asyncio.ensure_future(self._finish(state))
+            finish = asyncio.ensure_future(self._finish(state, slot if entered else None))
             try:
                 await asyncio.shield(finish)
             finally:
                 Agent._annotate(span, state, cost_before)
-                if entered:
-                    await slot.__aexit__(None, None, None)  # 只做同步的释放操作，被取消时也能完成
         return pending
 
-    async def _finish(self, state: RunState) -> None:
-        for h in self.hooks:
-            await _call_hook(h, "on_run_end", state)
-        await self._save(state)
+    async def _finish(self, state: RunState, slot=None) -> None:
+        try:
+            for h in self.hooks:
+                await _call_hook(h, "on_run_end", state)
+            await self._save(state)
+        finally:
+            # 舱壁名额在收尾真正完成后才释放：即使外层被再次取消、不再等待这个任务，也是如此
+            if slot is not None:
+                await slot.__aexit__(None, None, None)
 
     async def _prepare_and_loop(self, state: RunState, prepare) -> None:
         if prepare is not None:
@@ -477,6 +498,9 @@ class AsyncAgent:
                 # 用 wait 而不是 await task：如果这里再次被取消，await task 会把取消**转发**给运行任务，
                 # 打断它的收尾；wait 只是等待，不转发取消
                 await asyncio.wait({task})
+                if not task.cancelled() and task.exception() is not None:
+                    # 消费方已经走了，没人会接收这个异常：记录下来，而不是留一句 "exception was never retrieved"
+                    logger.warning("流式运行在消费方断开后以异常结束：%r", task.exception())
 
     # ------------------------------------------------------------------ 辅助
 
@@ -498,9 +522,24 @@ class AsyncAgent:
         return _run_checkpointer.get() or self.checkpointer
 
     async def _save(self, state: RunState) -> None:
-        # 同步或异步的检查点都支持；同一个 run 的读写按顺序排队
-        async with self._io_locks.hold(state.run_id):
-            await maybe_await(self._checkpointer().save(state))
+        """保存检查点。同一个 run 的读写按顺序排队。
+
+        异步检查点的**每一次**保存都放进独立任务并 shield：如果取消打断了一次"数据库已提交、
+        但客户端还没收到回复"的 UPDATE，带版本号 CAS 的检查点在本地记住的版本号就过期了，
+        之后的收尾保存会被当成冲突拒绝，状态永远停在 running（第 30 课 R1，实测约 4%）。
+        shield 保证每次保存都完整走完；为了不和之后的修改互相影响，保存的是一份浅快照。
+        同步检查点的 save 中间没有 await，不可能被取消打断，直接写，省掉创建任务的开销。
+        """
+        cp = self._checkpointer()
+        if not inspect.iscoroutinefunction(getattr(cp, "save", None)):
+            cp.save(state)
+            return
+        snapshot = _snapshot(state)
+        await asyncio.shield(asyncio.ensure_future(self._save_now(cp, snapshot)))
+
+    async def _save_now(self, cp, snapshot: RunState) -> None:
+        async with self._io_locks.hold(snapshot.run_id):
+            await cp.save(snapshot)
 
     async def _load(self, run_id: str) -> RunState | None:
         async with self._io_locks.hold(run_id):
