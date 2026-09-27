@@ -10,7 +10,7 @@
 缺少可选依赖时打印安装命令并以退出码 0 结束。
 
 四个部分：
-  1. 3 个 worker 进程 × 3 个租户 × 30 个任务：按租户限流（Redis Lua 令牌桶）、建工单（下游唯一约束做幂等），
+  1. 3 个 worker 进程 × 3 个租户 × 31 个任务（30 个普通任务 + 1 个需要审批的改密码）：按租户限流（Redis Lua 令牌桶）、建工单（下游唯一约束做幂等），
      中途 kill -9 一个 worker、冻结（SIGSTOP）两个 worker 制造"僵尸"，最后统计：没有重复工单、fence 拒绝了
      僵尸的提交、检查点冲突被检测到；然后用 SIGTERM 优雅停机。
   2. 审批：收件箱里查出等待审批的 run → 批准 → 入队 resume（重复点击只入队一次）→ 一个全新的 worker 进程恢复执行。
@@ -466,6 +466,7 @@ class Chaos:
         deadline = time.time() + 60
         while time.time() < deadline:  # 等别的 worker 接手并做完，再让僵尸醒来
             job = self.queue.get(c["job"])
+            # fence 取自全局序列：只要被重新领取过，新 fence 一定比僵尸手里的大（不一定是 +1）
             if job.fence > c["fence"] and job.status in ("succeeded", "failed", "dead"):
                 break
             time.sleep(0.1)
@@ -571,7 +572,7 @@ def report_part1(queue, ckpt, dsn, r, events, jobs, chaos_log, elapsed) -> None:
     kinds = [e["kind"] for e in events]
     dedups = kinds.count("dedup")
     info(f"任务：{s['succeeded']}/{len(jobs)} 成功，failed {s['failed']}，dead {s['dead']}；"
-         f"因崩溃 / 卡死被重新领取的：{', '.join(f'#{i}（第 {a} 次尝试完成，fence={f}）' for i, a, f in multi) or '无'}；"
+         f"因崩溃 / 卡死被重新领取的：{'、'.join(f'#{i}（第 {a} 次尝试完成，fence={f}）' for i, a, f in multi) or '无'}；"
          f"因限流被推迟 {kinds.count('deferred')} 次（不计入尝试次数）")
     ok = "✅" if tickets == keys else "❌"
     info(f"工单：{tickets} 张，幂等键 {keys} 个 → 重复 {tickets - keys} 张 {ok}；下游唯一约束挡下了 {dedups} 次重放")
@@ -625,6 +626,8 @@ def part2(args, dsn: str, redis_url: str, r, ctx) -> None:
     job = queue.get(a)
     final = ckpt.get_run(run_id)
     info(f"resume 任务 #{a}：{job.status}；run {run_id} 现在是 {final['status']}，最后写入者 {final['writer']}")
+    info(f"检查点的 fence：{row['fence']} → {final['fence']}（resume 是一个新任务，第一次领取就从全局序列拿到了更大的 fence，"
+         f"fenced load 接管成功）")
     info(f"回复：{short(final['output'], 60)}")
     for entry in final["state"]["approval_log"]:
         at = time.strftime("%H:%M:%S", time.localtime(entry["at"]))

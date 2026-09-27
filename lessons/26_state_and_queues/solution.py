@@ -114,7 +114,7 @@ def claim_one(conn, worker_id: str, lease_seconds: float) -> dict | None:
         - 否则                    → status='queued'（重新排队）
       两种情况都把 lease_until 清成 NULL。
 
-    第 2 步：原子领取"最老的"可领取任务（status='queued' 且 run_at <= now()，按 run_at, id 排序）：
+    第 2 步：原子领取"最老的"可领取任务（status='queued' 且 run_at <= now()，按 run_at, id 排序（适配器改成了按 id 排序，原因见 README 3.3；本练习只测"先领到最老的可执行任务"，两种写法都对））：
         UPDATE jobs SET status='leased', worker_id=..., lease_until = now() + make_interval(secs => ...),
                         attempts = attempts + 1, fence = fence + 1
         WHERE id = (SELECT id FROM jobs WHERE ... ORDER BY run_at, id LIMIT 1 FOR UPDATE SKIP LOCKED)

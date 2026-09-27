@@ -105,6 +105,8 @@ sequenceDiagram
     DB-->>A: 0 rows → CheckpointConflict, stop
 ```
 
+The fence=1 and fence=2 in the diagram only show which came first. Real fences come from one sequence shared by the whole queue table and only ever go up: when a later job for the same run (say, the resume job enqueued after an approval) is claimed for the first time, its fence is still larger than every previous holder's. Section 3.3 explains why it has to be this way.
+
 **How to choose**: default to A, and **let the queue's fence drive checkpoint takeover** (`AgentJobHandler` already does). If the state is very large (hundreds of KB or more), or you need "time travel" and branching, look at how LangGraph splits checkpoints across tables and writes increments per version. If the process spans days and needs reliable timers, go straight to Lesson 27.
 
 **This lesson's implementation**: [`PostgresCheckpointer`](../../agentkit/contrib/postgres.py), plus the async `AsyncPostgresCheckpointer` (for `agentkit.aio.AsyncAgent`, identical semantics). The test `test_plain_cas_is_first_writer_wins_but_fenced_takeover_makes_newest_holder_win` checks "first writer wins" and "newest holder wins" side by side. In one real-model run of part 1 of the demo, the frozen worker-3 wakes up, tries to write the checkpoint, and gets `Checkpoint conflict: run job-6 expected version 2, actual version 7 (last writer worker-1)`.
@@ -357,6 +359,7 @@ Design decisions:
 2. **Conflicts raise; they don't return False.** `Agent` saves on every step, so the exception propagates out of `agent.run`, and the worker classifies it as "ownership moved" and commits nothing. A return value is easy to ignore, and this signal means "stop now."
 3. **NUL characters.** Postgres `jsonb` can't store `\u0000` ([docs](https://www.postgresql.org/docs/current/datatype-json.html)), so a single tool returning binary content would fail the whole checkpoint write. The adapter replaces NUL with U+FFFD: getting the data stored matters more than byte-for-byte fidelity.
 4. **`get_run` / `list_runs` are read-only**: they don't take over or record versions; they're for the API and operators.
+5. **Versions are remembered only for runs that are still running.** The instance keeps each run's version in memory (`version_of`) for the next CAS. As soon as it saves a status other than running (completed, paused, cancelled, …), it drops that run's version: resuming and approving both `load` first, which records the latest version again. The first version only ever added entries, and a shared checkpointer serves thousands of runs, so the dict grew without bound: a memory leak (found in the Lesson 31 load test, now fixed; regression test `test_shared_checkpointer_forgets_versions_of_finished_runs`).
 
 ### 3.3 The queue: reap + claim
 
@@ -367,9 +370,12 @@ UPDATE agent_jobs SET status = CASE WHEN attempts >= max_attempts THEN 'dead' EL
  WHERE id IN (SELECT id FROM agent_jobs WHERE status = 'leased' AND lease_until < now()
               ORDER BY lease_until LIMIT 100 FOR UPDATE SKIP LOCKED);
 
--- Claim
+-- At table creation (setup()): one fence sequence shared by the whole queue table
+CREATE SEQUENCE IF NOT EXISTS agent_jobs_fence_seq;
+
+-- Claim: the fence is the sequence's next value, so it only ever goes up across the whole table
 UPDATE agent_jobs SET status = 'leased', worker_id = $me, lease_until = now() + $lease,
-                      attempts = attempts + 1, fence = fence + 1
+                      attempts = attempts + 1, fence = nextval('agent_jobs_fence_seq'::regclass)
  WHERE id = (SELECT id FROM agent_jobs
               WHERE status = 'queued' AND run_at <= now()
               ORDER BY priority DESC, id LIMIT 1
@@ -379,10 +385,12 @@ RETURNING *;
 
 - **SKIP LOCKED**: the PostgreSQL docs say plainly that skipping locked rows gives an inconsistent view of the data, unsuitable for general use, but useful for avoiding lock contention when multiple consumers access a queue-like table ([docs](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)). The test for exercise (b) holds a row lock and doesn't let go: without `SKIP LOCKED`, your implementation queues up behind it.
 - **Why reap back to `queued` instead of letting claim take expired rows directly?** Claim then scans only one partial index, `(priority DESC, id) WHERE status = 'queued'`, which stays a single index scan however large the backlog gets. The price: once a job is reaped, the old holder's late commit is rejected (its ownership ended at the moment of reaping). Before reaping, a late commit still counts, as in Lesson 13.
-- **Order by `id`, not `run_at`.** The first version used `ORDER BY run_at, id`. In the demo, a worker was killed at 1.7 s and nobody took over until 10.6 s, with a lease of only 2 s: reaping set `run_at` to "now + backoff," which sent the job to the **back of the queue** behind the whole backlog. Its user had already waited once and shouldn't have to queue again. After switching to enqueue order (`id`), a job whose backoff has elapsed goes back to its original place: in the same scenario it was taken over at 5.8 s (after waiting for the only free worker to finish its current job); in real-model mode, a worker killed at 11.6 s had its job taken over at 14.4 s (3 s lease).
+- **Order by `id`, not `run_at`.** The first version used `ORDER BY run_at, id`. In the demo, a worker was killed at 1.7 s and nobody took over until 10.6 s, with a lease of only 2 s: reaping set `run_at` to "now + backoff," which sent the job to the **back of the queue** behind the whole backlog. Its user had already waited once and shouldn't have to queue again. After switching to enqueue order (`id`), a job whose backoff has elapsed goes back to its original place: in the same scenario it is now killed at 0.9 s and taken over at 3.2 s, little more than the 2 s lease; in real-model mode, a worker killed at 11.6 s had its job taken over at 14.4 s (3 s lease).
 - **All times come from the database's `now()`**: every worker judges leases by the same clock.
 - **`attempts` is incremented on claim**, so poison messages still reach the dead-letter state (Lesson 13, Problem 3); `release()` (graceful shutdown, rate-limit deferral) gives that attempt back.
 - **`redrive` doesn't reset the fence**: fences must only go up, or an old holder's fence could come back to life.
+- **Fences must go up globally, not per job.** Checkpoint fence takeover protects a run, not a job, and one run maps to several jobs over time: the run job, then the resume job enqueued after an approval. The fence a later job gets on its first claim has to be larger than that of every earlier holder of the run, or its `fenced(fence).load` can't take over. That's why the fence comes from a sequence shared by the whole table instead of counting from 1 for each job.
+- **Found in testing → fixed: the first version counted fences per job.** The original claim said `fence = fence + 1`, so every job counted from 1. The Lesson 31 load test found the problem: once a run job had been taken over (fence=2), the resume job enqueued later got fence=1 on its first claim and was rejected by the checkpoint as an older holder (`CheckpointConflict` → `ownership_lost`), stuck until its lease expired. The more often the run job was claimed again (taken over, or reclaimed after a rate-limit deferral), the larger its fence; once that exceeded `max_attempts`, every claim of the resume job was rejected until it was dead-lettered. The fix: the queue table gets a sequence, `agent_jobs_fence_seq`, and claim uses `nextval`; `setup()` creates the sequence, and when upgrading an existing table it uses `setval` so the sequence continues after the table's current `max(fence)`, since otherwise new fences could be smaller than old ones. If a migration tool manages your schema, put the sequence and this `setval` step in the migration. Regression tests: `test_fence_is_global_so_a_later_job_for_the_same_run_can_take_over` and `test_upgrading_from_per_job_fences_continues_after_the_largest_existing_fence` ([`tests/contrib/test_postgres.py`](../../tests/contrib/test_postgres.py)).
 
 ### 3.4 Workers and graceful shutdown
 
@@ -455,82 +463,87 @@ Without the optional dependencies, the demo prints `pip install -e ".[prod,prod-
 **Part 1: 3 worker processes × 3 tenants × 31 jobs** (actual offline output, excerpt; demo output translated from Chinese.)
 
 ```text
-   [+  1.6s] worker-2 │ 🧾 Created ticket T-1004 (idempotency key job-5:call_c80218574ca8)
-   [+  1.6s] worker-1 │ 🧾 Created ticket T-1005 (idempotency key job-6:call_8ce4d4d67eda)
-   [+  1.6s] worker-2 │ Ticket created, but the result isn't in the checkpoint yet…
-   [+  1.6s] worker-1 │ Ticket created, but the result isn't in the checkpoint yet…
-   [+  1.7s] scheduler │ 💥 kill -9 worker-2 (pid 44528): no lease release, no checkpoint, no last words
-   [+  1.7s] scheduler │ 🔁 Started replacement worker-4 (like Kubernetes restarting a dead pod)
-   [+  1.9s] scheduler │ 🧊 SIGSTOP worker-1: the whole process is frozen (heartbeat thread too); lease expires in 2 s
-   [+  3.4s] worker-3 │ 😵 Agent finished; process frozen before committing the result (simulated GC pause)
-   [+  3.5s] scheduler │ 🧊 SIGSTOP worker-3: the whole process is frozen (heartbeat thread too); lease expires in 2 s
-   [+  5.8s] worker-4 │ Taking over job #5 (claim #2, fence=2): found predecessor worker-2's checkpoint (status=running, step 1) → resuming
-   [+  5.8s] worker-4 │ ♻️  Downstream unique constraint hit: returned existing ticket T-1004, no duplicate created
-   [+  5.9s] worker-4 │ Taking over job #6 (claim #2, fence=2): found predecessor worker-1's checkpoint (status=running, step 1) → resuming
-   [+  6.0s] worker-4 │ ♻️  Downstream unique constraint hit: returned existing ticket T-1005, no duplicate created
-   [+  6.2s] worker-4 │ Taking over job #7 (claim #2, fence=2): found predecessor worker-3's checkpoint (status=completed, step 2) → resuming
-   [+  6.2s] scheduler │ ▶️  SIGCONT worker-3: job #7 was finished by someone else long ago; the zombie wakes up
-   [+  6.2s] worker-3 │ 💔 Heartbeat rejected: job #7's fence is stale; the lease stopped being mine a while ago
-   [+  6.2s] worker-3 │ ❌ Commit rejected (LeaseLost): job #7 was reclaimed: current fence=2 (holder worker-4), your fence=1 is stale, commit rejected…
-   [+  6.2s] scheduler │ ▶️  SIGCONT worker-1: job #6 was finished by someone else long ago; the zombie wakes up
-   [+  6.2s] worker-1 │ Awake! The tool returns, and the agent goes on writing to the checkpoint…
-   [+  6.2s] worker-1 │ 💔 Heartbeat rejected: job #6's fence is stale; the lease stopped being mine a while ago
-   [+  6.2s] worker-1 │ ❌ Checkpoint conflict (CheckpointConflict): run job-6 expected version 2, actual version 7 (last writer worker-4) — another work…
+   [+  0.8s] worker-2 │ 🧾 Created ticket T-1004 (idempotency key job-5:call_18115252a824)
+   [+  0.8s] worker-2 │ Ticket created, but the result isn't in the checkpoint yet…
+   [+  0.8s] worker-3 │ 🧾 Created ticket T-1005 (idempotency key job-6:call_3a21d26b8f73)
+   [+  0.8s] worker-3 │ Ticket created, but the result isn't in the checkpoint yet…
+   [+  0.9s] scheduler │ 💥 kill -9 worker-2 (pid 17903): no lease release, no checkpoint, no last words
+   [+  0.9s] scheduler │ 🔁 Started replacement worker-4 (like Kubernetes restarting a dead pod)
+   [+  1.0s] scheduler │ 🧊 SIGSTOP worker-3: the whole process is frozen (heartbeat thread too); lease expires in 2 s
+   [+  2.7s] worker-1 │ 😵 Agent finished; process frozen before committing the result (simulated GC pause)
+   [+  2.8s] scheduler │ 🧊 SIGSTOP worker-1: the whole process is frozen (heartbeat thread too); lease expires in 2 s
+   [+  3.2s] worker-4 │ Taking over job #5 (claim #2, fence=13): found predecessor worker-2's checkpoint (status=running, step 1) → resuming
+   [+  3.2s] worker-4 │ ♻️  Downstream unique constraint hit: returned existing ticket T-1004, no duplicate created
+   [+  3.4s] worker-4 │ Taking over job #6 (claim #2, fence=14): found predecessor worker-3's checkpoint (status=running, step 1) → resuming
+   [+  3.4s] worker-4 │ ♻️  Downstream unique constraint hit: returned existing ticket T-1005, no duplicate created
+   [+  3.6s] scheduler │ ▶️  SIGCONT worker-3: job #6 was finished by someone else long ago; the zombie wakes up
+   [+  3.6s] worker-3 │ Awake! The tool returns, and the agent goes on writing to the checkpoint…
+   [+  3.6s] worker-3 │ 💔 Heartbeat rejected: job #6's fence is stale; the lease stopped being mine a while ago
+   [+  3.6s] worker-3 │ ❌ Checkpoint conflict (CheckpointConflict): run job-6 expected version 2, actual version 7 (last writer worker-4) — another work…
+   [+  5.5s] worker-3 │ Taking over job #7 (claim #2, fence=20): found predecessor worker-1's checkpoint (status=completed, step 2) → resuming
+   [+  5.6s] scheduler │ ▶️  SIGCONT worker-1: job #7 was finished by someone else long ago; the zombie wakes up
+   [+  5.6s] worker-1 │ Awake! Still thinks it holds the lease, so it goes on committing the result…
+   [+  5.6s] worker-1 │ 💔 Heartbeat rejected: job #7's fence is stale; the lease stopped being mine a while ago
+   [+  5.6s] worker-1 │ ❌ Commit rejected (LeaseLost): job #7 was reclaimed: current fence=20 (holder worker-3), your fence=7 is stale, commit rejected…
 
 ▶ All jobs done → SIGTERM every worker (graceful shutdown: stop claiming, finish the current job, exit)
    Exit codes: worker-1=0, worker-2=-9, worker-3=0, worker-4=0 (-9 = killed with kill -9; 0 = exited normally after SIGTERM)
 
-▶ 📊 Results (19.7 s)
-   Jobs: 31/31 succeeded, failed 0, dead 0; reclaimed after a crash / freeze: #5, #6, #7 (each finished on attempt 2, fence=2); deferred by rate limiting 16 times (not counted as attempts)
+▶ 📊 Results (19.3 s)
+   Jobs: 31/31 succeeded, failed 0, dead 0; reclaimed after a crash / freeze: #5 (finished on attempt 2, fence=13), #6 (finished on attempt 2, fence=14), #7 (finished on attempt 2, fence=20); deferred by rate limiting 21 times (not counted as attempts)
    Tickets: 18, idempotency keys 18 → 0 duplicates ✅; the downstream unique constraint stopped 2 replays
    Fence: rejected 1 commit and 2 heartbeats from zombie workers ✅
    Checkpoints: 1 conflict detected (a zombie trying to write after being taken over) ✅
 
    Tenant    Plan               Model calls  Deferred  Token wait total  Time to finish all
-   acme      standard (4/s)     21           0         0.1s              10.6s
-   globex    standard (4/s)     20           0         0.1s              10.7s
-   initech   free (1/s)         20           16        24.6s             19.6s
+   acme      standard (4/s)     21           0         0.0s              10.9s
+   globex    standard (4/s)     20           0         0.0s              10.9s
+   initech   free (1/s)         20           21        27.4s             19.2s
 ```
 
 One real-model run (gpt-5.5): 7 jobs, 13 model calls, 19.3 s to finish everything; kill -9 at 11.6 s, taken over at 14.4 s (3 s lease); likewise 0 duplicate tickets, 1 commit rejected by the fence, 1 checkpoint conflict. Each real model call takes several seconds, so the free plan's 1 call per second never caused a deferral.
 
 What to look for:
 
-1. **kill -9 (job #5)**: the ticket was created, but the result never reached the checkpoint. The worker that takes over replays the **same** tool call from the checkpoint (same `call_id`, therefore the same idempotency key). The Redis cache misses (the predecessor never got to `put`), and it's the downstream unique constraint that stops the duplicate. Killed at 1.7 s, taken over at 5.8 s, with a 2 s lease: after the lease expires, some worker still has to be free to claim the job, and the only one still working, worker-4, was busy with another job.
+1. **kill -9 (job #5)**: the ticket was created, but the result never reached the checkpoint. The worker that takes over replays the **same** tool call from the checkpoint (same `call_id`, therefore the same idempotency key). The Redis cache misses (the predecessor never got to `put`), and it's the downstream unique constraint that stops the duplicate. Killed at 0.9 s, taken over at 3.2 s: mostly waiting for the 2 s lease to expire, after which the replacement worker-4, the only worker still running at that point (the other two were frozen), picked it up.
 2. **A zombie in mid-run (job #6)**: when it wakes up and writes to the checkpoint, it gets `CheckpointConflict`: expected version 2, actual already 7. The +1 from the takeover plus the new worker's saves all happened while it was "asleep." Its heartbeat is rejected too.
-3. **A zombie at commit time (job #7)**: the new worker finds the checkpoint already `completed`, makes no model call at all, and commits directly; the zombie's commit after waking up is rejected by the fence.
-4. **Rate limiting**: the free tenant's jobs were deferred 16 times (20 in another run), yet **none of that consumed a retry attempt**, and no worker sat idle waiting (at most 1 s each time); the other two tenants barely waited for tokens at all.
-5. **SIGTERM**: the replacement worker and both zombies exit normally (exit code 0); the killed one shows -9.
+3. **A zombie at commit time (job #7)**: the new worker finds the checkpoint already `completed`, makes no model call at all, and commits directly; the zombie's commit after waking up is rejected by the fence. The worker that took it over is worker-3, itself just woken up: a zombie that wakes up can still claim new jobs; only the writes under its old lease are void.
+4. **The fence values**: the three jobs that were taken over got fence=13, 14, and 20, not "claim #2, so 2"; job #7's zombie holds fence=7. Fences come from a sequence shared by the whole queue table (section 3.3), which only guarantees that a later fence is larger than an earlier one.
+5. **Rate limiting**: the free tenant's jobs were deferred 21 times (16 to 20 in other runs), yet **none of that consumed a retry attempt**, and no worker sat idle waiting (at most 1 s each time); the other two tenants barely waited for tokens at all.
+6. **SIGTERM**: the replacement worker and both zombies exit normally (exit code 0); the killed one shows -9.
 
 **Part 2: approval → enqueue resume → a brand-new worker process resumes the run**
 
 ```text
 ▶ Approval inbox: ckpt.list_runs(status='paused') (served by the (status, updated_at) index)
-   run job-2 (tenant acme, user acme-zhang) awaiting approval: reset_password({"user": "zhang.san"}), last writer worker-3
+   run job-2 (tenant acme, user acme-zhang) awaiting approval: reset_password({"user": "zhang.san"}), last writer worker-1
 ▶ Approver alice clicked "approve" — twice, by accident; the API enqueues the resume job with idempotency key approve:<run_id>:<call_id>
    job_ids returned by the two enqueues: #33, #33 → same job ✅
 ▶ Start worker-9, a process that has never existed before (all state is in Postgres, so any process can continue)
-   [+  1.0s] worker-9 │ Claimed job #33 (op=resume, attempt 1, fence=1)
-   [+  1.2s] worker-9 │ ✅ Finished #33 (acme): Password reset; the new password was sent to your corporate email.
+   [+  0.3s] worker-9 │ Claimed job #33 (op=resume, attempt 1, fence=56)
+   [+  0.5s] worker-9 │ ✅ Finished #33 (acme): Password reset; the new password was sent to your corporate email.
    resume job #33: succeeded; run job-2 is now completed, last writer worker-9
-   Approval log: alice approved reset_password at 02:33:09 (verified by phone)
+   Checkpoint fence: 2 → 56 (resume is a new job; on its very first claim it got a larger fence from the global sequence, so the fenced load took over)
+   Approval log: alice approved reset_password at 04:45:04 (verified by phone)
 ```
+
+The resume job #33 got fence=56 on its first claim, not 1. The checkpoint's recorded fence was 2 (what run job #2 got when it was claimed); 56 is larger, so worker-9's fenced load can take over. With the old per-job counting, a resume job's first claim always got fence=1: in this run the run job was never taken over, so it happened to work; had the run job been claimed even once more, the resume job would have been rejected as an older holder (section 3.3).
 
 **Part 3: the same batch of jobs, sync workers vs one async worker process** (24 jobs, 2 model calls each, 0.15 s simulated latency; in real-model mode this part still uses the simulated model, because it measures the worker architecture, not the model's speed)
 
 ```text
    Setup                                   Procs×conc  Pool          Peak conns  Time     Jobs/s  Peak in-flight model calls
-   sync · 1 process                        1 × 1       -             5           8.44s    2.8     1
-   sync · 3 processes                      3 × 1       -             11          3.25s    7.4     3
-   async · 1 process · concurrency 16      1 × 16      16            10          0.66s    36.2    16
-   async · concurrency 16 · pool 4         1 × 16      4             6           0.64s    37.4    16
-   async · concurrency 16 · holds a conn   1 × 16      4 (biz DB)    11          1.93s    12.5    4
+   sync · 1 process                        1 × 1       -             5           7.91s    3.0     1
+   sync · 3 processes                      3 × 1       -             11          2.82s    8.5     3
+   async · 1 process · concurrency 16      1 × 16      16            10          0.65s    36.8    16
+   async · concurrency 16 · pool 4         1 × 16      4             6           0.65s    37.1    16
+   async · concurrency 16 · holds a conn   1 × 16      4 (biz DB)    11          1.93s    12.4    4
 ```
 
 (Peak conns counts the connections open on this database at the same time, including the parent process's connections for enqueueing and stats; for the two sync rows, peak in-flight model calls equals the number of processes, since each sync process can only have one model call in flight.)
 
-1. A sync worker sits idle while it waits for the model, so the only way to go faster is more processes: 3 processes give about 2.6×, and the connection count climbs with them.
-2. One async process drives 16 jobs at once, for about 5× the throughput of 3 sync processes.
+1. A sync worker sits idle while it waits for the model, so the only way to go faster is more processes: 3 processes give about 2.8×, and the connection count climbs with them.
+2. One async process drives 16 jobs at once, for more than 4× the throughput of 3 sync processes.
 3. **The pool's cap is 16, but it only grew to 10 connections on demand** (5 in another run): an agent spends nearly all its time waiting for the model, and checkpoint writes borrow a connection for a few milliseconds. With a 4-connection pool, throughput is the same.
 4. The last row is the anti-pattern: every job holds a connection (to another database) while it waits for the model, so concurrency collapses to the 4 connections and throughput drops to a third.
 
@@ -540,12 +553,12 @@ What to look for:
 ▶ pod-1 starts: concurrency 8, 2 s lease, 0.5 s grace period
    Kubernetes sends SIGTERM: pod-1 stops claiming and waits at most 0.5 s for in-flight jobs
    pod-1 exits: 5 finished, 1 cancelled after the grace period (not committed, not released)
-   run job-5's checkpoint: status=cancelled; the last message is the assistant's write-tool call ['call_5c05db284e91'], with no "not executed" filled in (left unanswered)
+   run job-5's checkpoint: status=cancelled; the last message is the assistant's write-tool call ['call_55243a0fba26'], with no "not executed" filled in (left unanswered)
 ▶ Waiting for the lease to expire on its own (2 s); pod-2 takes over
    pod-2 finished 1
 ▶ 📊 Results
-   pod-1 ran create_ticket, idempotency key job-5:call_5c05db284e91 → created
-   pod-2 ran create_ticket, idempotency key job-5:call_5c05db284e91 → unique constraint hit, returned the existing ticket
+   pod-1 ran create_ticket, idempotency key job-5:call_55243a0fba26 → created
+   pod-2 ran create_ticket, idempotency key job-5:call_55243a0fba26 → unique constraint hit, returned the existing ticket
    Both executions used the same idempotency key ✅
    6 tickets for 6 runs → no duplicates ✅
 ```
@@ -567,6 +580,8 @@ make lesson N=26
 # or: .venv/bin/python -m pytest lessons/26_state_and_queues -v
 ```
 
+This exercise counts fences per job (`fence = fence + 1`), which holds only within a single job: the exercise has no fenced checkpoint takeover and no run that maps to several jobs. The adapter uses a global sequence; section 3.3 explains why.
+
 The tests use the `pg_uri` (a fresh database per test) and `redis_client` (flushed per test) fixtures from the root `conftest.py`, and skip automatically without the optional dependencies. More complete tests for the contrib modules are in [`tests/contrib/test_postgres.py`](../../tests/contrib/test_postgres.py) and [`tests/contrib/test_redis_store.py`](../../tests/contrib/test_redis_store.py), covering conflicts, expiry, duplicates, multi-thread and multi-coroutine concurrency, connection pools, and resuming after cancellation.
 
 ## 6. Common pitfalls and findings from real runs
@@ -587,6 +602,7 @@ The tests use the `pg_uri` (a fresh database per test) and `redis_client` (flush
 | Refilling a token bucket with client time | Machines' clocks drift, and the refills don't add up | Use `redis.call('TIME')` in the script |
 | A lock without fencing, or trusting a Redis INCR token alone | After a failover, two holders write at once | Check the fence in the store; take correctness-critical tokens from Postgres or etcd |
 | Resetting the fence on `redrive` | An old holder's fence can come back to life | Fences only ever go up |
+| Counting fences per job (`fence = fence + 1`) | **Tested (Lesson 31 load test): after a run job had been taken over, the same run's resume job got fence=1 on its first claim, was rejected by the checkpoint as an older holder, and stayed stuck until its lease expired** | Take the fence from a sequence shared by the whole queue table (`nextval`), so it goes up globally (section 3.3; fixed) |
 | Session-level advisory locks, `LISTEN`, or `SET` behind PgBouncer transaction pooling | Locks, subscriptions, and settings leak onto other clients | Use transaction-level advisory locks; run `LISTEN` on a direct connection |
 | Long jobs on Celery + a Redis broker | Tasks running past `visibility_timeout` (default 1 hour) are delivered twice | Raise `visibility_timeout`, or use a queue where you can renew leases yourself |
 | Filling in "not executed" for a write that was already sent when the run is cancelled | **Tested: after resume the model retried with a new call_id, the idempotency key changed, and the side effect happened twice** (fixed in `agentkit.aio`; see item 1 below) | On cancellation or timeout, leave write calls unanswered and replay them with the same call_id on resume |
@@ -622,7 +638,8 @@ One question you must **decide deliberately**: when Redis is unavailable, does r
 - CAS only guarantees that "writes based on a stale version don't land," i.e. no lost updates;
 - when a zombie and the new worker read the same version, whoever writes first wins, which may well be the zombie; the new worker hits a conflict, exits, and its work is wasted;
 - a fenced load sets the row's fence to its own and bumps the version in a single `UPDATE ... RETURNING`: from then on every write by the old holder conflicts, and a load with a smaller fence is rejected;
-- the queue bumps the fence on every claim, so letting the queue's fence drive checkpoint takeover means the newest lease holder always wins.
+- every claim takes a larger fence from a sequence shared by the whole table (including later resume jobs for the same run), so letting the queue's fence drive checkpoint takeover means the newest lease holder always wins;
+- follow-up, "can each job count its fence from 1?": no. Takeover protects a run, and one run maps to several jobs over time; with per-job counting, the resume job enqueued after an approval gets fence=1 on its first claim and is rejected as an older holder than the run job.
 </details>
 
 <details>
@@ -691,7 +708,7 @@ One question you must **decide deliberately**: when Redis is unavailable, does r
 
 - [ ] I can explain whether checkpoints, jobs, idempotency records, rate-limit counters, and locks belong in Postgres or Redis, and what happens if each is lost
 - [ ] I can write the version-CAS SQL and explain why fence takeover is still needed
-- [ ] I can write the `FOR UPDATE SKIP LOCKED` claim and explain the design of reaping, the ordering key, and the fence
+- [ ] I can write the `FOR UPDATE SKIP LOCKED` claim, explain the design of reaping and the ordering key, and explain why the fence must go up globally
 - [ ] I can compare the delivery semantics and ops cost of Postgres, Redis Streams, RabbitMQ, Kafka, and SQS, and say when you don't need Kafka
 - [ ] I can explain what a Redis idempotency cache, a SET NX marker, and a downstream unique constraint each stop and don't stop
 - [ ] I can explain why the token bucket must be Lua, why it uses Redis's TIME, and the Lua float trap

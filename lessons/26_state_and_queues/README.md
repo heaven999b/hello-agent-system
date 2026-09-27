@@ -105,6 +105,8 @@ sequenceDiagram
     DB-->>A: 0 行 → CheckpointConflict，停手
 ```
 
+图里的 fence=1、fence=2 只表示谁先谁后。实际的 fence 取自整张队列表共用的一个序列，全局单调递增：同一个 run 后来的任务（比如审批之后入队的 resume 任务）第一次领取，拿到的 fence 也比之前所有持有者的都大。为什么必须这样，见 3.3。
+
 **怎么选**：默认选 A，并且**让队列的 fence 驱动检查点接管**（`AgentJobHandler` 已经这样做了）。状态特别大（几百 KB 以上），或者需要"时间旅行"、分支，参考 LangGraph 把检查点拆成多张表、按版本增量写的做法。流程跨天、需要可靠定时器的，直接上第 27 课。
 
 **本课实现**：[`PostgresCheckpointer`](../../agentkit/contrib/postgres.py)，以及异步版 `AsyncPostgresCheckpointer`（给 `agentkit.aio.AsyncAgent` 用，语义完全一致）。测试 `test_plain_cas_is_first_writer_wins_but_fenced_takeover_makes_newest_holder_win` 把"先写者赢"和"新持有者赢"并排验证了一遍。Demo 第 1 部分（真实模型模式的一次运行）里，被冻结的 worker-3 醒来后写检查点，收到了 `检查点冲突：run job-6 期望版本 2，实际版本 7（最后写入者 worker-1）`。
@@ -357,6 +359,7 @@ RETURNING version, state;          -- 0 行但行存在 → 你是被取代的�
 2. **冲突时抛异常，不返回 False。** `Agent` 在每一步都会保存，异常会一路穿出 `agent.run`，worker 把它归类为"所有权已经转移"，什么都不提交。返回值很容易被忽略，而这个信号的意思是"立刻停手"。
 3. **NUL 字符。** Postgres 的 `jsonb` 不能存 `\u0000`（[文档](https://www.postgresql.org/docs/current/datatype-json.html)），一个工具返回了二进制内容，就会让整个检查点写入失败。适配器会把 NUL 替换成 U+FFFD：能存进去比逐字节保真更重要。
 4. **`get_run` / `list_runs` 是只读的**：不接管、不记版本号，给 API 和运维用。
+5. **版本号只为还在跑的 run 记着。** 实例在内存里记着每个 run 的版本号（`version_of`），给下一次 CAS 用。一旦保存的状态不是 running（完成、暂停、取消……），这个 run 的版本号就被丢掉：恢复和审批都会先 `load`，重新记住最新版本。第一版只记不删，一个共享的检查点实例要服务成千上万个运行，这个字典只增不减，就是内存泄漏（第 31 课压测中发现，已修复；回归测试 `test_shared_checkpointer_forgets_versions_of_finished_runs`）。
 
 ### 3.3 队列：回收 + 领取
 
@@ -367,9 +370,12 @@ UPDATE agent_jobs SET status = CASE WHEN attempts >= max_attempts THEN 'dead' EL
  WHERE id IN (SELECT id FROM agent_jobs WHERE status = 'leased' AND lease_until < now()
               ORDER BY lease_until LIMIT 100 FOR UPDATE SKIP LOCKED);
 
--- 领取
+-- 建表时（setup()）：整张队列表共用一个 fence 序列
+CREATE SEQUENCE IF NOT EXISTS agent_jobs_fence_seq;
+
+-- 领取：fence 取序列的下一个值，全局单调递增
 UPDATE agent_jobs SET status = 'leased', worker_id = $me, lease_until = now() + $lease,
-                      attempts = attempts + 1, fence = fence + 1
+                      attempts = attempts + 1, fence = nextval('agent_jobs_fence_seq'::regclass)
  WHERE id = (SELECT id FROM agent_jobs
               WHERE status = 'queued' AND run_at <= now()
               ORDER BY priority DESC, id LIMIT 1
@@ -379,10 +385,12 @@ RETURNING *;
 
 - **SKIP LOCKED**：PostgreSQL 文档明确说，跳过被锁住的行会得到一个不一致的数据视图，不适合一般用途，但适合"多个消费者访问一张类似队列的表"来避免锁争用（[文档](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)）。练习 (b) 的测试会拿着一行的锁不放：少了 `SKIP LOCKED`，你的实现就会排队等锁。
 - **为什么先回收成 `queued`，而不是让 claim 直接领取过期的行？** claim 只扫描 `status = 'queued'` 这一个部分索引 `(priority DESC, id) WHERE status = 'queued'`，积压再大也是一次索引扫描。代价是：一旦被回收，旧持有者的迟到提交就会被拒绝（它的所有权在回收那一刻就结束了）。在回收之前，迟到的提交仍然有效，这和第 13 课一致。
-- **排序键用 `id`，不用 `run_at`。** 最初写的是 `ORDER BY run_at, id`。结果 demo 里 worker 在第 1.7 秒被 kill，到第 10.6 秒才有人接手，而租约只有 2 秒：回收时 `run_at` 被设成"现在 + 退避"，任务排到了**队尾**，要等前面的积压全部消化完。它的用户已经等过一轮了，不该再排一次队。改成按入队顺序（`id`）排序之后，退避结束的任务会回到原来的位置：同样的场景，第 5.8 秒就被接手了（还要等唯一空闲的 worker 做完手头的任务）；真实模式下第 11.6 秒被 kill，第 14.4 秒（租约 3 秒）被接手。
+- **排序键用 `id`，不用 `run_at`。** 最初写的是 `ORDER BY run_at, id`。结果 demo 里 worker 在第 1.7 秒被 kill，到第 10.6 秒才有人接手，而租约只有 2 秒：回收时 `run_at` 被设成"现在 + 退避"，任务排到了**队尾**，要等前面的积压全部消化完。它的用户已经等过一轮了，不该再排一次队。改成按入队顺序（`id`）排序之后，退避结束的任务会回到原来的位置：同样的场景，现在第 0.9 秒被 kill，第 3.2 秒就被接手了，差不多只等了 2 秒的租约；真实模式下第 11.6 秒被 kill，第 14.4 秒（租约 3 秒）被接手。
 - **所有时间都用数据库的 `now()`**：所有 worker 以同一个时钟判断租约。
 - **`attempts` 在领取时加一**，毒消息照样能进死信（第 13 课问题 3）；`release()`（优雅停机、被限流推迟）会把这一次还回去。
 - **`redrive` 不重置 fence**：fence 必须单调递增，否则旧持有者的 fence 可能"复活"。
+- **fence 必须全局单调，不能按任务计数。** 检查点的 fence 接管保护的是 run，不是任务，而同一个 run 会先后对应好几个任务：run 任务，以及审批之后入队的 resume 任务。后来的任务第一次领取拿到的 fence，必须比这个 run 之前所有持有者的都大，它的 `fenced(fence).load` 才能接管。所以 fence 取自整张表共用的序列，不从每个任务自己的 1 数起。
+- **实测发现 → 已修复：第一版的 fence 是按任务计数的。** 最初的领取语句写的是 `fence = fence + 1`，每个任务都从 1 数起。第 31 课压测时发现：run 任务被接手过一次（fence=2），之后入队的 resume 任务第一次领取拿到 fence=1，被检查点当成更旧的持有者拒绝（`CheckpointConflict` → `ownership_lost`），一直卡到租约过期。run 任务被重新领取的次数多了（被接手，或者被限流推迟后再领取），它的 fence 一旦超过 `max_attempts`，resume 任务每次领取都会被拒绝，最后进死信。修复：队列表配一个序列 `agent_jobs_fence_seq`，claim 改成 `nextval`；`setup()` 负责建序列，从旧表升级时用 `setval` 让序列从表里已有的 `max(fence)` 往后发，否则新发出的 fence 可能比旧的小。用迁移工具管理表结构的，要把序列和这一步 `setval` 一起写进迁移脚本。回归测试：`test_fence_is_global_so_a_later_job_for_the_same_run_can_take_over`、`test_upgrading_from_per_job_fences_continues_after_the_largest_existing_fence`（[`tests/contrib/test_postgres.py`](../../tests/contrib/test_postgres.py)）。
 
 ### 3.4 worker 与优雅停机
 
@@ -455,82 +463,87 @@ return 0
 **第 1 部分：3 个 worker 进程 × 3 个租户 × 31 个任务**（离线模式实际输出，节选）
 
 ```text
-   [+  1.6s] worker-2 │ 🧾 建工单 T-1004（幂等键 job-5:call_c80218574ca8）
-   [+  1.6s] worker-1 │ 🧾 建工单 T-1005（幂等键 job-6:call_8ce4d4d67eda）
-   [+  1.6s] worker-2 │ 工单建好了，但结果还没写进检查点……
-   [+  1.6s] worker-1 │ 工单建好了，但结果还没写进检查点……
-   [+  1.7s] 调度器   │ 💥 kill -9 worker-2（pid 44528）：不释放租约、不写检查点、不留遗言
-   [+  1.7s] 调度器   │ 🔁 启动替补 worker-4（相当于 K8s 发现 Pod 挂了，拉起一个新的）
-   [+  1.9s] 调度器   │ 🧊 SIGSTOP worker-1：整个进程被冻结（心跳线程也停了），租约 2 秒后过期
-   [+  3.4s] worker-3 │ 😵 Agent 跑完了，提交结果之前进程被冻结（模拟 GC 停顿）
-   [+  3.5s] 调度器   │ 🧊 SIGSTOP worker-3：整个进程被冻结（心跳线程也停了），租约 2 秒后过期
-   [+  5.8s] worker-4 │ 接手任务 #5（第 2 次领取，fence=2）：发现前任 worker-2 的检查点（status=running，第 1 步）→ 从断点继续
-   [+  5.8s] worker-4 │ ♻️  下游唯一约束命中：返回已有工单 T-1004，没有重复创建
-   [+  5.9s] worker-4 │ 接手任务 #6（第 2 次领取，fence=2）：发现前任 worker-1 的检查点（status=running，第 1 步）→ 从断点继续
-   [+  6.0s] worker-4 │ ♻️  下游唯一约束命中：返回已有工单 T-1005，没有重复创建
-   [+  6.2s] worker-4 │ 接手任务 #7（第 2 次领取，fence=2）：发现前任 worker-3 的检查点（status=completed，第 2 步）→ 从断点继续
-   [+  6.2s] 调度器   │ ▶️  SIGCONT worker-3：任务 #7 早已被别人完成，僵尸醒来
-   [+  6.2s] worker-3 │ 💔 心跳被拒绝：任务 #7 的 fence 已经过期，租约早就不是我的了
-   [+  6.2s] worker-3 │ ❌ 提交被拒绝（LeaseLost）：任务 #7 已被重新领取：当前 fence=2（持有者 worker-4），你的 fence=1 已过期，提交被拒绝…
-   [+  6.2s] 调度器   │ ▶️  SIGCONT worker-1：任务 #6 早已被别人完成，僵尸醒来
-   [+  6.2s] worker-1 │ 醒了！工具返回，Agent 继续往检查点里写……
-   [+  6.2s] worker-1 │ 💔 心跳被拒绝：任务 #6 的 fence 已经过期，租约早就不是我的了
-   [+  6.2s] worker-1 │ ❌ 检查点冲突（CheckpointConflict）：检查点冲突：run job-6 期望版本 2，实际版本 7（最后写入者 worker-4） —— 另一个 work…
+   [+  0.8s] worker-2 │ 🧾 建工单 T-1004（幂等键 job-5:call_18115252a824）
+   [+  0.8s] worker-2 │ 工单建好了，但结果还没写进检查点……
+   [+  0.8s] worker-3 │ 🧾 建工单 T-1005（幂等键 job-6:call_3a21d26b8f73）
+   [+  0.8s] worker-3 │ 工单建好了，但结果还没写进检查点……
+   [+  0.9s] 调度器   │ 💥 kill -9 worker-2（pid 17903）：不释放租约、不写检查点、不留遗言
+   [+  0.9s] 调度器   │ 🔁 启动替补 worker-4（相当于 K8s 发现 Pod 挂了，拉起一个新的）
+   [+  1.0s] 调度器   │ 🧊 SIGSTOP worker-3：整个进程被冻结（心跳线程也停了），租约 2 秒后过期
+   [+  2.7s] worker-1 │ 😵 Agent 跑完了，提交结果之前进程被冻结（模拟 GC 停顿）
+   [+  2.8s] 调度器   │ 🧊 SIGSTOP worker-1：整个进程被冻结（心跳线程也停了），租约 2 秒后过期
+   [+  3.2s] worker-4 │ 接手任务 #5（第 2 次领取，fence=13）：发现前任 worker-2 的检查点（status=running，第 1 步）→ 从断点继续
+   [+  3.2s] worker-4 │ ♻️  下游唯一约束命中：返回已有工单 T-1004，没有重复创建
+   [+  3.4s] worker-4 │ 接手任务 #6（第 2 次领取，fence=14）：发现前任 worker-3 的检查点（status=running，第 1 步）→ 从断点继续
+   [+  3.4s] worker-4 │ ♻️  下游唯一约束命中：返回已有工单 T-1005，没有重复创建
+   [+  3.6s] 调度器   │ ▶️  SIGCONT worker-3：任务 #6 早已被别人完成，僵尸醒来
+   [+  3.6s] worker-3 │ 醒了！工具返回，Agent 继续往检查点里写……
+   [+  3.6s] worker-3 │ 💔 心跳被拒绝：任务 #6 的 fence 已经过期，租约早就不是我的了
+   [+  3.6s] worker-3 │ ❌ 检查点冲突（CheckpointConflict）：检查点冲突：run job-6 期望版本 2，实际版本 7（最后写入者 worker-4） —— 另一个 work…
+   [+  5.5s] worker-3 │ 接手任务 #7（第 2 次领取，fence=20）：发现前任 worker-1 的检查点（status=completed，第 2 步）→ 从断点继续
+   [+  5.6s] 调度器   │ ▶️  SIGCONT worker-1：任务 #7 早已被别人完成，僵尸醒来
+   [+  5.6s] worker-1 │ 醒了！以为自己还持有租约，继续提交结果……
+   [+  5.6s] worker-1 │ 💔 心跳被拒绝：任务 #7 的 fence 已经过期，租约早就不是我的了
+   [+  5.6s] worker-1 │ ❌ 提交被拒绝（LeaseLost）：任务 #7 已被重新领取：当前 fence=20（持有者 worker-3），你的 fence=7 已过期，提交被拒绝…
 
 ▶ 所有任务结束 → 给每个 worker 发 SIGTERM（优雅停机：不再领取，手头的做完再退出）
    退出码：worker-1=0，worker-2=-9，worker-3=0，worker-4=0（-9 = 被 kill -9；0 = 收到 SIGTERM 后正常退出）
 
-▶ 📊 结果（19.7 秒）
-   任务：31/31 成功，failed 0，dead 0；因崩溃 / 卡死被重新领取的：#5、#6、#7（都是第 2 次尝试完成，fence=2）；因限流被推迟 16 次（不计入尝试次数）
+▶ 📊 结果（19.3 秒）
+   任务：31/31 成功，failed 0，dead 0；因崩溃 / 卡死被重新领取的：#5（第 2 次尝试完成，fence=13）、#6（第 2 次尝试完成，fence=14）、#7（第 2 次尝试完成，fence=20）；因限流被推迟 21 次（不计入尝试次数）
    工单：18 张，幂等键 18 个 → 重复 0 张 ✅；下游唯一约束挡下了 2 次重放
    fence：拒绝了僵尸 worker 的 1 次提交、2 次心跳 ✅
    检查点：检测到 1 次冲突（僵尸在被接管之后还想写检查点）✅
 
    租户      套餐            模型调用  等不到→推迟   等令牌总时长  全部完成用时
-   acme      标准（4/s）     21        0             0.1s          10.6s
-   globex    标准（4/s）     20        0             0.1s          10.7s
-   initech   免费（1/s）     20        16            24.6s         19.6s
+   acme      标准（4/s）     21        0             0.0s          10.9s
+   globex    标准（4/s）     20        0             0.0s          10.9s
+   initech   免费（1/s）     20        21            27.4s         19.2s
 ```
 
 真实模型模式（gpt-5.5）的一次运行：7 个任务、13 次模型调用，全部完成用时 19.3 秒；kill -9 在第 11.6 秒，第 14.4 秒（租约 3 秒）被接手；同样是 0 张重复工单、1 次提交被 fence 拒绝、1 次检查点冲突。真实模型每次调用要好几秒，免费套餐每秒 1 次的限额没有触发任何推迟。
 
 该观察什么：
 
-1. **kill -9（任务 #5）**：工单已经建好，但结果没来得及进检查点。接手的 worker 从检查点重放**同一个**工具调用（同一个 `call_id`，因此同一个幂等键）。Redis 缓存没有命中（前任没来得及 `put`），拦住重复的是下游的唯一约束。第 1.7 秒被 kill，第 5.8 秒才被接手，而租约只有 2 秒：租约过期以后，还要等某个 worker 空下来去领取，这时唯一还在干活的 worker-4 正忙着别的任务。
+1. **kill -9（任务 #5）**：工单已经建好，但结果没来得及进检查点。接手的 worker 从检查点重放**同一个**工具调用（同一个 `call_id`，因此同一个幂等键）。Redis 缓存没有命中（前任没来得及 `put`），拦住重复的是下游的唯一约束。第 0.9 秒被 kill，第 3.2 秒被接手：主要是在等 2 秒的租约过期，然后由当时唯一还在干活的替补 worker-4 领走（另外两个 worker 都被冻结了）。
 2. **跑到一半的僵尸（任务 #6）**：它醒来后要往检查点里写，得到的是 `CheckpointConflict`，期望版本 2，实际已经是 7；接管时的 +1 加上新 worker 的几次保存，都在它"睡着"的时候发生。它的心跳也被拒绝了。
-3. **提交阶段的僵尸（任务 #7）**：新 worker 读到的检查点已经是 `completed`，一次模型都没调，直接提交；僵尸醒来后的提交被 fence 拒绝。
-4. **限流**：免费租户的任务被推迟了 16 次（另一次运行是 20 次），但**没有一次消耗重试次数**，也没有占着 worker 干等（每次最多等 1 秒）；另外两个租户几乎没有等过令牌。
-5. **SIGTERM**：替补 worker 和两个僵尸都正常退出（退出码 0），被 kill 的那个是 -9。
+3. **提交阶段的僵尸（任务 #7）**：新 worker 读到的检查点已经是 `completed`，一次模型都没调，直接提交；僵尸醒来后的提交被 fence 拒绝。接手它的正是刚醒过来的 worker-3：僵尸醒来以后照样能领新任务，只是旧租约上的写入全部作废。
+4. **fence 的数值**：三个被接手的任务分别拿到 fence=13、14、20，不是"第 2 次领取所以是 2"；任务 #7 的僵尸手里是 fence=7。fence 取自整张队列表共用的序列（3.3），只保证后发的比先发的大。
+5. **限流**：免费租户的任务被推迟了 21 次（另外几次运行是 16 到 20 次），但**没有一次消耗重试次数**，也没有占着 worker 干等（每次最多等 1 秒）；另外两个租户几乎没有等过令牌。
+6. **SIGTERM**：替补 worker 和两个僵尸都正常退出（退出码 0），被 kill 的那个是 -9。
 
 **第 2 部分：审批 → 入队 resume → 一个全新的 worker 进程恢复执行**
 
 ```text
 ▶ 审批收件箱：ckpt.list_runs(status='paused')（按 (status, updated_at) 索引查询）
-   run job-2（租户 acme，用户 acme-zhang）等待审批：reset_password({"user": "zhang.san"})，最后写入者 worker-3
+   run job-2（租户 acme，用户 acme-zhang）等待审批：reset_password({"user": "zhang.san"})，最后写入者 worker-1
 ▶ 审批人 alice 点了“批准”——手抖点了两次；API 用 approve:<run_id>:<call_id> 作为幂等键入队 resume 任务
    两次入队返回的 job_id：#33、#33 → 同一个任务 ✅
 ▶ 启动一个之前从没出现过的 worker-9 进程来处理它（状态全在 Postgres 里，任何进程都能接着跑）
-   [+  1.0s] worker-9 │ 领取任务 #33（op=resume，第 1 次尝试，fence=1）
-   [+  1.2s] worker-9 │ ✅ 完成 #33（acme）：密码已重置，新密码已发到你的企业邮箱。
+   [+  0.3s] worker-9 │ 领取任务 #33（op=resume，第 1 次尝试，fence=56）
+   [+  0.5s] worker-9 │ ✅ 完成 #33（acme）：密码已重置，新密码已发到你的企业邮箱。
    resume 任务 #33：succeeded；run job-2 现在是 completed，最后写入者 worker-9
-   审批记录：alice 于 02:33:09 批准 reset_password（已电话核实本人）
+   检查点的 fence：2 → 56（resume 是一个新任务，第一次领取就从全局序列拿到了更大的 fence，fenced load 接管成功）
+   审批记录：alice 于 04:45:04 批准 reset_password（已电话核实本人）
 ```
+
+resume 任务 #33 第一次领取拿到的是 fence=56，不是 1。检查点上记着的 fence 是 2（run 任务 #2 领取时拿到的），56 比它大，所以 worker-9 的 fenced load 能接管。按任务计数的旧写法下，resume 任务第一次领取一定是 fence=1：这次 run 任务没被接手过，碰巧不出事；只要 run 任务被重新领取过一次，resume 任务就会被当成旧持有者拒绝（3.3）。
 
 **第 3 部分：同一批任务，同步 worker vs 单进程异步 worker**（24 个任务，每个调 2 次模型，模拟延迟 0.15 秒；真实模式下这一部分也用模拟模型，因为它测的是 worker 架构，不是模型速度）
 
 ```text
    方案                            进程×并发  连接池      连接峰值  耗时     任务/秒  在途模型调用峰值
-   同步 · 1 进程                   1 × 1      -           5         8.44s    2.8      1
-   同步 · 3 进程                   3 × 1      -           11        3.25s    7.4      3
-   异步 · 1 进程 · 并发 16         1 × 16     16          10        0.66s    36.2     16
-   异步 · 并发 16 · 连接池 4       1 × 16     4           6         0.64s    37.4     16
-   异步 · 并发 16 · 全程占着连接   1 × 16     4（业务库） 11        1.93s    12.5     4
+   同步 · 1 进程                   1 × 1      -           5         7.91s    3.0      1
+   同步 · 3 进程                   3 × 1      -           11        2.82s    8.5      3
+   异步 · 1 进程 · 并发 16         1 × 16     16          10        0.65s    36.8     16
+   异步 · 并发 16 · 连接池 4       1 × 16     4           6         0.65s    37.1     16
+   异步 · 并发 16 · 全程占着连接   1 × 16     4（业务库） 11        1.93s    12.4     4
 ```
 
 （连接峰值是这个库上同时打开的连接数，包括父进程用来入队和统计的连接；同步那两行的"在途模型调用峰值"按进程数算，每个同步进程同一时刻只能有一个模型调用。）
 
-1. 同步 worker 等模型的时候整个进程闲着，只能靠加进程来提速：3 个进程约 2.6 倍，连接数也跟着涨。
-2. 一个异步进程同时推进 16 个任务，吞吐是 3 个同步进程的约 5 倍。
+1. 同步 worker 等模型的时候整个进程闲着，只能靠加进程来提速：3 个进程约 2.8 倍，连接数也跟着涨。
+2. 一个异步进程同时推进 16 个任务，吞吐是 3 个同步进程的 4 倍多。
 3. **池的上限是 16，但它只按需长到了 10 个连接**（另一次运行只长到 5 个）：Agent 的时间几乎都花在等模型上，检查点写入只借用连接几毫秒。池只给 4 个连接，吞吐也一样。
 4. 最后一行是反模式：每个任务在等模型的时候都占着一个（另一个库的）连接，并发就被卡成了连接数 4，吞吐掉到三分之一。
 
@@ -540,12 +553,12 @@ return 0
 ▶ pod-1 启动：并发 8，租约 2 秒，宽限期 0.5 秒
    K8s 发来 SIGTERM：pod-1 不再领取新任务，等在途任务最多 0.5 秒
    pod-1 退出：完成 5 个，宽限期后取消 1 个（不提交、不归还）
-   run job-5 的检查点：status=cancelled，最后一条是 assistant 的写工具调用 ['call_5c05db284e91']，没有补“未执行”（保持未回答）
+   run job-5 的检查点：status=cancelled，最后一条是 assistant 的写工具调用 ['call_55243a0fba26']，没有补“未执行”（保持未回答）
 ▶ 等租约自然过期（2 秒），pod-2 接手
    pod-2 完成 1 个
 ▶ 📊 结果
-   pod-1 执行 create_ticket，幂等键 job-5:call_5c05db284e91 → 新建
-   pod-2 执行 create_ticket，幂等键 job-5:call_5c05db284e91 → 唯一约束命中，返回已有工单
+   pod-1 执行 create_ticket，幂等键 job-5:call_55243a0fba26 → 新建
+   pod-2 执行 create_ticket，幂等键 job-5:call_55243a0fba26 → 唯一约束命中，返回已有工单
    两次执行用的是同一个幂等键 ✅
    工单 6 张，对应 6 个 run → 没有重复 ✅
 ```
@@ -567,6 +580,8 @@ make lesson N=26
 # 或者：.venv/bin/python -m pytest lessons/26_state_and_queues -v
 ```
 
+本练习的 fence 按任务计数（`fence = fence + 1`），只在单个任务的范围内成立：练习里没有带 fence 的检查点接管，也没有一个 run 对应多个任务的情况。适配器用的是全局序列，原因见 3.3。
+
 测试用根目录 `conftest.py` 提供的 `pg_uri`（每个测试一个全新的数据库）和 `redis_client`（每个测试清空）。没装可选依赖时自动跳过。contrib 模块更完整的测试在 [`tests/contrib/test_postgres.py`](../../tests/contrib/test_postgres.py) 和 [`tests/contrib/test_redis_store.py`](../../tests/contrib/test_redis_store.py)，覆盖冲突、过期、重复、多线程和多协程并发、连接池、取消后恢复。
 
 ## 6. 常见坑与真实运行中的发现
@@ -587,6 +602,7 @@ make lesson N=26
 | 用客户端时间做令牌桶的补充 | 各机器的时钟快慢不一，补出来的令牌对不上 | 脚本里用 `redis.call('TIME')` |
 | 锁不带 fencing，或者只信 Redis INCR 的 token | 主从切换后两个持有者同时写 | 存储端校验 fence；正确性关键的 token 来自 Postgres、etcd |
 | `redrive` 时把 fence 清零 | 旧持有者的 fence 可能"复活" | fence 永远只增不减 |
+| fence 按任务计数（`fence = fence + 1`） | **实测（第 31 课压测）：run 任务被接手过以后，同一个 run 的 resume 任务第一次领取拿到 fence=1，被检查点当成旧持有者拒绝，卡到租约过期** | fence 取自整张队列表共用的序列（`nextval`），全局单调（3.3，已修复） |
 | 在 PgBouncer 事务池后面用会话级 advisory lock、`LISTEN`、`SET` | 锁、订阅、设置"串"到别的客户端上 | 用事务级 advisory lock；`LISTEN` 走直连 |
 | Celery + Redis broker 跑长任务 | 超过 `visibility_timeout`（默认 1 小时）的任务被投递两次 | 调大 `visibility_timeout`，或者换成自己可以续租的队列 |
 | 取消时给已经发出的写操作补上"未执行" | **实测：resume 后模型换了一个 call_id 重做，幂等键变了，副作用发生两次**（已在 `agentkit.aio` 修复，见下文第 1 条） | 取消 / 超时时写操作保持未回答，resume 用同一个 call_id 重放 |
@@ -622,7 +638,8 @@ make lesson N=26
 - CAS 只保证"基于过时版本的写入写不进去"，也就是不丢更新；
 - 僵尸和新 worker 读到同一个版本时，先写的赢，可能恰好是僵尸赢，新 worker 冲突退出、白跑一趟；
 - 带 fence 的 load 在同一条 `UPDATE ... RETURNING` 里把表里的 fence 改成自己的，并让 version 加一：从这一刻起旧持有者的任何写入都冲突，fence 更小的 load 直接被拒绝；
-- 队列每次领取都会让 fence 加一，所以用队列的 fence 驱动检查点接管，最新的租约持有者总是赢家。
+- 队列每次领取都从整张表共用的序列拿一个更大的 fence（同一个 run 后来的 resume 任务也一样），所以用队列的 fence 驱动检查点接管，最新的租约持有者总是赢家；
+- 追问"fence 能不能每个任务从 1 数起"：不能。接管保护的是 run，一个 run 会先后对应多个任务；按任务计数时，审批后的 resume 任务第一次领取拿到 fence=1，会被当成比 run 任务更旧的持有者拒绝。
 </details>
 
 <details>
@@ -691,7 +708,7 @@ make lesson N=26
 
 - [ ] 我能说清检查点、任务、幂等记录、限流计数、锁各自该放在 Postgres 还是 Redis，以及丢了会怎样
 - [ ] 我能写出版本号 CAS 的 SQL，并解释为什么还需要 fence 接管
-- [ ] 我能写出 `FOR UPDATE SKIP LOCKED` 的领取语句，并解释回收、排序键、fence 的设计
+- [ ] 我能写出 `FOR UPDATE SKIP LOCKED` 的领取语句，并解释回收、排序键的设计，以及 fence 为什么必须全局单调
 - [ ] 我能比较 Postgres、Redis Streams、RabbitMQ、Kafka、SQS 的投递语义和运维成本，并说出什么时候不需要 Kafka
 - [ ] 我能解释 Redis 幂等缓存、SET NX 标记、下游唯一约束各挡住什么、挡不住什么
 - [ ] 我能解释令牌桶为什么必须用 Lua、为什么用 Redis 的 TIME，以及 Lua 返回小数的坑
