@@ -5,7 +5,7 @@
 > 📖 Part of the "domain reference" handbook that accompanies the course.
 > Related: [Failure Modes](failure-modes.en.md) · [Cheatsheet](cheatsheet.en.md) · [Interview Questions](interview-questions.en.md) · [Glossary](glossary.en.md)
 
-This checklist is designed to be pasted straight into a PR description, a design doc, or review meeting notes. It has **19 sections and 199 items** (62 of them P0). Every item explains why it matters and, where possible, links to the relevant failure mode (e.g., [T5](failure-modes.en.md#t5-duplicate-side-effects)) and lesson.
+This checklist is designed to be pasted straight into a PR description, a design doc, or review meeting notes. It has **20 sections and 224 items** (68 of them P0). Every item explains why it matters and, where possible, links to the relevant failure mode (e.g., [T5](failure-modes.en.md#t5-duplicate-side-effects)) and lesson.
 
 ## How to Use It
 
@@ -19,7 +19,7 @@ This checklist is designed to be pasted straight into a PR description, a design
 
 **Suggested process**
 
-1. **Design phase** (before writing code): go through "Requirements and Scope," "Orchestration," "Security," "Permissions and Approval," and "Distributed Systems and Concurrency." Decisions in these sections are the hardest to change later. If you use long-term memory, MCP, code execution, coding agents, or proactive notifications, add Section 19, "Extended Capabilities."
+1. **Design phase** (before writing code): go through "Requirements and Scope," "Orchestration," "Security," "Permissions and Approval," and "Distributed Systems and Concurrency." Decisions in these sections are the hardest to change later. If you use long-term memory, MCP, code execution, coding agents, or proactive notifications, add Section 19, "Extended Capabilities." When you swap the teaching implementations for mature components and deploy a multi-instance service, add Section 20, "Production."
 2. **Pre-launch review**: go through the whole list, and back every P0 with evidence (links to code, config, eval reports, trace screenshots), not a verbal "yes, we have that."
 3. **Quarterly re-review**: models, tools, and user bases all change, so the checklist needs another pass, especially the "Evals," "Cost," and Section 18 "Data, Eval Methodology, and Optimization" sections.
 
@@ -48,7 +48,8 @@ This checklist is designed to be pasted straight into a PR description, a design
 | 17 | Enterprise Knowledge and RAG | 9 | 2 | [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
 | 18 | Data, Eval Methodology, and Optimization | 16 | 3 | [Lesson 21](../lessons/21_agent_data/README.en.md) · [Lesson 22](../lessons/22_eval_methodology/README.en.md) · [Lesson 23](../lessons/23_optimization/README.en.md) |
 | 19 | Extended Capabilities (Retrieval / Memory / MCP / Code Execution / Coding Agents / Proactive) | 20 | 6 | [Lesson 17](../lessons/17_retrieval_quality/README.en.md) · [Lesson 18](../lessons/18_memory_systems/README.en.md) · [Lesson 19](../lessons/19_mcp_and_sandbox/README.en.md) · [Lesson 20](../lessons/20_frameworks_bridge/README.en.md) · [Lesson 24](../lessons/24_coding_agents/README.en.md) · [Lesson 25](../lessons/25_proactive_and_frontier/README.en.md) |
-| | **Total** | **199** | **62** | |
+| 20 | Production (State and Queues / Durable Workflows / Observability / Gateways and Policy / Async Runtime / Deployment and Scaling) | 25 | 6 | [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 27](../lessons/27_durable_workflows/README.en.md) · [Lesson 28](../lessons/28_production_observability/README.en.md) · [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) · [Lesson 30](../lessons/30_async_runtime/README.en.md) · [Lesson 31](../lessons/31_deployment_and_scaling/README.en.md) |
+| | **Total** | **224** | **68** | |
 
 ---
 
@@ -506,6 +507,61 @@ This checklist is designed to be pasted straight into a PR description, a design
   — A proactive agent that keeps reading email and calendars is a textbook lethal-trifecta setup ([S3](failure-modes.en.md#s3-lethal-trifecta-exfiltration), [C6](failure-modes.en.md#c6-memory-poisoning-and-staleness)).
 - [ ] 🟢 **P2** Online metrics for proactive features go beyond adoption rate to interruptions per user per day, the "don't remind me again" rate, and the share of users who turn the feature off.
   — Optimize adoption rate alone and you get clickbait notifications ([A10](failure-modes.en.md#a10-over-interrupting-proactive-agent)).
+
+---
+
+## 20. Production (State and Queues / Durable Workflows / Observability / Gateways and Policy / Async Runtime / Deployment and Scaling)
+
+- [ ] 🔴 **P0** Checkpoints and task state live in durable, shared storage (such as Postgres), with version-number CAS on writes; when runs execute through a queue, the task's fence drives checkpoint takeover, and a conflict raises and stops the run immediately.
+  — Plain CAS is "first writer wins," so a zombie worker waking from a GC pause can win; file and in-memory checkpoints aren't shared across instances at all ([PR2](failure-modes.en.md#pr2-cas-without-fenced-takeover), [D2](failure-modes.en.md#d2-zombie-worker)).
+- [ ] 🔴 **P0** Idempotency for write tools lives in the system that performs the side effect: a unique constraint in the same transaction, or the downstream Idempotency-Key. Idempotency records in Redis are only a cache.
+  — As long as "perform the side effect" and "record that it happened" aren't in the same transaction, a crash can always land in the gap between them ([T5](failure-modes.en.md#t5-duplicate-side-effects), [D3](failure-modes.en.md#d3-duplicate-delivery)).
+- [ ] 🟠 **P1** Async workers take a concurrency slot before claiming (backpressure); heartbeats run at about 1/3 of the lease; leases or visibility timeouts exceed the p99 task duration, and long tasks renew them.
+  — A worker that keeps claiming while saturated lets leases expire en masse, and other workers run those tasks again ([PR1](failure-modes.en.md#pr1-over-claiming-worker)).
+- [ ] 🟠 **P1** Attempts are counted at claim time (so a poison message that crashes the worker still reaches the dead-letter state), while rate-limit deferrals and shutdown returns don't count; dead letters have alerts and a redrive process, and redrive never resets the fence.
+  — Count the other way and either poison messages loop forever or healthy tasks get dead-lettered at peak ([D4](failure-modes.en.md#d4-queue-backlog-avalanche), [PR12](failure-modes.en.md#pr12-in-flight-runs-lost-on-shutdown)).
+- [ ] 🟠 **P1** Before using a lock, answer "is this for efficiency or for correctness?" Correctness means the protected storage checks a monotonically increasing fencing token that comes from a system that can't go backward (Postgres, etcd). If the job can become "a task plus an idempotency key," skip the lock.
+  — Redis replication is asynchronous, so a failover can lose a lock and also the latest INCR, handing out the same token twice ([D2](failure-modes.en.md#d2-zombie-worker)).
+- [ ] 🟠 **P1** Connection pools are sized by "coroutines using a connection at the same time," with all processes together under the database's `max_connections`; no connection is held while waiting on the model; table creation and migrations run once in the release pipeline, not at every worker's startup.
+  — Measured in Lesson 26: with 8 connections running `CREATE TABLE IF NOT EXISTS` at once, 7 failed with `UniqueViolation`; holding a connection while waiting on the model caps concurrency at the number of connections.
+- [ ] 🟢 **P2** The queue table gets its own lower autovacuum threshold, and finished tasks are archived regularly (the dedup window equals the retention period); monitor how long the oldest runnable task has waited, expired leases, and fence rejections; Redis holds only data you can rebuild if it's lost.
+  — A queue table is a textbook high-churn table and bloats; a Redis failover can lose roughly the last second of writes.
+- [ ] 🟠 **P1** Adopting Temporal comes with a written justification that at least two of these hold: single tasks often exceed 30 minutes, you wait on people, there are timed actions, failures need human cleanup, and someone will run it. Otherwise, use AsyncAgent + Postgres checkpoints + a lease queue.
+  — Durable execution pays off only when tasks are long and wait on people, but you pay its costs from day one.
+- [ ] 🟠 **P1** With Temporal, every activity has `maximum_attempts` (unlimited by default), a start-to-close timeout, and a heartbeat timeout; write tools get retry counts by risk, with a single attempt for non-idempotent writes; client-side retries are off.
+  — Activities are at-least-once, and their retries multiply with client retries ([PR3](failure-modes.en.md#pr3-stacked-retries)).
+- [ ] 🟠 **P1** Workflow code does no direct IO, clock reads, or random numbers; workflow changes go through patching or Worker Versioning; CI replays sampled production event histories; `WorkflowTaskFailed` has an alert.
+  — Changing a single line of orchestration code can stall every in-flight run, and it only shows up on replay ([PR4](failure-modes.en.md#pr4-nondeterminism-after-deploy)).
+- [ ] 🟠 **P1** Long processes are designed with continue-as-new, context compaction, and large objects stored externally; event histories are treated as sensitive data, with Payload Codec encryption, a retention period, and access control on the Web UI.
+  — An agent's event history grows quadratically with its steps, and prompts, tool arguments, and results are all stored in it verbatim ([PR5](failure-modes.en.md#pr5-event-history-blowup), [S7](failure-modes.en.md#s7-sensitive-information-disclosure)).
+- [ ] 🟠 **P1** Instrumentation uses OpenTelemetry + GenAI semantic conventions + OTLP, the application sends only to the Collector, and the convention version is pinned; content attributes are off by default; cancellations, approval pauses, and budget stops aren't marked ERROR.
+  — Backend platforms change, and so do the conventions; marking cancellations as errors triggers alerts and makes tail sampling keep all of them ([S7](failure-modes.en.md#s7-sensitive-information-disclosure)).
+- [ ] 🟠 **P1** traceparent travels through the queue in the task payload, workers continue it with `continue_trace`, and the sampler is `ParentBased`; when waits can be long, span links are used instead; tail sampling's `decision_wait` covers the p99 run duration, and all spans of a trace route to the same Collector instance.
+  — Otherwise one request shows up as several traces, and slow traces get split in two and decided separately ([PR6](failure-modes.en.md#pr6-trace-broken-at-the-queue)).
+- [ ] 🟠 **P1** The SLO spells out which events count as bad and which don't count; paging alerts use multiwindow, multi-burn-rate rules with a minimum-sample guard; every alert links to a runbook.
+  — Fixed thresholds false-alarm at low traffic and react slowly at high traffic; too loose an SLO makes burn-rate alerts meaningless ([P1](failure-modes.en.md#p1-silent-failure)).
+- [ ] 🟠 **P1** Every metric label documents its value ceiling and who enforces it; `user_id`, `run_id`, and `trace_id` are never labels; multi-process deployments use prometheus_client's multiprocess mode.
+  — Every label combination is a time series, and labels multiply ([PR7](failure-modes.en.md#pr7-label-cardinality-explosion)).
+- [ ] 🟠 **P1** Model calls go through one gateway, retries live at exactly one layer, and you've worked out the worst-case number of upstream calls per user request; with multiple gateway instances, limit counters live in shared storage, and you've decided whether to allow or deny when that storage is unavailable.
+  — Retries across layers multiply; without shared counters, N instances means N times the limit ([PR3](failure-modes.en.md#pr3-stacked-retries), [D9](failure-modes.en.md#d9-local-only-rate-limiting)).
+- [ ] 🟠 **P1** Every model in the fallback chain goes through the evals; metrics are broken down by the model that actually answered; the fallback rate has an alert.
+  — Fallbacks inside the gateway are invisible to the application, so quality can be sliding while the dashboards stay green ([PR8](failure-modes.en.md#pr8-gateway-fallback-masks-a-regression), [R3](failure-modes.en.md#r3-silent-degradation)).
+- [ ] 🔴 **P0** Authorization fails closed: policy evaluation errors count as a deny; policies are validated against the schema at startup; entities are built and completed only from the authenticated context; approval timeouts count as rejections.
+  — Cedar skips policies that error during evaluation, so leaving out one entity can disable a forbid ([PR9](failure-modes.en.md#pr9-fail-open-policy-and-limits), [S4](failure-modes.en.md#s4-confused-deputy)).
+- [ ] 🟠 **P1** New guardrail classifiers start in flag-only mode to observe false positives; cascade thresholds come from a sweep over a labeled set; what happens when a classifier fails is part of the design and has an alert.
+  — The detection layer both misfires and misses; it may fail open, but never silently ([PR9](failure-modes.en.md#pr9-fail-open-policy-and-limits), [S1](failure-modes.en.md#s1-direct-prompt-injection)).
+- [ ] 🔴 **P0** No blocking calls on an async service's code paths: CI statically checks async functions for blocking calls, and production exports an event-loop lag metric; unavoidable sync SDKs run in a bounded thread pool.
+  — One blocking call stalls every session and heartbeat in the process ([PR10](failure-modes.en.md#pr10-event-loop-blocked-by-sync-calls)).
+- [ ] 🔴 **P0** Cancellation semantics are verified: `CancelledError` is re-raised after cleanup; after a client disconnects, the checkpoint records `cancelled` and in-flight model calls drop to zero; interrupted write calls stay unanswered and are replayed with the same `call_id` on resume.
+  — A cancelled write's outcome is unknown; filling in "not executed" changes the idempotency key and repeats the side effect ([PR11](failure-modes.en.md#pr11-cancellation-leaves-work-half-done), [T5](failure-modes.en.md#t5-duplicate-side-effects)).
+- [ ] 🟠 **P1** Timeouts grow from the inside out: tool timeout < the run's overall deadline < gateway and proxy timeouts; per-tenant bulkheads, per-model concurrency caps, and connection pool limits agree with one another; shared Agents and Hooks keep no per-run data on instance attributes.
+  — If the outer layer gives up first, the inner layer keeps working for nothing; a pool smaller than the concurrency cap turns "model timeouts" into queueing in your own pool; a shared instance is read and written by hundreds of sessions at once ([D1](failure-modes.en.md#d1-lost-update)).
+- [ ] 🔴 **P0** Graceful shutdown on SIGTERM: fail the readiness probe and stop claiming → let in-flight tasks finish within the grace period → cancel the rest and hand them back to the queue → flush traces and close connection pools; `terminationGracePeriodSeconds` exceeds the grace period plus cleanup; rolling-update drills are on record.
+  — Otherwise every release loses or reruns a batch of runs ([PR12](failure-modes.en.md#pr12-in-flight-runs-lost-on-shutdown), [R4](failure-modes.en.md#r4-lost-progress)).
+- [ ] 🟠 **P1** The liveness probe checks only this process (whether the event loop responds), and the readiness probe checks dependencies and whether the process is shutting down; all configuration comes from environment variables, is validated at startup, and fails fast; the same image is used across environments.
+  — A liveness probe that checks the database restarts every Pod at once when the database blips; a config error found only at the first request is already in production.
+- [ ] 🟠 **P1** Workers scale on queue backlog, the age of the oldest task, or in-flight saturation, with the replica ceiling set by the model quota; before launch, a load test with fault injection (`kill -9`, rolling restarts, unavailable dependencies) verifies end states, no duplicate side effects, and metrics that match the database, with tail latency measured by an open-loop test.
+  — CPU-based autoscaling never triggers for IO-bound agents; closed-loop load tests flatter tail latency ([PR13](failure-modes.en.md#pr13-autoscaling-on-the-wrong-signal), [PR11](failure-modes.en.md#pr11-cancellation-leaves-work-half-done)).
 
 ---
 

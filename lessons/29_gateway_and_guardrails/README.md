@@ -191,7 +191,7 @@ agent = Agent(llm, tools, hooks=[ClassifierGuard(cascade, on="input"), Classifie
 | B. 网关层（LiteLLM Proxy） | 虚拟 key 和团队都能设 `max_budget` + `budget_duration`、`rpm_limit`、`tpm_limit`；多实例共享 Redis 计数 | 组织级的硬上限：一个团队、一个 key 这个月最多花多少；共享厂商限额 | 不知道"运行"和"步"；拦下时 Agent 已经走到一半 | 服务多于一个时必备 |
 | C. 厂商侧 | 厂商控制台的项目级额度 | 最后一道闸 | 粒度粗，触发时整个项目停摆 | 兜底 |
 
-**怎么选**：A 和 B 都要，分工不同：A 管单次运行的语义预算，B 管组织级的总量和共享限额，C 作为最后兜底。两个关键配置：**多实例一定要配 Redis**，否则按官方文档，每个实例各用各的内存计数，N 个实例就是 N 倍限额；限流比可用性更重要时，打开 `fail_closed_rate_limit_enforcement`，Redis 不可达时直接返回 503，而不是退回按实例计数。
+**怎么选**：A 和 B 都要，分工不同：A 管单次运行的语义预算，B 管组织级的总量和共享限额，C 作为最后兜底。两个关键配置：**多实例一定要配 Redis**，否则按官方文档，每个实例各用各的内存计数，N 个实例就是 N 倍限额；限流比可用性更重要时，打开 `fail_closed_rate_limit_enforcement`，Redis 不可达时直接返回 503，而不是退回按实例计数。这个开关是 LiteLLM 较新版本才加入的（[litellm#43251](https://github.com/BerriAI/litellm/pull/43251)；本仓库实测用的 1.83.0 里还没有），配置前先确认你的版本支持。
 
 **本课实现**：团队和 key 的预算通过管理 API 创建（`/team/new`、`/key/generate`，示例命令写在配置文件末尾），数据存在 Postgres。超预算时 Proxy 按认证错误返回（`ExceededTokenBudget`），agentkit 把它映射成不可重试的错误，正好不会被重试。多实例共享状态用 fakeredis 实测过一种：`tests/contrib/test_gateway.py` 让两个 Router 实例连同一个 Redis，实例 A 把坏掉的部署冷却之后，实例 B 从第一个请求起就不再打它。
 

@@ -304,3 +304,147 @@ flowchart TD
 | 记忆持续增长，内容是"关于这个人的偏好和状态" | 抽取式事实库（写时消解）：写入走异步队列、用小模型，保留审计历史 |
 | 长期陪伴型的 Agent，需要自己决定记什么 | 分层记忆（MemGPT / Letta）：核心记忆里放事实库的精华 |
 | 要回答"谁和谁是什么关系、什么时候变的" | 知识图谱式（Zep / Graphiti），按知识库的方式建设和治理 |
+
+---
+
+## 9. 第四部分速查
+
+> 对应第 26–31 课。默认值取自 agentkit 源码（`agentkit/aio`、`agentkit/contrib`）和各课引用的官方文档；它们是起点，不是标准答案，最终以你自己的负载和压测为准。
+
+### 9.1 组件怎么选
+
+| 要解决的问题 | 默认选择 | 什么时候换 | 课程 |
+|---|---|---|---|
+| 检查点（多实例） | Postgres：jsonb + 版本号 CAS + fence 接管（`PostgresCheckpointer` / `AsyncPostgresCheckpointer`） | 流程跨小时到天、要等人、要可靠的定时器 → Temporal；已经深度使用 LangGraph → 它自带的 checkpointer | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) |
+| 任务队列 | Postgres `FOR UPDATE SKIP LOCKED`（`PostgresJobQueue` / `AsyncPostgresJobQueue`） | 在 AWS 上、不想运维 → SQS；同一份数据要被多方订阅、要回放、写入量太大 → 加 Kafka（和任务队列并存） | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 幂等 | 下游唯一约束或 Idempotency-Key（底线）+ Redis 缓存（`RedisIdempotencyStore`，可选） | 下游不支持幂等、并发重复的代价又很高 → 加 `claim()` 占位，但它挡不住所有情况 | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 跨实例限流 | Redis Lua 令牌桶（`RedisTokenBucket` + `RateLimitHook`，异步版带 `Async` 前缀） | 多个团队共用一个模型出口 → 网关的团队预算；厂商配额是最后一道墙，不是限流方案 | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 锁 | 尽量不用：改成"任务 + 幂等键"；资源就在 Postgres 里 → `pg_advisory_xact_lock` | 跨系统、正确性要求高 → etcd（revision 当 fencing token）；只为效率 → `RedisLock` | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 长流程、审批、定时 | AsyncAgent + Postgres 检查点 + 租约队列 | "超过 30 分钟 / 要等人 / 有定时动作 / 失败要人工善后 / 有人运维"中满足任意两条 → Temporal（`make_worker` / `start_agent`） | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| 追踪 | OTel + GenAI 语义约定 + OTLP → Collector（`OTelTracer`） | 需要看对话、做在线评估 → Collector 再分一路给能自托管的 LLM 平台 | [第 28 课](../lessons/28_production_observability/README.md) |
+| 指标与告警 | `PrometheusHook` 全量计数 + 多窗口多燃烧率告警 | 组织统一用 OTel Metrics → 用 OTLP 发指标；高基数维度 → 放进 trace 和日志 | [第 28 课](../lessons/28_production_observability/README.md) |
+| 模型出口 | 单个服务：进程内 `LiteLLMRouterLLM`；多个服务：LiteLLM Proxy 或云厂商的 AI 网关 | 已经深度使用某朵云 → 它的网关；要自托管、多云 → 自建开源网关 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 权限策略 | 规则少、只有一个团队 → `PermissionPolicy`；跨团队、要评审、要 ABAC → Cedar（`CedarPolicy`） | 平台已经统一用 OPA → OPA；产品核心是层级共享 → OpenFGA | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 注入检测 | 级联：正则 → LLM 评委（`CascadeClassifier`） | 高流量、英文为主 → 中间加一级 Prompt Guard 类小模型；已在某朵云上且合规允许 → 托管护栏服务 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 并发模型 | 每个 CPU 核一个进程，每个进程一个事件循环（一个 `AsyncAgent` 实例被所有会话复用） | 任务超过一两分钟或者不能白跑 → 队列 + worker（worker 里仍是 `AsyncAgent`）；不可信代码 → 容器或 microVM | [第 30 课](../lessons/30_async_runtime/README.md) |
+| 流式协议 | SSE + 断开即取消 + 按 `run_id` 恢复 | 语音、需要中途插话 → WebSocket；长任务、不能白跑 → 断开不取消，事件写进缓冲区，按 `Last-Event-ID` 重放 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| 部署与扩缩容 | API 和 worker 分开部署；worker 按队列积压扩缩（KEDA 的 `postgresql` scaler 或 HPA 外部指标） | — | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+
+### 9.2 默认参数起点
+
+| 参数 | 起点 | 取值思路 |
+|---|---|---|
+| 租约 / 心跳 | 租约 30 秒（`run_worker` / `run_async_worker` 的默认值），心跳 = 租约的 1/3（默认） | 心跳不超过租约的一半，否则一次 GC 停顿就丢租约；长任务靠续租，不靠把租约拉长 |
+| 异步 worker 并发 | 从 16–64 开始（`run_async_worker` 默认 16），每个 CPU 核一个进程 | 按模型配额和内存调，不按 CPU |
+| 数据库连接池 | 先按并发度的 1/4 起步 | 看 `get_stats()` 里的 `requests_queued` 是否持续增长；所有进程加起来 < `max_connections` |
+| 停机宽限期 | `run_async_worker(grace_period=25)`；K8s 的 `terminationGracePeriodSeconds` 默认 30 秒 | 后者 > 前者 + 收尾时间；宽限期不必覆盖最长的任务 |
+| 队列最大尝试次数 | `PostgresJobQueue(max_attempts=5)`，退避从 1 秒起、上限 300 秒 | 领取时计数；限流推迟和停机归还不计入 |
+| Temporal 工具重试 | 只读 5 次、带幂等键的写 3 次、不幂等的写 1 次（`retry_policy_for`） | Activity 默认不限次数，必须设上限；客户端重试关掉 |
+| Temporal 心跳超时 / 审批超时 | 10 秒 / 24 小时（`AgentInput` 的默认值） | 心跳超时同时决定"多久发现 worker 死了"和"取消多久送达" |
+| Temporal worker 并发 | `max_concurrent_activities`、`max_concurrent_workflow_tasks` 默认各 100 | 前者对齐模型网关的并发配额 |
+| 采样 | SDK `sample_ratio=1.0` 全量发给 Collector；尾部采样错误和慢请求全留、其余约 5% | `decision_wait` ≥ p99 运行时长；`num_traces`（默认 50000）≥ 每秒 trace 数 × `decision_wait` |
+| 燃烧率告警 | page：1h 与 5m 都 > 14.4，或 6h 与 30m 都 > 6；ticket：3d 与 6h 都 > 1 | 加最小样本数保护；SLO 太松时，燃烧率的上限 1 ÷ (1 − SLO) 会低于阈值 |
+| 租户标签上限 | `PrometheusHook(max_tenants=50)` | 最好再给白名单 `allowed_tenants`，其余归入 `__other__` |
+| 网关重试 | `LiteLLMRouterLLM` 默认 `num_retries=2` | 主模型出错时先重试再降级；面向用户的同步请求调小，或者给整次请求设截止时间 |
+| AsyncAgent 上限 | `max_parallel_tools=8`、`max_threads=32`；`AsyncOpenAICompatLLM(max_connections=100)` | 每个模型的 `max_concurrency` ≤ `max_connections`；设 `run_timeout` 和 `limiter_timeout`，最坏延迟是两者之和 |
+
+### 9.3 五个必须会算的数
+
+| 估算 | 公式 | 例子 | 启示 |
+|---|---|---|---|
+| **需要多少并发**（利特尔法则） | L = λ × W | 每秒 50 个请求 × 8 秒 = 400 个同时在等的会话 | W 按 p95 取；一个同步线程就是一个名额 |
+| **燃烧率** | 实际错误率 ÷ (1 − SLO)，上限是 1 ÷ (1 − SLO) | SLO 99% 时，错误率 14.4% 就是燃烧率 14.4，持续 1 小时烧掉 30 天预算的 2%；SLO 95% 时燃烧率最多只有 20 | SLO 定得太松，燃烧率告警就失效 |
+| **最坏上游请求数** | (num_retries + 1) × 模型组数 × 外层尝试次数 | Router `num_retries=2`、一主一备、外层再试 3 次 → 18 次 | 重试只放一层 |
+| **尾部采样的 Collector 内存** | 高峰每秒新 trace 数 × `decision_wait` × 每条 trace 大小 | 12 条/秒 × 180 秒 × 25 KB ≈ 54 MB | 规模扩大 100 倍就要分两层部署 |
+| **连接池大小** | 并发度 × 每个任务持有连接的时间占比 + 余量（心跳、领取） | 第 26 课：16 路并发，池只按需长到 5–10 个连接，只给 4 个吞吐也一样 | 等模型时别占着连接 |
+
+### 9.4 关键代码
+
+**多 worker：Postgres 队列 + fence 检查点 + Redis 幂等与限流**（[第 26 课](../lessons/26_state_and_queues/README.md)）
+
+```python
+from psycopg_pool import AsyncConnectionPool
+from agentkit.aio import AsyncAgent, default_async_llm
+from agentkit.contrib.postgres import AgentJobHandler, AsyncPostgresCheckpointer, AsyncPostgresJobQueue, run_async_worker, stop_on_signals
+from agentkit.contrib.redis_store import AsyncRateLimitHook, AsyncRedisIdempotencyStore, AsyncRedisTokenBucket
+
+pool = AsyncConnectionPool(DSN, max_size=8, kwargs={"autocommit": True})   # 队列和检查点共用一个池
+queue, ckpt = AsyncPostgresJobQueue(pool), AsyncPostgresCheckpointer(pool)
+limiter = AsyncRateLimitHook(AsyncRedisTokenBucket(REDIS_URL, rate_per_sec=5, capacity=10), wait_timeout=2)
+agent = AsyncAgent(default_async_llm(max_connections=20), TOOLS, checkpointer=ckpt, hooks=[limiter],
+                   idempotency_store=AsyncRedisIdempotencyStore(REDIS_URL))   # 只是缓存，底线是下游唯一约束
+stop = asyncio.Event(); stop_on_signals(stop)                               # SIGTERM → 停止领取、排空
+await run_async_worker(queue, AgentJobHandler(agent, ckpt), worker_id=os.environ["HOSTNAME"],
+                       stop_event=stop, concurrency=32, grace_period=25)   # 每个任务自动用带 fence 的检查点视图
+```
+
+**Temporal：启动、审批、查状态**（[第 27 课](../lessons/27_durable_workflows/README.md)）
+
+```python
+from agentkit.contrib.temporal import agent_status, approve, make_worker, start_agent
+
+worker = make_worker(client, "support-agents", lambda: default_async_llm(max_connections=20), TOOLS,
+                     idempotency_store=AsyncRedisIdempotencyStore(REDIS_URL))   # 跨 worker 共享，写工具才按幂等重试
+handle = await start_agent(client, "订单 A1001 申请退款", {"tenant_id": "acme", "user_id": "u1"},
+                           workflow_id="refund-A1001", task_queue="support-agents", approval_timeout_s=24 * 3600)
+st = await agent_status(client, "refund-A1001")                              # query：等待中的审批、调用过的工具
+await approve(client, "refund-A1001", st.pending_approvals[0]["call_id"], True, by="zhang.manager", wait=True)  # update
+```
+
+**OpenTelemetry + Prometheus + 跨队列传播**（[第 28 课](../lessons/28_production_observability/README.md)）
+
+```python
+from agentkit.contrib.otel import OTelTracer, PrometheusHook, continue_trace, inject_context, setup_tracing, start_metrics_server
+
+tracer = OTelTracer(setup_tracing("support-agent", sample_ratio=1.0))       # 端点从 OTEL_EXPORTER_OTLP_ENDPOINT 读；默认不采集内容
+metrics = PrometheusHook(tenant_label=True, allowed_tenants={"acme", "globex"})
+start_metrics_server(9464, addr="0.0.0.0")
+agent = AsyncAgent(llm, TOOLS, tracer=tracer, hooks=[tracer, metrics])
+
+payload = {"input": text, "trace": inject_context({})}                      # 生产者：traceparent 随 payload 走
+async with continue_trace(payload["trace"]):                                # worker：接着同一条 trace
+    await agent.run(payload["input"])
+```
+
+**网关 + Cedar + 级联护栏**（[第 29 课](../lessons/29_gateway_and_guardrails/README.md)）
+
+```python
+from agentkit.contrib.gateway import AsyncLiteLLMRouterLLM
+from agentkit.contrib.guards import AsyncClassifierGuard, CascadeClassifier, LLMClassifier, RegexClassifier
+from agentkit.contrib.policy import CedarPolicy, entity_args_context
+
+llm = AsyncLiteLLMRouterLLM.from_env()          # LLM_MODEL 失败时降级到 LLM_FALLBACK_MODEL；重试只放在这一层
+policy = CedarPolicy("policies.cedar", "schema.cedarschema", tools=TOOLS,    # 构造时用 schema 校验；求值出错按拒绝
+                     context_fn=entity_args_context({"reset_password": {"target_user_id": ("target_user", "User")}}))
+guard = AsyncClassifierGuard(CascadeClassifier([RegexClassifier(), LLMClassifier(llm)], [(0.1, 0.95), (0.5, 0.5)]),
+                             on="input", mode="serial")
+agent = AsyncAgent(llm, TOOLS, hooks=[guard, policy])
+```
+
+**AsyncAgent：舱壁、截止时间、进程隔离、流式与取消**（[第 30 课](../lessons/30_async_runtime/README.md)）
+
+```python
+from agentkit.aio import AsyncAgent, AsyncOpenAICompatLLM, AsyncResilientLLM, KeyedLimiter, isolated
+
+agent = AsyncAgent(
+    AsyncResilientLLM(AsyncOpenAICompatLLM(max_connections=50), max_concurrency=20),  # 每个模型的并发 ≤ 连接池
+    tools=[search_kb, isolated(run_report)],               # isolated：同步工具在子进程里跑，超时直接 kill
+    limiter=KeyedLimiter(per_key=5, global_limit=200), limiter_timeout=0.5,   # 按租户的舱壁，排不上就 rate_limited
+    run_timeout=120,                                       # 整次运行的截止时间
+)
+async with contextlib.aclosing(agent.stream(text, metadata={"tenant_id": "acme"})) as events:
+    async for event in events: ...                         # 消费方断开 → 运行被取消，检查点记为 cancelled
+```
+
+### 9.5 上生产前再问 6 个问题
+
+接着第 6 节的 15 问，换成成熟组件、部署成多实例服务之前再过一遍：
+
+| # | 问题 | 回答不上来意味着 |
+|---|---|---|
+| 16 | worker 在执行中被 `kill -9`，或者冻结 1 分钟后醒来，谁来拦住它迟到的写入？下游会多出记录吗？ | 检查点没有 fence 接管，或幂等没有下沉（[PR2](failure-modes.md#pr2-检查点只做-cascas-without-fenced-takeover)、[PR1](failure-modes.md#pr1-贪心领取over-claiming-worker)） |
+| 17 | 故障时，一次用户请求最多会变成多少次上游调用？降级发生时，谁会知道？ | 重试层层叠加，降级在静默发生（[PR3](failure-modes.md#pr3-重试层层叠加stacked-retries)、[PR8](failure-modes.md#pr8-网关降级掩盖质量回归gateway-fallback-masks-a-regression)） |
+| 18 | 授权、限流、护栏组件自己挂了，结果是放行还是拒绝？是谁决定的？ | 可能在故障时放行（[PR9](failure-modes.md#pr9-故障时放行fail-open-policy-and-limits)） |
+| 19 | 用户关掉页面后，多久停止花钱？恢复之后，写操作会不会重复？ | 取消语义没做对（[PR11](failure-modes.md#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done)、[PR10](failure-modes.md#pr10-同步调用卡住事件循环event-loop-blocked-by-sync-calls)） |
+| 20 | 滚动发布时，正在跑的任务会怎样？扩缩容看的是什么指标？ | 发布会丢任务，扩容信号选错了（[PR12](failure-modes.md#pr12-停机丢掉在途运行in-flight-runs-lost-on-shutdown)、[PR13](failure-modes.md#pr13-按错误的信号扩缩容autoscaling-on-the-wrong-signal)） |
+| 21 | 改了 workflow 代码之后，正在等审批的运行还能恢复吗？怎么证明？ | 缺少版本化和重放测试（[PR4](failure-modes.md#pr4-发版后的非确定性错误nondeterminism-after-deploy)） |

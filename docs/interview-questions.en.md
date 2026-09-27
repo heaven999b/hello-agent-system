@@ -7,7 +7,7 @@
 
 ## How to Use This Question Bank
 
-- **76 questions in total**: 15 conceptual, 12 scenario, 11 troubleshooting, 16 on distributed systems / concurrency / cost / release, 7 short system design questions, and 15 advanced questions from Part 3 of the course, plus **3 fully worked system design answers** (Part 7, counted separately).
+- **88 questions in total**: 15 conceptual, 12 scenario, 11 troubleshooting, 16 on distributed systems / concurrency / cost / release, 7 short system design questions, 15 advanced questions from Part 3 of the course, and 12 production questions from Part 4 of the course, plus **3 fully worked system design answers** (Part 8, counted separately).
 - Difficulty: ⭐ Fundamentals (you should be able to answer after the corresponding lesson), ⭐⭐ Intermediate (requires combining material from several lessons), ⭐⭐⭐ Advanced (requires production experience or deeper thinking).
 - **Answer on your own first, then expand the key points.** The answers are key points, not scripts. In the interview, connect them in your own words, ideally with concrete numbers and first-hand experience.
 - How interviewers grade: explaining *what* it is gets you a pass; explaining *why*, and what breaks if you don't do it, is good; discussing *trade-offs, edge cases, and how you would verify it* is excellent.
@@ -880,7 +880,7 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 
 ## Part 5: Short System Design Questions
 
-> These questions come with the "skeleton" of an answer. For what a complete answer looks like, see the three worked examples in Part 7.
+> These questions come with the "skeleton" of an answer. For what a complete answer looks like, see the three worked examples in Part 8.
 
 ### D1. Design an internal knowledge-base Q&A agent where employees can only see the documents they're authorized to see. ⭐⭐
 
@@ -1196,7 +1196,171 @@ Fixes: pass the idempotency key (`run_id:call_id`) to the ticketing system; pers
 
 ---
 
-## Part 7: Worked System Design Answers
+## Part 7: Production: State, Workflows, Observability, Gateways, the Async Runtime, and Deployment
+
+> This part maps to Part 4 of the course ([Lesson 26](../lessons/26_state_and_queues/README.en.md) through [Lesson 31](../lessons/31_deployment_and_scaling/README.en.md)). The questions lean toward "choosing components, and what those components do when things fail": once checkpoints, queues, workflows, tracing, gateways, policies, and the runtime are mature components, which guarantees come from the component and which are still your job.
+
+### P1. Your checkpoints already use version-number CAS. Why do you still need a fence? What do SKIP LOCKED, fences, and idempotency keys each protect against? ⭐⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **CAS only guarantees no lost updates**: `UPDATE ... WHERE version = expected` rejects writes based on a stale version. But when a zombie and a new worker read the same version, the first writer wins, and that may be the zombie, leaving the new worker to hit a conflict and throw away its work.
+- **Fenced takeover**: every claim bumps the task's fence. A fenced `load` sets the checkpoint's fence to its own and bumps the version in a single `UPDATE ... RETURNING`, so every later write by the old holder conflicts, and a `load` with a smaller fence is rejected outright. The newest lease holder always wins.
+- **How the three divide the work**: SKIP LOCKED lets many workers claim concurrently without double-claiming or queueing on locks; fences block a zombie's late writes to the queue and the checkpoint; idempotency keys block duplicate side effects (if a crash lands between "downstream executed" and "result persisted," recovery replays the same `call_id`, and downstream deduplicates it).
+- **Bonus points**: the storage has to make the call at the moment of the write; a worker checking "do I still hold the lease?" before writing isn't reliable (it can pause between the check and the write). Raise on conflict instead of returning an easy-to-ignore False. `redrive` never resets the fence.
+- See: [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · failure modes [PR2](failure-modes.en.md#pr2-cas-without-fenced-takeover), [D2](failure-modes.en.md#d2-zombie-worker)
+
+</details>
+
+### P2. Your team proposes "moving the agent task queue to Kafka." How do you review it? When does a Postgres queue, SQS, or RabbitMQ fit? ⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **Start from what an agent queue typically looks like**: each task is handled by one worker, runs for minutes and needs lease renewal, and never needs replay. Throughput is almost never the bottleneck; the model quota is.
+- **Postgres + `FOR UPDATE SKIP LOCKED`**: nearly zero extra operations if you already run Postgres, and enqueueing can share a transaction with business data (the outbox effect). The cost is building leases, heartbeats, retries, dead-lettering, and fences yourself, and watching table bloat and VACUUM. The starting point for most agent platforms.
+- **SQS**: fully managed; standard queues are at-least-once and may deliver duplicates; the visibility timeout defaults to 30 seconds with a 12-hour maximum, so long tasks must extend it; old receipt handles can't do fencing. **RabbitMQ quorum queues**: at-least-once with manual acks, a fit for complex routing and multiple consumers.
+- **Signals that Kafka is warranted**: several systems must subscribe to the same data, you need strict per-key ordering with replay, or write volume outgrows Postgres. Its consumer-offset model isn't built for "one message takes 3 minutes," and its exactly-once only holds for read-process-write inside Kafka; writes to external systems still rely on idempotency.
+- **Bonus points**: task frameworks such as Celery aren't storage, so check the broker defaults: with Redis as the broker, `visibility_timeout` defaults to 1 hour, and longer tasks get redelivered to another worker and run twice.
+- See: [Lesson 26](../lessons/26_state_and_queues/README.en.md) · failure modes [PR1](failure-modes.en.md#pr1-over-claiming-worker), [D3](failure-modes.en.md#d3-duplicate-delivery)
+
+</details>
+
+### P3. When should you bring in Temporal, and when is AsyncAgent + Postgres checkpoints + a lease queue enough? ⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **The difference is who guarantees what**: with checkpoints, detecting crashes, triggering recovery, mutual exclusion when two processes recover the same run, and approval timers are all your code (leases, heartbeats, fences, sweepers). With Temporal, the service records the event history, detects failures by timeout, dispatches work to a live worker, and keeps time with durable timers.
+- **You pay from day one**: another service to run (or Temporal Cloud to buy), determinism constraints, and a few extra network round trips per step. Lesson 27 measured about 50 milliseconds of Temporal's own overhead per workflow.
+- **Rule of thumb** (Lesson 27): consider Temporal when at least two of these hold: single tasks often exceed 30 minutes; you wait on people; there are timed actions; a failure needs human cleanup; and someone will run it (or there's budget for the cloud service).
+- **Migration can be cheap**: Lesson 27's `execute_tool` runs tools with `AsyncToolExecutor`, the same execution semantics as `AsyncAgent`, so moving from checkpoints to Temporal doesn't change a line of tool code.
+- See: [Lesson 27](../lessons/27_durable_workflows/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 30](../lessons/30_async_runtime/README.en.md)
+
+</details>
+
+### P4. Running an agent on Temporal: LLMs are nondeterministic, so how does the workflow stay deterministic? Why do activities still need idempotency? And you have a change shipping Friday while some runs are waiting for approval. What do you do? ⭐⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **Determinism constrains only the orchestration code**: model calls and tool calls are activities whose results are written to the event history on first execution and read back from it on replay, so the model isn't called again. The workflow just turns the model's decision into the next activity. Use `workflow.now()` / `workflow.random()` for time and randomness.
+- **Activities are at-least-once**: Temporal guarantees an activity is *observed* as completed exactly once, but if the worker crashes between finishing and reporting, it runs again. Write operations either get `maximum_attempts=1` (hand "result unknown" to a human) or pass `workflow_id:call_id` downstream as an idempotency key. Activities also retry without limit by default, so set a cap.
+- **Shipping the change**: add an activity at the start of the workflow and old runs no longer match their history on replay; they get stuck on a `NondeterminismError`. Wrap the new logic in `workflow.patched("id")`, switch to `deprecate_patch` once all old runs have finished, and delete it after that; or use Worker Versioning's Pinned behavior so old runs finish on old workers. Before releasing, run a `Replayer` over sampled production histories.
+- **Bonus points**: replay compares commands, not arguments, so changing a prompt raises no error while the in-memory state may already diverge; modules passed through into the sandbox aren't protected by it; an agent's event history grows quadratically with its steps, so design for continue-as-new and context compaction.
+- See: [Lesson 27](../lessons/27_durable_workflows/README.en.md) · failure modes [PR4](failure-modes.en.md#pr4-nondeterminism-after-deploy), [PR5](failure-modes.en.md#pr5-event-history-blowup), [PR3](failure-modes.en.md#pr3-stacked-retries)
+
+</details>
+
+### P5. You're moving from Lesson 10's home-grown Tracer to OpenTelemetry. What decisions do you have to make? ⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **Pick the instrumentation standard before the backend**: OTel SDK + GenAI semantic conventions + OTLP. The application sends only to the Collector, which decides whether data goes to an operations backend (Tempo, Jaeger) or an LLM platform (such as Langfuse) and which attributes each gets. Business code doesn't depend on any platform SDK. The conventions are still in Development status, so pin the version and recheck attribute names on upgrade.
+- **What counts as an error**: per OTel's conventions for recording errors, leave the status UNSET when nothing failed. A tool failure turns only `execute_tool` red; if the model absorbs the error and the run completes, the root span isn't marked. Approval waits, budget stops, and client cancellations are not ERROR: marking them would trigger error-rate alerts and make tail sampling keep all of them.
+- **Content capture**: prompts, replies, and tool arguments are opt-in and off by default; when enabled, redact first, then truncate; the Collector adds another layer of HMAC redaction; operations backends never receive content attributes.
+- **Metrics take a separate path**: `PrometheusHook` counts every run before any sampling, alerts and SLOs are based on metrics, and traces are only for investigation. Every label needs a stated ceiling.
+- See: [Lesson 28](../lessons/28_production_observability/README.en.md) · [Lesson 10](../lessons/10_observability/README.en.md) · failure modes [PR7](failure-modes.en.md#pr7-label-cardinality-explosion), [S7](failure-modes.en.md#s7-sensitive-information-disclosure)
+
+</details>
+
+### P6. Explain multiwindow, multi-burn-rate alerting. Which events count as bad in an agent's availability SLO? What happens if you set the SLO at 95%? ⭐⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **Burn rate** = actual error rate ÷ error budget (1 − SLO); a burn rate of 1 means you use up the budget exactly at the end of the period. A burn rate of 14.4 sustained for 1 hour burns 2% of a 30-day budget.
+- **Why two windows**: page when both the 1-hour and 5-minute burn rates exceed 14.4, or both the 6-hour and 30-minute rates exceed 6; open a ticket when both the 3-day and 6-hour rates exceed 1. The long window proves a meaningful chunk of budget really burned (precision); the short window proves it's still burning (so alerts clear promptly after recovery).
+- **Defining bad events**: model unavailable, steps exhausted, timeout, rejected by your own rate limiter — in all of these, the user got no answer. Not counted: waiting for approval, client cancellation, budget stops, blocked input; those are policies working as designed.
+- **Too loose an SLO disables burn-rate alerting**: the burn rate can be at most 1 ÷ (1 − SLO), which is 20 at 95%, so a 14.4 threshold only pages once the error rate exceeds 72%. Also, in low-traffic periods a single failure is a large error rate, so page rules need a minimum sample count.
+- See: [Lesson 28](../lessons/28_production_observability/README.en.md) · failure mode [P1](failure-modes.en.md#p1-silent-failure)
+
+</details>
+
+### P7. A task waited 2 hours in the queue before a worker picked it up. How should its trace connect? How do you size memory for tail sampling in the Collector? ⭐⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **Propagation**: at enqueue, `inject_context` writes `traceparent` into the payload, and the worker continues it with `continue_trace`; the sampler is `ParentBased`, following the upstream decision.
+- **After a 2-hour wait**: making the producer the parent stretches the trace across 2 hours, and the Collector decided the first half long ago, after `decision_wait`, so the worker's spans arrive late. Better: start a new trace with a span link back to the producer (the messaging conventions' default), correlate with `run_id`, and configure `decision_cache` so late spans follow the decision already made.
+- **Memory**: ≈ peak new traces per second × `decision_wait` × trace size. Agent runs last minutes, so `decision_wait` must cover the p99 run duration, and `num_traces` (default 50000) should be at least "traces per second × decision_wait". All spans of a trace must reach the same instance: route by trace ID with the loadbalancing exporter in a first tier, and tail-sample in a second.
+- **Bonus points**: OTel Python may emit traceparent flags of `03` (the random bit set too), so test the sampled bit bitwise; baggage goes verbatim to every downstream service, so never put user IDs in it.
+- See: [Lesson 28](../lessons/28_production_observability/README.en.md) · failure mode [PR6](failure-modes.en.md#pr6-trace-broken-at-the-queue)
+
+</details>
+
+### P8. Twenty services at your company are moving onto one model gateway. Which layer retries? Which layer enforces budgets? How do you keep fallbacks from hiding quality problems? ⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **Why a gateway**: centralized keys (services hold only virtual keys), budgets and limits shared across services, unified auditing, and switching providers without touching business code. With multiple gateway instances, counters must live in Redis, or N instances means N times the limit; decide in advance whether to allow or deny when Redis is unreachable (LiteLLM's `fail_closed_rate_limit_enforcement`).
+- **Retry at one layer**: the Router already does "retry → fallback"; wrap it in `ResilientLLM` and put a Proxy behind it, and the counts multiply (`num_retries=2`, one primary and one fallback, 3 outer attempts: up to 18 upstream requests). A common split: the gateway owns retries, fallbacks, and limits; the application keeps only a bulkhead (concurrency cap) and semantic budgets. Streaming calls can only retry or fall back before the first token.
+- **Budgets at both layers**: the application layer (`BudgetHook`) knows what "a run" and "a step" are, so it can stop runaway loops and degrade by business meaning; the gateway sees every service and enforces organization-wide hard caps.
+- **Fallbacks can't be silent**: break down metrics by the model that actually answered, alert on the fallback rate, and put every model in the fallback chain through the same evals. `x-litellm-attempted-retries` counts only the model group that finally succeeded, so count retries from callbacks or gateway logs.
+- See: [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) · [Lesson 08](../lessons/08_reliability/README.en.md) · failure modes [PR3](failure-modes.en.md#pr3-stacked-retries), [PR8](failure-modes.en.md#pr8-gateway-fallback-masks-a-regression), [D9](failure-modes.en.md#d9-local-only-rate-limiting)
+
+</details>
+
+### P9. What do you gain by replacing in-code RBAC with Cedar? When does a forbid policy "not take effect"? If the guardrail classifier is down, should you allow or deny? ⭐⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **Policy as code**: reviewable (the security team reads the policy diff), testable (static schema validation plus decision test cases), auditable (`explain()` names the policy that decided), and released independently of code (a single forbid can disable a tool globally). It can also express argument-level rules such as "you can only reset your own password."
+- **When forbid fails**: Cedar skips policies that error during evaluation. Leave out one entity, and a forbid that reads its attributes stops working; the result can flip from Deny to Allow (Lesson 29, demo 2e). Schema validation checks the policies, not whether runtime entities are complete. So the adapter treats any evaluation error as a deny and builds and completes entities only from trusted metadata.
+- **Classifier outages**: the detection layer isn't a security boundary, so it may fail open to stay available (`ClassifierGuard`'s `on_error` allows by default), but it must record and alert. The real floor is permissions and approval, and those must fail closed.
+- **Choosing**: Cedar for in-app RBAC + ABAC; stick with OPA if the platform already standardized on it; use OpenFGA for relationships when the product is about hierarchical sharing (documents, folders, teams).
+- See: [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) · [Lesson 09](../lessons/09_security/README.en.md) · failure modes [PR9](failure-modes.en.md#pr9-fail-open-policy-and-limits), [S5](failure-modes.en.md#s5-excessive-agency)
+
+</details>
+
+### P10. When a user closes the page, how do you make the server actually stop? And how do you make sure resuming doesn't repeat side effects? ⭐⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **The chain**: TCP closes → the ASGI server reports `http.disconnect` → Starlette cancels the response task → the streaming generator's `finally` cancels the run task → `CancelledError` lands in the awaited model call, the HTTP request is aborted, and the connection goes back to the pool. This requires an async model client; with a sync client in a thread, cancellation can only "stop waiting," and the request finishes in the background and is billed anyway.
+- **Clean up correctly**: re-raise `CancelledError` after cleanup; record the checkpoint as `cancelled`; in frameworks with level-triggered cancellation such as AnyIO, `await`s during cleanup are cancelled again, so shield them; protect every save to an async checkpointer, or a save that the database committed but whose reply never arrived leaves the local version stale and the final save is rejected by CAS.
+- **A cancelled write's outcome is unknown**: leave write / dangerous tool calls unanswered and fill in "not executed" only for read-only ones; `resume` replays the same `call_id`, the idempotency key `run_id:call_id` stays the same, and downstream deduplicates. Fill in "not executed" for a write, and after resuming the model issues a new `call_id`, so the side effect happens twice.
+- **How to prove it**: check the checkpoint status, that in-flight model calls drop to zero, and the downstream record count; cancel at many moments of a run and sort the results into "stopped," "stuck at running," and "never stopped." Also know that in Python 3.11 and earlier, `asyncio.wait_for` can swallow a cancellation (`agentkit.aio.wait_for` avoids it with `asyncio.timeout()` on 3.11+ and `asyncio.wait` on 3.10).
+- See: [Lesson 30](../lessons/30_async_runtime/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) · failure modes [PR11](failure-modes.en.md#pr11-cancellation-leaves-work-half-done), [T5](failure-modes.en.md#t5-duplicate-side-effects)
+
+</details>
+
+### P11. At the morning peak you get 50 requests per second, each taking 8 seconds on average, on a 4-core machine. How do you choose processes, concurrency, connection pools, and rate limits? How do you autoscale? ⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **Little's Law**: L = 50 × 8 = 400 sessions waiting at once; for capacity planning, take W at p95, not the average.
+- **Concurrency model**: one process per CPU core and one event loop per process (a single `AsyncAgent` instance shared by every session, with per-run state in `RunState`); legacy sync code in a bounded thread pool; tasks longer than a minute or two go through a queue and workers.
+- **Line up the limits**: each model's concurrency cap ≤ the HTTP connection pool size; size database pools by "coroutines using a connection at the same time," with all processes together under `max_connections`; async workers take a slot before claiming (backpressure).
+- **Three layers of rate limiting**: the gateway owns contracts and money, Redis owns per-tenant quotas across instances, and an in-process bulkhead (`KeyedLimiter`) keeps this process from being overwhelmed, returning 429 quickly when there's no slot. Timeouts grow from the inside out: tool timeout < `run_timeout` < gateway and proxy timeouts.
+- **Autoscaling**: scale workers on queue backlog, the age of the oldest task, or in-flight saturation (KEDA's `postgresql` scaler or HPA external metrics), not CPU; set the replica ceiling from the model quota.
+- See: [Lesson 30](../lessons/30_async_runtime/README.en.md) · [Lesson 31](../lessons/31_deployment_and_scaling/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) · failure modes [PR13](failure-modes.en.md#pr13-autoscaling-on-the-wrong-signal), [PR10](failure-modes.en.md#pr10-event-loop-blocked-by-sync-calls)
+
+</details>
+
+### P12. During a Kubernetes rolling update, what happens to a worker in the middle of a long task? How do you design graceful shutdown and health checks, and how do you prove that releases neither lose tasks nor repeat side effects? ⭐⭐⭐
+
+<details>
+<summary>Key points</summary>
+
+- **Kubernetes's timeline**: run preStop, then send SIGTERM to the container, then SIGKILL after `terminationGracePeriodSeconds` (30 seconds by default, including preStop time).
+- **The worker on SIGTERM**: readiness returns 503 and claiming stops → in-flight tasks finish within the grace period while heartbeats keep renewing leases → tasks that can't finish are cancelled (the checkpoint records `cancelled`, write calls stay unanswered) and handed back to the queue right away with a fence check, so another worker takes over and replays the same `call_id` → flush traces, close connection pools, and exit. The grace period doesn't have to cover the longest task, but `terminationGracePeriodSeconds` must exceed the grace period plus cleanup. With `kill -9` nothing gets done; lease expiry and checkpoints are the backstop.
+- **Health checks**: liveness checks only this process (whether the event loop can respond), not the database; otherwise a database blip restarts every Pod at once. Readiness checks dependencies and whether the process is shutting down.
+- **Proving it**: inject faults during a load test (`kill -9` mid-run, a rolling restart that starts the new worker before SIGTERMing the old one, two approvers clicking approve at once, streams disconnected midway), then verify item by item: every run ends in an explainable state, every write call maps to exactly one downstream record, disconnected runs are recorded as `cancelled`, and metrics match the counts in the database. Measure tail latency with an open-loop test; a closed-loop test suffers from coordinated omission and flatters the latency distribution.
+- See: [Lesson 31](../lessons/31_deployment_and_scaling/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 30](../lessons/30_async_runtime/README.en.md) · failure modes [PR12](failure-modes.en.md#pr12-in-flight-runs-lost-on-shutdown), [PR1](failure-modes.en.md#pr1-over-claiming-worker)
+
+</details>
+
+---
+
+## Part 8: Worked System Design Answers
 
 System design questions have no single correct answer. What the interviewer is evaluating is your **thought process**. A recommended framework for structuring your answer:
 

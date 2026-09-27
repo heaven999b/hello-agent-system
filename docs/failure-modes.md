@@ -5,7 +5,7 @@
 > 📖 本文是"领域参考手册"的一部分，配合课程使用。
 > 相关文档：[设计评审清单](design-review-checklist.md) · [速查表](cheatsheet.md) · [术语表](glossary.md) · [面试题](interview-questions.md)
 
-这份图鉴收录了 **79 种**生产环境里真实会遇到的 Agent 失败模式，分为十一类（第十类是分布式、高并发与发布，第十一类对应课程第三部分的进阶主题：检索、记忆、数据、评估、优化与扩展能力）。为什么要专门整理？
+这份图鉴收录了 **92 种**生产环境里真实会遇到的 Agent 失败模式，分为十二类（第十类是分布式、高并发与发布，第十一类对应课程第三部分的进阶主题：检索、记忆、数据、评估、优化与扩展能力，第十二类对应课程第四部分：换上成熟组件、部署成多实例服务之后才会遇到的问题）。为什么要专门整理？
 
 传统软件出错，通常是"报了个异常"；Agent 出错，常常是**一切看起来都很正常**：HTTP 200、没有报错、回答语气自信——但它编造了一个退款政策、给同一个用户建了两张工单、或者把另一家公司的数据告诉了你。
 Agent 的失败有三个特点：
@@ -113,6 +113,20 @@ Agent 的失败有三个特点：
 | [A10](#a10-主动式-agent-过度打扰over-interrupting-proactive-agent) | 主动式 Agent 过度打扰 Over-Interrupting Proactive Agent | 什么都提醒，用户关掉了整个功能 | 🟠 中 | 打扰决策器 + 频率上限 |
 | [A11](#a11-融合挤掉好结果fusion-crowds-out-good-results) | 融合挤掉好结果 Fusion Crowds Out Good Results | 上了混合检索，好文档反而掉出前 10 | 🟡 低 | 向量下限 + 调权重 + 按类别评估 |
 | [A12](#a12-benchmark-漏洞leaky-benchmark) | Benchmark 漏洞 Leaky Benchmark | 什么都不做的 Agent 也能拿 38% | 🔴 高 | 探针 Agent + ABC 清单 |
+| **生产落地：状态、工作流、可观测性、网关、异步运行时与部署** |||||
+| [PR1](#pr1-贪心领取over-claiming-worker) | 贪心领取 Over-Claiming Worker | worker 满载还在领取，租约成片过期，任务被执行两次 | 🔴 高 | 先拿名额再领取 + fence |
+| [PR2](#pr2-检查点只做-cascas-without-fenced-takeover) | 检查点只做 CAS CAS Without Fenced Takeover | 僵尸和新 worker 读到同一版本，先写的僵尸赢了 | 🔴 高 | 队列 fence 驱动检查点接管 |
+| [PR3](#pr3-重试层层叠加stacked-retries) | 重试层层叠加 Stacked Retries | SDK、ResilientLLM、Router、Temporal 各重试一遍，一次请求变十几次 | 🟠 中 | 重试只放一层 + 幂等键 |
+| [PR4](#pr4-发版后的非确定性错误nondeterminism-after-deploy) | 发版后的非确定性错误 Nondeterminism After Deploy | 发布后等审批的运行卡在 WorkflowTaskFailed | 🔴 高 | patching + 重放测试 |
+| [PR5](#pr5-事件历史撑爆event-history-blowup) | 事件历史撑爆 Event History Blowup | 跑了几十步的 workflow 因历史超限失败 | 🟠 中 | continue-as-new + 上下文压缩 |
+| [PR6](#pr6-trace-在队列处断开trace-broken-at-the-queue) | trace 在队列处断开 Trace Broken at the Queue | API 和 worker 在后端里是两条 trace | 🟡 低 | traceparent 随 payload 传递 |
+| [PR7](#pr7-指标标签基数爆炸label-cardinality-explosion) | 指标标签基数爆炸 Label Cardinality Explosion | user_id 当标签，Prometheus 内存告警 | 🟠 中 | 标签只用枚举 + 白名单 |
+| [PR8](#pr8-网关降级掩盖质量回归gateway-fallback-masks-a-regression) | 网关降级掩盖质量回归 Gateway Fallback Masks a Regression | 看板全绿，完成率和差评悄悄变差 | 🟠 中 | 按实际模型拆指标 + 降级告警 |
+| [PR9](#pr9-故障时放行fail-open-policy-and-limits) | 故障时放行 Fail-Open Policy and Limits | 策略求值出错被跳过，本该拒绝的危险操作放行了 | 🔴 高 | 授权 fail closed + 故障演练 |
+| [PR10](#pr10-同步调用卡住事件循环event-loop-blocked-by-sync-calls) | 同步调用卡住事件循环 Event Loop Blocked by Sync Calls | 一个阻塞调用，整个进程的会话和心跳一起停 | 🟠 中 | 全链路 async + 事件循环延迟监控 |
+| [PR11](#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done) | 取消后副作用重复或状态悬空 Cancellation Leaves Work Half-Done | 断开重连后建了两张工单；检查点停在 running | 🔴 高 | 写调用保持未回答 + 保存受 shield 保护 |
+| [PR12](#pr12-停机丢掉在途运行in-flight-runs-lost-on-shutdown) | 停机丢掉在途运行 In-Flight Runs Lost on Shutdown | 每次滚动发布都有一批运行失败或重跑 | 🟠 中 | SIGTERM 排空 + 归还任务 |
+| [PR13](#pr13-按错误的信号扩缩容autoscaling-on-the-wrong-signal) | 按错误的信号扩缩容 Autoscaling on the Wrong Signal | CPU 全绿，任务越排越久 | 🟠 中 | 按积压和最老任务年龄扩缩 |
 
 > 严重度是一般性经验判断：🔴 致命 = 可能造成数据泄露/资金损失/法律责任；🔴 高 = 直接伤害用户或业务；🟠 中 = 体验和成本问题；🟡 低 = 效率问题。你的业务场景可能不同。
 
@@ -955,6 +969,143 @@ Agent 的失败有三个特点：
 | 检测 | 写几个不调用模型的探针 Agent（什么都不做、固定话术、偷看环境里的隐藏字段、参考解），确认钻空子的探针得分接近 0，这一步零成本、可以放进 CI；用参考解逐条核对标注，证明每个任务都可解；换日期、打乱顺序、接在别的运行后面再跑，参考解的得分应该不变；报告平凡 Agent 的基线（ABC R.13）；定期读 transcript。 |
 | 修复/预防 | 按 ABC 清单审查（任务有效性 T.1–T.10、结果有效性 O.a–O.i、结果报告 R.1–R.13）；评分器看环境终态，"什么都不做"必定失败；每次试验新建环境；标准答案不出现在 Agent 能看到的地方；基础设施错误单独标记并重试，仍然失败就中止评估；随时间变化的输入（比如日期）按和线上一致的方式处理；benchmark 本身带版本号，任务、评分器、环境、评委 prompt 任何一个变了，分数都不再和旧版本直接可比。 |
 | 课程 | [第 22 课](../lessons/22_eval_methodology/README.md) · [第 11 课](../lessons/11_evals/README.md) · [第 24 课](../lessons/24_coding_agents/README.md) |
+
+---
+
+## 十二、生产落地：状态、工作流、可观测性、网关、异步运行时与部署
+
+> 这一类对应课程第四部分（第 26–31 课）。把教学实现换成 Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar 和 asyncio 之后，组件本身是成熟的，但它们的默认值、组合方式和"自己出故障时怎么办"都要你来把关，而且这些问题大多只在多进程、多实例、真实负载和发布时才出现。相关的已有条目：[D2](failure-modes.md#d2-僵尸-workerzombie-worker)（僵尸 Worker）、[D3](failure-modes.md#d3-重复投递duplicate-delivery)（重复投递）、[D4](failure-modes.md#d4-队列积压雪崩queue-backlog-avalanche)（队列积压雪崩）、[D9](failure-modes.md#d9-限流只在单机生效local-only-rate-limiting)（限流只在单机生效）、[R1](failure-modes.md#r1-重试风暴retry-storm)（重试风暴）、[R3](failure-modes.md#r3-降级后静默变差silent-degradation)（降级后静默变差）、[R4](failure-modes.md#r4-中断后从头重来lost-progress)（中断后从头重来）。
+
+### PR1 贪心领取（Over-Claiming Worker）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 高峰期同一个任务被执行了两次，日志里成片出现租约过期和 fence 拒绝；一个异步 worker 进程手里的任务数远超它的并发上限，内存上涨，任务却迟迟没进展；另一类表现：跑几十分钟的任务总是被"再投递"一次。 |
+| 根因 | worker 领取的速度超过了它处理的速度。异步 worker 满载时还在 claim，一个进程把几百个任务囤在内存里，处理不过来，租约一个接一个过期，这些任务被别的 worker 重新领取、重复执行。同一类问题还有：租约或可见性超时短于任务时长的 p99（例如 Celery 用 Redis 做 broker 时 `visibility_timeout` 默认 1 小时，超过的任务会被投递给别的 worker）；心跳间隔太接近租约时长，一次 GC 停顿或数据库抖动就丢了租约。 |
+| 检测 | 过期未回收的租约数（`stats()["expired_leases"]`）、fence 拒绝次数（`on_event("fence_rejected")`）、同一任务 attempts 的分布；每个 worker 的在途任务数和并发上限对比；任务时长 p99 和租约 / 可见性超时对比。 |
+| 修复/预防 | **背压**：先拿到并发名额再 claim（`run_async_worker(concurrency=...)` 就是这么做的），满载时任务留在队列里给别人；心跳间隔约为租约的 1/3（第 31 课的参考服务在启动时校验：心跳不能超过租约的一半）；租约或可见性超时大于任务时长 p99，长任务定期续租；最后由 fence 和下游幂等兜底，即使被重复领取也不会重复产生副作用（[D2](failure-modes.md#d2-僵尸-workerzombie-worker)、[D3](failure-modes.md#d3-重复投递duplicate-delivery)）。 |
+| 课程 | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+
+### PR2 检查点只做 CAS（CAS Without Fenced Takeover）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 接手的新 worker 反复收到 `CheckpointConflict`、白跑一趟退出，检查点里留下的却是僵尸 worker 写的旧状态；或者更糟，用的是只保证"写得完整"的文件检查点，僵尸醒来后直接覆盖了新 worker 写的两步，用户看到 Agent"失忆"，系统没报任何错。 |
+| 根因 | 检查点只回答"这次写入是否完整"（`FileCheckpointer` 的临时文件 + `os.replace`）或"是否基于最新版本"（版本号 CAS），没回答"谁是当前的租约持有者"。僵尸和新 worker 读到同一个版本时，先写的赢，输的可能恰好是新 worker。worker 在写入前自己检查"我还持有租约吗"也没用：检查和写入之间还可能再停顿一次。 |
+| 检测 | 检查点表记录 `writer` 和 `fence`；统计冲突次数，以及冲突的输家是谁（fence 大的输给了 fence 小的，就是这个问题）；演练：`SIGSTOP` 一个正在执行的 worker，等租约过期、任务被接手后再 `SIGCONT`（第 26 课 Demo 第 1 部分）。 |
+| 修复/预防 | 用队列的 fence 驱动检查点接管：带 fence 的 `load` 在同一条 `UPDATE ... RETURNING` 里把表里的 fence 改成自己的、版本号加一，从这一刻起旧持有者的任何写入都冲突，fence 更小的 `load` 直接被拒绝（`ckpt.fenced(job.fence)`，`AgentJobHandler` 已经这样做）；冲突时抛异常、立刻停手，而不是返回一个容易被忽略的 False；`redrive` 不重置 fence，fence 永远只增不减。另见 [D2](failure-modes.md#d2-僵尸-workerzombie-worker)。 |
+| 课程 | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+
+### PR3 重试层层叠加（Stacked Retries）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 一次模型故障期间，同一个用户请求打到上游十几次，429 和账单一起飙升；主模型坏了，用户却要等好几秒才切到备用模型；在 Temporal 里，一笔退款被执行了两次；事件历史里看不到内层的重试。 |
+| 根因 | 每一层都觉得"多试几次更可靠"：SDK 自带重试、`ResilientLLM` / `AsyncResilientLLM`、LiteLLM Router 的 `num_retries` 加降级、Proxy 自己的重试、Temporal Activity 默认的不限次重试，次数相乘。第 29 课算过：Router `num_retries=2`、一主一备，外面再套 `max_attempts=3`，一次请求最坏是 18 次上游调用；实测主模型返回 500 时，`num_retries=2` 要约 3.84 秒才降级。另一个坑：`AsyncResilientLLM` 在全部尝试失败后抛出不可重试的错误，套进 Temporal 会让本可重试的 429 被直接放弃。Activity 本身又是"至少执行一次"的，没有幂等键的写工具每多试一次就可能多一次副作用。 |
+| 检测 | 按请求 ID 聚合网关日志，数每个用户请求对应多少次上游调用；看 Router 的 `last_route` 和 `events`；注意 `x-litellm-attempted-retries` 响应头只统计最终成功的那个模型组，看不出主模型组的重试；Temporal 事件历史里每个 activity 的 attempt 分布。 |
+| 修复/预防 | **重试只放一层**：用 Temporal 时关掉客户端重试（`AsyncOpenAICompatLLM` 本来就是 `max_retries=0`），由 RetryPolicy 负责，并给每个工具设上限（`retry_policy_for`：只读 5 次、带幂等键的写 3 次、不幂等的写 1 次）；用 Router 时不再外包 `ResilientLLM`，需要舱壁就用 `AsyncResilientLLM(max_attempts=1, max_concurrency=…)`；业务服务后面有 Proxy 时，客户端不重试；面向用户的同步请求调小 `num_retries` 或给整次请求设截止时间；所有写操作带幂等键。另见 [R1](failure-modes.md#r1-重试风暴retry-storm)。 |
+| 课程 | [第 27 课](../lessons/27_durable_workflows/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) · [第 08 课](../lessons/08_reliability/README.md) |
+
+### PR4 发版后的非确定性错误（Nondeterminism After Deploy）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 发布之后，正在等审批的运行卡住不动，Temporal 的界面里是 `WorkflowTaskFailed`、`Nondeterminism error`；新 worker 一启动就报 `Failed validating workflow`；更隐蔽的是，重放"通过"了，运行却在之后的某个分支判断上走了另一条路。 |
+| 根因 | Temporal 靠重放恢复内存状态，要求同样的事件历史产生同样的命令序列。在 workflow 开头加一个 `workflow.sleep` 或一个 activity，命令顺序就和历史对不上；在 workflow 里读时钟、生成随机数、读环境变量、迭代 set；以 passthrough 方式进沙箱的模块不受沙箱保护（例如 agentkit 的 `RunState()` 默认值用了 `uuid4()` 和 `time.time()`，每次重放得到不同的 `run_id`）；重放只比对命令的种类和顺序，不比对参数，所以改了 system prompt 重放照样通过，内存状态却悄悄不一致了。 |
+| 检测 | CI 里用生产抽样的事件历史跑 `Replayer`（重放测试）；给 `WorkflowTaskFailed` 配告警（workflow 代码抛出普通异常时，默认只是这个 workflow 任务失败并不断重试，运行无声地挂着）；用静态检查找 workflow 代码里的 `time`、`random`、`uuid`、HTTP 调用（第 27 课练习 c）。 |
+| 修复/预防 | 编排和 IO 分离：所有 IO 放进 activity，时间和随机数用 `workflow.now()` / `workflow.random()`，显式传入 `run_id` 和 `started_at`；改 workflow 代码时用 `workflow.patched("id")` 包住新逻辑，旧运行都结束后改成 `deprecate_patch`，再之后删除，或者用 Worker Versioning 的 Pinned 让旧运行在旧 worker 上跑完；发布前必跑重放测试。 |
+| 课程 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+
+### PR5 事件历史撑爆（Event History Blowup）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 一个跑了几十步的研究型 Agent 突然失败，原因是事件历史超过上限；越往后，continue-as-new 越频繁；最后连单个 activity 的输入都超过了 payload 上限。 |
+| 根因 | 每次 `llm_step` 的输入都带着完整的对话，历史里于是存了 N 份越来越长的对话，大小随步数平方增长。第 27 课实测（每个工具返回约 6 KB）：21 步时事件历史 2,797 KiB，而对话本身只有 122 KiB。Temporal 对单个执行的硬上限是 51,200 个事件或 50 MB（10,240 个或 10 MB 时开始告警），单个 payload 默认上限 2 MB。只做 continue-as-new 不够：对话本身越来越长，新 run 越来越快撞线。 |
+| 检测 | 监控每个 workflow 的事件数、历史大小和 continue-as-new 次数；`workflow.info().is_continue_as_new_suggested()`；对话长度（token 数）的分布。 |
+| 修复/预防 | 三件事一起做：continue-as-new 控制历史长度（`AgentWorkflow` 在服务端建议时自动做，也可以用 `continue_as_new_after_events` 设更小的阈值）；上下文压缩控制对话长度（压缩的模型调用放在 activity 里）；大对象走外部存储，历史里只放引用。 |
+| 课程 | [第 27 课](../lessons/27_durable_workflows/README.md) · [第 04 课](../lessons/04_context_memory/README.md) |
+
+### PR6 trace 在队列处断开（Trace Broken at the Queue）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 排查一次投诉时，API、worker 和下游检索服务在追踪后端里是三条互不相关的 trace；或者 worker 那一段被尾部采样单独丢掉，只剩半截 trace；或者生产者那边采样了，worker 自己按比例采样，没接上。 |
+| 根因 | HTTP 调用有自动埋点帮你透传 `traceparent`，队列 payload 没人帮你；任务在队列里等了很久（积压、等审批），trace 被拉长到超过 Collector 的 `decision_wait`，前半段早就做了决定，worker 那一段成了迟到的 span；worker 用的采样器不跟随上游的决定；自己写代码判断 `flags == "01"` 认定已采样（OTel Python 1.45 生成的是 `03`，同时置上了 W3C Trace Context Level 2 的 random 标志位）。 |
+| 检测 | 发一个端到端请求，确认后端里只出现一个 trace_id；统计队列等待时间的分布并和 `decision_wait` 对比；监控 `otelcol_processor_tail_sampling_sampling_trace_dropped_too_early`；span 上带着 `agentkit.run_id`，断开时还能按业务 ID 找回来。 |
+| 修复/预防 | 入队时 `inject_context({})` 写进 payload，worker 用 `with` / `async with continue_trace(job["trace"])` 接着处理；采样器用 `ParentBased(...)`，跟随上游的决定；等待时间可能超过 `decision_wait` 或者批量消费时，消费端新开 trace、用 span link 关联生产者（消息约定的默认做法），并配置 `decision_cache`；span 上永远带 `run_id`、`conversation_id` 这类业务 ID；按位判断采样标志（`int(flags, 16) & 0x01`）。 |
+| 课程 | [第 28 课](../lessons/28_production_observability/README.md) · [第 10 课](../lessons/10_observability/README.md) |
+
+### PR7 指标标签基数爆炸（Label Cardinality Explosion）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 为了看"每个用户的成功率"加了一个标签，一周后 Prometheus 内存告警、查询越来越慢；序列数随用户数和实例数一起上涨；或者每个请求新建一个 Hook，第二个请求就报 `Duplicated timeseries`；多进程部署时，各进程的计数对不上。 |
+| 根因 | 每个不同的标签组合都是一条独立的时间序列：`user_id`、`run_id`、`trace_id`、包含 ID 的原始 URL 路径被当成了标签；看似有限的维度其实不受控（租户数随销售增长，模型可以编出任意工具名）；标签之间是乘法关系（工具 × 错误类型 × 租户）。第 28 课算过：`status`（6 种）×`reason`（约 10 种）×`tenant`（50 个）约 3000 条序列，换成 10 万个用户就是约 600 万条，而且每个实例还要再乘一遍。 |
+| 检测 | `count by (__name__)({__name__=~"agent_.*"})` 看每个指标有多少条序列，超出预期就告警；代码评审时要求每个标签写明取值上限、由谁保证；HTTP 指标按路由模板计数，而不是按原始路径。 |
+| 修复/预防 | 标签只用枚举（`status`、`reason`、`direction`）；`tool` 由工具注册表限定，未知名字记为 `__unknown__`；`tenant` 只在租户数有上限时开，并给白名单（`PrometheusHook(tenant_label=True, max_tenants=50, allowed_tenants=...)`，其余归入 `__other__`）；高基数维度放进 trace 和日志（HMAC 后的 `user.hash`），"每个用户的成功率"从 trace 或数仓里算；指标对象放在进程级缓存里；多进程部署按 prometheus_client 的多进程模式汇总。 |
+| 课程 | [第 28 课](../lessons/28_production_observability/README.md) |
+
+### PR8 网关降级掩盖质量回归（Gateway Fallback Masks a Regression）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 主模型出问题的那几天，任务完成率、工具调用错误率和用户差评悄悄变差，可用性和错误率看板却全是绿的；p95 延迟莫名多了好几秒；月底账单上的模型分布变了，没人知道为什么。 |
+| 根因 | 降级发生在网关（Router 或 Proxy）里，对业务代码是透明的：请求"成功"了，只是回答的是备用模型；备用模型没有过同一套评估；可用性 SLO 只看"有没有返回"，不看"谁返回的"；降级之前还要先按 `num_retries` 重试并退避，延迟就这样多出来；`x-litellm-attempted-retries` 响应头只统计最终成功的模型组，主模型组的重试从它上面看不到。 |
+| 检测 | 按实际回答的模型（`LLMResponse.model`、`last_route["model_group"]`）拆分完成率、工具错误率、成本和延迟；降级事件（`events`）计数，超过阈值就告警；定期在备用模型上跑评估集。 |
+| 修复/预防 | 降级链上的每个模型都过同一套评估（[R3](failure-modes.md#r3-降级后静默变差silent-degradation)）；指标和 trace 带上实际回答的模型（模型名是有限枚举，可以当标签）；降级率进告警，而不是静默；关键任务宁可明确失败、转人工，也不降级到能力差太多的模型；上线前检查降级链：不引用不存在的模型组、没有循环、不降级到同一个上游的同一个模型（第 29 课练习 c）。 |
+| 课程 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) · [第 08 课](../lessons/08_reliability/README.md) · [第 28 课](../lessons/28_production_observability/README.md) |
+
+### PR9 故障时放行（Fail-Open Policy and Limits）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 一条 forbid 策略"不生效"，免费版租户执行了危险操作；Redis 抖了一下，全局限流瞬间失效，厂商配额被打满；护栏服务超时的那段时间，所有输入都被放行，而且没人知道。 |
+| 根因 | 控制组件自己出错时，默认行为是放行。Cedar 的官方语义是求值出错的策略被**跳过**：第 29 课 Demo 2e 漏传了 Tenant 实体，`free-plan-no-dangerous` 读不到 `principal.tenant.plan`，裸调 cedarpy 返回 Allow；schema 校验只检查策略本身，查不了运行时实体传全了没有。LiteLLM Proxy 在 Redis 不可达时退回按实例计数，除非打开 `fail_closed_rate_limit_enforcement`；Envoy 全局限流的 `failure_mode_deny` 默认是 false；`ClassifierGuard` 的 `on_error` 默认放行。放行本身不一定错，错在"没有人决定过、也没有告警"。 |
+| 检测 | 统计策略求值错误（`PolicyDecision.errors`）、护栏错误（`state.metadata["guard_errors"]`、`CascadeClassifier.errors`）和限流后端的连接错误；故障演练：故意漏传实体、停掉 Redis、让分类器超时，看结果是拒绝还是放行。 |
+| 修复/预防 | 把"组件故障时放行还是拒绝"写进设计文档，逐个组件决定：安全边界（授权、审批）一律 fail closed，`CedarPolicy` 把任何求值错误当拒绝，构造时用 schema 校验策略，`build_entities` 从可信 metadata 补全实体；审批超时按拒绝处理；限流比可用性更重要时打开 fail-closed；检测层（护栏）可以 fail open 保可用性，但必须记录并告警，底线仍是权限和审批（[S5](failure-modes.md#s5-过度授权excessive-agency)）。 |
+| 课程 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+
+### PR10 同步调用卡住事件循环（Event Loop Blocked by Sync Calls）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 同一个进程里所有会话一起变慢，而且和负载关系不大；心跳超时，租约莫名过期，任务被别的 worker 接手；Temporal 的 activity 被判心跳超时并重试，模型调用多付了一次钱；asyncio 调试模式报 `Executing <Task ...> took 0.303 seconds` 这类慢回调。 |
+| 根因 | 事件循环是单线程的，协程只在 `await` 处让出。在 async 函数或同步 Hook 里调用 `time.sleep`、`requests`、同步的 psycopg / redis-py / OpenAI 客户端，这段时间里所有协程都停住，包括所有任务的续租心跳。隐蔽的版本是"第一次调用时才创建客户端"：导入 openai、httpx 要零点几秒到几秒。第 27 课场景 6：模型客户端在 async 里用 `time.sleep` 模拟阻塞 IO，20 个 workflow 耗时 7.05 秒、模型调用峰值并发 1，和串行一样，而正常的并发版本是 1.15 秒。 |
+| 检测 | 导出事件循环延迟指标（一个定时心跳协程测量自己被推迟了多久）；staging 环境打开 `PYTHONASYNCIODEBUG=1`，超过 100 毫秒的回调会被记进日志；CI 里用 `ast` 找 async 函数里的阻塞调用（第 30 课练习 c）；worker 的存活探针由事件循环自己应答（第 31 课参考服务的做法），`/metrics` 由另一个线程提供，事件循环卡死时它照样返回 200，不能当存活探针。 |
+| 修复/预防 | 整条链路用 async 客户端（`AsyncOpenAICompatLLM`、`redis.asyncio`、psycopg 的 async 连接、`httpx.AsyncClient`）；绕不开的同步代码用 `asyncio.to_thread` 或有上限的线程池；同步 Hook 只做内存计数（如 `PrometheusHook`），要查库的指标放到独立的定时任务里；客户端在进程启动时创建（`make_worker` 的做法）；异步 Agent 配 `AsyncRateLimitHook`，不用同步的 `RateLimitHook`。 |
+| 课程 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 28 课](../lessons/28_production_observability/README.md) |
+
+### PR11 取消后副作用重复或状态悬空（Cancellation Leaves Work Half-Done）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 用户关掉页面、重连后按 `run_id` 恢复，结果建了两张工单；客户端断开后，检查点一直停在 `running`，对账程序以为它还在跑；或者取消信号干脆"丢了"，运行照样跑完、照样花钱。 |
+| 根因 | 被取消的写操作，结果是"未知"，不是"失败"：取消时给已经发出的写工具调用补上"未执行"，恢复后模型会发起一个新的 `call_id`，幂等键跟着变了，下游去重失效，副作用发生两次（第 26 课实测，已在 `agentkit.aio` 修复）。Starlette 底层的 AnyIO 是电平触发的取消，收尾时保存 `cancelled` 状态的那次 `await` 会被再次取消；取消还可能打断"数据库已提交、客户端没收到回复"的那次保存，本地版本号过期，收尾保存被 CAS 拒绝。吞掉 `CancelledError`（`except BaseException`，或者 `suppress(CancelledError)` 加 `await task`）会让取消失效；Python 3.11 及更早的 `asyncio.wait_for` 在结果和取消同时到达时会吞掉取消（CPython gh-86296）。 |
+| 检测 | 每次取消之后检查三样：检查点是 `cancelled`、模型调用的在途数归零、下游记录数没有多；扫描故障窗口：在一次运行的多个时刻各取消一次，把结果分成"停住了""卡在 running""根本没停"三类（第 30 课的做法，第三类往往指向另一个 bug）；按业务键对账下游副作用。 |
+| 修复/预防 | 取消或超时时，写 / 高危工具的调用保持未回答，只读工具补"未执行"，`resume` 用同一个 `call_id` 重放，下游按 `run_id:call_id` 去重（`AsyncAgent` 的现行语义）；异步检查点的每一次保存都放进受 `asyncio.shield` 保护的独立任务；`CancelledError` 收尾后必须重新抛出；等一个你刚取消的任务用 `asyncio.wait({task})`，不要 `await task`；Python 3.12 之前，可能被取消的超时不要用 `wait_for`（3.11 用 `asyncio.timeout()`，3.10 用 `asyncio.wait` 自己实现）。 |
+| 课程 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+
+### PR12 停机丢掉在途运行（In-Flight Runs Lost on Shutdown）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 每次滚动发布都有一批运行失败或从头重跑；被停掉的 worker 手里的任务，要等一整个租约时长才被别人接手；Pod 在收尾时被 SIGKILL，最后一段 trace 和指标丢了；发布期间有流量打到正在退出的 Pod 上，返回 5xx。 |
+| 根因 | 进程没有处理 SIGTERM（信号发给了容器的 1 号进程，没有到达 worker；或者根本没调用 `stop_on_signals`）；`terminationGracePeriodSeconds`（默认 30 秒，preStop 的耗时也算在内）小于 worker 的宽限期加收尾时间，被硬杀；收到 SIGTERM 后还在领取新任务，就绪探针也没有变成失败；被取消的任务不归还，只能等租约过期；停机归还和限流推迟被算成失败尝试，高峰期健康的任务被送进了死信。 |
+| 检测 | 滚动重启演练（先起新的、就绪后再给旧的发 SIGTERM），数失败、重跑和重复副作用；worker 的退出码（0 还是被 SIGKILL）；从 SIGTERM 到退出的耗时和宽限期对比；发布期间的 5xx 比例。 |
+| 修复/预防 | 容器入口让 Python 进程直接接收信号，调用 `stop_on_signals(stop)`；收到 SIGTERM 后：就绪探针返回 503、停止领取 → 在途任务在 `grace_period` 内做完（心跳照常续租）→ 做不完的取消（检查点记 `cancelled`，写调用保持未回答）并带 fence 立刻归还（第 31 课参考 worker 的做法）→ 刷新 trace、关闭连接池后退出；`terminationGracePeriodSeconds` 大于宽限期加收尾时间；`release()` 不计入尝试次数。宽限期不必覆盖最长的任务：做不完的交给检查点、租约和幂等键。 |
+| 课程 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+
+### PR13 按错误的信号扩缩容（Autoscaling on the Wrong Signal）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 用户说"提交了一直没反应"，CPU 和内存监控却全是绿的，自动扩缩容一个 Pod 都没加；或者延迟一升高就加 Pod，结果 429 反而更多；缩容时，正在跑长任务的 Pod 被删掉。 |
+| 根因 | Agent worker 是 IO 密集型的，大部分时间在等模型，按 CPU 扩缩容永远不会触发；瓶颈往往是模型配额，加 Pod 只会让每个进程各自的限流放出更多请求（[D9](failure-modes.md#d9-限流只在单机生效local-only-rate-limiting)）；多个 API 副本都在上报队列积压，查询里用 `sum` 会重复计算；缩容时没有走优雅停机。 |
+| 检测 | 看"最老的可执行任务等了多久"（`agent_queue_oldest_job_age_seconds`）和在途运行数相对并发上限的饱和度（`agent_runs_in_flight`），而不是 CPU；扩容前后 429 的比例；缩容时被取消的任务数。 |
+| 修复/预防 | 按队列积压、最老任务的等待时间或在途饱和度扩缩 worker（KEDA 的 `postgresql` scaler 用一条 SQL 的结果和 `targetQueryValue` 比较，或者 HPA 的外部指标）；副本数上限按模型配额来定，而不是"越多越好"；全局配额放在 Redis 或网关；多副本上报的积压指标用 `max` 聚合；缩容走优雅停机（PR12），HPA 配缩容稳定窗口，防止副本数来回抖动。另见 [D4](failure-modes.md#d4-队列积压雪崩queue-backlog-avalanche)。 |
+| 课程 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 28 课](../lessons/28_production_observability/README.md) |
+
 ---
 
 ## 附：从症状反查失败模式
@@ -989,6 +1140,19 @@ Agent 的失败有三个特点：
 | "别再提醒"和关闭通知的用户变多 | A10 主动式 Agent 过度打扰 |
 | 上了混合检索后，某一类查询反而变差 | A11 融合挤掉好结果 |
 | 什么都不做的 Agent 也能拿到不低的分数；两个版本的差距来回翻转 | A12 Benchmark 漏洞、A1 评估集泄漏 |
+| 同一任务被执行两次，日志里成片出现租约过期 | PR1 贪心领取、D2 僵尸 Worker、D3 重复投递 |
+| 接手的 worker 反复遇到 CheckpointConflict，或者 Agent"失忆" | PR2 检查点只做 CAS、D1 丢失更新 |
+| 故障期间上游调用数是用户请求的十几倍，降级要等好几秒 | PR3 重试层层叠加、R1 重试风暴 |
+| 发布后，等审批的运行卡在 WorkflowTaskFailed | PR4 发版后的非确定性错误 |
+| 长任务 workflow 因事件历史超限而失败 | PR5 事件历史撑爆 |
+| 一次请求在追踪后端里是好几条 trace | PR6 trace 在队列处断开 |
+| Prometheus 的内存和序列数随用户数上涨 | PR7 指标标签基数爆炸 |
+| 可用性全绿，完成率和差评却悄悄变差 | PR8 网关降级掩盖质量回归、R3 降级后静默变差、P1 静默失败 |
+| 某个组件出故障期间，本该拒绝的操作被放行了 | PR9 故障时放行 |
+| 同一进程里所有会话一起变慢，心跳超时 | PR10 同步调用卡住事件循环 |
+| 断开重连后副作用重复；检查点一直停在 running | PR11 取消后副作用重复或状态悬空、T5 重复副作用 |
+| 每次滚动发布都有一批运行失败或重跑 | PR12 停机丢掉在途运行、R4 中断后从头重来 |
+| CPU 全绿，任务却越排越久 | PR13 按错误的信号扩缩容、D4 队列积压雪崩 |
 
 ## 延伸阅读
 
@@ -1003,3 +1167,4 @@ Agent 的失败有三个特点：
 - Martin Kleppmann：[How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)（fencing token）
 - Chris Richardson：[Pattern: Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html)
 - 第三部分（A1–A12）：Shankar 等 [Who Validates the Validators?](https://arxiv.org/abs/2404.12272)（评委校准与标准漂移）、Agrawal 等 [GEPA](https://arxiv.org/abs/2507.19457)（优化与帕累托前沿）、Chhikara 等 [Mem0](https://arxiv.org/abs/2504.19413)（记忆写入）、Postmark [Security Alert: Malicious 'postmark-mcp' npm Package](https://postmarkapp.com/blog/information-regarding-malicious-postmark-mcp-package)（rug pull）、Zhong 等 [ImpossibleBench](https://arxiv.org/abs/2510.20270)（编码 Agent 作弊）、Horvitz [Principles of Mixed-Initiative User Interfaces](https://erichorvitz.com/chi99horvitz.pdf)（什么时候该打扰）
+- 第四部分（PR1–PR13）：Temporal [Activity Definition](https://docs.temporal.io/activity-definition)（至少执行一次与幂等）、Google SRE Workbook [Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/)（燃烧率告警）、Cedar [Authorization](https://docs.cedarpolicy.com/auth/authorization.html)（求值出错的策略会被跳过）、Python [Coroutines and Tasks](https://docs.python.org/3/library/asyncio-task.html)（取消语义）、Kubernetes [Termination of Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)（优雅停机）

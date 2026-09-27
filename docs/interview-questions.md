@@ -7,7 +7,7 @@
 
 ## 怎么用这份题库
 
-- **共 76 道题**：概念题 15 道、场景题 12 道、故障排查题 11 道、分布式/高并发/成本/发布专题 16 道、系统设计短题 7 道、进阶专题（课程第三部分）15 道，外加 **3 道完整系统设计题的作答示范**（第七部分，另计）。
+- **共 88 道题**：概念题 15 道、场景题 12 道、故障排查题 11 道、分布式/高并发/成本/发布专题 16 道、系统设计短题 7 道、进阶专题（课程第三部分）15 道、生产落地专题（课程第四部分）12 道，外加 **3 道完整系统设计题的作答示范**（第八部分，另计）。
 - 难度：⭐ 基础（学完对应课程应能回答）、⭐⭐ 进阶（需要综合多课内容）、⭐⭐⭐ 高级（需要生产经验或深入思考）。
 - **先自己作答，再展开答案要点**。答案给的是"要点"，面试时要用自己的话串起来，最好能结合具体数字和亲身经历。
 - 面试官视角的评分标准：能说出"是什么"是及格；能说出"为什么、不这样会怎样"是良好；能说出"权衡、边界情况、怎么验证"是优秀。
@@ -880,7 +880,7 @@
 
 ## 五、系统设计短题
 
-> 这几道题给出作答的"骨架"。完整作答方式参见第七部分的三道示范。
+> 这几道题给出作答的"骨架"。完整作答方式参见第八部分的三道示范。
 
 ### D1. 设计一个企业内部知识库问答 Agent，要求员工只能看到自己有权限看的文档。 ⭐⭐
 
@@ -1196,7 +1196,171 @@
 
 ---
 
-## 七、完整系统设计作答示范
+## 七、生产落地：状态、工作流、可观测性、网关、异步运行时与部署
+
+> 这一部分对应课程第四部分（[第 26 课](../lessons/26_state_and_queues/README.md) 到 [第 31 课](../lessons/31_deployment_and_scaling/README.md)）。题目偏"组件选型，以及组件在故障时的语义"：把检查点、队列、工作流、追踪、网关、策略和运行时换成成熟组件之后，哪些保证是组件给的，哪些仍然是你的责任。
+
+### P1. 检查点已经用了版本号 CAS，为什么还需要 fence？SKIP LOCKED、fence 和幂等键各自挡住什么？ ⭐⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **CAS 只保证不丢更新**：`UPDATE ... WHERE version = 期望值`，基于过时版本的写入写不进去；但僵尸和新 worker 读到同一个版本时，先写的赢，可能恰好是僵尸赢，新 worker 冲突退出、白跑一趟。
+- **fence 接管**：队列每次领取都让任务的 fence 加一；带 fence 的 `load` 在同一条 `UPDATE ... RETURNING` 里把检查点的 fence 改成自己的、版本号加一，旧持有者此后的写入全部冲突，fence 更小的 `load` 直接被拒绝。所以最新的租约持有者总是赢家。
+- **三样东西分工**：SKIP LOCKED 让多个 worker 并发领取时既不重复领取、也不互相排队等锁；fence 挡住僵尸对队列和检查点的迟到写入；幂等键挡住副作用重复（崩溃落在"下游已执行、结果还没落盘"之间时，恢复会重放同一个 `call_id`，由下游去重）。
+- **加分点**：判断必须由存储在写入的那一刻做，worker 写之前自检"我还持有租约吗"不可靠（检查和写入之间还会停顿）；冲突要抛异常，而不是返回一个容易被忽略的 False；`redrive` 不重置 fence。
+- 课程：[第 26 课](../lessons/26_state_and_queues/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · 失败模式 [PR2](failure-modes.md#pr2-检查点只做-cascas-without-fenced-takeover)、[D2](failure-modes.md#d2-僵尸-workerzombie-worker)
+
+</details>
+
+### P2. 团队提议为 Agent 任务队列"上 Kafka"。你怎么评审？Postgres 队列、SQS、RabbitMQ 各在什么时候合适？ ⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **先看 Agent 队列的典型画像**：每个任务只被一个 worker 处理，一跑几分钟、需要续租，不需要回放。吞吐几乎从来不是瓶颈，模型配额才是。
+- **Postgres + `FOR UPDATE SKIP LOCKED`**：已经有 Postgres 就几乎零运维；入队可以和业务数据写在同一个事务里（outbox 的效果）；代价是租约、心跳、重试、死信、fence 都要自己做，还要关注表膨胀和 VACUUM。大多数 Agent 平台的起点。
+- **SQS**：全托管；标准队列是至少一次、可能重复投递；可见性超时默认 30 秒、最长 12 小时，长任务要续期；旧的 receipt handle 做不到 fencing。**RabbitMQ quorum queue**：手动 ack 时至少一次，适合复杂路由、多个消费方。
+- **该上 Kafka 的信号**：同一份数据要被多个系统订阅、需要按 key 严格有序并且能回放、写入量大到 Postgres 扛不住。它的消费位点模型不擅长"一条消息处理 3 分钟"，"恰好一次"也只在 Kafka 内部的读-处理-写中成立，写外部系统仍然要靠幂等。
+- **加分点**：Celery 这类任务框架本身不是存储，要注意 broker 的默认值：Redis broker 的 `visibility_timeout` 默认 1 小时，超过的任务会被投递给别的 worker、执行两次。
+- 课程：[第 26 课](../lessons/26_state_and_queues/README.md) · 失败模式 [PR1](failure-modes.md#pr1-贪心领取over-claiming-worker)、[D3](failure-modes.md#d3-重复投递duplicate-delivery)
+
+</details>
+
+### P3. 什么时候该引入 Temporal？什么时候 AsyncAgent + Postgres 检查点 + 租约队列就够了？ ⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **区别在"谁来保证"**：检查点方案里，发现崩溃、触发恢复、两个进程同时恢复时的互斥、审批计时，都是你写的代码（租约、心跳、fence、扫描器）；Temporal 由服务端记事件历史、按超时判定失败、把任务派给活着的 worker、用持久化定时器计时。
+- **代价从第一天就开始付**：多运维一套服务（或买 Temporal Cloud）、接受确定性约束、每一步多几次网络往返。第 27 课实测，光 Temporal 本身每个 workflow 约 50 毫秒开销。
+- **经验法则**（第 27 课）：单次任务经常超过 30 分钟、要等人、有定时动作、一次失败要人工善后、有人运维或有预算买云服务，满足任意两条再考虑。
+- **迁移成本可以很低**：第 27 课的 `execute_tool` 直接用 `AsyncToolExecutor` 执行工具，和 `AsyncAgent` 是同一套执行语义，从检查点方案迁到 Temporal，工具代码一行不改。
+- 课程：[第 27 课](../lessons/27_durable_workflows/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 30 课](../lessons/30_async_runtime/README.md)
+
+</details>
+
+### P4. 把 Agent 放进 Temporal：LLM 是不确定的，workflow 怎么保持确定性？Activity 为什么还要幂等？周五要发一个改动，正在等审批的运行怎么办？ ⭐⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **确定性只约束编排代码**：模型调用、工具调用都是 activity，结果第一次执行时写进事件历史，重放时直接从历史里取，不会再调模型；workflow 只负责"把模型的决定翻译成下一个 activity"。时间和随机数用 `workflow.now()` / `workflow.random()`。
+- **Activity 是至少执行一次**：Temporal 保证它"被观察到完成"恰好一次，但 worker 在"执行完"和"报告结果"之间崩溃时，它会被再执行一次。写操作要么 `maximum_attempts=1`（结果未知时交给人），要么把 `workflow_id:call_id` 作为幂等键交给下游。另外 activity 默认不限重试次数，必须自己设上限。
+- **发版**：在 workflow 开头加一个 activity，旧运行重放时命令序列和历史对不上，卡在 `NondeterminismError`。用 `workflow.patched("id")` 包住新逻辑，所有旧运行结束后改成 `deprecate_patch`，再之后删除；或者用 Worker Versioning 的 Pinned 让旧运行在旧 worker 上跑完。发布前用生产抽样的事件历史跑 `Replayer`。
+- **加分点**：重放只比对命令，不比对参数，改了 prompt 不会报错，但内存状态可能已经不一致；passthrough 进沙箱的模块不受沙箱保护；Agent 的事件历史按步数平方增长，要设计 continue-as-new 和上下文压缩。
+- 课程：[第 27 课](../lessons/27_durable_workflows/README.md) · 失败模式 [PR4](failure-modes.md#pr4-发版后的非确定性错误nondeterminism-after-deploy)、[PR5](failure-modes.md#pr5-事件历史撑爆event-history-blowup)、[PR3](failure-modes.md#pr3-重试层层叠加stacked-retries)
+
+</details>
+
+### P5. 从第 10 课的自研 Tracer 迁到 OpenTelemetry，你要做哪几个决定？ ⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **先定埋点标准，再选后端**：OTel SDK + GenAI 语义约定 + OTLP；应用只发给 Collector，由 Collector 决定发往运维后端（Tempo、Jaeger）还是 LLM 平台（如 Langfuse），以及每个后端拿到哪些属性；业务代码不依赖任何平台 SDK。约定仍是 Development 状态，要锁定版本、升级时复查属性名。
+- **什么算错误**：按 OTel 记录错误的约定，没出错时状态保持 UNSET。工具失败只让 `execute_tool` 变红，模型"消化"了错误、运行照常完成，根 span 不标；等审批、预算中止、客户端取消都不标 ERROR：标了会触发错误率告警，还会让尾部采样把它们全部留下。
+- **内容采集**：prompt、回复、工具参数是 Opt-In，默认不采集；打开时先脱敏再截断；Collector 再用 HMAC 做一层脱敏；运维后端拿不到内容属性。
+- **指标另走一路**：`PrometheusHook` 在采样之前全量计数，告警和 SLO 以指标为准，trace 只用来排查；每个标签都要说清取值上限。
+- 课程：[第 28 课](../lessons/28_production_observability/README.md) · [第 10 课](../lessons/10_observability/README.md) · 失败模式 [PR7](failure-modes.md#pr7-指标标签基数爆炸label-cardinality-explosion)、[S7](failure-modes.md#s7-敏感信息泄露sensitive-information-disclosure)
+
+</details>
+
+### P6. 解释多窗口多燃烧率告警。Agent 的可用性 SLO 里哪些算坏事件？SLO 设成 95% 会怎样？ ⭐⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **燃烧率** = 实际错误率 ÷ 错误预算（1 − SLO）；燃烧率为 1 表示刚好在周期末用完预算。燃烧率 14.4 持续 1 小时，会烧掉 30 天预算的 2%。
+- **为什么要两个窗口**：1 小时和 5 分钟都 > 14.4，或 6 小时和 30 分钟都 > 6 时叫人（page）；3 天和 6 小时都 > 1 时开工单（ticket）。长窗口保证确实烧掉了可观的预算（精确率），短窗口保证现在还在烧（故障恢复后告警能及时解除）。
+- **坏事件的定义**：模型不可用、步数耗尽、超时、被自己的限流拒绝，用户都没拿到答案；不计入的：等审批、客户端取消、预算中止、输入被拦截，这些是策略在按设计工作。
+- **SLO 定得太松，燃烧率告警就失效**：燃烧率最大只能到 1 ÷ (1 − SLO)，95% 时是 20，14.4 的阈值意味着错误率要超过 72% 才会叫人。另外，低流量时段一次失败就是很高的错误率，page 规则要加最小样本数。
+- 课程：[第 28 课](../lessons/28_production_observability/README.md) · 失败模式 [P1](failure-modes.md#p1-静默失败silent-failure)
+
+</details>
+
+### P7. 一个任务在队列里等了 2 小时才被处理，trace 应该怎么接？Collector 的尾部采样怎么估内存？ ⭐⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **透传**：入队时 `inject_context` 把 `traceparent` 写进 payload，worker 用 `continue_trace` 接上；采样器用 `ParentBased`，跟随上游的决定。
+- **等了 2 小时**：直接把生产者当父 span，trace 会跨越 2 小时，Collector 早在 `decision_wait` 之后就对前半段做了决定，worker 那一段成了迟到的 span。更好的做法是新开 trace，加一个指向生产者的 span link（消息约定的默认做法），再用 `run_id` 关联；同时配置 `decision_cache`，让迟到的 span 沿用已经做出的决定。
+- **内存估算**：≈ 高峰每秒新 trace 数 × `decision_wait` × 每条 trace 的大小；Agent 的运行是分钟级的，`decision_wait` 要覆盖 p99 运行时长；`num_traces`（默认 50000）至少设到"每秒 trace 数 × decision_wait"。同一条 trace 的 span 必须到同一个实例：第一层用 loadbalancing 导出器按 trace ID 路由，第二层做尾部采样。
+- **加分点**：OTel Python 生成的 traceparent 标志位可能是 `03`（同时置了 random 位），判断是否采样要按位；baggage 会原样传给所有下游，不要往里放用户 ID。
+- 课程：[第 28 课](../lessons/28_production_observability/README.md) · 失败模式 [PR6](failure-modes.md#pr6-trace-在队列处断开trace-broken-at-the-queue)
+
+</details>
+
+### P8. 公司 20 个服务要统一接模型网关。重试放哪一层？预算放哪一层？怎么避免降级掩盖质量问题？ ⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **为什么要网关**：密钥集中（业务只拿虚拟 key）、预算和限额跨服务共享、统一审计、换厂商不改业务代码。多实例网关的计数必须放在 Redis，否则 N 个实例就是 N 倍限额；Redis 不可达时放行还是拒绝要提前决定（LiteLLM 的 `fail_closed_rate_limit_enforcement`）。
+- **重试只放一层**：Router 已经在做"重试 → 降级"，外面再套 `ResilientLLM`、后面还有 Proxy，次数就会相乘（`num_retries=2`、一主一备、外层 3 次，最坏 18 次上游请求）。常见分工：网关负责重试、降级和限额，应用侧只保留舱壁（并发上限）和语义预算；流式调用只能在首 token 之前重试或降级。
+- **预算两层都要**：应用层（`BudgetHook`）知道"一次运行""一步"，能拦住死循环、按业务语义降级；网关层看得到所有服务，执行组织级的硬上限。
+- **降级不能静默**：指标按实际回答的模型拆分，降级率进告警，降级链上的每个模型都过同一套评估；`x-litellm-attempted-retries` 只统计最终成功的模型组，重试次数要从回调或网关日志里统计。
+- 课程：[第 29 课](../lessons/29_gateway_and_guardrails/README.md) · [第 08 课](../lessons/08_reliability/README.md) · 失败模式 [PR3](failure-modes.md#pr3-重试层层叠加stacked-retries)、[PR8](failure-modes.md#pr8-网关降级掩盖质量回归gateway-fallback-masks-a-regression)、[D9](failure-modes.md#d9-限流只在单机生效local-only-rate-limiting)
+
+</details>
+
+### P9. 用 Cedar 替换代码里的 RBAC 有什么好处？什么情况下 forbid 会"不生效"？护栏分类器挂了，该放行还是拒绝？ ⭐⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **策略即代码**：可评审（安全团队直接看策略的 diff）、可测试（schema 静态校验 + 判定用例）、可审计（`explain()` 说得出是哪条策略决定的）、与发版解耦（发一条 forbid 就能全局停用一个工具）；还能表达参数级授权，比如"只能重置自己的密码"。
+- **forbid 失效**：Cedar 的语义是求值出错的策略会被跳过。漏传一个实体，读它属性的 forbid 就不生效，结果可能从 Deny 变成 Allow（第 29 课 Demo 2e）。schema 校验只检查策略本身，检查不了运行时实体传全了没有。所以适配器把任何求值错误当拒绝，实体只从可信的 metadata 构造并补全。
+- **分类器故障**：检测层不是安全边界，可以 fail open 保住可用性（`ClassifierGuard` 的 `on_error` 默认放行），但要记录、告警；真正的底线是权限和审批，它们必须 fail closed。
+- **选型**：应用内的 RBAC + ABAC 选 Cedar；平台已经统一用 OPA 的继续用 OPA；产品核心是层级共享（文档、文件夹、团队）的，用 OpenFGA 管关系。
+- 课程：[第 29 课](../lessons/29_gateway_and_guardrails/README.md) · [第 09 课](../lessons/09_security/README.md) · 失败模式 [PR9](failure-modes.md#pr9-故障时放行fail-open-policy-and-limits)、[S5](failure-modes.md#s5-过度授权excessive-agency)
+
+</details>
+
+### P10. 用户关掉页面后，怎么让服务端真的停下来？恢复时怎么保证副作用不重复？ ⭐⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **链路**：TCP 断开 → ASGI 服务器报告 `http.disconnect` → Starlette 取消响应任务 → 流式生成器的 `finally` 取消运行任务 → `CancelledError` 抛进正在 await 的模型调用，HTTP 请求被中止、连接归还连接池。前提是模型客户端本身是异步的：同步客户端放在线程里，取消只能"不再等它"，请求照样在后台跑完、照样计费。
+- **收尾要做对**：`CancelledError` 收完尾必须重新抛出；检查点记为 `cancelled`；在 AnyIO 这类电平触发取消的框架里，收尾时的 `await` 会被再次取消，要用 shield 保护；异步检查点的每一次保存都要受保护，否则"数据库已提交、客户端没收到回复"的那次保存会让本地版本号过期，收尾保存被 CAS 拒绝。
+- **被取消的写操作，结果是未知**：写 / 高危工具的调用保持未回答，只读工具补"未执行"；`resume` 用同一个 `call_id` 重放，幂等键 `run_id:call_id` 不变，由下游去重。给写调用补"未执行"，恢复后模型会发起新的 `call_id`，副作用就会发生两次。
+- **怎么证明**：看检查点状态、在途模型调用数是否归零、下游记录数；在一次运行的多个时刻各取消一次，把结果分成"停住了""卡在 running""根本没停"三类。还要知道 Python 3.11 及更早的 `asyncio.wait_for` 可能吞掉取消（`agentkit.aio.wait_for` 在 3.11+ 用 `asyncio.timeout()`、在 3.10 用 `asyncio.wait` 规避）。
+- 课程：[第 30 课](../lessons/30_async_runtime/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · 失败模式 [PR11](failure-modes.md#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done)、[T5](failure-modes.md#t5-重复副作用duplicate-side-effects)
+
+</details>
+
+### P11. 早高峰每秒 50 个请求、每个平均 8 秒，部署在 4 核机器上。进程数、并发、连接池和限流怎么定？怎么扩缩容？ ⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **利特尔法则**：L = 50 × 8 = 400 个同时在等的会话；做容量规划时 W 要按 p95 取，不能按平均值。
+- **并发模型**：每个 CPU 核一个进程，每个进程一个事件循环（一个 `AsyncAgent` 实例被所有会话复用，本次运行的状态都在 `RunState` 里）；同步老代码进有上限的线程池；超过一两分钟的任务改走队列加 worker。
+- **各层上限要对齐**：每个模型的并发上限 ≤ HTTP 连接池上限；数据库连接池按"同时正在用连接的协程数"估算，所有进程加起来不超过 `max_connections`；异步 worker 先拿名额再领取（背压）。
+- **限流分三层**：网关管合同和钱，Redis 管跨实例的租户配额，进程内的舱壁（`KeyedLimiter`）管"本进程别被压垮"，排不上就快速返回 429。时限从内到外递增：工具超时 < `run_timeout` < 网关和代理的超时。
+- **扩缩容**：按队列积压、最老任务的等待时间或在途饱和度扩缩 worker（KEDA 的 `postgresql` scaler，或 HPA 的外部指标），不按 CPU；副本数上限按模型配额来定。
+- 课程：[第 30 课](../lessons/30_async_runtime/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · 失败模式 [PR13](failure-modes.md#pr13-按错误的信号扩缩容autoscaling-on-the-wrong-signal)、[PR10](failure-modes.md#pr10-同步调用卡住事件循环event-loop-blocked-by-sync-calls)
+
+</details>
+
+### P12. K8s 滚动发布时，正在跑长任务的 worker 会怎样？你怎么设计优雅停机和健康检查？又怎么证明"发布不丢任务、不重复副作用"？ ⭐⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **K8s 的时间线**：先执行 preStop，再给容器发 SIGTERM，等 `terminationGracePeriodSeconds`（默认 30 秒，preStop 的耗时也算在内）之后发 SIGKILL。
+- **worker 收到 SIGTERM**：就绪探针变 503、停止领取 → 在途任务在宽限期内做完，心跳照常续租 → 做不完的取消（检查点记 `cancelled`，写调用保持未回答），带 fence 立刻归还给队列，别的 worker 马上接手、用同一个 `call_id` 重放 → 刷新追踪、关闭连接池后退出。宽限期不必覆盖最长的任务；`terminationGracePeriodSeconds` 要大于宽限期加收尾时间。`kill -9` 时什么都来不及做，由租约过期和检查点兜底。
+- **健康检查**：存活探针只检查本进程（事件循环能否应答），不查数据库，否则数据库一抖，所有 Pod 会被一起重启；就绪探针检查依赖是否可用、是否正在停机。
+- **怎么证明**：压测时注入故障（执行中 `kill -9`、先起新的再给旧的发 SIGTERM 的滚动重启、两个审批人同时点批准、流式中途断开），结束后逐项核对：所有运行都到达可解释的状态、每个写调用恰好对应一条下游记录、断开的运行记为 `cancelled`、指标和数据库里的数量一致。测尾延迟要用开环压测：闭环压测有协调遗漏，会美化延迟分布。
+- 课程：[第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) · 失败模式 [PR12](failure-modes.md#pr12-停机丢掉在途运行in-flight-runs-lost-on-shutdown)、[PR1](failure-modes.md#pr1-贪心领取over-claiming-worker)
+
+</details>
+
+---
+
+## 八、完整系统设计作答示范
 
 系统设计题没有标准答案，面试官看的是**思考过程**。推荐的作答框架：
 

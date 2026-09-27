@@ -5,7 +5,7 @@
 > 📖 本文是"领域参考手册"的一部分，配合课程使用。
 > 相关文档：[失败模式图鉴](failure-modes.md) · [速查表](cheatsheet.md) · [面试题](interview-questions.md) · [术语表](glossary.md)
 
-这是一份可以直接复制到 PR 描述、设计文档或评审会议纪要里的清单，共 **19 个分组、199 项**（其中 P0 62 项）。每一项都附了"为什么要查"，并尽量链接到对应的失败模式（如 [T5](failure-modes.md#t5-重复副作用duplicate-side-effects)）和课程。
+这是一份可以直接复制到 PR 描述、设计文档或评审会议纪要里的清单，共 **20 个分组、224 项**（其中 P0 68 项）。每一项都附了"为什么要查"，并尽量链接到对应的失败模式（如 [T5](failure-modes.md#t5-重复副作用duplicate-side-effects)）和课程。
 
 ## 怎么用
 
@@ -19,7 +19,7 @@
 
 **建议流程**
 
-1. **设计阶段**（写代码前）：过一遍"需求与范围""编排""安全""权限与审批""分布式与高并发"，这几组的决策最难事后修改；用到长期记忆、MCP、代码执行、编码 Agent 或主动提醒时，再加上第 19 组"扩展能力"；
+1. **设计阶段**（写代码前）：过一遍"需求与范围""编排""安全""权限与审批""分布式与高并发"，这几组的决策最难事后修改；用到长期记忆、MCP、代码执行、编码 Agent 或主动提醒时，再加上第 19 组"扩展能力"；把教学实现换成成熟组件、部署成多实例服务时，再加上第 20 组"生产落地"；
 2. **上线前评审**：全量过一遍，P0 逐条给出证据（链接到代码、配置、eval 报告、trace 截图），而不是口头说"有的"；
 3. **季度复查**：模型、工具、用户群都会变，清单也要重新过——尤其是"评估""成本"和第 18 组"数据、评估方法论与优化"。
 
@@ -48,7 +48,8 @@
 | 17 | 企业知识与 RAG | 9 | 2 | [第 15 课](../lessons/15_enterprise_rag/README.md) |
 | 18 | 数据、评估方法论与优化 | 16 | 3 | [第 21 课](../lessons/21_agent_data/README.md) · [第 22 课](../lessons/22_eval_methodology/README.md) · [第 23 课](../lessons/23_optimization/README.md) |
 | 19 | 扩展能力（检索 / 记忆 / MCP / 代码执行 / 编码 Agent / 主动式） | 20 | 6 | [第 17 课](../lessons/17_retrieval_quality/README.md) · [第 18 课](../lessons/18_memory_systems/README.md) · [第 19 课](../lessons/19_mcp_and_sandbox/README.md) · [第 20 课](../lessons/20_frameworks_bridge/README.md) · [第 24 课](../lessons/24_coding_agents/README.md) · [第 25 课](../lessons/25_proactive_and_frontier/README.md) |
-| | **合计** | **199** | **62** | |
+| 20 | 生产落地（状态与队列 / 持久化工作流 / 可观测性 / 网关与策略 / 异步运行时 / 部署与扩缩容） | 25 | 6 | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) · [第 28 课](../lessons/28_production_observability/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| | **合计** | **224** | **68** | |
 
 ---
 
@@ -506,6 +507,61 @@
   —— 主动式 Agent 持续读邮件和日历，是致命三要素的典型场景（[S3](failure-modes.md#s3-致命三要素外泄lethal-trifecta-exfiltration)、[C6](failure-modes.md#c6-记忆投毒与过期memory-poisoning--staleness)）。
 - [ ] 🟢 **P2** 主动式功能的线上指标不只看采纳率，还看每人每天的打扰次数、"别再提醒"率和关闭功能的比例。
   —— 只优化采纳率，会学出"标题党"式的提醒（[A10](failure-modes.md#a10-主动式-agent-过度打扰over-interrupting-proactive-agent)）。
+
+---
+
+## 20. 生产落地（状态与队列 / 持久化工作流 / 可观测性 / 网关与策略 / 异步运行时 / 部署与扩缩容）
+
+- [ ] 🔴 **P0** 检查点和任务状态放在持久、共享的存储里（如 Postgres），写入带版本号 CAS；经队列执行时由任务的 fence 驱动检查点接管，冲突时抛异常、立刻停手。
+  —— 纯 CAS 是"先写者赢"，GC 停顿后醒来的僵尸 worker 可能赢；文件和内存检查点在多实例之间根本不共享（[PR2](failure-modes.md#pr2-检查点只做-cascas-without-fenced-takeover)、[D2](failure-modes.md#d2-僵尸-workerzombie-worker)）。
+- [ ] 🔴 **P0** 写工具的幂等下沉到执行副作用的系统：同一个事务里的唯一约束，或者下游的 Idempotency-Key；Redis 里的幂等记录只当缓存。
+  —— 只要"执行副作用"和"记下做过了"不在同一个事务里，崩溃总能落进两者之间的缝（[T5](failure-modes.md#t5-重复副作用duplicate-side-effects)、[D3](failure-modes.md#d3-重复投递duplicate-delivery)）。
+- [ ] 🟠 **P1** 异步 worker 先拿并发名额再领取（背压）；心跳间隔约为租约的 1/3；租约或可见性超时大于任务时长的 p99，长任务定期续租。
+  —— 满载还在领取的 worker 会让租约成片过期，任务被别的 worker 重复执行（[PR1](failure-modes.md#pr1-贪心领取over-claiming-worker)）。
+- [ ] 🟠 **P1** 尝试次数在领取时计数（让 worker 崩溃的毒消息也能进死信），限流推迟和停机归还不计入；死信有告警和 redrive 流程，redrive 不重置 fence。
+  —— 计数方式反了，要么毒消息无限循环，要么高峰期健康的任务进了死信（[D4](failure-modes.md#d4-队列积压雪崩queue-backlog-avalanche)、[PR12](failure-modes.md#pr12-停机丢掉在途运行in-flight-runs-lost-on-shutdown)）。
+- [ ] 🟠 **P1** 用锁之前先回答"为了效率还是为了正确性"：正确性由被保护的存储校验单调递增的 fencing token，token 来自不会倒退的系统（Postgres、etcd）；能改成"任务 + 幂等键"的就不用锁。
+  —— Redis 复制是异步的，主从切换可能丢掉锁，也可能丢掉最近的 INCR，让 token 被重复发放（[D2](failure-modes.md#d2-僵尸-workerzombie-worker)）。
+- [ ] 🟠 **P1** 连接池按"同时正在用连接的协程数"估算，所有进程加起来不超过数据库的 `max_connections`；不在等模型的时候占着连接；建表和迁移在发布流水线里执行一次，而不是每个 worker 启动时都做。
+  —— 第 26 课实测：8 个连接同时执行 `CREATE TABLE IF NOT EXISTS`，7 个报 `UniqueViolation`；等模型时占着连接，并发就被卡成了连接数。
+- [ ] 🟢 **P2** 队列表单独调低 autovacuum 阈值，已完成的任务定期归档（去重窗口 = 保留时长）；监控最老的可执行任务等了多久、过期租约数和 fence 拒绝次数；Redis 只放丢了能重建的东西。
+  —— 队列表是典型的高频更新表，会膨胀；Redis 主从切换时可能丢掉最近约 1 秒的写入。
+- [ ] 🟠 **P1** 引入 Temporal 之前书面论证：单次任务经常超过 30 分钟、要等人、有定时动作、失败要人工善后、有人运维，至少满足两条；否则用 AsyncAgent + Postgres 检查点 + 租约队列。
+  —— 持久化执行的好处在任务长、要等人时才显现，它的成本却从第一天就开始付。
+- [ ] 🟠 **P1** 用 Temporal 时，每个 activity 都设了 `maximum_attempts`（默认不限）、start-to-close 超时和心跳超时；写工具按风险定重试次数，不幂等的写只试一次；客户端重试关闭。
+  —— activity 是至少执行一次的，而且它的重试会和客户端重试相乘（[PR3](failure-modes.md#pr3-重试层层叠加stacked-retries)）。
+- [ ] 🟠 **P1** workflow 代码里没有直接的 IO、时钟、随机数；修改 workflow 用 patching 或 Worker Versioning；CI 里用生产抽样的事件历史跑重放测试；`WorkflowTaskFailed` 有告警。
+  —— 改一行编排代码，就可能让所有在途运行卡住，而且只在重放时才暴露（[PR4](failure-modes.md#pr4-发版后的非确定性错误nondeterminism-after-deploy)）。
+- [ ] 🟠 **P1** 长流程设计了 continue-as-new、上下文压缩和大对象外置；事件历史按敏感数据对待：Payload Codec 加密、设保留期、控制 Web UI 的访问权限。
+  —— Agent 的事件历史按步数平方增长；prompt、工具参数和结果都原样存在历史里（[PR5](failure-modes.md#pr5-事件历史撑爆event-history-blowup)、[S7](failure-modes.md#s7-敏感信息泄露sensitive-information-disclosure)）。
+- [ ] 🟠 **P1** 埋点用 OpenTelemetry + GenAI 语义约定 + OTLP，应用只发给 Collector，锁定约定版本；内容属性默认不采集；取消、审批暂停、预算中止不标 ERROR。
+  —— 后端平台会变，约定本身也还在变；把取消标成错误会触发告警，还会让尾部采样把它们全部留下（[S7](failure-modes.md#s7-敏感信息泄露sensitive-information-disclosure)）。
+- [ ] 🟠 **P1** traceparent 随任务 payload 穿过队列，worker 用 `continue_trace` 接上，采样器用 `ParentBased`；等待可能很长时改用 span link；尾部采样的 `decision_wait` 覆盖 p99 运行时长，同一条 trace 路由到同一个 Collector 实例。
+  —— 否则一次请求在后端里是好几条 trace，慢 trace 还会被切成两半分别决策（[PR6](failure-modes.md#pr6-trace-在队列处断开trace-broken-at-the-queue)）。
+- [ ] 🟠 **P1** SLO 写明了哪些算坏事件、哪些不计入；叫人的告警用多窗口多燃烧率，并有最小样本数保护；每条告警都附 runbook 链接。
+  —— 固定阈值在低流量时误报、高流量时迟钝；SLO 定得太松，燃烧率告警就形同虚设（[P1](failure-modes.md#p1-静默失败silent-failure)）。
+- [ ] 🟠 **P1** 每个指标标签都写明取值上限和由谁保证；`user_id`、`run_id`、`trace_id` 不当标签；多进程部署用 prometheus_client 的多进程模式。
+  —— 每个标签组合都是一条时间序列，标签之间还是乘法关系（[PR7](failure-modes.md#pr7-指标标签基数爆炸label-cardinality-explosion)）。
+- [ ] 🟠 **P1** 模型调用经过统一网关，重试只放在一层，并算出一次用户请求最坏会变成多少次上游调用；多实例网关的限额计数放在共享存储，并决定共享存储不可用时放行还是拒绝。
+  —— 多层重试会相乘；计数不共享，N 个实例就是 N 倍限额（[PR3](failure-modes.md#pr3-重试层层叠加stacked-retries)、[D9](failure-modes.md#d9-限流只在单机生效local-only-rate-limiting)）。
+- [ ] 🟠 **P1** 降级链上的每个模型都过评估；指标按实际回答的模型拆分；降级率有告警。
+  —— 网关里的降级对业务是透明的，看板全绿的时候质量可能正在变差（[PR8](failure-modes.md#pr8-网关降级掩盖质量回归gateway-fallback-masks-a-regression)、[R3](failure-modes.md#r3-降级后静默变差silent-degradation)）。
+- [ ] 🔴 **P0** 授权组件 fail closed：策略求值出错按拒绝处理；策略在启动时用 schema 校验；实体只从认证上下文构造并补全；审批超时按拒绝处理。
+  —— Cedar 会跳过求值出错的策略，漏传一个实体，forbid 就可能不生效（[PR9](failure-modes.md#pr9-故障时放行fail-open-policy-and-limits)、[S4](failure-modes.md#s4-身份由模型决定confused-deputy)）。
+- [ ] 🟠 **P1** 新的护栏分类器先用只标记、不拦截的模式观察误报；级联的阈值在带标签的集合上扫描确定；分类器故障时的行为写进设计并有告警。
+  —— 检测层既会误伤也会漏报；它可以 fail open，但不能悄悄地 fail open（[PR9](failure-modes.md#pr9-故障时放行fail-open-policy-and-limits)、[S1](failure-modes.md#s1-直接提示词注入direct-prompt-injection)）。
+- [ ] 🔴 **P0** async 服务的代码路径上没有阻塞调用：CI 静态检查 async 函数里的阻塞调用，线上导出事件循环延迟指标；绕不开的同步 SDK 放进有上限的线程池。
+  —— 一个阻塞调用，会让同一进程里所有会话和心跳一起停住（[PR10](failure-modes.md#pr10-同步调用卡住事件循环event-loop-blocked-by-sync-calls)）。
+- [ ] 🔴 **P0** 取消语义经过验证：`CancelledError` 收尾后重新抛出；客户端断开后检查点记为 `cancelled`、在途模型调用归零；被打断的写调用保持未回答，恢复时用同一个 `call_id` 重放。
+  —— 被取消的写操作，结果是未知的；给它补上"未执行"会让幂等键改变，副作用发生两次（[PR11](failure-modes.md#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done)、[T5](failure-modes.md#t5-重复副作用duplicate-side-effects)）。
+- [ ] 🟠 **P1** 时限从内到外递增：工具超时 < 整次运行的截止时间 < 网关和代理的超时；按租户的舱壁、每个模型的并发上限和连接池上限彼此一致；共享的 Agent 和 Hook 不在实例属性上保存本次运行的数据。
+  —— 外层先断开，内层还在白干；池子比并发上限小，"模型超时"其实是在自己的池子里排队；共享的实例会被几百个会话同时读写（[D1](failure-modes.md#d1-丢失更新lost-update)）。
+- [ ] 🔴 **P0** SIGTERM 优雅停机：就绪探针变失败、停止领取 → 在途任务在宽限期内做完 → 做不完的取消并归还队列 → 刷新追踪、关闭连接池；`terminationGracePeriodSeconds` 大于宽限期加收尾时间；有滚动发布演练的记录。
+  —— 否则每次发布都会丢掉或重跑一批运行（[PR12](failure-modes.md#pr12-停机丢掉在途运行in-flight-runs-lost-on-shutdown)、[R4](failure-modes.md#r4-中断后从头重来lost-progress)）。
+- [ ] 🟠 **P1** 存活探针只检查本进程（事件循环能否应答），就绪探针检查依赖和是否正在停机；所有配置来自环境变量，启动时校验、出错即失败，同一个镜像跨环境使用。
+  —— 存活探针查数据库，数据库一抖所有 Pod 会被一起重启；配置错误要是等到第一个请求才发现，就已经在生产里了。
+- [ ] 🟠 **P1** worker 按队列积压、最老任务的等待时间或在途饱和度扩缩容，副本数上限按模型配额定；上线前做压测加故障注入（`kill -9`、滚动重启、依赖不可用），逐项核对终态、无重复副作用、指标与数据库一致，尾延迟用开环压测。
+  —— 按 CPU 扩缩容，对 IO 密集的 Agent 永远不会触发；闭环压测会美化尾延迟（[PR13](failure-modes.md#pr13-按错误的信号扩缩容autoscaling-on-the-wrong-signal)、[PR11](failure-modes.md#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done)）。
 
 ---
 

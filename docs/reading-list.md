@@ -12,14 +12,15 @@
 | 路线 | 适合谁 | 建议阅读 | 预计时间 |
 |---|---|---|---|
 | **A. 一小时入门** | 刚学完课程第一部分 | A1 → A2 → B1 → G2 | 约 1 小时 |
-| **B. 工程师一周** | 要把 Agent 做上线的开发者 | 路线 A + C1 → D4 → E1 → E2 → I2 → J1 → J2 → A–M 组剩余的 ⭐；学完第三部分再加读 N1 → O1 → U1 → S1 | 每天 1 小时，约一周 |
+| **B. 工程师一周** | 要把 Agent 做上线的开发者 | 路线 A + C1 → D4 → E1 → E2 → I2 → J1 → J2 → A–M 组剩余的 ⭐；学完第三部分再加读 N1 → O1 → U1 → S1；学完第四部分再加读 W1 → X1 → Y1 → AA1 | 每天 1 小时，约一周 |
 | **C. 安全负责人** | 做安全评审、红队的人 | I 组全部（按顺序）+ C4 + H2 + P 组 + O6 + U3 → U4 | 约一天 |
-| **D. 平台/架构师** | 负责多租户平台、基础设施 | E 组 + F 组 + G 组 + L 组 + D4 + P1 → P6 → P7 + Q 组 | 约一天半 |
+| **D. 平台/架构师** | 负责多租户平台、基础设施 | E 组 + F 组 + G 组 + L 组 + D4 + P1 → P6 → P7 + Q 组；做生产部署时再加 W 组 + X 组 + AB 组 | 约两天 |
 | **E. 评估负责人** | 负责质量、评估体系的人 | J 组全部 + B4 + D3 + R 组 + S 组 + T2 | 约一天 |
 | **F. 检索与记忆工程师** | 做知识库问答、个性化助手的人 | H1 → N 组 → B6 → B7 → O 组 | 约一天 |
 | **G. 优化与 ML 闭环** | 负责"让 Agent 持续变好"（数据 → 评估 → 优化）的人 | R1 → R2 → S1 → S2 → Q1 → T 组 → S9 | 约一天 |
 | **H. 编码 Agent 与长任务** | 做编码 Agent、长时运行 Agent 的人 | U1 → D7 → U3 → U4 → S8 → P5 → I12 → U5 | 约半天 |
 | **I. 前沿与研究** | 做 Agent 研究、关注前沿方向的人 | V 组全部 + S1 + S7 + J5 | 约一天 |
+| **J. 生产落地** | 学完第四部分、要把 Agent 服务真正部署上线并负责运维的人 | W1 → F1 → W3 → X1 → X5 → Y1 → Y2 → Z1 → Z2 → AA1 → AA2 → AB1 → AB2 | 约一天 |
 
 > 💡 读论文的建议：先读摘要和结论，再看图表，最后才看方法细节。本清单中的论文，大多只需要理解它"提出了什么概念、为什么重要"。
 
@@ -77,21 +78,21 @@
 | 顺序 | 资料 | 作者 · 年份 | 为什么值得读 | 课程 |
 |---|---|---|---|---|
 | E1 ⭐ | [Exponential Backoff And Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/) | Marc Brooker（AWS 架构博客）· 2015 | 用模拟实验对比几种抖动策略，结论是"全抖动"最好——agentkit `backoff_delay` 的出处。 | [第 08 课](../lessons/08_reliability/README.md) |
-| E2 ⭐ | [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) | Google SRE Book | 级联故障的成因与防范；其中"多层重试相乘"（三层各 4 次尝试 → 64 次）的例子是理解重试风暴的最佳材料。 | [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| E2 ⭐ | [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) | Google SRE Book | 级联故障的成因与防范；其中"多层重试相乘"（三层各 4 次尝试 → 64 次）的例子是理解重试风暴的最佳材料。 | [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
 | E3 | [Handling Overload](https://sre.google/sre-book/handling-overload/) | Google SRE Book | 过载处理：客户端节流、按客户限额、请求优先级——对应模型网关的限流与降级设计。 | [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | E4 | [CircuitBreaker](https://martinfowler.com/bliki/CircuitBreaker.html) | Martin Fowler · 2014 | 熔断器模式最经典的短文，对应 agentkit `CircuitBreaker`。 | [第 08 课](../lessons/08_reliability/README.md) |
-| E5 ⭐ | [Designing robust and predictable APIs with idempotency](https://stripe.com/blog/idempotency) | Stripe · 2017 | 幂等键设计的业界范本：为什么需要、客户端和服务端各做什么。理解"把幂等键传给下游"。 | [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| E6 | [The definitive guide to Durable Execution](https://temporal.io/blog/what-is-durable-execution) | Temporal · 2025 | 持久化执行的概念介绍，理解检查点/事件重放为什么对长时间运行的 Agent 重要。 | [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| E5 ⭐ | [Designing robust and predictable APIs with idempotency](https://stripe.com/blog/idempotency) | Stripe · 2017 | 幂等键设计的业界范本：为什么需要、客户端和服务端各做什么。理解"把幂等键传给下游"。 | [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| E6 | [The definitive guide to Durable Execution](https://temporal.io/blog/what-is-durable-execution) | Temporal · 2025 | 持久化执行的概念介绍，理解检查点/事件重放为什么对长时间运行的 Agent 重要。 | [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) |
 
 ## F. 分布式与高并发
 
 | 顺序 | 资料 | 作者 · 年份 | 为什么值得读 | 课程 |
 |---|---|---|---|---|
-| F1 ⭐ | [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) | Martin Kleppmann · 2016 | 用 GC 停顿导致租约过期的例子，讲清楚为什么需要 fencing token——理解"僵尸 worker"问题的必读文章。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| F1 ⭐ | [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) | Martin Kleppmann · 2016 | 用 GC 停顿导致租约过期的例子，讲清楚为什么需要 fencing token——理解"僵尸 worker"问题的必读文章。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
 | F2 ⭐ | [Pattern: Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html) | microservices.io（Chris Richardson） | 事务性发件箱模式的标准描述，解决"写库成功、消息没发"的双写问题。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | F3 | [Pattern: Saga](https://microservices.io/patterns/data/saga.html) | microservices.io（Chris Richardson） | 跨服务长事务的补偿模式，对应"新员工入职"这类多系统流程。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | F4 | [singleflight 包文档](https://pkg.go.dev/golang.org/x/sync/singleflight) | Go 项目 | 请求合并模式的经典实现，文档很短，读完就能理解如何防止缓存未命中风暴。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 14 课](../lessons/14_cost_latency/README.md) |
-| F5 | [Server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) | MDN | SSE 的权威参考，流式输出 Agent 进度的常用技术。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| F5 | [Server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) | MDN | SSE 的权威参考，流式输出 Agent 进度的常用技术。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
 
 ## G. 成本与延迟
 
@@ -144,7 +145,7 @@
 
 | 顺序 | 资料 | 作者 · 年份 | 为什么值得读 | 课程 |
 |---|---|---|---|---|
-| K1 ⭐ | [OpenTelemetry GenAI Semantic Conventions](https://github.com/open-telemetry/semantic-conventions-genai) | OpenTelemetry 项目 | GenAI 相关的 Span、指标、事件的字段命名约定（agentkit 的 `gen_ai.*` 属性参考了它）。注意：该约定已从 OpenTelemetry 主语义约定仓库迁移到这个独立仓库。 | [第 10 课](../lessons/10_observability/README.md) |
+| K1 ⭐ | [OpenTelemetry GenAI Semantic Conventions](https://github.com/open-telemetry/semantic-conventions-genai) | OpenTelemetry 项目 | GenAI 相关的 Span、指标、事件的字段命名约定（agentkit 的 `gen_ai.*` 属性参考了它）。注意：该约定已从 OpenTelemetry 主语义约定仓库迁移到这个独立仓库。 | [第 10 课](../lessons/10_observability/README.md) · [第 28 课](../lessons/28_production_observability/README.md) |
 | K2 | [Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/) | Google SRE Book | 监控的基本功：四个黄金信号、症状 vs 原因、告警设计原则。Agent 的监控同样适用。 | [第 10 课](../lessons/10_observability/README.md) |
 
 ## L. 发布与运维
@@ -273,6 +274,90 @@
 | V6 | [Measuring Progress on Scalable Oversight for Large Language Models](https://arxiv.org/abs/2211.03540) | Bowman 等 · 2022 | Agent 做的事超出人能检查的范围时，怎样借助 AI 做出可靠判断。理解为什么短期内最实用的监督手段是"让环境来验证"。 | [第 25 课](../lessons/25_proactive_and_frontier/README.md) |
 | V7 | [Chain of Thought Monitorability: A New and Fragile Opportunity for AI Safety](https://arxiv.org/abs/2507.11473) | Korbak 等 · 2025 | 多家机构联合署名：监控思维链是有希望但脆弱的安全机会，训练方式的改变可能让思维链不再反映真实推理。 | [第 25 课](../lessons/25_proactive_and_frontier/README.md) |
 | V8 | [Agentic Misalignment: How LLMs could be insider threats](https://www.anthropic.com/research/agentic-misalignment) | Anthropic · 2025 | 在刻意构造的虚构公司场景里对 16 个主流模型做压力测试，作者也强调没有在真实部署中看到这类行为。读它是为了理解：安全不能寄托在"模型对齐得很好"上。 | [第 25 课](../lessons/25_proactive_and_frontier/README.md) · [第 09 课](../lessons/09_security/README.md) |
+
+---
+
+> 以下 W–AB 组对应课程**第四部分：生产落地**（第 26–31 课）。W–AA 组的第一条 ⭐ 是对应课程的必读；AB 组对应第 31 课和 `production/` 参考服务，⭐ 标的是它的停机流程所依据的官方文档。前面各组里被第四部分引用的资料（E2 级联故障、E5 Stripe 幂等、E6 持久化执行、F1 Kleppmann 分布式锁、F5 SSE、K1 GenAI 语义约定）也已补上第四部分的课程链接。
+
+## W. 状态、队列与分布式协调
+
+| 顺序 | 资料 | 作者 · 年份 | 为什么值得读 | 课程 |
+|---|---|---|---|---|
+| W1 ⭐ | [Devious SQL: Message Queuing Using Native PostgreSQL](https://www.crunchydata.com/blog/message-queuing-using-native-postgresql) | David Christensen（Crunchy Data）· 2021 | 第 26 课必读。用十几行 SQL 从零搭出一个 `FOR UPDATE SKIP LOCKED` 队列，顺带讲了两件本课代码里处处都有影子的事：事务回滚时任务自动回到队列；队列表更新频繁会膨胀，要调 autovacuum。 | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| W2 | [PostgreSQL 文档：SELECT 的锁定子句](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE) | PostgreSQL 项目 | SKIP LOCKED 的原始说明：它得到的是不一致的数据视图，不适合一般用途，但适合多个消费者领取"类似队列的表"、避免锁争用。读完就知道它能用在哪、不能用在哪。 | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| W3 | [Distributed Locks with Redis](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/) | Redis 官方文档 | `SET NX PX` 加锁、"比较后删除"释放（Redis 8.4 起有 `DELEX`）、Redlock 算法，以及文末关于一致性的免责声明：要实现 fencing token；Redis 的过期时间用的不是单调时钟。和 F1 对照读。 | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| W4 | [Is Redlock safe?](https://antirez.com/news/101) | antirez · 2016 | Redis 作者对 F1 的回应：在合理的时钟和时序假设下 Redlock 是安全的。两篇一起读，比只读一方更能想清楚"锁到底保证了什么"。 | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| W5 | [etcd versus other key-value stores](https://etcd.io/docs/v3.5/learning/why/) | etcd 项目 | "Notes on the usage of lock and lease"一节把 Kleppmann 说的 fencing token 对应为 etcd 的 revision。需要跨系统、正确性要求高的锁时，token 该从哪里来。 | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| W6 | [Connection pools](https://www.psycopg.org/psycopg3/docs/advanced/pool.html) | psycopg 3 文档 | `ConnectionPool` / `AsyncConnectionPool`：`with pool.connection()` 正常退出时提交、异常时回滚；`get_stats()` 里的 `requests_queued` 是判断池子是否太小的指标。 | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| W7 | [Routine Vacuuming](https://www.postgresql.org/docs/current/routine-vacuuming.html) | PostgreSQL 文档 | `UPDATE` 和 `DELETE` 不会立刻删掉旧的行版本，要等 VACUUM 回收，这是 MVCC 的代价。队列表每个任务要更新好几次，是典型的高频更新表。 | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| W8 | [Scripting with Lua](https://redis.io/docs/latest/develop/programmability/eval-intro/) | Redis 官方文档 | 脚本执行期间服务器上的其他操作全部等待，所以令牌桶的读-改-写要整段放进脚本；5.0 起脚本默认按效果复制、7.0 起只剩这一种方式，所以在脚本里调用 `TIME` 是安全的。 | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| W9 | [Idempotent requests](https://docs.stripe.com/api/idempotent_requests) | Stripe API 文档 | 下游幂等的样板：保存第一次请求的状态码和响应体（包括 500 错误），key 至少保留 24 小时才可能被清理，参数不同会报错。和 E5 一起读：幂等最终要下沉到执行副作用的系统。 | [第 26 课](../lessons/26_state_and_queues/README.md) |
+
+## X. 持久化工作流
+
+| 顺序 | 资料 | 作者 · 年份 | 为什么值得读 | 课程 |
+|---|---|---|---|---|
+| X1 ⭐ | [Of course you can build dynamic AI agents with Temporal](https://temporal.io/blog/of-course-you-can-build-dynamic-ai-agents-with-temporal) | Mason Egger、Steve Androulakis（Temporal）· 2025 | 第 27 课必读。回答"Workflow 要求确定性，LLM 这种不确定的东西怎么放进去"这个最常见的误解：确定性只约束编排代码，模型调用和工具调用都放在 Activity 里，模型依然决定下一步做什么。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| X2 | [Temporal Workflow](https://docs.temporal.io/workflows) | Temporal 文档 | 确定性和重放的正式说明：同样的历史必须做出同样的决定；恢复时从头重放、已完成的步骤从历史里取结果，而不是恢复一份内存快照。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| X3 | [Detecting Activity Failures](https://docs.temporal.io/encyclopedia/detecting-activity-failures) | Temporal 文档 | Schedule-To-Start、Start-To-Close、Schedule-To-Close 三种超时和心跳各管什么；取消只能在心跳时送达，不发心跳的 activity 收不到取消。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| X4 | [Temporal Retry Policy](https://docs.temporal.io/encyclopedia/retry-policies) | Temporal 文档 | Activity 默认不限重试次数（`maximum_attempts` 为 0 表示不限）。模型调用和写工具都必须自己设上限，并标出不可重试的错误。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| X5 | [Activity Definition](https://docs.temporal.io/activity-definition) | Temporal 文档 | 带重试策略的 Activity 保证"被观察到完成"恰好一次，但可能被执行多次，所以要幂等。这和第 13 课的"至少一次投递"是同一个问题。 | [第 27 课](../lessons/27_durable_workflows/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| X6 | [Workflow message passing - Python SDK](https://docs.temporal.io/develop/python/message-passing) | Temporal 文档 | Signal、Query、Update 的区别和用法；Update 的验证器可以在请求写进事件历史之前拒绝它。设计审批接口之前读。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| X7 | [Versioning - Python SDK](https://docs.temporal.io/develop/python/versioning) | Temporal 文档 | `patched()` 在事件历史里插入标记，让新旧代码路径并存；`deprecate_patch()` 负责收尾；Worker Versioning 让旧运行留在旧 worker 上跑完。改 workflow 代码之前必读。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| X8 | [Workflow Execution Limits](https://docs.temporal.io/workflow-execution/limits) 与 [Continue-As-New - Python SDK](https://docs.temporal.io/develop/python/continue-as-new) | Temporal 文档 | 单个执行的事件历史上限是 51,200 个事件或 50 MB（10,240 个 / 10 MB 时开始告警）；`workflow.info().is_continue_as_new_suggested()` 告诉你什么时候该重开。Agent 的历史按步数平方增长，这两页要一起看。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| X9 | [Testing - Python SDK](https://docs.temporal.io/develop/python/testing-suite) | Temporal 文档 | 其中"How to Replay a Workflow Execution"一节：拿已有的事件历史重放新代码，在发布前抓出非确定性错误。把生产抽样的历史放进 CI，就是照这个做的。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+
+## Y. 生产可观测性
+
+| 顺序 | 资料 | 作者 · 年份 | 为什么值得读 | 课程 |
+|---|---|---|---|---|
+| Y1 ⭐ | [Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/) | Steven Thurgood 等（Google SRE Workbook）· 2018 | 第 28 课必读。从"错误率超过阈值就告警"一步步演进到"多窗口多燃烧率"，每一步修掉上一步在精确率、召回率、检测时间、重置时间上的哪个缺点；"低流量服务"一节对波峰波谷明显的 Agent 流量尤其有用。 | [第 28 课](../lessons/28_production_observability/README.md) |
+| Y2 | [Recording errors](https://github.com/open-telemetry/semantic-conventions/blob/main/docs/general/recording-errors.md) | OpenTelemetry 项目 | 什么时候把 span 标成 Error：没出错时状态必须保持 UNSET；出错时设 Error 并写 `error.type`；已经被处理、让操作顺利完成的错误不记在这个操作上。据此决定取消、等审批、工具失败该不该"标红"。 | [第 28 课](../lessons/28_production_observability/README.md) |
+| Y3 | [Trace Context](https://www.w3.org/TR/trace-context/) | W3C Recommendation · 2021 | `traceparent` 和 `tracestate` 两个头部的标准格式，跨服务、跨队列传播 trace 的基础。自己解析 trace flags 之前先读。 | [第 28 课](../lessons/28_production_observability/README.md) |
+| Y4 | [Semantic conventions for messaging spans](https://opentelemetry.io/docs/specs/semconv/messaging/messaging-spans/) | OpenTelemetry 项目 | 生产者给每条消息附上创建上下文；默认用 span link 关联生产者和消费者（批量消费时这是唯一的办法），处理单条消息时才可以直接把它当父级。决定"在队列里等了 2 小时的任务怎么接 trace"时读。 | [第 28 课](../lessons/28_production_observability/README.md) |
+| Y5 | [Tail sampling processor](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/tailsamplingprocessor) | OpenTelemetry Collector | `decision_wait`、`num_traces`（默认 50000）、按状态码 / 延迟 / 概率的策略、处理迟到 span 的 `decision_cache`，以及用 loadbalancing 导出器分两层部署，保证同一条 trace 到同一个实例。 | [第 28 课](../lessons/28_production_observability/README.md) |
+| Y6 | [Metric and label naming](https://prometheus.io/docs/practices/naming/) | Prometheus 文档 | 每个不同的标签组合都是一条新的时间序列，不要把用户 ID、邮箱这类取值无上限的维度当标签。设计 Agent 指标之前的必读短文。 | [第 28 课](../lessons/28_production_observability/README.md) |
+| Y7 | [Multiprocess Mode](https://prometheus.github.io/client_python/multiprocess/) | prometheus_client 文档 | gunicorn 这类多进程部署怎么汇总指标：`PROMETHEUS_MULTIPROC_DIR`、`MultiProcessCollector`、`mark_process_dead`，以及 Gauge 的多进程聚合方式（如 `livesum`）。 | [第 28 课](../lessons/28_production_observability/README.md) |
+
+## Z. 模型网关、策略即代码与护栏
+
+| 顺序 | 资料 | 作者 · 年份 | 为什么值得读 | 课程 |
+|---|---|---|---|---|
+| Z1 ⭐ | [Cedar: A New Language for Expressive, Fast, Safe, and Analyzable Authorization](https://arxiv.org/abs/2403.04651) | Joseph W. Cutler 等 · 2024（OOPSLA 2024，扩展版） | 第 29 课必读。同一门语言怎样表达 RBAC、ABAC 和关系型授权；为什么刻意不图灵完备，好让验证器和符号分析站得住（用 Lean 做了形式化证明）；以及和 OpenFGA、Rego 的性能对比。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| Z2 | [Authorization](https://docs.cedarpolicy.com/auth/authorization.html) | Cedar 文档 | 判定规则：默认拒绝、forbid 优先于 permit；以及最容易踩的一条：求值出错的策略会被跳过，错误写在诊断信息里，由应用决定怎么处理。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| Z3 | [Router - Load Balancing](https://docs.litellm.ai/docs/routing) | LiteLLM 文档 | 模型组、路由策略、重试、冷却和降级链；多实例时用 Redis 共享冷却状态和 tpm / rpm 计数。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| Z4 | [Fallbacks (Provider Failover)](https://docs.litellm.ai/docs/proxy/reliability) | LiteLLM 文档 | 网关层的降级：普通降级、上下文超长降级、内容策略降级，以及它们和重试、冷却怎么配合。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| Z5 | [Budgets, Rate Limits](https://docs.litellm.ai/docs/proxy/users) | LiteLLM 文档 | 按团队、虚拟 key、用户设 `max_budget`、`budget_duration`、`rpm_limit`、`tpm_limit`，回答"每个团队花了多少钱、最多能花多少"。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| Z6 | [Zanzibar: Google's Consistent, Global Authorization System](https://www.usenix.org/conference/atc19/presentation/pang) | Ruoming Pang 等 · 2019（USENIX ATC） | 关系型授权（ReBAC）的源头：统一的数据模型和配置语言、全球一致、低延迟。OpenFGA 等开源实现都受它启发。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| Z7 | [Open Policy Agent](https://www.openpolicyagent.org/docs) | OPA 项目 | 通用策略引擎与 Rego 语言：把策略决策和执行分开，Kubernetes、API 网关、CI 都能用同一套。和 Cedar 对照读，理解"通用"和"可分析"之间的取舍。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| Z8 | [What is FGA?](https://openfga.dev/docs/fga) | OpenFGA 项目 | 受 Zanzibar 启发的细粒度授权：文档、文件夹、团队这类层级共享天然好表达。产品的核心是"共享与层级"时读。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| Z9 | [Llama Prompt Guard 2 86M 模型卡](https://huggingface.co/meta-llama/Llama-Prompt-Guard-2-86M) | Meta | 专用的注入分类模型：基于 mDeBERTa-base，BENIGN / MALICIOUS 二分类，上下文 512 token（长文本要切段）；官方评测的 8 种语言不含中文。放进级联分类器的中间一级之前，要用自己的数据评估。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| Z10 | [NVIDIA NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails) | NVIDIA | 开源护栏编排框架：用 Colang 定义 input、dialog、retrieval、execution、output 五类 rails，可以把各种分类器串起来。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+
+## AA. 异步运行时
+
+| 顺序 | 资料 | 作者 · 年份 | 为什么值得读 | 课程 |
+|---|---|---|---|---|
+| AA1 ⭐ | [Notes on structured concurrency, or: Go statement considered harmful](https://vorpus.org/blog/notes-on-structured-concurrency-or-go-statement-considered-harmful/) | Nathaniel J. Smith · 2018 | 第 30 课必读。为什么"随手开一个后台任务"像 goto 一样破坏抽象；重点读"Nurseries"一节：子任务不能比创建它的作用域活得更久，错误传播和取消才重新变得可以推理。 | [第 30 课](../lessons/30_async_runtime/README.md) |
+| AA2 | [Coroutines and Tasks](https://docs.python.org/3/library/asyncio-task.html) | Python 官方文档 | `TaskGroup`、取消、`shield`、`timeout`：吞掉 `CancelledError` 会让 `TaskGroup` 和 `asyncio.timeout()` 行为异常；事件循环只对任务保留弱引用，`create_task` 的返回值要保存；`gather` 默认参数下，一个出错时其余任务不会被取消。 | [第 30 课](../lessons/30_async_runtime/README.md) |
+| AA3 | [Developing with asyncio](https://docs.python.org/3/library/asyncio-dev.html) | Python 官方文档 | 调试模式（`PYTHONASYNCIODEBUG=1`）会记录超过 100 毫秒的慢回调；阻塞代码怎么交给执行器；从未 await 的协程怎么发现。查"谁卡住了事件循环"的第一站。 | [第 30 课](../lessons/30_async_runtime/README.md) |
+| AA4 | [Cancellation and timeouts](https://anyio.readthedocs.io/en/stable/cancellation.html) | AnyIO 文档 | 电平触发的取消：任务只要还在一个已取消的作用域里，每碰到一个 yield 点就会再被取消一次，所以收尾时的 `await` 要放进受保护（shielded）的取消作用域。FastAPI / Starlette 就建立在 AnyIO 之上。 | [第 30 课](../lessons/30_async_runtime/README.md) |
+| AA5 | [AsyncIO's wait_for can hide cancellation in a rare race condition（gh-86296）](https://github.com/python/cpython/issues/86296) | CPython issue | 内部结果和外部取消在同一轮事件循环里到达时，`wait_for` 返回结果、吞掉取消。第 30 课在 3.11.7 上稳定复现，在 3.12.3 和 3.13.1 上不再出现。还在老版本 Python 上的项目要读。 | [第 30 课](../lessons/30_async_runtime/README.md) |
+| AA6 | [HTML Standard：Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html) | WHATWG | 重连时浏览器带上 `Last-Event-ID`；`retry:` 字段设置重连间隔；每 15 秒左右发一行注释，防止旧代理断开空闲连接。设计流式断线续传时读原文。 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| AA7 | [Understanding Lambda function scaling](https://docs.aws.amazon.com/lambda/latest/dg/lambda-concurrency.html) | AWS 文档 | 用"并发 = 平均每秒请求数 × 平均请求时长"估算并发，也就是利特尔法则的工程版；同时说明了一个执行环境在处理请求期间不能处理别的请求。 | [第 30 课](../lessons/30_async_runtime/README.md) |
+
+## AB. 部署与扩缩容
+
+| 顺序 | 资料 | 作者 · 年份 | 为什么值得读 | 课程 |
+|---|---|---|---|---|
+| AB1 ⭐ | [Pod Lifecycle：Termination of Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination) | Kubernetes 文档 | 删除 Pod 时先执行 preStop，再给容器发 SIGTERM，等 `terminationGracePeriodSeconds`（默认 30 秒，preStop 的耗时也算在内）之后发 SIGKILL。worker 的优雅停机时间线就是照着它设计的。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| AB2 | [Configure Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) | Kubernetes 文档 | 存活探针失败会重启容器，就绪探针失败只把 Pod 从 Service 的端点里摘掉。分清两者，才不会把"数据库抖一下"变成"所有 Pod 一起重启"。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| AB3 | [Horizontal Pod Autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/) | Kubernetes 文档 | HPA 除了 CPU，还能按自定义指标和外部指标扩缩；缩容稳定窗口和扩缩速率策略防止副本数来回抖动。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| AB4 | [PostgreSQL scaler](https://keda.sh/docs/2.21/scalers/postgresql/) | KEDA 文档 | 用一条返回数字的 SQL（比如可执行的任务数）和 `targetQueryValue` 比较，来扩缩 worker。队列就在 Postgres 里时，这是按积压扩缩容最直接的做法。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| AB5 | [The Twelve-Factor App：IX. Disposability](https://12factor.net/disposability) | 12factor.net | 进程收到 SIGTERM 要优雅退出；对 worker 来说，优雅停机就是把手上的任务还回队列。第 31 课的 worker 正是这么做的。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| AB6 | [Uvicorn settings](https://uvicorn.dev/settings/) | Uvicorn 文档 | `--limit-concurrency`（超过就返回 503）、`--timeout-graceful-shutdown`、`--workers`：API 进程的最后一道闸和停机时限。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| AB7 | [Open and closed models](https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/) | Grafana k6 文档 | 闭环压测在系统变慢时自己也发得慢了，这就是协调遗漏；要测固定到达率下的尾延迟，用 arrival-rate 执行器（开环）。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| AB8 | [wrk2](https://github.com/giltene/wrk2) | Gil Tene | 以恒定吞吐发请求、按"本该发出的时刻"计算延迟的压测工具；README 讲清了协调遗漏为什么会把最坏的那段延迟藏起来。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
 
 ---
 

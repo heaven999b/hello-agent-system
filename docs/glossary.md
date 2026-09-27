@@ -7,7 +7,7 @@
 
 **用法**：每条术语给出一句"大白话"解释。带 `代码字体` 的是 agentkit 中对应的类或函数，可以直接去源码里找。遇到不懂的词，`Ctrl+F` 搜中文或英文都可以。
 
-共收录 **246** 条术语（分 14 组），另附 27 组易混淆术语对比。
+共收录 **278** 条术语（分 15 组），另附 34 组易混淆术语对比。
 
 ---
 
@@ -28,7 +28,7 @@
 | 结束原因 | Stop Reason / Finish Reason | 一次运行或一次模型调用为什么结束：给出答案、达到上限、被拦截、等待审批……是最重要的监控维度之一。`RunResult.stop_reason` | [第 02 课](../lessons/02_agent_loop/README.md) |
 | 非确定性 | Non-determinism | 同样的输入，模型可能给出不同的输出、走不同的步骤；所以"试一次没问题"不等于没问题。 | [第 01 课](../lessons/01_llm_essentials/README.md) · [第 11 课](../lessons/11_evals/README.md) |
 | 温度 | Temperature | 控制模型输出随机性的采样参数，越低越稳定；但即使设为 0 也不保证完全可复现。 | [第 01 课](../lessons/01_llm_essentials/README.md) |
-| 流式输出 | Streaming | 模型边生成边返回，用户不用等到全部完成才看到内容；对长任务的体验很关键。 | [第 01 课](../lessons/01_llm_essentials/README.md) · [第 14 课](../lessons/14_cost_latency/README.md) |
+| 流式输出 | Streaming | 模型边生成边返回，用户不用等到全部完成才看到内容；对长任务的体验很关键。 | [第 01 课](../lessons/01_llm_essentials/README.md) · [第 14 课](../lessons/14_cost_latency/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
 | 推理模型 | Reasoning Model | 回答前先生成一段内部"思考"的模型；思考 token 按输出计费、占上下文，适合规划和难题，不适合简单分类和对延迟敏感的步骤。 | [第 01 课](../lessons/01_llm_essentials/README.md) |
 | 幻觉 | Hallucination | 模型流畅、自信地说出错误内容；事实要靠工具和检索，"做了什么"要看工具执行记录，不能信模型的文字。 | [第 01 课](../lessons/01_llm_essentials/README.md) |
 | 测试替身（剧本模型） | Test Double / Scripted LLM | 按预先写好的剧本返回结果的"假模型"，让 Agent 测试零成本、可复现。`ScriptedLLM` | [第 02 课](../lessons/02_agent_loop/README.md) |
@@ -45,7 +45,7 @@
 | 错误即观察 | Errors as Observations | 工具出错时不抛异常搞崩 Agent，而是把错误写成模型能看懂的文字反馈给它，让它自己纠正。`ToolResult` | [第 03 课](../lessons/03_tools/README.md) |
 | 风险分级 | Risk Tiering | 给每个工具标上 read / write / dangerous 等级，权限和审批据此决定是否放行。`Tool(risk=...)` | [第 03 课](../lessons/03_tools/README.md) |
 | 幂等 | Idempotency | 同一个操作执行一次和执行多次效果相同；重试和崩溃恢复都依赖它，否则会重复扣款、重复建单。 | [第 08 课](../lessons/08_reliability/README.md) |
-| 幂等键 | Idempotency Key | 标识"这是同一次操作"的唯一键，重放时据此去重。agentkit 用 `run_id:call_id`。`ToolContext.idempotency_key` | [第 08 课](../lessons/08_reliability/README.md) |
+| 幂等键 | Idempotency Key | 标识"这是同一次操作"的唯一键，重放时据此去重。agentkit 用 `run_id:call_id`。`ToolContext.idempotency_key` | [第 08 课](../lessons/08_reliability/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
 | 可信上下文 | Trusted Context | 由系统（而非模型）注入给工具的信息，如用户 ID、租户 ID、角色；模型看不到也改不了。`ToolContext` | [第 03 课](../lessons/03_tools/README.md) |
 | 输出截断 | Output Truncation | 工具返回太长时只保留前 N 个字符，并告诉模型"已截断"，防止撑爆上下文。`Tool(max_output_chars=...)` | [第 03 课](../lessons/03_tools/README.md) |
 | Agent-计算机接口 | ACI (Agent-Computer Interface) | 类比"人机界面（HCI）"：工具的名称、参数、描述、返回格式就是 Agent 的操作界面，值得同样用心设计。 | [第 03 课](../lessons/03_tools/README.md) · [第 24 课](../lessons/24_coding_agents/README.md) |
@@ -109,11 +109,11 @@
 | 指数退避 | Exponential Backoff | 每次重试前等待的时间按指数增长（0.5s、1s、2s……），给下游恢复的时间。`backoff_delay` | [第 08 课](../lessons/08_reliability/README.md) |
 | 抖动 | Jitter | 在退避时间上加随机量，避免成千上万个客户端在同一时刻整齐地重试。 | [第 08 课](../lessons/08_reliability/README.md) |
 | 惊群效应 | Thundering Herd | 大量客户端在同一时刻同时发起请求（比如同时重试），把刚恢复的服务再次打垮。 | [第 08 课](../lessons/08_reliability/README.md) |
-| 重试风暴 | Retry Storm | 多层重试相乘、没有抖动，导致故障期间请求量被放大数倍甚至数十倍。 | [第 08 课](../lessons/08_reliability/README.md) |
-| 熔断器 | Circuit Breaker | 下游持续失败时"跳闸"，一段时间内直接快速失败，过后放少量请求试探；有关闭/打开/半开三种状态。`CircuitBreaker` | [第 08 课](../lessons/08_reliability/README.md) |
-| 降级 | Fallback / Graceful Degradation | 主方案不可用时切换到备用方案（备用模型、缓存、规则、转人工），宁可差一点也别完全不可用。`ResilientLLM` | [第 08 课](../lessons/08_reliability/README.md) |
-| 检查点 | Checkpoint | 每走一步就把完整运行状态存盘，崩溃或暂停后可以从断点继续。`Checkpointer` | [第 08 课](../lessons/08_reliability/README.md) |
-| 持久化执行 | Durable Execution | 保证一段程序即使经历崩溃、重启也能从断点继续执行完的运行方式；Temporal、LangGraph 的检查点都属于这一思路。 | [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 重试风暴 | Retry Storm | 多层重试相乘、没有抖动，导致故障期间请求量被放大数倍甚至数十倍。 | [第 08 课](../lessons/08_reliability/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 熔断器 | Circuit Breaker | 下游持续失败时"跳闸"，一段时间内直接快速失败，过后放少量请求试探；有关闭/打开/半开三种状态。`CircuitBreaker` | [第 08 课](../lessons/08_reliability/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| 降级 | Fallback / Graceful Degradation | 主方案不可用时切换到备用方案（备用模型、缓存、规则、转人工），宁可差一点也别完全不可用。`ResilientLLM` | [第 08 课](../lessons/08_reliability/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 检查点 | Checkpoint | 每走一步就把完整运行状态存盘，崩溃或暂停后可以从断点继续。`Checkpointer` | [第 08 课](../lessons/08_reliability/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) |
+| 持久化执行 | Durable Execution | 保证一段程序即使经历崩溃、重启也能从断点继续执行完的运行方式；Temporal、LangGraph 的检查点都属于这一思路。 | [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) |
 | 原子写入 | Atomic Write | 写文件要么完整成功要么完全没发生，不会出现写了一半的损坏文件（先写临时文件再改名）。`FileCheckpointer` | [第 08 课](../lessons/08_reliability/README.md) |
 | Saga / 补偿事务 | Saga / Compensation | 把长事务拆成多步，每一步都配一个"撤销动作"，中途失败时依次撤销已完成的步骤。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 预算 | Budget | 对一次运行的步数、token、金额、工具调用次数、时长设上限，超限就优雅停止。`BudgetHook` | [第 08 课](../lessons/08_reliability/README.md) |
@@ -132,9 +132,9 @@
 | 聚光灯（数据标记） | Spotlighting | 用标签或编码把外部数据明确标记为"数据而不是指令"，帮助模型区分来源；能降低注入成功率但不能根除。`ToolOutputGuard` | [第 09 课](../lessons/09_security/README.md) |
 | 致命三要素 | Lethal Trifecta | Simon Willison 提出：Agent 同时能访问私有数据、接触不可信内容、对外通信时，数据外泄只差一次注入。 | [第 09 课](../lessons/09_security/README.md) |
 | 数据外泄 | Data Exfiltration | 数据被悄悄送到外部，例如通过模型输出中的图片链接、对外发邮件的工具。 | [第 09 课](../lessons/09_security/README.md) |
-| 护栏 | Guardrail | 对输入、输出或工具调用做检查和拦截的机制；降低风险的概率，但不能替代权限设计。`InputGuard` / `OutputGuard` | [第 09 课](../lessons/09_security/README.md) |
+| 护栏 | Guardrail | 对输入、输出或工具调用做检查和拦截的机制；降低风险的概率，但不能替代权限设计。`InputGuard` / `OutputGuard` | [第 09 课](../lessons/09_security/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
 | 最小权限 | Least Privilege | 只给完成任务所必需的最少权限；假设模型一定会被骗，然后限制它被骗后能做的事。 | [第 09 课](../lessons/09_security/README.md) |
-| 基于角色的访问控制 | RBAC (Role-Based Access Control) | 按用户角色决定能用哪些工具；agentkit 中既"不给看"也"不让调"。`PermissionPolicy(role_tools=...)` | [第 09 课](../lessons/09_security/README.md) |
+| 基于角色的访问控制 | RBAC (Role-Based Access Control) | 按用户角色决定能用哪些工具；agentkit 中既"不给看"也"不让调"。`PermissionPolicy(role_tools=...)` | [第 09 课](../lessons/09_security/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
 | 人在回路 | HITL (Human-in-the-Loop) | 关键步骤由人来确认或决策，典型场景是高风险操作的人工审批。`PauseRun` / `agent.approve` | [第 09 课](../lessons/09_security/README.md) |
 | 过度授权 | Excessive Agency | Agent 拥有超出任务所需的功能、权限或自主性（OWASP LLM Top 10 中的一类风险）。 | [第 09 课](../lessons/09_security/README.md) |
 | 混淆代理人 | Confused Deputy | 有权限的程序被没权限的人"借用"了权限，例如让模型填 user_id 从而查到别人的数据。 | [第 09 课](../lessons/09_security/README.md) |
@@ -154,11 +154,11 @@
 | 可观测性 | Observability | 能从外部数据（日志、指标、追踪）推断系统内部发生了什么的能力。 | [第 10 课](../lessons/10_observability/README.md) |
 | 链路追踪 | Tracing | 把一次请求拆成嵌套的步骤树，记录每一步的输入、输出、耗时，是排查 Agent 问题的主要手段。`Tracer` | [第 10 课](../lessons/10_observability/README.md) |
 | 追踪 / 跨度 | Trace / Span | 一次完整运行叫一个 trace；其中每个步骤（一次模型调用、一次工具调用）叫一个 span，span 可以嵌套。`Span` | [第 10 课](../lessons/10_observability/README.md) |
-| OpenTelemetry | OpenTelemetry (OTel) | 开源的可观测性标准和工具集；其 GenAI 语义约定规定了 `gen_ai.request.model` 等字段名，方便对接各种后端。 | [第 10 课](../lessons/10_observability/README.md) |
+| OpenTelemetry | OpenTelemetry (OTel) | 开源的可观测性标准和工具集；其 GenAI 语义约定规定了 `gen_ai.request.model` 等字段名，方便对接各种后端。 | [第 10 课](../lessons/10_observability/README.md) · [第 28 课](../lessons/28_production_observability/README.md) |
 | 轨迹 | Trajectory | Agent 在一次运行中依次做了哪些动作（调用了哪些工具、顺序如何）；评估和排查都要看它。`RunResult.tools_called()` | [第 10 课](../lessons/10_observability/README.md) |
-| 指标 | Metrics | 可聚合的数值（成功率、延迟、token 数、成本），用于看板和告警。 | [第 10 课](../lessons/10_observability/README.md) |
-| 采样 | Sampling | 只保留一部分追踪数据以节省成本；调试数据可以采样，审计数据不能。 | [第 10 课](../lessons/10_observability/README.md) |
-| 服务等级目标 | SLO / SLI | SLI 是衡量服务质量的指标（如任务完成率），SLO 是你对它承诺的目标值（如 ≥ 95%）。 | [第 12 课](../lessons/12_production_architecture/README.md) |
+| 指标 | Metrics | 可聚合的数值（成功率、延迟、token 数、成本），用于看板和告警。 | [第 10 课](../lessons/10_observability/README.md) · [第 28 课](../lessons/28_production_observability/README.md) |
+| 采样 | Sampling | 只保留一部分追踪数据以节省成本；调试数据可以采样，审计数据不能。 | [第 10 课](../lessons/10_observability/README.md) · [第 28 课](../lessons/28_production_observability/README.md) |
+| 服务等级目标 | SLO / SLI | SLI 是衡量服务质量的指标（如任务完成率），SLO 是你对它承诺的目标值（如 ≥ 95%）。 | [第 12 课](../lessons/12_production_architecture/README.md) · [第 28 课](../lessons/28_production_observability/README.md) |
 | 静默失败 | Silent Failure | 系统看起来一切正常（HTTP 200、没报错），但任务其实没完成；Agent 最常见的失败形态。 | [第 10 课](../lessons/10_observability/README.md) |
 
 ## 八、评估
@@ -183,11 +183,11 @@
 
 | 中文 | English | 大白话解释 | 课程 |
 |---|---|---|---|
-| 模型网关 | LLM Gateway | 所有模型调用都经过的统一入口，集中做鉴权、限流、计量、路由、缓存和密钥管理。 | [第 12 课](../lessons/12_production_architecture/README.md) |
+| 模型网关 | LLM Gateway | 所有模型调用都经过的统一入口，集中做鉴权、限流、计量、路由、缓存和密钥管理。 | [第 12 课](../lessons/12_production_architecture/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
 | 多租户 | Multi-tenancy | 一套系统同时服务多个客户（租户），它们的数据和配额必须严格隔离。 | [第 12 课](../lessons/12_production_architecture/README.md) |
 | 租户隔离 | Tenant Isolation | 保证一个租户永远看不到、影响不到另一个租户的数据和资源；必须在存储/检索层强制执行。 | [第 12 课](../lessons/12_production_architecture/README.md) |
 | 吵闹邻居 | Noisy Neighbor | 一个租户的大流量挤占共享资源，导致其他租户变慢或被限流。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 限流 / 令牌桶 | Rate Limiting / Token Bucket | 限制单位时间内的请求量；令牌桶是常用算法：按固定速率往桶里放令牌，请求要拿到令牌才能执行。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 限流 / 令牌桶 | Rate Limiting / Token Bucket | 限制单位时间内的请求量；令牌桶是常用算法：按固定速率往桶里放令牌，请求要拿到令牌才能执行。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
 | 配额 | Quota | 在较长周期（天、月）内允许的总用量上限，常按租户或用户设置。 | [第 12 课](../lessons/12_production_architecture/README.md) |
 | 灰度发布 | Canary Release | 新版本先给一小部分流量用，观察指标没问题再逐步扩大。 | [第 16 课](../lessons/16_release_ops/README.md) |
 | 金丝雀数据 | Canary Token | 故意埋进数据中的唯一字符串，一旦在不该出现的地方出现，就说明发生了泄露。 | [第 12 课](../lessons/12_production_architecture/README.md) · [第 15 课](../lessons/15_enterprise_rag/README.md) |
@@ -201,32 +201,32 @@
 
 | 中文 | English | 大白话解释 | 课程 |
 |---|---|---|---|
-| 横向扩展 | Horizontal Scaling | 通过增加机器/实例数量（而不是换更强的机器）来提升处理能力；前提是 worker 无状态。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 无状态 Worker | Stateless Worker | 进程内不保存任何会话或运行状态，状态都放在共享存储里；这样任何一个 worker 都能接手任何任务，挂了也不丢东西。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 横向扩展 | Horizontal Scaling | 通过增加机器/实例数量（而不是换更强的机器）来提升处理能力；前提是 worker 无状态。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| 无状态 Worker | Stateless Worker | 进程内不保存任何会话或运行状态，状态都放在共享存储里；这样任何一个 worker 都能接手任何任务，挂了也不丢东西。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
 | 会话粘性 | Session Affinity / Sticky Session | 把同一会话的请求总是路由到同一个实例；能减少并发冲突，但实例宕机时要能转移。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | Actor 模型 | Actor Model | 每个实体（如一个会话）是一个"演员"，有自己的信箱，逐条处理消息；同一会话的消息天然串行，不会并发写。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 服务器推送事件 | SSE (Server-Sent Events) | 服务器通过一个长连接持续向浏览器推送消息的标准，常用于流式输出和进度通知。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 异步任务队列 | Async Task Queue | 请求先放进队列立刻返回，由后台 worker 慢慢处理，完成后再通知用户；适合几十秒以上的长任务。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 工作流引擎 | Workflow Engine | 专门负责可靠地执行多步骤、长时间流程的系统（如 Temporal），自带重试、超时、状态持久化。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 服务器推送事件 | SSE (Server-Sent Events) | 服务器通过一个长连接持续向浏览器推送消息的标准，常用于流式输出和进度通知。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| 异步任务队列 | Async Task Queue | 请求先放进队列立刻返回，由后台 worker 慢慢处理，完成后再通知用户；适合几十秒以上的长任务。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 工作流引擎 | Workflow Engine | 专门负责可靠地执行多步骤、长时间流程的系统（如 Temporal），自带重试、超时、状态持久化。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) |
 | 投递语义 | Delivery Semantics | 消息系统对"一条消息会被处理几次"的承诺：最多一次、至少一次、恰好一次。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 至少一次 | At-least-once | 保证消息不丢，但可能重复投递；最常见的语义，所以消费者必须幂等。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 恰好一次 | Exactly-once | 每条消息只生效一次；端到端很难直接做到，实践中用"至少一次 + 幂等"达到效果上的恰好一次。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 可见性超时 | Visibility Timeout | 消息被某个消费者取走后，在这段时间内对其他消费者不可见；超时仍未确认就会被重新投递。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 可见性超时 | Visibility Timeout | 消息被某个消费者取走后，在这段时间内对其他消费者不可见；超时仍未确认就会被重新投递。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
 | 死信队列 | DLQ (Dead Letter Queue) | 多次处理失败的消息被移到这里，等待人工排查，而不是无限重试拖垮系统。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 毒消息 | Poison Message | 无论重试多少次都会处理失败的消息（如格式错误），不隔离就会反复消耗资源。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 租约 | Lease | 带过期时间的"占有权"：worker 在租约有效期内独占一个任务，过期不续就会被别人接手。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 心跳 | Heartbeat | worker 定期发送"我还活着"的信号，用来续约或让系统判断它是否失联。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 防护令牌 | Fencing Token | 每次授予锁/租约时发放的单调递增编号，写入时携带；存储端拒绝旧编号的写入，从而挡住"以为自己还持有锁"的僵尸 worker。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 毒消息 | Poison Message | 无论重试多少次都会处理失败的消息（如格式错误），不隔离就会反复消耗资源。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 租约 | Lease | 带过期时间的"占有权"：worker 在租约有效期内独占一个任务，过期不续就会被别人接手。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 心跳 | Heartbeat | worker 定期发送"我还活着"的信号，用来续约或让系统判断它是否失联。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) |
+| 防护令牌 | Fencing Token | 每次授予锁/租约时发放的单调递增编号，写入时携带；存储端拒绝旧编号的写入，从而挡住"以为自己还持有锁"的僵尸 worker。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
 | 丢失更新 | Lost Update | 两个进程同时"读-改-写"同一份数据，后写的覆盖了先写的，先写的修改就丢了。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 分布式锁 | Distributed Lock | 跨多台机器的互斥锁；实现正确并不容易，需要配合租约和防护令牌。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 乐观锁 / 比较并交换 | Optimistic Locking / CAS (Compare-And-Swap) | 不加锁，写入时检查版本号是否还是自己读到的那个，不是就重读重试；冲突少时比加锁高效。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 分布式锁 | Distributed Lock | 跨多台机器的互斥锁；实现正确并不容易，需要配合租约和防护令牌。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 乐观锁 / 比较并交换 | Optimistic Locking / CAS (Compare-And-Swap) | 不加锁，写入时检查版本号是否还是自己读到的那个，不是就重读重试；冲突少时比加锁高效。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
 | 按会话分区串行化 | Per-session Partitioning | 按会话 ID 把消息分到固定的分区/队列，同一会话的消息按顺序由一个消费者处理，从根源上避免并发写。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 背压 | Backpressure | 下游处理不过来时，把"慢一点"的信号传回上游（拒绝、排队、限速），而不是无限接收直到崩溃。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 准入控制 / 负载削减 | Admission Control / Load Shedding | 系统过载时主动拒绝一部分请求，保证其余请求能正常完成；比"大家一起超时"好。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 背压 | Backpressure | 下游处理不过来时，把"慢一点"的信号传回上游（拒绝、排队、限速），而不是无限接收直到崩溃。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| 准入控制 / 负载削减 | Admission Control / Load Shedding | 系统过载时主动拒绝一部分请求，保证其余请求能正常完成；比"大家一起超时"好。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
 | 加权公平排队 | Weighted Fair Queuing | 多个租户共享资源时，按权重轮流服务各租户的队列，防止一个大租户独占。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 事务性发件箱 | Transactional Outbox | 把"要发的事件"和业务数据写在同一个数据库事务里，再由独立进程发布，避免"库写了、消息没发"的不一致。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 请求合并 | Singleflight / Request Coalescing | 同一个键的多个并发请求只放行一个去真正执行，其余等待并共享结果；防止缓存过期瞬间的请求风暴。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
-| 全局限流 | Global Rate Limiting | 在所有实例之间共享的限流（如集中式令牌桶），而不是每台机器各限各的。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 全局限流 | Global Rate Limiting | 在所有实例之间共享的限流（如集中式令牌桶），而不是每台机器各限各的。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
 
 ## 十一、成本与延迟优化
 
@@ -239,7 +239,7 @@
 | 缓存未命中风暴 | Cache Stampede | 热点缓存过期瞬间，大量相同请求同时去计算，把后端打垮或让成本飙升。 | [第 14 课](../lessons/14_cost_latency/README.md) |
 | 对冲请求 | Hedged Request | 第一个请求迟迟不返回时再发一个相同的请求，取先返回的那个；能压低长尾延迟，但只适合幂等请求。出自《The Tail at Scale》。 | [第 14 课](../lessons/14_cost_latency/README.md) |
 | 批处理 | Batching | 把多个请求攒在一起处理以降低单位成本，代价是延迟变高；适合离线任务。 | [第 14 课](../lessons/14_cost_latency/README.md) |
-| 首 token 延迟 | TTFT (Time to First Token) | 从发出请求到收到第一个输出 token 的时间，决定了用户"感觉"有多快。 | [第 14 课](../lessons/14_cost_latency/README.md) |
+| 首 token 延迟 | TTFT (Time to First Token) | 从发出请求到收到第一个输出 token 的时间，决定了用户"感觉"有多快。 | [第 14 课](../lessons/14_cost_latency/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
 | 并行工具调用 | Parallel Tool Calls | 模型在一轮中同时请求多个互不依赖的工具，程序并发执行，减少总等待时间。 | [第 14 课](../lessons/14_cost_latency/README.md) |
 
 ## 十二、企业知识与 RAG
@@ -330,6 +330,45 @@
 | 打扰成本 | Interruption Cost | 每次主动开口都会占用用户的注意力，专注、开会、深夜时代价更高。决策器用"收益 × 置信度 − 情境成本"，过了阈值才说，否则攒进摘要或者不说。 | [第 25 课](../lessons/25_proactive_and_frontier/README.md) |
 | 50% 时间跨度 | 50% Time Horizon | METR 提出的指标：人类完成需要多长时间的任务，AI 能以 50% 的成功率完成。论文发现它自 2019 年以来大约每 7 个月翻一倍；注意它是按 50% 成功率定义的，不等于可靠。 | [第 25 课](../lessons/25_proactive_and_frontier/README.md) |
 
+## 十五、第四部分：生产落地
+
+> 本组对应第 26–31 课：把教学实现换成 Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar、asyncio 这些成熟组件，再部署成多进程、多实例的服务时会遇到的术语。租约、心跳、防护令牌、乐观锁（CAS）、背压、持久化执行、工作流引擎、可见性超时、毒消息、模型网关、护栏、采样、SLO 等术语在前面各组已经收录，并补上了第四部分的课程链接，这里不再重复。
+
+| 中文 | English | 大白话解释 | 课程 |
+|---|---|---|---|
+| 跳过已锁行 | SKIP LOCKED (`FOR UPDATE SKIP LOCKED`) | 锁住选中的行，别人已经锁住的行直接跳过，不排队等。PostgreSQL 文档说它得到的是不一致的数据视图，不适合一般用途，但适合"多个消费者领取一张类似队列的表"。`PostgresJobQueue.claim` | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| fence 接管 | Fenced Takeover | 新的租约持有者读检查点时，在同一条 `UPDATE ... RETURNING` 里把表里的 fence 改成自己的、版本号加一，旧持有者手里的版本号当场作废。它补上了纯 CAS"先写者赢"的缺口：最新的持有者一定赢。`PostgresCheckpointer.fenced` | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 咨询锁 | Advisory Lock | Postgres 里含义由应用自己定义的锁。事务级的 `pg_advisory_xact_lock` 在事务结束时自动释放，被保护的写入和锁在同一个事务里，持有者一死两者一起作废；会话级锁不遵守事务语义，也和 PgBouncer 的事务池模式不兼容。 | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| Lua 脚本（Redis） | Redis Lua Script | 在 Redis 服务器里原子执行的一小段程序，执行期间服务器上的其他操作全部等待。令牌桶的"读 → 补充 → 判断 → 写回"必须整段放进脚本；时钟取 Redis 的 `TIME`，小数要 `tostring` 后再返回（否则会被截断成整数）。`RedisTokenBucket` | [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 连接池 | Connection Pool | 一组预先建好、反复借还的数据库连接。大小按"同时**正在用**连接的协程数"估算，而不是按并发任务数；所有进程加起来不能超过数据库的 `max_connections`，再多就在前面加 PgBouncer（事务池模式下不能用会话级特性）。 | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| Activity | Activity | Temporal 里真正干活的函数：调模型、调工具、查数据库。它可以失败，会按 RetryPolicy 重试。官方保证它"被观察到完成"恰好一次，但它可能被**执行**多次，所以写操作必须幂等。`llm_step` / `execute_tool` | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| 事件历史 / 重放 | Event History / Replay | Temporal 服务端记下每个命令、每个结果、每个 signal 的流水账。worker 崩溃后，新 worker 把 workflow 代码从头执行一遍，已完成的 activity 直接从历史里取结果，不再真的执行。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| 确定性约束 | Workflow Determinism | 同样的事件历史必须产生同样的命令序列，所以 workflow 代码里不能直接做 IO、读时钟、生成随机数（改用 activity 和 `workflow.now()` / `workflow.random()`）。重放只比对命令的种类和顺序，不比对参数。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| Signal / Update / Query | Signal / Update / Query | 发给正在运行的 workflow 的三种消息：signal 单向，发出去就算；update 会等 workflow 处理完并返回结果，还能挂验证器提前拒绝；query 只读，不写事件历史。审批界面要告诉审批人"这一票算不算数"时用 update。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| 持久化定时器 | Durable Timer | 记在服务端的定时器，worker 全部重启过也照样到点触发。审批等 24 小时没人批就按拒绝处理，靠的就是它（`wait_condition(..., timeout=...)`）。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| Continue-As-New | Continue-As-New | 事件历史太长时，带着当前状态"重开"一个新的 run。单个执行的上限是 51,200 个事件或 50 MB；Agent 每次调模型都带着完整对话，历史大小随步数平方增长，所以必须设计它，并配合上下文压缩。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| 补丁 / Worker 版本化 | Patching / Worker Versioning | 改 workflow 代码又不让正在跑的旧运行重放失败的两种办法：`workflow.patched("id")` 给新旧执行各留一条路，旧运行都结束后再清理；或者按部署版本把旧运行固定（Pinned）在旧版本的 worker 上跑完。 | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| GenAI 语义约定 | GenAI Semantic Conventions | OpenTelemetry 为生成式 AI 定的 span 和属性命名：`chat {模型}`、`invoke_agent {Agent}`、`execute_tool {工具}`，以及 `gen_ai.usage.input_tokens` 等。prompt、回复、工具参数这类内容属性是 Opt-In，默认不采集；约定仍处于 Development 状态，升级 SDK 时要复查属性名。 | [第 28 课](../lessons/28_production_observability/README.md) |
+| 上下文传播 | Context Propagation | 把 trace 上下文（W3C `traceparent`）带过进程边界，让下游的 span 接在同一条 trace 上。HTTP 有自动埋点代劳，队列要自己把它写进任务 payload；任务等了很久或者批量消费时，消费端新开 trace、用 span link 关联生产者。`inject_context` / `continue_trace` | [第 28 课](../lessons/28_production_observability/README.md) |
+| 头部采样 / 尾部采样 | Head Sampling / Tail Sampling | 头部采样在请求一开始就决定留不留，会按比例丢掉失败的 trace；尾部采样在 Collector 里等整条 trace 到齐再决定（错误、慢请求全留），代价是内存，而且同一条 trace 的 span 必须到同一个实例。Agent 的 trace 是分钟级的，`decision_wait` 要覆盖 p99 运行时长。 | [第 28 课](../lessons/28_production_observability/README.md) |
+| 标签基数 | Label Cardinality | 一个指标的标签有多少种取值组合；每种组合都是一条独立的时间序列。`user_id`、`run_id`、`trace_id` 永远不当标签；租户要有上限或白名单，模型编造的工具名归入 `__unknown__`。`PrometheusHook(allowed_tenants=...)` | [第 28 课](../lessons/28_production_observability/README.md) |
+| 错误预算 / 燃烧率 | Error Budget / Burn Rate | SLO 允许失败的比例叫错误预算；燃烧率 = 实际错误率 ÷ 错误预算，等于 1 表示刚好在周期末用完。Google SRE Workbook 推荐多窗口多燃烧率告警：1 小时和 5 分钟都 > 14.4、或 6 小时和 30 分钟都 > 6 时叫人，3 天和 6 小时都 > 1 时开工单。 | [第 28 课](../lessons/28_production_observability/README.md) |
+| 虚拟 key | Virtual Key | 模型网关发给各团队、各服务的"替身"密钥：业务只拿它，真正的厂商 key 只留在网关里；每个虚拟 key 或团队都能单独设预算和 rpm / tpm 上限，泄露了也能单独吊销。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 策略即代码 | Policy as Code | 把授权规则写成独立的策略文件，而不是散落在代码里的 if-else：可评审（安全团队直接看 diff）、可测试（schema 校验 + 判定用例）、可审计（每次判定说得出是哪条策略）、与发版解耦。`CedarPolicy` | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| Cedar | Cedar | 一门授权策略语言：permit / forbid 加 `when` / `unless`；任一 forbid 命中就拒绝，否则任一 permit 命中才允许，都没命中默认拒绝；可以用 schema 静态校验。注意：求值出错的策略会被**跳过**，所以适配器要把求值错误当拒绝。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| ABAC / ReBAC | ABAC / ReBAC | 比 RBAC 更细的两种授权：ABAC 按属性和参数判断（"只能重置自己的密码""免费版不开放危险操作"）；ReBAC 按关系判断（"文档属于文件夹，文件夹共享给了团队"），源自 Google 的 Zanzibar，开源实现有 OpenFGA。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 失败即关闭 / 失败即放行 | Fail-closed / Fail-open | 控制组件（授权、限流、护栏）自己出故障时，是一律拒绝还是一律放行。安全边界要 fail closed（Cedar 求值出错当拒绝、审批超时按拒绝）；检测层可以 fail open 保住可用性，但必须记录并告警。 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) |
+| 级联分类器 | Classifier Cascade | 护栏分几级：便宜的分类器（正则、小模型）先判，有把握就直接放行或拦截，拿不准才交给贵的（LLM 评委、托管服务）。大部分流量在第一级就结束；阈值决定了你会继承第一级的哪一种错误。`CascadeClassifier` | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 利特尔法则 | Little's Law | L = λ × W：系统里同时在处理的请求数，等于到达速率乘以平均停留时间。每秒 50 个请求、每个 8 秒，就要能同时"等着" 400 个会话；做容量规划时 W 要按 p95 取，不能按平均值。 | [第 30 课](../lessons/30_async_runtime/README.md) |
+| 舱壁 | Bulkhead | 像船舱之间的隔板：按租户限制同时在跑的运行数，再加一个全局上限，一个租户把自己的名额用满了，别的租户照样有位置。代价是它不"按需分配"：吵闹租户用不上别人空着的名额。`KeyedLimiter` | [第 30 课](../lessons/30_async_runtime/README.md) |
+| 结构化并发 | Structured Concurrency | 子任务不能比创建它的作用域活得更久：作用域退出前要等所有子任务结束，一个出错就取消其余的并等它们收好尾（Trio 的 nursery、asyncio 的 `TaskGroup`）。随手 `create_task` 就像 goto：出错没人知道，取消了也没人等它收尾。 | [第 30 课](../lessons/30_async_runtime/README.md) |
+| 取消传播 | Cancellation Propagation | 调用方的取消（客户端断开、超时、停机）一路传到正在进行的模型调用和工具，让它们真正停下、不再花钱。`CancelledError` 收完尾必须重新抛出；在 AnyIO 这类"电平触发"取消的框架里，收尾时的 `await` 要用 shield 保护。 | [第 30 课](../lessons/30_async_runtime/README.md) |
+| 硬超时 / 进程隔离 | Hard Timeout / Process Isolation | Python 的线程杀不掉，协程只能在 `await` 处取消，一个没有 `await` 的死循环只能靠杀进程停下来：`isolated(tool)` 让工具在子进程里跑，超时就 kill。它不是沙箱，不可信代码仍然要放进容器或 microVM。 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 19 课](../lessons/19_mcp_and_sandbox/README.md) |
+| 存活探针 / 就绪探针 | Liveness / Readiness Probe | Kubernetes 的两种健康检查：存活探针失败会重启容器，所以只该检查"本进程还能应答"；就绪探针失败只把 Pod 从流量里摘掉、不重启，用来检查依赖是否可用、是否正在停机。第 31 课的参考服务不在存活探针里查数据库：否则数据库一抖，所有 Pod 会被一起重启。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| 优雅停机 | Graceful Shutdown | 收到 SIGTERM 之后：就绪探针变失败、不再接新请求和领取新任务 → 在途任务在宽限期内做完 → 做不完的取消、把任务归还给队列 → 刷新追踪、关闭连接池后退出。全部要在 `terminationGracePeriodSeconds`（默认 30 秒，preStop 的耗时也算在内）之内完成。`stop_on_signals` | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 按队列积压扩缩容 | Queue-depth Autoscaling | 按"队列里有多少任务、最老的一个等了多久"加减 worker，而不是按 CPU：Agent worker 大部分时间在等模型，CPU 几乎不动。KEDA 的 `postgresql` scaler 可以直接拿一条 SQL 的结果做依据；副本数上限要按模型配额来定。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 协调遗漏 | Coordinated Omission | 闭环压测（每个虚拟用户等上一个请求返回才发下一个）在系统变慢时自己也发得慢了，最慢的那段延迟于是被漏掉，延迟分布被美化。要测"固定到达率下的尾延迟"，用开环压测，例如 k6 的 arrival-rate 执行器或 wrk2。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+
 ---
 
 ## 附：容易混淆的术语对
@@ -363,3 +402,10 @@
 | agent harness vs evaluation harness | 让模型能作为 Agent 工作的系统（处理输入、编排工具调用） vs 端到端跑评估的基础设施（提供任务和工具、并发执行、记录每一步、打分、汇总）。 |
 | 单点评分 vs 成对比较 | 给每条回答单独打分或判通过，适合回归测试和上线门禁 vs 比较两条回答哪条更好，更敏感，适合选模型和选 prompt，但有位置偏差。 |
 | 事件驱动 Agent vs 主动式 Agent | 架构问题：事件怎么进来、怎么排队、怎么幂等 vs 交互问题：处理完之后要不要打扰这个人、什么时候说、说什么。 |
+| 纯 CAS vs fence 接管 | 保证不丢更新，但僵尸和新 worker 读到同一个版本时先写者赢，可能是僵尸赢 vs 最新的租约持有者读取的那一刻就让旧版本号作废，保证新持有者赢。 |
+| 检查点 + 租约队列 vs Temporal | 恢复的触发、互斥、审批定时器都由你自己写，只多一个 Postgres vs 服务端记事件历史、派发恢复、管定时器，代价是多运维一套服务、接受确定性约束。 |
+| Signal vs Update | 发出去就算，发送方不知道 workflow 接没接受 vs 等 workflow 处理完并返回结果，可以用验证器在写进历史之前拒绝。 |
+| 头部采样 vs 尾部采样 | 请求开始时就决定，省 SDK 开销，但会按比例丢掉错误 trace vs 整条 trace 到齐后再决定，错误和慢请求全留，要内存，还要按 trace ID 路由到同一个 Collector。 |
+| 舱壁 vs 限流 | 限制同时在跑的数量（并发） vs 限制单位时间内的次数（速率）。 |
+| 存活探针 vs 就绪探针 | 失败就重启容器，只看本进程 vs 失败就摘掉流量、不重启，可以检查依赖。 |
+| 失败即关闭 vs 失败即放行 | 组件故障时一律拒绝，保安全 vs 组件故障时一律放行，保可用；授权和审批选前者，检测层可以选后者，但要记录和告警。 |

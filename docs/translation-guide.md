@@ -127,3 +127,50 @@ This repository is bilingual. Every Markdown document has a Chinese version (`xx
 | 勿扰时段 / 频率上限 / 紧急通道 | quiet hours / rate limit / urgent override |
 | 50% 时间跨度 | 50% time horizon |
 | 可扩展的监督 | scalable oversight |
+
+### Part 4 terms (Lessons 26–31) / 第四部分术语（第 26–31 课）
+
+| 中文 | English |
+|---|---|
+| 生产落地 / 成熟组件 / 教学实现 | production / mature components / teaching implementation |
+| 从嵌入式换成托管服务 | switch from embedded to managed services |
+| 跳过已锁行 / 部分索引 / 回收（过期租约） | SKIP LOCKED / partial index / reap (expired leases) |
+| 版本号 CAS / fence 接管 / 先写者赢 | version-number CAS / fenced takeover / first writer wins |
+| 检查点冲突 / 租约丢失 / 稍后重试 / 永久失败 | checkpoint conflict (`CheckpointConflict`) / lease lost (`LeaseLost`) / retry later (`RetryLater`) / permanent failure (`PermanentJobError`) |
+| 僵尸 worker / 替补 worker / 接手 | zombie worker / replacement worker / take over |
+| 咨询锁 / 事务级 / 会话级 | advisory lock / transaction-level / session-level |
+| 效率锁 / 正确性锁 | lock for efficiency / lock for correctness |
+| 连接池 / 事务池模式 / 表膨胀 | connection pool / transaction pooling mode / table bloat |
+| 幂等缓存 / "执行中"标记 / 下游唯一约束 | idempotency cache / in-flight marker / downstream unique constraint |
+| 队头阻塞 | head-of-line blocking |
+| Activity / 事件历史 / 重放 | activity / event history / replay |
+| 确定性约束 / 非确定性错误 | determinism constraint / nondeterminism error |
+| 持久化定时器 / 审批超时 | durable timer / approval timeout |
+| 补丁 / Worker 版本化 | patching / Worker Versioning |
+| 心跳超时 / 开始到关闭超时 | heartbeat timeout / start-to-close timeout |
+| 语义约定 / 内容采集（Opt-In） | semantic conventions / content capture (opt-in) |
+| 上下文传播 / 迟到的 span | context propagation / late-arriving spans |
+| 头部采样 / 尾部采样 / 决策等待时间 | head sampling / tail sampling / `decision_wait` |
+| 标签基数 / 溢出桶 | label cardinality / overflow bucket (`__other__`) |
+| 错误预算 / 燃烧率 / 多窗口多燃烧率告警 | error budget / burn rate / multiwindow, multi-burn-rate alert |
+| 叫人（page）/ 开工单（ticket） | page / ticket |
+| 模型网关 / 虚拟 key / 冷却 | model gateway / virtual key / cooldown |
+| 重试放大 | retry amplification |
+| 策略即代码 / 策略决策点 | policy as code / policy decision point |
+| 求值出错即跳过 | skip on error |
+| 失败即关闭 / 失败即放行 | fail closed / fail open |
+| 级联分类器 / 只标记不拦截 | classifier cascade / flag-only mode |
+| 事件循环 / 协程 / 载体 | event loop / coroutine / carrier (thread, process, or coroutine) |
+| 利特尔法则 | Little's Law |
+| 舱壁 / 名额 | bulkhead / slot |
+| 结构化并发 / 取消传播 / 电平触发的取消 | structured concurrency / cancellation propagation / level-triggered cancellation |
+| 硬超时 / 进程隔离 | hard timeout / process isolation |
+| 首 token 之前才能重试 | retry only before the first token |
+| 事件出口 | event sink |
+| API 与 worker 分离 | API / worker split |
+| 存活探针 / 就绪探针 | liveness probe / readiness probe |
+| 优雅停机 / 宽限期 / 排空 | graceful shutdown / grace period / drain |
+| 滚动发布 / 先起新的再停旧的 | rolling update / surge first, then stop the old one |
+| 按队列积压扩缩容 | queue-depth autoscaling |
+| 压测 / 故障注入 | load test / fault injection |
+| 闭环压测 / 开环压测 / 协调遗漏 | closed-loop / open-loop load test / coordinated omission |

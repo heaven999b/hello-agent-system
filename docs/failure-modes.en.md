@@ -5,7 +5,7 @@
 > 📖 Part of the "domain reference" handbook that accompanies the course.
 > Related: [Design Review Checklist](design-review-checklist.en.md) · [Cheatsheet](cheatsheet.en.md) · [Glossary](glossary.en.md) · [Interview Questions](interview-questions.en.md)
 
-This guide catalogs **79** agent failure modes that show up in real production systems, grouped into eleven categories (the tenth covers distributed systems, concurrency, and release; the eleventh covers the advanced topics from Part 3 of the course: retrieval, memory, data, evals, optimization, and extended capabilities). Why a dedicated catalog?
+This guide catalogs **92** agent failure modes that show up in real production systems, grouped into twelve categories (the tenth covers distributed systems, concurrency, and release; the eleventh covers the advanced topics from Part 3 of the course: retrieval, memory, data, evals, optimization, and extended capabilities; the twelfth covers Part 4 of the course: problems that only appear once you move to mature components and deploy a multi-instance service). Why a dedicated catalog?
 
 When traditional software fails, it usually throws an exception. When an agent fails, **everything often looks perfectly normal**: HTTP 200, no errors, a confident tone. Meanwhile it has invented a refund policy, opened two tickets for the same user, or told you another company's data.
 Agent failures share three traits:
@@ -113,6 +113,20 @@ Detection methods reference real agentkit fields (such as `RunResult.status`, `T
 | [A10](#a10-over-interrupting-proactive-agent) | Over-Interrupting Proactive Agent | It notifies about everything; users turn the feature off | 🟠 Medium | Interruption decider + rate limit |
 | [A11](#a11-fusion-crowds-out-good-results) | Fusion Crowds Out Good Results | After adding hybrid search, a good document falls out of the top 10 | 🟡 Low | Vector floor + tuned weights + per-category evals |
 | [A12](#a12-leaky-benchmark) | Leaky Benchmark | An agent that does nothing still scores 38% | 🔴 High | Probe agents + the ABC checklist |
+| **Production: State, Workflows, Observability, Gateways, the Async Runtime, and Deployment** |||||
+| [PR1](#pr1-over-claiming-worker) | Over-Claiming Worker | A saturated worker keeps claiming; leases expire en masse and tasks run twice | 🔴 High | Take a slot before claiming + fences |
+| [PR2](#pr2-cas-without-fenced-takeover) | CAS Without Fenced Takeover | Zombie and new worker read the same version, and the zombie writes first and wins | 🔴 High | Queue fence drives checkpoint takeover |
+| [PR3](#pr3-stacked-retries) | Stacked Retries | SDK, ResilientLLM, Router, and Temporal each retry; one request becomes a dozen | 🟠 Medium | Retry at one layer + idempotency keys |
+| [PR4](#pr4-nondeterminism-after-deploy) | Nondeterminism After Deploy | After a release, runs waiting for approval are stuck in WorkflowTaskFailed | 🔴 High | Patching + replay tests |
+| [PR5](#pr5-event-history-blowup) | Event History Blowup | A workflow that ran dozens of steps fails on the history limit | 🟠 Medium | Continue-as-new + context compaction |
+| [PR6](#pr6-trace-broken-at-the-queue) | Trace Broken at the Queue | The API and the worker show up as two traces | 🟡 Low | Carry traceparent in the payload |
+| [PR7](#pr7-label-cardinality-explosion) | Label Cardinality Explosion | user_id became a label; Prometheus runs out of memory | 🟠 Medium | Enumerated labels + allowlists |
+| [PR8](#pr8-gateway-fallback-masks-a-regression) | Gateway Fallback Masks a Regression | Dashboards are green while completion and complaints quietly get worse | 🟠 Medium | Metrics by actual model + fallback alerts |
+| [PR9](#pr9-fail-open-policy-and-limits) | Fail-Open Policy and Limits | A policy that errored was skipped, and a dangerous operation went through | 🔴 High | Authorization fails closed + failure drills |
+| [PR10](#pr10-event-loop-blocked-by-sync-calls) | Event Loop Blocked by Sync Calls | One blocking call stalls every session and heartbeat in the process | 🟠 Medium | Async end to end + event-loop lag monitoring |
+| [PR11](#pr11-cancellation-leaves-work-half-done) | Cancellation Leaves Work Half-Done | Two tickets after a reconnect; checkpoints stuck at running | 🔴 High | Leave writes unanswered + shielded saves |
+| [PR12](#pr12-in-flight-runs-lost-on-shutdown) | In-Flight Runs Lost on Shutdown | Every rolling release fails or reruns a batch of runs | 🟠 Medium | Drain on SIGTERM + hand tasks back |
+| [PR13](#pr13-autoscaling-on-the-wrong-signal) | Autoscaling on the Wrong Signal | CPU is green while tasks wait longer and longer | 🟠 Medium | Scale on backlog and oldest-task age |
 
 > Severity is a general rule of thumb: 🔴 Critical = possible data breach, financial loss, or legal liability; 🔴 High = direct harm to users or the business; 🟠 Medium = user-experience and cost problems; 🟡 Low = efficiency problems. Your business context may differ.
 
@@ -955,6 +969,143 @@ Detection methods reference real agentkit fields (such as `RunResult.status`, `T
 | Detection | Write a few probe agents that never call a model (do nothing, canned reply, peek at hidden fields in the environment, reference solution) and confirm the gaming probes score near 0; this costs nothing and can run in CI. Check every label against the reference solution to prove each task is solvable. Rerun with a different date, a shuffled order, or right after another run; the reference solution's score shouldn't change. Report the trivial-agent baseline (ABC R.13). Read transcripts regularly. |
 | Fix / prevention | Audit with the ABC checklist (task validity T.1–T.10, outcome validity O.a–O.i, reporting R.1–R.13). Grade the final environment state, and make "do nothing" always fail. Start every trial in a fresh environment. Keep ground truth out of anything the agent can see. Mark infrastructure errors separately and retry, aborting the eval if they persist. Handle inputs that change over time (such as dates) the way production does. Version the benchmark itself: change the tasks, the scorer, the environment, or the judge prompt, and scores are no longer directly comparable with the old version. |
 | Lessons | [Lesson 22](../lessons/22_eval_methodology/README.en.md) · [Lesson 11](../lessons/11_evals/README.en.md) · [Lesson 24](../lessons/24_coding_agents/README.en.md) |
+
+---
+
+## 12. Production: State, Workflows, Observability, Gateways, the Async Runtime, and Deployment
+
+> This category covers Part 4 of the course (Lessons 26–31). Once you swap the teaching implementations for Postgres, Redis, Temporal, OpenTelemetry, LiteLLM, Cedar, and asyncio, the components themselves are mature, but their defaults, how you combine them, and what happens when they fail are still up to you. Most of these problems only show up with multiple processes and instances, real load, and real releases. Related modes from other categories: [D2](failure-modes.en.md#d2-zombie-worker) (Zombie Worker), [D3](failure-modes.en.md#d3-duplicate-delivery) (Duplicate Delivery), [D4](failure-modes.en.md#d4-queue-backlog-avalanche) (Queue Backlog Avalanche), [D9](failure-modes.en.md#d9-local-only-rate-limiting) (Local-Only Rate Limiting), [R1](failure-modes.en.md#r1-retry-storm) (Retry Storm), [R3](failure-modes.en.md#r3-silent-degradation) (Silent Degradation), and [R4](failure-modes.en.md#r4-lost-progress) (Lost Progress).
+
+### PR1 Over-Claiming Worker
+
+| Aspect | Details |
+|---|---|
+| Symptoms | At peak, the same task runs twice, and the logs fill with expired leases and fence rejections; one async worker process holds far more tasks than its concurrency limit, its memory grows, and the tasks make no progress; or jobs that run for tens of minutes always get "redelivered" once. |
+| Root cause | The worker claims work faster than it can process it. An async worker that keeps claiming while saturated hoards hundreds of tasks in memory, can't get through them, and lets their leases expire one after another, so other workers claim them again and run them twice. Related variants: a lease or visibility timeout shorter than the p99 task duration (for example, with Redis as the Celery broker, `visibility_timeout` defaults to 1 hour, and longer tasks are redelivered to another worker); a heartbeat interval too close to the lease length, so a single GC pause or database hiccup loses the lease. |
+| Detection | The number of expired leases not yet reaped (`stats()["expired_leases"]`), fence rejections (`on_event("fence_rejected")`), the distribution of attempts per task; each worker's in-flight tasks vs. its concurrency limit; the p99 task duration vs. the lease or visibility timeout. |
+| Fix / prevention | **Backpressure**: take a concurrency slot before you claim (`run_async_worker(concurrency=...)` does exactly this), so that when a worker is full, tasks stay in the queue for others. Heartbeat at about 1/3 of the lease (Lesson 31's reference service validates at startup that the heartbeat is no more than half the lease). Make the lease or visibility timeout longer than the p99 task duration and renew it for long tasks. Fences and downstream idempotency are the backstop, so a task claimed twice still produces its side effects only once ([D2](failure-modes.en.md#d2-zombie-worker), [D3](failure-modes.en.md#d3-duplicate-delivery)). |
+| Lessons | [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 31](../lessons/31_deployment_and_scaling/README.en.md) |
+
+### PR2 CAS Without Fenced Takeover
+
+| Aspect | Details |
+|---|---|
+| Symptoms | The new worker that took over keeps getting `CheckpointConflict` and exits after wasted work, while the checkpoint is left holding the zombie worker's stale state. Or worse, with a file checkpointer that only guarantees "complete writes," the zombie wakes up and overwrites the two steps the new worker wrote; users see the agent "forget," and the system reports no error at all. |
+| Root cause | The checkpoint answers "was this write complete?" (`FileCheckpointer`'s temp file + `os.replace`) or "is it based on the latest version?" (version-number CAS), but not "who holds the lease right now?" When a zombie and a new worker read the same version, the first writer wins, and the loser may well be the new worker. Having the worker check "do I still hold the lease?" before writing doesn't help either: it can pause again between the check and the write. |
+| Detection | Record `writer` and `fence` in the checkpoint table; count conflicts and look at who lost them (a larger fence losing to a smaller one is exactly this problem); drill it: `SIGSTOP` a worker mid-run, wait for its lease to expire and the task to be taken over, then `SIGCONT` it (Part 1 of Lesson 26's demo). |
+| Fix / prevention | Let the queue's fence drive checkpoint takeover: a fenced `load` sets the table's fence to its own and bumps the version in a single `UPDATE ... RETURNING`, so from that moment every write by the old holder conflicts, and a `load` with a smaller fence is rejected outright (`ckpt.fenced(job.fence)`; `AgentJobHandler` already does this). On conflict, raise and stop immediately instead of returning an easy-to-ignore False. `redrive` never resets the fence; fences only ever go up. See also [D2](failure-modes.en.md#d2-zombie-worker). |
+| Lessons | [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) |
+
+### PR3 Stacked Retries
+
+| Aspect | Details |
+|---|---|
+| Symptoms | During a model outage, a single user request hits the upstream a dozen times or more, and 429s and the bill climb together; the primary model is down, yet users wait several seconds before the fallback kicks in; in Temporal, a refund executes twice; the inner retries are invisible in the event history. |
+| Root cause | Every layer thinks "a few more tries is safer": the SDK's built-in retries, `ResilientLLM` / `AsyncResilientLLM`, LiteLLM Router's `num_retries` plus fallbacks, the Proxy's own retries, and Temporal activities' unlimited retries by default, and the counts multiply. Lesson 29 worked it out: with Router `num_retries=2`, one primary and one fallback, wrapped in `max_attempts=3`, a single request can become 18 upstream calls in the worst case; measured, with the primary returning 500 and `num_retries=2`, the fallback took about 3.84 seconds to kick in. Another trap: after all its attempts fail, `AsyncResilientLLM` raises a non-retryable error, so inside Temporal it turns a retryable 429 into one the RetryPolicy gives up on. And activities are at-least-once, so every extra try of a write tool without an idempotency key can mean another side effect. |
+| Detection | Aggregate gateway logs by request ID and count upstream calls per user request; check the Router's `last_route` and `events`; note that the `x-litellm-attempted-retries` response header counts only the model group that finally succeeded, so it hides the primary group's retries; look at the attempt distribution per activity in the Temporal event history. |
+| Fix / prevention | **Retry at one layer only.** With Temporal, turn client retries off (`AsyncOpenAICompatLLM` already uses `max_retries=0`), let the RetryPolicy own retries, and cap each tool (`retry_policy_for`: read 5, write with an idempotency key 3, non-idempotent write 1). With the Router, don't wrap it in `ResilientLLM` again; if you need a bulkhead, use `AsyncResilientLLM(max_attempts=1, max_concurrency=…)`. Behind a Proxy, clients don't retry. For synchronous user-facing requests, lower `num_retries` or set a deadline for the whole request. Give every write an idempotency key. See also [R1](failure-modes.en.md#r1-retry-storm). |
+| Lessons | [Lesson 27](../lessons/27_durable_workflows/README.en.md) · [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) · [Lesson 08](../lessons/08_reliability/README.en.md) |
+
+### PR4 Nondeterminism After Deploy
+
+| Aspect | Details |
+|---|---|
+| Symptoms | After a release, runs waiting for approval get stuck, and the Temporal UI shows `WorkflowTaskFailed` and a `Nondeterminism error`; a new worker fails at startup with `Failed validating workflow`; more subtly, replay "passes," but the run later takes a different branch. |
+| Root cause | Temporal restores in-memory state by replay, which requires the same event history to produce the same sequence of commands. Add a `workflow.sleep` or an activity at the start of a workflow and the command order no longer matches the history. Reading the clock, generating random numbers, reading environment variables, or iterating over a set inside a workflow does the same. Modules passed through into the sandbox aren't protected by it (agentkit's `RunState()` defaults call `uuid4()` and `time.time()`, so each replay gets a different `run_id`). And replay compares only the kind and order of commands, not their arguments, so a changed system prompt still replays fine while the in-memory state quietly diverges. |
+| Detection | Run a `Replayer` over sampled production event histories in CI (replay tests); alert on `WorkflowTaskFailed` (by default, an ordinary exception in workflow code only fails that workflow task, which retries forever while the run silently hangs); statically check workflow code for `time`, `random`, `uuid`, and HTTP calls (Lesson 27, exercise c). |
+| Fix / prevention | Separate orchestration from IO: all IO in activities, `workflow.now()` / `workflow.random()` for time and randomness, and pass `run_id` and `started_at` in explicitly. When changing workflow code, wrap the new logic in `workflow.patched("id")`, switch to `deprecate_patch` once all old runs have finished, and delete it after that; or use Worker Versioning's Pinned behavior so old runs finish on old workers. Always run replay tests before a release. |
+| Lessons | [Lesson 27](../lessons/27_durable_workflows/README.en.md) |
+
+### PR5 Event History Blowup
+
+| Aspect | Details |
+|---|---|
+| Symptoms | A research agent that has run for dozens of steps suddenly fails because its event history exceeded the limit; later in its life, continue-as-new happens more and more often; eventually a single activity's input exceeds the payload limit. |
+| Root cause | Every `llm_step` input carries the full conversation, so the history stores N ever-longer copies of it and grows quadratically with the number of steps. Measured in Lesson 27 (each tool returning about 6 KB): at 21 steps the event history was 2,797 KiB, while the conversation itself was only 122 KiB. Temporal's hard limit per execution is 51,200 events or 50 MB (warnings start at 10,240 events or 10 MB), and a single payload is capped at 2 MB by default. Continue-as-new alone isn't enough: the conversation keeps growing, and each new run hits the limit sooner. |
+| Detection | Monitor each workflow's event count, history size, and continue-as-new count; `workflow.info().is_continue_as_new_suggested()`; the distribution of conversation length (in tokens). |
+| Fix / prevention | Do all three together: continue-as-new to bound history length (`AgentWorkflow` does it automatically when the server suggests it, or set a smaller threshold with `continue_as_new_after_events`); context compaction to bound conversation length (with the compaction model call in an activity); and large objects in external storage, with only references in the history. |
+| Lessons | [Lesson 27](../lessons/27_durable_workflows/README.en.md) · [Lesson 04](../lessons/04_context_memory/README.en.md) |
+
+### PR6 Trace Broken at the Queue
+
+| Aspect | Details |
+|---|---|
+| Symptoms | While investigating a complaint, the API, the worker, and a downstream retrieval service show up in the tracing backend as three unrelated traces; or tail sampling drops the worker's part on its own, leaving half a trace; or the producer sampled the trace but the worker, sampling at its own ratio, didn't join it. |
+| Root cause | HTTP auto-instrumentation propagates `traceparent` for you; nobody does it for a queue payload. A task that waits a long time in the queue (backlog, pending approval) stretches the trace past the Collector's `decision_wait`, so the first half has already been decided and the worker's spans arrive late. The worker's sampler doesn't follow the upstream decision. Or your own code treats `flags == "01"` as "sampled" (OTel Python 1.45 emits `03`, which also sets the random flag from W3C Trace Context Level 2). |
+| Detection | Send one end-to-end request and confirm the backend shows a single trace_id; compare the distribution of queue wait times with `decision_wait`; monitor `otelcol_processor_tail_sampling_sampling_trace_dropped_too_early`; keep `agentkit.run_id` on spans so you can still find the pieces by business ID. |
+| Fix / prevention | At enqueue time, write `inject_context({})` into the payload, and wrap processing in the worker with `with` / `async with continue_trace(job["trace"])`. Use a `ParentBased(...)` sampler that follows the upstream decision. When waits can exceed `decision_wait`, or consumption is batched, start a new trace in the consumer and link back to the producer with a span link (the default in the messaging conventions), and configure `decision_cache`. Always put business IDs such as `run_id` and `conversation_id` on spans. Test the sampled flag bitwise (`int(flags, 16) & 0x01`). |
+| Lessons | [Lesson 28](../lessons/28_production_observability/README.en.md) · [Lesson 10](../lessons/10_observability/README.en.md) |
+
+### PR7 Label Cardinality Explosion
+
+| Aspect | Details |
+|---|---|
+| Symptoms | Someone adds a label to get "success rate per user," and a week later Prometheus is alerting on memory and queries keep getting slower; series counts grow with the number of users and instances; or a Hook created per request fails on the second request with `Duplicated timeseries`; in a multi-process deployment, the counts from different processes don't add up. |
+| Root cause | Every unique combination of labels is its own time series: `user_id`, `run_id`, `trace_id`, or raw URL paths that contain IDs have become labels. Dimensions that look bounded aren't (the number of tenants grows with sales, and the model can invent any tool name). Labels multiply (tool × error type × tenant). Lesson 28's arithmetic: `status` (6) × `reason` (about 10) × `tenant` (50) is about 3,000 series; swap in 100,000 users and it's about 6 million, multiplied again by every instance. |
+| Detection | `count by (__name__)({__name__=~"agent_.*"})` shows how many series each metric has; alert when it exceeds expectations. In code review, require every label to state its value ceiling and who enforces it. Count HTTP metrics by route template, not raw path. |
+| Fix / prevention | Use only enumerations as labels (`status`, `reason`, `direction`); `tool` is bounded by the tool registry, with unknown names recorded as `__unknown__`; enable `tenant` only when the tenant count is bounded, with an allowlist (`PrometheusHook(tenant_label=True, max_tenants=50, allowed_tenants=...)`, everything else goes to `__other__`). Put high-cardinality dimensions in traces and logs (an HMAC'd `user.hash`), and compute per-user success rates from traces or the data warehouse. Keep metric objects in a process-level cache. Aggregate multi-process deployments with prometheus_client's multiprocess mode. |
+| Lessons | [Lesson 28](../lessons/28_production_observability/README.en.md) |
+
+### PR8 Gateway Fallback Masks a Regression
+
+| Aspect | Details |
+|---|---|
+| Symptoms | During the days the primary model has problems, task completion, tool-call errors, and user complaints quietly get worse, while availability and error-rate dashboards stay green; p95 latency grows by several seconds for no obvious reason; at month end the bill's model mix has changed and no one knows why. |
+| Root cause | The fallback happens inside the gateway (the Router or the Proxy) and is invisible to application code: the request "succeeded," it's just that the fallback model answered. The fallback model never went through the same evals. The availability SLO checks "did something come back," not "who answered." The gateway first retries `num_retries` times with backoff before falling back, which is where the latency comes from. And the `x-litellm-attempted-retries` header counts only the model group that finally succeeded, so the primary group's retries don't show up in it. |
+| Detection | Break down completion rate, tool errors, cost, and latency by the model that actually answered (`LLMResponse.model`, `last_route["model_group"]`); count fallback events (`events`) and alert above a threshold; run the eval set against the fallback models regularly. |
+| Fix / prevention | Put every model in the fallback chain through the same evals ([R3](failure-modes.en.md#r3-silent-degradation)); tag metrics and traces with the model that actually answered (model names are a bounded enumeration, so they can be labels); alert on the fallback rate instead of degrading silently; for critical tasks, fail explicitly or hand off to a human rather than fall back to a much weaker model; check the fallback chain before launch: no references to missing model groups, no cycles, no fallback to the same model on the same upstream (Lesson 29, exercise c). |
+| Lessons | [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) · [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 28](../lessons/28_production_observability/README.en.md) |
+
+### PR9 Fail-Open Policy and Limits
+
+| Aspect | Details |
+|---|---|
+| Symptoms | A forbid policy "doesn't take effect," and a free-plan tenant runs a dangerous operation; Redis hiccups, global rate limiting stops working for a moment, and the provider quota gets maxed out; while the guardrail service is timing out, every input is let through, and nobody knows. |
+| Root cause | When a control component fails, its default is to allow. In Cedar's official semantics, a policy that errors during evaluation is **skipped**: Lesson 29's demo 2e leaves out the Tenant entity, `free-plan-no-dangerous` can't read `principal.tenant.plan`, and calling cedarpy directly returns Allow. Schema validation checks only the policies themselves, not whether the runtime entities are complete. LiteLLM Proxy falls back to per-instance counting when Redis is unreachable unless `fail_closed_rate_limit_enforcement` is on; Envoy's global rate limiting has `failure_mode_deny` set to false by default; `ClassifierGuard`'s `on_error` allows by default. Allowing isn't necessarily wrong. What's wrong is that nobody decided it and nothing alerts on it. |
+| Detection | Count policy evaluation errors (`PolicyDecision.errors`), guardrail errors (`state.metadata["guard_errors"]`, `CascadeClassifier.errors`), and connection errors from the rate-limit backend; run failure drills: leave out an entity on purpose, stop Redis, make the classifier time out, and see whether the result is deny or allow. |
+| Fix / prevention | Write down, component by component, whether it allows or denies when it fails. Security boundaries (authorization, approval) always fail closed: `CedarPolicy` treats any evaluation error as a deny, validates policies against the schema at construction, and `build_entities` fills in entities from trusted metadata; approval timeouts count as rejections; turn on fail-closed rate limiting when the limit matters more than availability. A detection layer (guardrails) may fail open to stay available, but it must record and alert, and the floor is still permissions and approval ([S5](failure-modes.en.md#s5-excessive-agency)). |
+| Lessons | [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) |
+
+### PR10 Event Loop Blocked by Sync Calls
+
+| Aspect | Details |
+|---|---|
+| Symptoms | Every session in a process slows down at once, largely regardless of load; heartbeats time out, leases expire for no apparent reason, and other workers take over the tasks; Temporal activities hit heartbeat timeouts and retry, so model calls get paid for twice; asyncio debug mode reports slow callbacks such as `Executing <Task ...> took 0.303 seconds`. |
+| Root cause | The event loop is single-threaded, and coroutines yield only at an `await`. Call `time.sleep`, `requests`, or a synchronous psycopg / redis-py / OpenAI client inside an async function or a synchronous Hook, and every coroutine stops for that long, including every task's lease heartbeat. A sneaky version is creating a client lazily on first use: importing openai and httpx takes a fraction of a second to several seconds. Lesson 27, scenario 6: with the model client simulating blocking IO via `time.sleep` inside async code, 20 workflows took 7.05 seconds with a peak model-call concurrency of 1, no better than running them one by one, versus 1.15 seconds for the properly concurrent version. |
+| Detection | Export an event-loop lag metric (a periodic heartbeat coroutine measures how late it runs); in staging, set `PYTHONASYNCIODEBUG=1` so callbacks over 100 milliseconds are logged; in CI, use `ast` to find blocking calls inside async functions (Lesson 30, exercise c). Have the event loop itself answer the worker's liveness probe (as Lesson 31's reference service does); `/metrics` is served from another thread and keeps returning 200 even when the event loop is stuck, so it can't be the liveness probe. |
+| Fix / prevention | Use async clients end to end (`AsyncOpenAICompatLLM`, `redis.asyncio`, psycopg's async connections, `httpx.AsyncClient`); run unavoidable sync code with `asyncio.to_thread` or a bounded thread pool; keep synchronous Hooks to in-memory counting (like `PrometheusHook`), and move metrics that query the database into a separate periodic task; create clients at process startup (as `make_worker` does); give async agents `AsyncRateLimitHook`, not the synchronous `RateLimitHook`. |
+| Lessons | [Lesson 30](../lessons/30_async_runtime/README.en.md) · [Lesson 27](../lessons/27_durable_workflows/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 28](../lessons/28_production_observability/README.en.md) |
+
+### PR11 Cancellation Leaves Work Half-Done
+
+| Aspect | Details |
+|---|---|
+| Symptoms | A user closes the page, reconnects, and resumes by `run_id`, and two tickets get created; after a client disconnect, the checkpoint stays at `running` forever, and reconciliation thinks the run is still going; or the cancellation simply "gets lost," and the run finishes and keeps costing money. |
+| Root cause | The outcome of a cancelled write is "unknown," not "failed." If cancellation fills in "not executed" for a write-tool call that was already sent, the model issues a new `call_id` on resume, the idempotency key changes with it, downstream deduplication stops working, and the side effect happens twice (measured in Lesson 26 and since fixed in `agentkit.aio`). AnyIO, which Starlette is built on, uses level-triggered cancellation, so the `await` that saves the `cancelled` state during cleanup gets cancelled again. A cancellation can also interrupt a save that the database committed but whose reply never reached the client, leaving the local version number stale so the final save is rejected by CAS. Swallowing `CancelledError` (`except BaseException`, or `suppress(CancelledError)` plus `await task`) makes cancellation ineffective, and in Python 3.11 and earlier, `asyncio.wait_for` swallows a cancellation that arrives together with the result (CPython gh-86296). |
+| Detection | After every cancellation, check three things: the checkpoint says `cancelled`, in-flight model calls drop to zero, and the downstream record count didn't grow. Sweep the failure window: cancel at many different moments of a run and sort the outcomes into "stopped," "stuck at running," and "never stopped" (Lesson 30's approach; the third kind usually points to a different bug). Reconcile downstream side effects by business key. |
+| Fix / prevention | On cancellation or timeout, leave write / dangerous tool calls unanswered and fill in "not executed" only for read-only ones, so `resume` replays the same `call_id` and downstream deduplicates on `run_id:call_id` (`AsyncAgent`'s current semantics). Run every save to an async checkpointer as a separate task protected by `asyncio.shield`. Re-raise `CancelledError` after cleanup. To wait for a task you just cancelled, use `asyncio.wait({task})`, not `await task`. Before Python 3.12, don't use `wait_for` for timeouts on anything that may be cancelled (on 3.11 use `asyncio.timeout()`; on 3.10 build it yourself with `asyncio.wait`). |
+| Lessons | [Lesson 30](../lessons/30_async_runtime/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) |
+
+### PR12 In-Flight Runs Lost on Shutdown
+
+| Aspect | Details |
+|---|---|
+| Symptoms | Every rolling release fails or restarts a batch of runs; tasks held by a stopped worker wait a full lease before anyone takes them over; Pods get SIGKILLed while cleaning up, losing the last stretch of traces and metrics; during releases, some traffic hits Pods that are shutting down and gets 5xx responses. |
+| Root cause | The process doesn't handle SIGTERM (the signal went to the container's PID 1 and never reached the worker, or `stop_on_signals` was never called); `terminationGracePeriodSeconds` (30 seconds by default, including preStop time) is shorter than the worker's grace period plus cleanup, so it gets killed; after SIGTERM it keeps claiming new tasks and its readiness probe doesn't start failing; cancelled tasks aren't returned and must wait for their leases to expire; returns at shutdown and rate-limit deferrals count as failed attempts, so at peak, healthy tasks end up dead-lettered. |
+| Detection | Rolling-restart drills (start the new one first, then SIGTERM the old one once the new one is ready), counting failures, reruns, and duplicate side effects; worker exit codes (0 vs. killed by SIGKILL); time from SIGTERM to exit vs. the grace period; the 5xx rate during releases. |
+| Fix / prevention | Make sure the Python process receives signals directly in the container, and call `stop_on_signals(stop)`. On SIGTERM: return 503 from the readiness probe and stop claiming → let in-flight tasks finish within `grace_period` (heartbeats keep renewing leases) → cancel the ones that can't finish (the checkpoint records `cancelled`, write calls stay unanswered) and hand them back immediately with a fence check (as Lesson 31's reference worker does) → flush traces, close connection pools, and exit. Set `terminationGracePeriodSeconds` above the grace period plus cleanup time. `release()` doesn't count as an attempt. The grace period doesn't need to cover the longest task: checkpoints, leases, and idempotency keys take care of what's unfinished. |
+| Lessons | [Lesson 31](../lessons/31_deployment_and_scaling/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 30](../lessons/30_async_runtime/README.en.md) |
+
+### PR13 Autoscaling on the Wrong Signal
+
+| Aspect | Details |
+|---|---|
+| Symptoms | Users say "I submitted it and nothing happens," while CPU and memory dashboards are all green and the autoscaler hasn't added a single Pod; or Pods get added as soon as latency rises, and there are more 429s, not fewer; scale-down deletes Pods in the middle of long tasks. |
+| Root cause | Agent workers are IO-bound and spend most of their time waiting on the model, so CPU-based autoscaling never triggers. The bottleneck is usually the model quota, and adding Pods only lets each process's own rate limiter release more requests ([D9](failure-modes.en.md#d9-local-only-rate-limiting)). When several API replicas all report queue backlog, a `sum` in the query double-counts it. Scale-down doesn't go through graceful shutdown. |
+| Detection | Watch how long the oldest runnable task has waited (`agent_queue_oldest_job_age_seconds`) and in-flight runs relative to the concurrency limit (`agent_runs_in_flight`), not CPU; the 429 rate before and after scaling out; the number of tasks cancelled during scale-down. |
+| Fix / prevention | Scale workers on queue backlog, the age of the oldest task, or in-flight saturation (KEDA's `postgresql` scaler compares a SQL query result with `targetQueryValue`, or use HPA external metrics). Set the replica ceiling from the model quota, not "the more the better." Keep global quotas in Redis or the gateway. Aggregate backlog metrics reported by several replicas with `max`. Scale down through graceful shutdown (PR12), and give HPA a scale-down stabilization window so the replica count doesn't flap. See also [D4](failure-modes.en.md#d4-queue-backlog-avalanche). |
+| Lessons | [Lesson 31](../lessons/31_deployment_and_scaling/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 28](../lessons/28_production_observability/README.en.md) |
+
 ---
 
 ## Appendix: From Symptom to Failure Mode
@@ -989,6 +1140,19 @@ Detection methods reference real agentkit fields (such as `RunResult.status`, `T
 | More users click "don't remind me again" or turn notifications off | A10 Over-Interrupting Proactive Agent |
 | One category of queries gets worse after adding hybrid search | A11 Fusion Crowds Out Good Results |
 | An agent that does nothing still scores decently; the gap between two versions keeps flipping | A12 Leaky Benchmark, A1 Eval Set Leakage |
+| The same task runs twice, and the logs fill with expired leases | PR1 Over-Claiming Worker, D2 Zombie Worker, D3 Duplicate Delivery |
+| The worker that took over keeps hitting CheckpointConflict, or the agent "forgets" | PR2 CAS Without Fenced Takeover, D1 Lost Update |
+| During an outage, upstream calls are a dozen times the user requests, and fallback takes seconds | PR3 Stacked Retries, R1 Retry Storm |
+| After a release, runs waiting for approval are stuck in WorkflowTaskFailed | PR4 Nondeterminism After Deploy |
+| A long-running workflow fails on the event history limit | PR5 Event History Blowup |
+| One request shows up as several traces in the tracing backend | PR6 Trace Broken at the Queue |
+| Prometheus memory and series counts grow with the number of users | PR7 Label Cardinality Explosion |
+| Availability is all green, yet completion and complaints quietly get worse | PR8 Gateway Fallback Masks a Regression, R3 Silent Degradation, P1 Silent Failure |
+| While a component was failing, operations that should have been denied went through | PR9 Fail-Open Policy and Limits |
+| Every session in a process slows down at once, and heartbeats time out | PR10 Event Loop Blocked by Sync Calls |
+| Duplicate side effects after a reconnect; checkpoints stuck at running | PR11 Cancellation Leaves Work Half-Done, T5 Duplicate Side Effects |
+| Every rolling release fails or reruns a batch of runs | PR12 In-Flight Runs Lost on Shutdown, R4 Lost Progress |
+| CPU is green, but tasks wait longer and longer | PR13 Autoscaling on the Wrong Signal, D4 Queue Backlog Avalanche |
 
 ## Further Reading
 
@@ -1003,3 +1167,4 @@ Every external source cited in this guide has been verified. For the full list a
 - Martin Kleppmann: [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) (fencing tokens)
 - Chris Richardson: [Pattern: Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html)
 - Part 3 (A1–A12): Shankar et al., [Who Validates the Validators?](https://arxiv.org/abs/2404.12272) (judge calibration and criteria drift); Agrawal et al., [GEPA](https://arxiv.org/abs/2507.19457) (optimization and Pareto fronts); Chhikara et al., [Mem0](https://arxiv.org/abs/2504.19413) (memory writes); Postmark, [Security Alert: Malicious 'postmark-mcp' npm Package](https://postmarkapp.com/blog/information-regarding-malicious-postmark-mcp-package) (rug pulls); Zhong et al., [ImpossibleBench](https://arxiv.org/abs/2510.20270) (coding agents cheating); Horvitz, [Principles of Mixed-Initiative User Interfaces](https://erichorvitz.com/chi99horvitz.pdf) (when to interrupt)
+- Part 4 (PR1–PR13): Temporal, [Activity Definition](https://docs.temporal.io/activity-definition) (at-least-once execution and idempotency); Google SRE Workbook, [Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/) (burn-rate alerts); Cedar, [Authorization](https://docs.cedarpolicy.com/auth/authorization.html) (policies that error are skipped); Python, [Coroutines and Tasks](https://docs.python.org/3/library/asyncio-task.html) (cancellation semantics); Kubernetes, [Termination of Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination) (graceful shutdown)

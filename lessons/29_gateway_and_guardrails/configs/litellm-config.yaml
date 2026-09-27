@@ -61,7 +61,7 @@ litellm_settings:
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY    # 管理员 key（sk- 开头）；用它创建团队和虚拟 key
   database_url: os.environ/DATABASE_URL        # 虚拟 key、团队、花费记录都存在 Postgres 里
-  fail_closed_rate_limit_enforcement: true     # Redis 不可达时直接 503，而不是退回"各实例各算各的"
+  fail_closed_rate_limit_enforcement: true     # Redis 不可达时直接 503，而不是退回"各实例各算各的"（较新版本才有，1.83.0 没有：见 litellm#43251）
 
 # ------------------------------------------------------------------------------------------------
 # 按团队 / 按 key 的预算与限流不写在这个文件里，而是由平台团队用管理 API 创建（存进 Postgres）：
