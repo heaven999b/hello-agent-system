@@ -313,15 +313,16 @@ def test_readme_matches_catalog(lang):
     assert all(report.covered[f"dim:{d.id}"].how == "heading" for d in P.DIMENSIONS)
     # 2) README 里没有目录之外的 id
     assert _ids_in(text) == set(P.CATALOG_BY_ID)
-    # 3) 每一条：只出现一次，标题、级别、触发条件都与目录一致
+    # 3) 每一条恰好有一行"定义"（同时带 `id` 和级别标记；其他地方可以引用 id），标题、级别、触发条件都与目录一致
     lines = text.splitlines()
+    tags = [f"{P.SEVERITY_ICON[s]} {s}" for s in P.SEVERITIES]
     for c in P.CATALOG:
-        hits = [line for line in lines if f"`{c.id}`" in line]
-        assert len(hits) == 1, f"{c.id} 应该恰好出现在一行里"
+        hits = [line for line in lines if f"`{c.id}`" in line and any(t in line for t in tags)]
+        assert len(hits) == 1, f"{c.id} 应该恰好有一行定义，实际 {len(hits)} 行"
         line = hits[0]
         assert c.title(lang) in line, f"{c.id} 的标题与目录不一致"
-        tags = {s for s in P.SEVERITIES if f"{P.SEVERITY_ICON[s]} {s}" in line}
-        assert tags == {c.severity}, f"{c.id} 的级别应该是 {c.severity}，README 里是 {tags}"
+        severities = {s for s in P.SEVERITIES if f"{P.SEVERITY_ICON[s]} {s}" in line}
+        assert severities == {c.severity}, f"{c.id} 的级别应该是 {c.severity}，README 里是 {severities}"
         if c.when is not None:
             assert f"`{P.render_condition(c.when)}`" in line, f"{c.id} 的触发条件与目录不一致"
 

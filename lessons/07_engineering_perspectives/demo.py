@@ -345,6 +345,9 @@ def focus_weights(impl, profile: dict) -> Counter:
     return weights
 
 
+DIM_WIDTH = {"zh": 24, "en": 34}  # 维度名的显示宽度（英文名更长）
+
+
 def dim_name(dim: str, lang: str) -> str:
     d = P.DIMENSION_BY_ID[dim]
     return d.zh if lang == "zh" else d.en
@@ -381,7 +384,7 @@ def show_coverage(impl, text: str, lang: str, t: dict, show_evidence: bool) -> N
     if show_evidence:
         for dim, ev in report.covered.items():
             how = t["by_heading"] if ev.how == "heading" else t["by_keyword"]
-            info(f"  ✔ {pad(dim_name(dim, lang), 22)}{pad(how, 8)} L{ev.line_no:<4} {short(ev.line, 58)}")
+            info(f"  ✔ {pad(dim_name(dim, lang), DIM_WIDTH[lang])}{pad(how, 8)} L{ev.line_no:<4} {short(ev.line, 58)}")
     if report.missing:
         sep = "、" if lang == "zh" else ", "
         info(t["missing"] + " " + sep.join(dim_name(r.id, lang) for r in report.missing))
@@ -457,7 +460,7 @@ def main() -> int:
     info(t["weights"])
     per_dim = Counter(x.item.dimension for x in triggered if x.item.when is not None)
     for dim, w in weights.most_common(6):
-        info(f"  {pad(dim_name(dim, lang), 24)}{'█' * int(w)} {w:g}   (+{per_dim[dim]})")
+        info(f"  {pad(dim_name(dim, lang), DIM_WIDTH[lang])}{'█' * int(w)} {w:g}   (+{per_dim[dim]})")
     takeaway(t["take2"])
 
     # ---- 3. 排序
