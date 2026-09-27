@@ -1,0 +1,123 @@
+# 第 28 课：OpenTelemetry Collector 配置（otelcol-contrib 发行版）
+#
+# 应用（setup_tracing / OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318）只发给 Collector，由 Collector：
+#   1. 限内存（memory_limiter）→ 截断超长属性（transform）→ 按值脱敏（redaction）
+#   2. 尾部采样：错误全留、慢请求全留、其余 5%（tail_sampling）
+#   3. 扇出：运维后端（Tempo / Jaeger）拿不到任何内容属性；LLM 平台（Langfuse）另走一条管道
+#
+# 组件名与字段按 opentelemetry-collector(-contrib) v0.161.0（2026-09）的 README 核实：
+#   - 自 v0.144.0 起导出器 otlp 改名 otlp_grpc、otlphttp 改名 otlp_http，旧名仍可用但已弃用；接收器仍叫 otlp。
+#   - tail_sampling / redaction / transform / attributes 均为 beta，tail_sampling 只在 contrib / k8s 发行版里。
+# 语法已用 pyyaml 校验（tests/contrib/test_otel.py）；本机没有 Docker，未实际启动 Collector 验证。
+# 密钥全部用 ${env:VAR} 从环境变量读取，不要写进这个文件。
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317   # 默认只监听 localhost；容器里要显式写 0.0.0.0
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # 永远放第一个：内存吃紧时先拒收，而不是被 OOM kill（尾部采样要在内存里攒整条 trace）
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  # 属性值统一截断：单个属性过大会被很多后端拒收（Langfuse、Jaeger 都有大小上限）
+  transform/limits:
+    error_mode: ignore
+    trace_statements:
+      - truncate_all(span.attributes, 4096)
+
+  # 按"值"脱敏：不管属性叫什么名字，匹配到的内容一律换成 HMAC（同一个手机号得到同一个哈希，能关联、不能反查）
+  redaction:
+    allow_all_keys: true            # 只按值屏蔽；设为 false 则只保留 allowed_keys 里的键（fail-closed，更严格）
+    blocked_values:
+      - "1[3-9][0-9]{9}"            # 中国大陆手机号（11 位，以 1 开头）
+      - "[0-9]{17}[0-9Xx]"          # 居民身份证号（18 位）
+      - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"   # 邮箱
+      - "4[0-9]{12}(?:[0-9]{3})?"   # Visa 卡号
+    # 注意：不要写 ".*token.*" 这种键模式 —— 它会把 gen_ai.usage.input_tokens 也屏蔽掉
+    blocked_key_patterns:
+      - "(?i).*(api[_-]?key|secret|password|authorization).*"
+    hash_function: hmac-sha256
+    hmac_key: "${env:REDACTION_HMAC_KEY}"
+    summary: info                   # 只记"屏蔽了几个"，不记屏蔽了哪些键（键名本身也可能泄露信息）
+
+  # 尾部采样：整条 trace 到齐（decision_wait）后再决定留不留
+  tail_sampling:
+    decision_wait: 30s              # 默认 30s；比最长的正常运行短会把慢 trace 切成两半
+    num_traces: 100000              # 内存里最多攒多少条 trace；太小会在决策前被挤掉（sampling_trace_dropped_too_early）
+    expected_new_traces_per_sec: 200
+    decision_cache:                 # 记住已做过的决定：队列 worker 几分钟后才到的"迟到 span"沿用同一决定
+      sampled_cache_size: 500000
+      non_sampled_cache_size: 500000
+    policies:
+      - name: keep-errors           # 工具失败、运行 failed / max_steps（OTelTracer 会把它们标成 ERROR）
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: keep-slow             # 与 SLO 阈值一致：超过 30 秒的运行全部保留
+        type: latency
+        latency:
+          threshold_ms: 30000
+      - name: keep-escalations      # 需要人工审批的运行：审计和复盘常要看
+        type: string_attribute
+        string_attribute:
+          key: agentkit.agent.status
+          values: [paused]
+      - name: baseline              # 其余按 5% 抽样（按 trace_id 哈希，同一条 trace 的决定一致）
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 5
+
+  # 运维管道：删掉所有内容类属性。即使某个服务误开了内容采集，内容也到不了 Tempo / Jaeger
+  attributes/strip-content:
+    actions:
+      - key: gen_ai.input.messages
+        action: delete
+      - key: gen_ai.output.messages
+        action: delete
+      - key: gen_ai.system_instructions
+        action: delete
+      - key: gen_ai.tool.call.arguments
+        action: delete
+      - key: gen_ai.tool.call.result
+        action: delete
+      - key: user.id
+        action: delete
+
+  batch: {}                         # 放在采样之后：先丢数据再攒批
+
+connectors:
+  forward/sampled: {}               # 把"已脱敏 + 已采样"的数据分叉给两条导出管道（只采样一次，不用两份内存）
+
+exporters:
+  otlp_grpc/tempo:                  # Grafana Tempo；换成 Jaeger v2 只需改 endpoint（两者都原生接收 OTLP）
+    endpoint: tempo:4317
+    tls:
+      insecure: true                # 集群内明文；跨网络请配置 TLS
+  otlp_http/langfuse:               # Langfuse 只支持 OTLP/HTTP（不支持 gRPC）；导出器会自动补 /v1/traces
+    endpoint: https://cloud.langfuse.com/api/public/otel
+    headers:
+      Authorization: "Basic ${env:LANGFUSE_AUTH}"   # base64("pk-lf-...:sk-lf-...")
+  debug:
+    verbosity: basic                # 排查管道时临时改成 detailed；生产别长期开
+
+service:
+  pipelines:
+    traces/in:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/limits, redaction, tail_sampling]
+      exporters: [forward/sampled]
+    traces/ops:
+      receivers: [forward/sampled]
+      processors: [attributes/strip-content, batch]
+      exporters: [otlp_grpc/tempo, debug]
+    traces/llm:
+      receivers: [forward/sampled]
+      processors: [batch]
+      exporters: [otlp_http/langfuse]

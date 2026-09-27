@@ -1,0 +1,211 @@
+# 第 28 课：Agent 的 SLO 记录规则与告警规则（Prometheus 规则文件格式）
+#
+# 指标来自 agentkit.contrib.otel.PrometheusHook（namespace 默认 agent）。两个 SLO：
+#   可用性：99% 的有效运行成功结束（错误预算 1%）
+#   延迟  ：99% 的成功运行在 60 秒内结束（错误预算 1%；60 是 DEFAULT_RUN_BUCKETS 的桶边界）
+#
+# 什么算"坏"、什么不算（与 OTelTracer 标 ERROR 的口径一致，第 28 课问题 5）：
+#   坏    ：reason=llm_error（status=failed）、max_steps、timeout、rate_limited
+#   不计入：paused（等审批）、cancelled（客户端主动断开）、budget_exceeded / blocked_input（策略按设计生效）
+#
+# 告警写法：Google SRE Workbook《Alerting on SLOs》的多窗口多燃烧率（表 5-8）：
+#   page  ：1h 与 5m 燃烧率都 > 14.4（1 小时烧掉 30 天预算的 2%），或 6h 与 30m 都 > 6（6 小时烧掉 5%）
+#   ticket：3d 与 6h 燃烧率都 > 1（3 天烧掉 10%）
+#   阈值 = 燃烧率 × 错误预算，例如 14.4 × 0.01。短窗口取长窗口的 1/12。
+#
+# 语法已用 pyyaml 校验（tests/contrib/test_otel.py 还会检查这里引用的指标确实由 PrometheusHook 暴露）；
+# 本机没有 Prometheus，未用 promtool check rules 实际校验，上线前请跑：promtool check rules prometheus-rules.yaml
+# Prometheus 3 起直方图的 le 标签统一规范化为浮点写法：要写 le="60.0"，不能写 le="60"。
+
+groups:
+  # ------------------------------------------------------------------------ SLI 记录规则
+  - name: agent-slo-sli
+    interval: 30s
+    rules:
+      # 可用性 SLI：坏运行 / 有效运行。"or vector(0)"：还没出现过坏运行时分子是空的，补 0 才能算出 0% 而不是"无数据"
+      - record: agent:slo_errors_per_run:ratio_rate5m
+        expr: |
+          (sum(rate(agent_runs_total{reason=~"llm_error|max_steps|timeout|rate_limited"}[5m])) or vector(0))
+          /
+          sum(rate(agent_runs_total{status!~"paused|cancelled", reason!~"budget_exceeded|blocked_input"}[5m]))
+      - record: agent:slo_errors_per_run:ratio_rate30m
+        expr: |
+          (sum(rate(agent_runs_total{reason=~"llm_error|max_steps|timeout|rate_limited"}[30m])) or vector(0))
+          /
+          sum(rate(agent_runs_total{status!~"paused|cancelled", reason!~"budget_exceeded|blocked_input"}[30m]))
+      - record: agent:slo_errors_per_run:ratio_rate1h
+        expr: |
+          (sum(rate(agent_runs_total{reason=~"llm_error|max_steps|timeout|rate_limited"}[1h])) or vector(0))
+          /
+          sum(rate(agent_runs_total{status!~"paused|cancelled", reason!~"budget_exceeded|blocked_input"}[1h]))
+      - record: agent:slo_errors_per_run:ratio_rate6h
+        expr: |
+          (sum(rate(agent_runs_total{reason=~"llm_error|max_steps|timeout|rate_limited"}[6h])) or vector(0))
+          /
+          sum(rate(agent_runs_total{status!~"paused|cancelled", reason!~"budget_exceeded|blocked_input"}[6h]))
+      - record: agent:slo_errors_per_run:ratio_rate3d
+        expr: |
+          (sum(rate(agent_runs_total{reason=~"llm_error|max_steps|timeout|rate_limited"}[3d])) or vector(0))
+          /
+          sum(rate(agent_runs_total{status!~"paused|cancelled", reason!~"budget_exceeded|blocked_input"}[3d]))
+
+      # 延迟 SLI：成功运行里超过 60 秒的比例 = 1 - (≤60s 的运行数 / 全部成功运行数)
+      - record: agent:slo_slow_runs:ratio_rate5m
+        expr: |
+          1 - (
+            sum(rate(agent_run_duration_seconds_bucket{status="completed", le="60.0"}[5m]))
+            /
+            sum(rate(agent_run_duration_seconds_count{status="completed"}[5m]))
+          )
+      - record: agent:slo_slow_runs:ratio_rate30m
+        expr: |
+          1 - (
+            sum(rate(agent_run_duration_seconds_bucket{status="completed", le="60.0"}[30m]))
+            /
+            sum(rate(agent_run_duration_seconds_count{status="completed"}[30m]))
+          )
+      - record: agent:slo_slow_runs:ratio_rate1h
+        expr: |
+          1 - (
+            sum(rate(agent_run_duration_seconds_bucket{status="completed", le="60.0"}[1h]))
+            /
+            sum(rate(agent_run_duration_seconds_count{status="completed"}[1h]))
+          )
+      - record: agent:slo_slow_runs:ratio_rate6h
+        expr: |
+          1 - (
+            sum(rate(agent_run_duration_seconds_bucket{status="completed", le="60.0"}[6h]))
+            /
+            sum(rate(agent_run_duration_seconds_count{status="completed"}[6h]))
+          )
+
+      # 看板和成本告警用：每次运行（不含等审批的那一段）的平均成本
+      - record: agent:cost_per_run_usd:ratio_rate1h
+        expr: |
+          sum(rate(agent_llm_cost_usd_total[1h]))
+          /
+          sum(rate(agent_runs_total{status!="paused"}[1h]))
+
+  # ------------------------------------------------------------------------ SLO 告警（多窗口多燃烧率）
+  - name: agent-slo-alerts
+    rules:
+      - alert: AgentErrorBudgetBurn
+        # 两条 page 规则合在一个告警里（与 SRE Workbook 的写法一致）；最后一段是低流量保护：
+        # 1 小时里有效运行不足 20 次时，一两次失败就能让比例飙到几十个百分点，不值得半夜叫人
+        expr: |
+          (
+            (agent:slo_errors_per_run:ratio_rate1h > (14.4 * 0.01) and agent:slo_errors_per_run:ratio_rate5m > (14.4 * 0.01))
+            or
+            (agent:slo_errors_per_run:ratio_rate6h > (6 * 0.01) and agent:slo_errors_per_run:ratio_rate30m > (6 * 0.01))
+          )
+          and on()
+          sum(increase(agent_runs_total{status!~"paused|cancelled"}[1h])) >= 20
+        labels:
+          severity: page
+        annotations:
+          summary: "Agent 运行失败率正在快速消耗 30 天错误预算（SLO 99%）"
+          description: "触发窗口的失败率 {{ $value | humanizePercentage }}（预算 1%）。先看 agent_runs_total 按 reason 拆分，再到 Tempo / Jaeger 按 error.type 查 trace。"
+          runbook_url: "https://example.com/runbooks/agent-error-budget"
+
+      - alert: AgentErrorBudgetSlowBurn
+        expr: |
+          agent:slo_errors_per_run:ratio_rate3d > (1 * 0.01)
+          and
+          agent:slo_errors_per_run:ratio_rate6h > (1 * 0.01)
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Agent 失败率在缓慢消耗错误预算（3 天烧掉 10% 以上），工作时间处理"
+
+      - alert: AgentLatencyBudgetBurn
+        expr: |
+          (agent:slo_slow_runs:ratio_rate1h > (14.4 * 0.01) and agent:slo_slow_runs:ratio_rate5m > (14.4 * 0.01))
+          or
+          (agent:slo_slow_runs:ratio_rate6h > (6 * 0.01) and agent:slo_slow_runs:ratio_rate30m > (6 * 0.01))
+        labels:
+          severity: page
+        annotations:
+          summary: "超过 60 秒的运行占比正在快速消耗延迟错误预算（SLO：99% ≤ 60s）"
+
+  # ------------------------------------------------------------------------ 非 SLO 告警：不叫醒人，开工单 / 发群消息
+  - name: agent-ops-alerts
+    rules:
+      - alert: AgentLatencyP95High
+        # p95 用直方图估算（桶内线性插值），只做趋势提醒；真正叫人的是上面的延迟 SLO
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(agent_run_duration_seconds_bucket{status="completed"}[10m]))) > 30
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "成功运行的 p95 耗时超过 30 秒：{{ $value | humanizeDuration }}"
+
+      - alert: AgentCostPerRunSpike
+        # 每次运行的成本是上周同一时段的 3 倍以上：多半是死循环、prompt 变长或被刷
+        expr: |
+          agent:cost_per_run_usd:ratio_rate1h > 3 * (agent:cost_per_run_usd:ratio_rate1h offset 1w)
+          and on()
+          sum(increase(agent_runs_total{status!="paused"}[1h])) >= 50
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "每次运行成本 {{ $value | humanize }} 美元，是上周同期的 3 倍以上"
+
+      - alert: AgentHourlySpendHigh
+        # 绝对上限：不管什么原因，一小时花超过 50 美元就要有人看（数字按你的预算改）
+        expr: sum(increase(agent_llm_cost_usd_total[1h])) > 50
+        labels:
+          severity: page
+        annotations:
+          summary: "过去 1 小时模型花费 {{ $value | humanize }} 美元"
+
+      - alert: AgentToolErrorRateHigh
+        # 按工具看：整体成功率可能还很好看（第 10 课问题 5），单个工具已经坏了。denied 是策略拒绝，不算
+        expr: |
+          (
+            sum by (tool) (rate(agent_tool_calls_total{error_type!~"none|denied"}[10m]))
+            /
+            sum by (tool) (rate(agent_tool_calls_total[10m]))
+          ) > 0.2
+          and
+          sum by (tool) (increase(agent_tool_calls_total[10m])) >= 20
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "工具 {{ $labels.tool }} 的错误率 {{ $value | humanizePercentage }}"
+
+      - alert: AgentUnknownToolCalls
+        # 模型在调用不存在的工具：prompt / 工具描述出问题，或者有人在做注入试探
+        expr: sum(increase(agent_tool_calls_total{tool="__unknown__"}[15m])) > 10
+        labels:
+          severity: ticket
+        annotations:
+          summary: "15 分钟内模型调用了 {{ $value }} 次不存在的工具"
+
+      - alert: AgentQueueBacklog
+        # 积压看"最老的任务等了多久"而不是队列长度：长度 1000 但每秒消费 500 没问题，长度 10 但卡住了就有问题
+        expr: max by (queue) (agent_queue_oldest_job_age_seconds) > 300
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "队列 {{ $labels.queue }} 里最老的任务已等待 {{ $value | humanizeDuration }}"
+
+      - alert: AgentApprovalsPilingUp
+        expr: sum(agent_approvals_pending) > 50
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} 个运行在等人工审批：审批人不够，或者审批通知没发出去"
+
+      - alert: AgentMetricsMissing
+        # 抓不到指标时，上面所有告警都会"安静"——这本身就要告警。job 名按你的 Prometheus 抓取配置修改
+        expr: absent(up{job="agent"} == 1)
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "抓取不到 Agent 服务的 /metrics"

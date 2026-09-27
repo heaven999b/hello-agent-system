@@ -16,7 +16,7 @@ import json
 import os
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Protocol
 
@@ -44,7 +44,14 @@ class RunState:
     segment_started_at: float = field(default_factory=time.time)  # 本段执行（run 或某次 resume）的开始时间
 
     def to_dict(self) -> dict:
+        """深拷贝的字典快照（可以放心修改）。"""
         return asdict(self)
+
+    def to_json(self, **kwargs) -> str:
+        """直接序列化成 JSON，不做中间深拷贝：检查点每一步都要调用，asdict 的深拷贝在高并发下是 CPU 大头。"""
+        data = {f.name: getattr(self, f.name) for f in fields(self)}
+        data["usage"] = asdict(self.usage)
+        return json.dumps(data, ensure_ascii=False, **kwargs)
 
     @classmethod
     def from_dict(cls, d: dict) -> "RunState":
@@ -67,7 +74,7 @@ class InMemoryCheckpointer:
 
     def save(self, state: RunState) -> None:
         # 存序列化后的 JSON 而不是对象引用，保证和文件/数据库版本行为一致
-        self._data[state.run_id] = json.dumps(state.to_dict(), ensure_ascii=False)
+        self._data[state.run_id] = state.to_json()
 
     def load(self, run_id: str) -> RunState | None:
         raw = self._data.get(run_id)
@@ -91,9 +98,9 @@ class FileCheckpointer:
     def save(self, state: RunState) -> None:
         path = self._path(state.run_id)
         # 临时文件名必须唯一：两个进程同时保存同一个 run 时，固定的 .tmp 会互相踩。
-        # （更根本的问题——旧持有者覆盖新检查点——需要 fencing token，见第 16 课。）
+        # （更根本的问题——旧持有者覆盖新检查点——需要 fencing token，见第 13 课 6.7 节与第 26 课的 PostgresCheckpointer。）
         tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
-        tmp.write_text(json.dumps(state.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(state.to_json(indent=2), encoding="utf-8")
         os.replace(tmp, path)
 
     def load(self, run_id: str) -> RunState | None:

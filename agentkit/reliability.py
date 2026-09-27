@@ -143,7 +143,8 @@ class ResilientLLM:
         self.events: list[str] = []  # 记录重试/降级事件，方便观测
 
     def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
-        errors = []
+        errors: list[str] = []
+        transient: list[bool] = []
         for llm, breaker in self.chain:
             def attempt(llm=llm):
                 return retry_call(
@@ -158,5 +159,8 @@ class ResilientLLM:
                 return breaker.call(attempt)
             except LLMError as e:
                 errors.append(f"{llm.model}: {e}")
+                transient.append(e.retryable or isinstance(e, CircuitOpenError))
                 self.events.append(f"fallback from {llm.model}: {e}")
-        raise LLMError("所有模型都失败了 → " + " | ".join(errors), retryable=False)
+        # 全部是暂时性故障（限流、5xx、熔断中）时保留 retryable=True：外层如果还有重试（例如 Temporal 的 RetryPolicy），
+        # 它应该过一会儿再试；只要有一个是 400/401 这类永久错误，就明确告诉外层"别再试了"
+        raise LLMError("所有模型都失败了 → " + " | ".join(errors), retryable=bool(transient) and all(transient))

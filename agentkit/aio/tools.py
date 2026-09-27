@@ -104,9 +104,10 @@ async def run_in_subprocess(fn, kwargs: dict, timeout: float):
     ctx = multiprocessing.get_context("spawn")  # spawn 比 fork 安全：fork 一个带着事件循环和线程的进程容易死锁
     parent, child = ctx.Pipe(duplex=False)
     proc = ctx.Process(target=_subprocess_entry, args=(child, fn, kwargs), daemon=True)
-    proc.start()
-    child.close()
     loop = asyncio.get_running_loop()
+    # spawn 一个进程要 fork/exec + 传参，同步调用会卡住事件循环（实测每次 ~10ms，所有会话一起等）
+    await loop.run_in_executor(None, proc.start)
+    child.close()
     try:
         ready = await loop.run_in_executor(None, parent.poll, timeout)
         if not ready:
@@ -117,7 +118,7 @@ async def run_in_subprocess(fn, kwargs: dict, timeout: float):
     finally:
         if proc.is_alive():
             proc.kill()  # 超时或被取消：直接杀掉，不给它继续消耗 CPU 的机会
-        proc.join(timeout=2)
+        await asyncio.shield(loop.run_in_executor(None, proc.join, 2))  # join 也可能阻塞：放进线程；被取消也要把僵尸进程收掉
         parent.close()
     if kind == "ok":
         return payload

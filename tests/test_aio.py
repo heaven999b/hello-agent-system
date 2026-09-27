@@ -475,3 +475,242 @@ def test_stream_reports_approval_required():
 
     events = run(main())
     assert any(isinstance(e, ApprovalRequired) for e in events) and events[-1].result.status == "paused"
+
+
+def test_cancel_keeps_in_flight_write_unanswered_and_resume_replays_same_call_id():
+    """取消时正在执行的写操作：不能补"未执行"，否则 resume 后模型会换一个 call_id 重做，幂等键失效。"""
+    from agentkit import IdempotencyStore
+
+    executed = []
+
+    @tool(risk="write")
+    async def create_ticket(title: str) -> str:
+        """建工单（有副作用）"""
+        executed.append(title)
+        await asyncio.sleep(30)  # 下游已经收到请求，响应还没回来时运行被取消
+        return "T-1"
+
+    async def main():
+        store = IdempotencyStore()
+        llm = AsyncScriptedLLM([call_tool("create_ticket", title="打印机坏了"), reply("已建单")])
+        agent = AsyncAgent(llm, [create_ticket], idempotency_store=store)
+        task = asyncio.create_task(agent.run("建单", run_id="r-w"))
+        while not executed:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        state = agent.checkpointer.load("r-w")
+        return state, llm
+
+    state, llm = run(main())
+    assert state.status == "cancelled"
+    assert state.messages[-1]["role"] == "assistant" and state.messages[-1]["tool_calls"]  # 写调用保持未回答
+    from agentkit.agent import RunResult
+    from agentkit.types import Usage as U
+    history = RunResult(None, "cancelled", "r-w", 1, U(), 0.0, state.messages).history
+    assert history[-1]["role"] == "tool" and "未完成的运行" in history[-1]["content"]  # 给新对话用的历史仍然合法
+
+
+def test_per_run_checkpointer_and_shared_executor():
+    from agentkit.aio import AsyncToolExecutor
+    from agentkit.state import InMemoryCheckpointer
+    from agentkit.tools import ToolRegistry
+
+    async def main():
+        registry = ToolRegistry([add])
+        shared = AsyncToolExecutor(registry, max_threads=4)
+        per_job = [InMemoryCheckpointer() for _ in range(3)]
+        agents = [AsyncAgent(AsyncScriptedLLM([call_tool("add", a=1, b=i), reply(str(i))]), registry, executor=shared) for i in range(3)]
+        results = await asyncio.gather(*(a.run("x", run_id=f"j{i}", checkpointer=per_job[i]) for i, a in enumerate(agents)))
+        for a in agents:
+            await a.aclose()  # 不拥有共享执行器：不能把它关掉
+        ok_after_close = await shared.execute(__import__("agentkit").ToolCall("c", "add", '{"a": 1, "b": 1}'), __import__("agentkit").ToolContext())
+        return results, per_job, ok_after_close, agents
+
+    results, per_job, ok_after_close, agents = run(main())
+    assert [r.output for r in results] == ["0", "1", "2"]
+    assert all(cp.load(f"j{i}") is not None for i, cp in enumerate(per_job))  # 每个运行写进了自己的检查点
+    assert all(a.checkpointer.load(f"j{i}") is None for i, a in enumerate(agents))  # 而不是构造时的默认检查点
+    assert ok_after_close.ok and ok_after_close.content == "2"
+
+
+# ------------------------------------------------------------------ 第 30 课实测发现的问题：回归测试
+
+
+class SlowAsyncStore:
+    """模拟真实的异步数据库检查点：每次写都要一段时间（期间可能被再次取消）。"""
+
+    def __init__(self, delay=0.05):
+        self.delay, self.data = delay, {}
+
+    async def save(self, state):
+        payload = state.to_json()  # 先把"当下"序列化
+        await asyncio.sleep(self.delay)
+        self.data[state.run_id] = payload
+
+    async def load(self, run_id):
+        from agentkit.state import RunState
+
+        await asyncio.sleep(0)
+        return RunState.from_dict(json.loads(self.data[run_id])) if run_id in self.data else None
+
+
+def test_repeated_cancellation_still_records_cancelled_state():
+    """AnyIO/Starlette 断开时会**反复**取消：第二次取消不能打断最后一次保存。"""
+
+    async def main():
+        store = SlowAsyncStore(delay=0.05)
+        llm = AsyncScriptedLLM([call_tool("add", a=1, b=1), reply("晚了")], latency=lambda n: 0 if n == 1 else 30)
+        agent = AsyncAgent(llm, [add], checkpointer=store)
+        task = asyncio.create_task(agent.run("x", run_id="r-double"))
+        while len(llm.calls) < 2:
+            await asyncio.sleep(0.005)
+        task.cancel()
+        await asyncio.sleep(0.01)  # 此时运行正在收尾保存
+        task.cancel()  # 第二次取消
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        state = await agent._load("r-double")  # _load 会等后台的收尾写完
+        return state
+
+    for _ in range(5):
+        assert run(main()).status == "cancelled"
+
+
+def test_stream_disconnect_with_slow_async_checkpointer_always_records_cancel():
+    async def main():
+        results = []
+        for i in range(10):
+            store = SlowAsyncStore(delay=0.03)
+            llm = AsyncScriptedLLM([call_tool("add", a=1, b=1), reply("晚了")], latency=lambda n: 0 if n == 1 else 30)
+            agent = AsyncAgent(llm, [add], checkpointer=store)
+
+            async def consume():
+                async with contextlib.aclosing(agent.stream("x", run_id=f"s{i}")) as events:
+                    async for event in events:
+                        if isinstance(event, ToolFinished):
+                            await asyncio.sleep(30)  # 卡在这里，等外部取消（模拟客户端断开）
+
+            c = asyncio.create_task(consume())
+            while len(llm.calls) < 2:
+                await asyncio.sleep(0.005)
+            c.cancel()
+            await asyncio.sleep(0.005)
+            c.cancel()  # 断开连接时的第二次取消
+            with contextlib.suppress(asyncio.CancelledError):
+                await c
+            results.append((await agent._load(f"s{i}")).status)
+        return results
+
+    assert run(main()) == ["cancelled"] * 10
+
+
+def test_keyed_limiter_per_key_limit_holds_when_global_is_saturated():
+    async def main():
+        limiter = KeyedLimiter(per_key=2, global_limit=2)
+        active: dict[str, int] = {}
+        peak: dict[str, int] = {}
+
+        async def worker(key, hold):
+            async with limiter.slot(key):
+                active[key] = active.get(key, 0) + 1
+                peak[key] = max(peak.get(key, 0), active[key])
+                await asyncio.sleep(hold)
+                active[key] -= 1
+
+        # b 占满全局槽位；a 的请求拿到租户槽位后在全局槽位上排队 —— 以前这时 a 的信号量会被错误回收
+        await asyncio.gather(*[worker("b", 0.05) for _ in range(2)], *[worker("a", 0.01) for _ in range(8)], *[worker("b", 0.01) for _ in range(4)])
+        return peak, limiter
+
+    peak, limiter = run(main())
+    assert peak["a"] <= 2 and peak["b"] <= 2
+    assert limiter._sems == {} and limiter._refs == {}  # 全部回收，没有泄漏
+
+
+def test_parallel_read_tools_respect_tool_call_budget():
+    executed = []
+
+    @tool
+    async def lookup(n: int) -> int:
+        """只读查询"""
+        executed.append(n)
+        await asyncio.sleep(0.01)
+        return n
+
+    llm = AsyncScriptedLLM([call_tools(*[("lookup", {"n": i}) for i in range(4)])])
+    res = run(AsyncAgent(llm, [lookup], hooks=[BudgetHook(max_tool_calls=1)]).run("x"))
+    assert res.stop_reason == "budget_exceeded" and executed == [0]
+
+
+def test_concurrent_approvals_execute_dangerous_tool_once():
+    executed = []
+
+    @tool(risk="dangerous")
+    async def wire_money(amount: int) -> str:
+        """转账"""
+        executed.append(amount)
+        await asyncio.sleep(0.05)
+        return "ok"
+
+    async def main():
+        llm = AsyncScriptedLLM(responder=lambda m: reply("完成") if m[-1]["role"] == "tool" else call_tool("wire_money", amount=100))
+        agent = AsyncAgent(llm, [wire_money], hooks=[PermissionPolicy()])
+        paused = await agent.run("转账")
+        outcomes = await asyncio.gather(
+            agent.approve(paused.run_id, by="a"), agent.approve(paused.run_id, by="b"), return_exceptions=True
+        )
+        return outcomes
+
+    outcomes = run(main())
+    assert executed == [100]
+    assert sum(isinstance(o, ValueError) for o in outcomes) == 1  # 第二个审批被明确拒绝：没有待审批的操作了
+
+
+def test_subprocess_start_does_not_run_on_event_loop_thread(monkeypatch):
+    import multiprocessing.context as mpctx
+    import threading
+
+    started_on = []
+    original = mpctx.SpawnProcess.start
+
+    def spy(self):
+        started_on.append(threading.current_thread() is threading.main_thread())
+        return original(self)
+
+    monkeypatch.setattr(mpctx.SpawnProcess, "start", spy)
+    t = isolated(__import__("agentkit").Tool(whoami_pid, name="whoami", description="子进程 pid"))
+    res = run(AsyncAgent(AsyncScriptedLLM([call_tool("whoami"), reply("ok")]), [t]).run("x"))
+    assert res.ok and started_on == [False]  # 在线程池里启动，没有卡住事件循环所在的主线程
+
+
+def test_half_open_breaker_lets_only_one_probe_through():
+    from agentkit.aio import AsyncCircuitBreaker
+    from agentkit.reliability import CircuitOpenError
+
+    async def main():
+        now = [0.0]
+        cb = AsyncCircuitBreaker("m", failure_threshold=1, reset_timeout=10, clock=lambda: now[0])
+        with pytest.raises(LLMError):
+            await cb.acall(lambda: _fail())
+        now[0] = 11  # 进入半开
+        calls = []
+
+        async def probe():
+            calls.append(1)
+            await asyncio.sleep(0.05)
+            return "ok"
+
+        results = await asyncio.gather(*(cb.acall(probe) for _ in range(5)), return_exceptions=True)
+        return calls, results, cb.state
+
+    async def _fail():
+        raise LLMError("down")
+
+    calls, results, state = run(main())
+    assert len(calls) == 1 and sum(r == "ok" for r in results) == 1
+    assert sum(isinstance(r, CircuitOpenError) for r in results) == 4 and state == "closed"
+
+
+def test_tool_schema_is_cached():
+    assert add.schema() is add.schema()

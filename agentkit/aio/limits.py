@@ -31,6 +31,7 @@ class KeyedLimiter:
         self._global = asyncio.Semaphore(global_limit) if global_limit else None
         self._sems: dict[str, asyncio.Semaphore] = {}
         self._in_use: dict[str, int] = {}
+        self._refs: dict[str, int] = {}  # 正在使用某个 key 的协程数（含排队等全局槽位的）：归零才能回收信号量
 
     def limit_for(self, key: str) -> int:
         return self.overrides.get(key, self.per_key)
@@ -45,27 +46,36 @@ class KeyedLimiter:
         sem = self._sems.get(key)
         if sem is None:
             sem = self._sems[key] = asyncio.Semaphore(self.limit_for(key))
-        deadline = None if timeout is None else time.monotonic() + timeout
-        await _acquire(sem, timeout, key)
+        # 引用计数覆盖"持有租户槽位、但还在排队等全局槽位"的阶段。
+        # 以前只按"已拿到全部槽位"的数量判断空闲，会在别人还持有信号量时把它删掉，
+        # 新来的请求拿到一个全新的信号量 → 同一租户的并发突破上限。
+        self._refs[key] = self._refs.get(key, 0) + 1
         try:
-            if self._global is not None:
-                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                await _acquire(self._global, remaining, "global")
-        except BaseException:
-            sem.release()
-            raise
-        self._in_use[key] = self._in_use.get(key, 0) + 1
-        try:
-            yield
+            deadline = None if timeout is None else time.monotonic() + timeout
+            await _acquire(sem, timeout, key)
+            try:
+                if self._global is not None:
+                    remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                    await _acquire(self._global, remaining, "global")
+            except BaseException:
+                sem.release()
+                raise
+            self._in_use[key] = self._in_use.get(key, 0) + 1
+            try:
+                yield
+            finally:
+                self._in_use[key] -= 1
+                if not self._in_use[key]:
+                    del self._in_use[key]
+                if self._global is not None:
+                    self._global.release()
+                sem.release()
         finally:
-            self._in_use[key] -= 1
-            if self._global is not None:
-                self._global.release()
-            sem.release()
-            if self._in_use[key] == 0:
-                # 空闲的 key 回收掉，避免租户很多时字典无限增长
-                del self._in_use[key]
-                if not sem.locked() and self._sems.get(key) is sem:
+            self._refs[key] -= 1
+            if not self._refs[key]:
+                # 没有任何协程再引用这个 key：安全回收，避免租户很多时字典无限增长
+                del self._refs[key]
+                if self._sems.get(key) is sem:
                     del self._sems[key]
 
 
@@ -117,3 +127,25 @@ class AsyncTokenBucket:
             if deadline is not None and time.monotonic() + wait > deadline:
                 return False
             await asyncio.sleep(wait)
+
+
+class KeyedLocks:
+    """按 key 的互斥锁（例如同一个 run_id 的读写、审批要串行），没人使用的 key 自动回收。"""
+
+    def __init__(self):
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._refs: dict[str, int] = {}
+
+    @asynccontextmanager
+    async def hold(self, key: str) -> AsyncIterator[None]:
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        self._refs[key] = self._refs.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            self._refs[key] -= 1
+            if not self._refs[key]:
+                del self._refs[key]
+                if self._locks.get(key) is lock:
+                    del self._locks[key]

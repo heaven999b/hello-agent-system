@@ -697,3 +697,14 @@ def test_eval_flags_infrastructure_errors_separately():
     scripts = iter([[reply("3")], [LLMError("503 gateway", retryable=False)]])
     report = run_eval(lambda: Agent(ScriptedLLM(next(scripts)), []), cases)
     assert report.infra_errors == ["down"] and "网关故障" in report.summary()
+
+
+def test_resilient_llm_final_error_keeps_retryable_when_all_failures_are_transient():
+    llm = ResilientLLM(ScriptedLLM([LLMError("429", retryable=True)] * 2), max_attempts=2, sleep=lambda s: None)
+    with pytest.raises(LLMError) as info:
+        llm.chat([])
+    assert info.value.retryable is True  # 外层（如 Temporal）还应该再试
+    llm = ResilientLLM(ScriptedLLM([LLMError("401", retryable=False)]), sleep=lambda s: None)
+    with pytest.raises(LLMError) as info:
+        llm.chat([])
+    assert info.value.retryable is False

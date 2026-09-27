@@ -11,12 +11,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+def _repo_root() -> Path:
+    # 用到时才解析路径（而不是在 import 时）：Temporal 的 workflow 沙箱等受限环境禁止在导入阶段访问文件系统
+    return Path(__file__).resolve().parent.parent
 
 
 def load_dotenv(path: str | Path | None = None) -> Path | None:
     """极简 .env 加载器（不引入 python-dotenv 依赖）。返回实际加载的文件路径。"""
-    candidates = [Path(path)] if path else [Path.cwd() / ".env", _REPO_ROOT / ".env"]
+    candidates = [Path(path)] if path else [Path.cwd() / ".env", _repo_root() / ".env"]
     for p in candidates:
         if p.is_file():
             for line in p.read_text(encoding="utf-8").splitlines():

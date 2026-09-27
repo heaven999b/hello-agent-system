@@ -83,7 +83,11 @@ def fake_redis_server():
     代码只需要换 URL。注意：它不模拟持久化、主从切换这些"真 Redis 才有"的故障，相关讨论见第 26 课。
     """
     fakeredis = importlib.import_module("fakeredis")
-    server = fakeredis.TcpFakeServer(("127.0.0.1", 0), server_type="redis")
+
+    class _Server(fakeredis.TcpFakeServer):
+        request_queue_size = 128  # 默认监听 backlog 只有 5，多进程/多线程同时连接时会被拒
+
+    server = _Server(("127.0.0.1", 0), server_type="redis")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:

@@ -23,7 +23,7 @@ frameworks = [
 # 第 19 课：官方 MCP SDK 对照（可选，手写协议不依赖它）
 mcp = ["mcp>=2.2"]
 # 第四部分（第 26–30 课）：agentkit.contrib 的生产组件适配器
-postgres = ["psycopg[binary]>=3.2"]
+postgres = ["psycopg[binary,pool]>=3.2"]
 redis = ["redis>=5"]
 temporal = ["temporalio>=1.9"]
 otel = ["opentelemetry-sdk>=1.27", "opentelemetry-exporter-otlp-proto-http>=1.27", "prometheus-client>=0.21"]

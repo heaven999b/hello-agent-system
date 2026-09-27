@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# import litellm 时默认会联网拉取模型价格表：测试必须离线、确定，所以强制用包内自带的本地价格表
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 
 @pytest.fixture(scope="session")

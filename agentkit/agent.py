@@ -20,6 +20,7 @@ Agent 的本质只有一句话：**让模型在循环里调用工具，直到它
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Iterable, Protocol
@@ -68,7 +69,14 @@ class RunResult:
         多轮对话请用它，而不是自己过滤 messages：输入被拦截时它保留之前的历史，
         运行中止时未执行的工具调用也已补上"未执行"结果，保证下一轮消息协议合法。
         """
-        return [m for m in self.messages if m.get("role") != "system"]
+        msgs = [m for m in self.messages if m.get("role") != "system"]
+        idx = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i].get("role") == "assistant"), None)
+        if idx is not None:
+            answered = {m.get("tool_call_id") for m in msgs[idx + 1 :] if m.get("role") == "tool"}
+            missing = [c for c in calls_in(msgs[idx]) if c.id not in answered]
+            if missing:  # 例如被取消的运行里、保持未回答的写操作：要继续它请用 resume，而不是开新对话
+                msgs = msgs + [tool_message(c.id, "未执行：该调用属于一次未完成的运行，如需继续请恢复那次运行") for c in missing]
+        return msgs
 
     def tools_called(self) -> list[str]:
         """按顺序列出**本次运行**中模型请求过的工具名（含被拒绝的；不含传入的历史消息里的调用）。评估时常用。"""
@@ -103,6 +111,12 @@ class Agent:
         self.context_strategy = context_strategy
         self.checkpointer = checkpointer or InMemoryCheckpointer()
         self.tracer = tracer or Tracer()
+        self._run_locks: dict[str, threading.Lock] = {}
+        self._run_locks_guard = threading.Lock()
+
+    def _lock_for(self, run_id: str) -> threading.Lock:
+        with self._run_locks_guard:
+            return self._run_locks.setdefault(run_id, threading.Lock())
 
     # ------------------------------------------------------------------ 公共 API
 
@@ -139,6 +153,10 @@ class Agent:
 
         approvals: {tool_call_id: True/False}，True 批准执行，False 拒绝。
         """
+        with self._lock_for(run_id):  # 同一个 run 的恢复/审批串行：两个线程同时审批，高危工具也只执行一次
+            return self._resume_locked(run_id, approvals)
+
+    def _resume_locked(self, run_id: str, approvals: dict[str, bool] | None) -> RunResult:
         state = self.checkpointer.load(run_id)
         if state is None:
             raise KeyError(f"找不到 run_id={run_id} 的检查点")
@@ -157,15 +175,16 @@ class Agent:
 
         by / comment 会写入 state.approval_log（审计要求记录"谁、何时、为什么"批准）。
         """
-        state = self.checkpointer.load(run_id)
-        if state is None or not state.pending:
-            raise ValueError(f"run {run_id} 没有等待审批的操作")
-        call_id = state.pending["id"]
-        state.approval_log.append(
-            {"call_id": call_id, "tool": state.pending["name"], "approved": approved, "by": by, "comment": comment, "at": time.time()}
-        )
-        self._save(state)
-        return self.resume(run_id, {call_id: approved})
+        with self._lock_for(run_id):
+            state = self.checkpointer.load(run_id)  # 锁内重新读取：已被别人审批过的，这里会明确报错
+            if state is None or not state.pending:
+                raise ValueError(f"run {run_id} 没有等待审批的操作")
+            call_id = state.pending["id"]
+            state.approval_log.append(
+                {"call_id": call_id, "tool": state.pending["name"], "approved": approved, "by": by, "comment": comment, "at": time.time()}
+            )
+            self._save(state)
+            return self._resume_locked(run_id, {call_id: approved})
 
     # ------------------------------------------------------------------ 主循环
 
@@ -290,7 +309,7 @@ class Agent:
         # 注意顺序：必须先脱敏再截断 —— 先截断可能把手机号切成半截，正则匹配不到，漏出部分数字。
         with self.tracer.span(
             f"tool.{call.name}",
-            **{"tool.name": call.name, "tool.arguments": redact_pii(call.arguments)[:500], "tool.risk": t.risk if t else None},
+            **{"tool.name": call.name, "gen_ai.tool.call.id": call.id, "tool.arguments": redact_pii(call.arguments)[:500], "tool.risk": t.risk if t else None},
         ) as span:
             denial = None
             for h in self.hooks:
@@ -309,8 +328,8 @@ class Agent:
                     # 其余可信属性（部门、用户组、数据区域……）原样透传给工具
                     extra={k: v for k, v in state.metadata.items() if k not in ("tenant_id", "user_id", "roles")},
                 )
+                state.tool_calls_count += 1  # 与异步版一致：执行前计数
                 result = self.registry.execute(call, ctx)
-                state.tool_calls_count += 1
             for h in self.hooks:
                 new = h.after_tool(state, call, result)
                 if new is not None:
@@ -345,6 +364,7 @@ class Agent:
         span.set(
             **{
                 "agent.status": state.status,
+                "agent.stop_reason": state.stop_reason,
                 "agent.steps": state.step,
                 "agent.cost_usd": round(state.cost_usd, 6),  # 整个 run 的累计值
                 "agent.segment_cost_usd": round(state.cost_usd - cost_before, 6),  # 本段（run 或某次 resume）新增的成本

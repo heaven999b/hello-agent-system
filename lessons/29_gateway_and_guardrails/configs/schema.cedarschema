@@ -1,0 +1,27 @@
+// 第 29 课：IT 助手授权模型的 Cedar schema。
+// validate_policies 用它在上线前静态检查策略：属性名写错、类型不对、动作不存在，都会在 CI 里报错。
+// 实体全部由服务端根据可信身份构造（agentkit.contrib.policy.build_entities），模型和用户都填不了。
+
+entity Tenant = {
+  plan: String,              // free / pro / enterprise；查不到时按 free（最受限）处理
+};
+
+entity User in [Tenant] = {
+  roles: Set<String>,        // employee / it_admin ……
+  tenant: Tenant,
+  department: String,
+};
+
+entity Tool = {
+  risk: String,              // read / write / dangerous（来自工具定义，经过代码评审）
+  tenant?: Tenant,           // 租户专属工具（例如某租户自己的 AD / CRM 连接器）才有；平台共享工具没有
+};
+
+// call_tool：能不能调用这个工具；call_tool_unattended：能不能不经人工审批直接执行。
+action call_tool, call_tool_unattended appliesTo {
+  principal: User,
+  resource: Tool,
+  context: {
+    target_user?: User,      // 参数级授权：reset_password 的目标用户（由 context_fn 从工具参数转换而来）
+  },
+};

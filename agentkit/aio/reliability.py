@@ -48,18 +48,31 @@ async def aretry_call(
 class AsyncCircuitBreaker(CircuitBreaker):
     """状态机与同步版完全相同，只是被保护的调用是协程。"""
 
+    _probing = False
+
     async def acall(self, fn: Callable[[], Awaitable[T]]) -> T:
-        if self.state == "open":
+        state = self.state
+        if state == "open":
             raise CircuitOpenError(self.name)
+        probe = state == "half_open"
+        if probe:
+            # 半开：只放行**一个**试探请求，其余并发请求继续快速失败。
+            # 否则下游刚恢复一点，几百个并发请求一拥而上，又把它压垮（第 08 课练习 c 的异步版）
+            if self._probing:
+                raise CircuitOpenError(self.name)
+            self._probing = True
         try:
             result = await fn()
         except Exception as e:
             if self.record_if is not None and not self.record_if(e):
                 raise
             self.failures += 1
-            if self.state == "half_open" or self.failures >= self.failure_threshold:
+            if probe or self.state == "half_open" or self.failures >= self.failure_threshold:
                 self.opened_at = self.clock()
             raise
+        finally:
+            if probe:
+                self._probing = False
         self.failures = 0
         self.opened_at = None
         return result
@@ -104,7 +117,8 @@ class AsyncResilientLLM:
         return lambda n, e, d: self.events.append(f"retry {model} #{n} after {d:.2f}s: {e}")
 
     async def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
-        errors = []
+        errors: list[str] = []
+        transient: list[bool] = []
         for llm, breaker, sem in self.chain:
             async def attempt(llm=llm):
                 return await aretry_call(
@@ -122,8 +136,10 @@ class AsyncResilientLLM:
                     return await breaker.acall(attempt)
             except LLMError as e:
                 errors.append(f"{llm.model}: {e}")
+                transient.append(e.retryable or isinstance(e, CircuitOpenError))
                 self.events.append(f"fallback from {llm.model}: {e}")
-        raise LLMError("所有模型都失败了 → " + " | ".join(errors), retryable=False)
+        # 与同步版一致：全部是暂时性故障时保留 retryable=True，交给外层重试决定
+        raise LLMError("所有模型都失败了 → " + " | ".join(errors), retryable=bool(transient) and all(transient))
 
     async def stream(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> AsyncIterator[StreamEvent]:
         errors = []

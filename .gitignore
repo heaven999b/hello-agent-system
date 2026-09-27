@@ -12,3 +12,4 @@ traces/
 .DS_Store
 trace.html
 traces.html
+.handoff/

@@ -34,7 +34,7 @@ from ..state import InMemoryCheckpointer, RunState
 from ..tools import IdempotencyStore, Tool, ToolContext, ToolRegistry, ToolResult
 from ..tracing import Span, Tracer
 from ..types import LLMResponse, Message, ToolCall, calls_in, system, tool_message, user
-from .limits import KeyedLimiter, LimitExceeded
+from .limits import KeyedLimiter, KeyedLocks, LimitExceeded
 from .llm import StreamDone, TextDelta
 from .tools import AsyncToolExecutor, maybe_await
 
@@ -75,6 +75,9 @@ AgentEvent = Union[RunStarted, TextDelta, ToolStarted, ToolFinished, ApprovalReq
 # 每个 asyncio Task 有自己的上下文副本，事件不会串到别人的流里。
 _emitter: ContextVar[Callable[[AgentEvent], None] | None] = ContextVar("agentkit_aio_emitter", default=None)
 
+# 本次运行专用的检查点（例如 worker 按任务的 fence 创建的视图）。同样用 ContextVar：并发的运行互不影响。
+_run_checkpointer: ContextVar[object | None] = ContextVar("agentkit_aio_run_checkpointer", default=None)
+
 
 def _emit(event: AgentEvent) -> None:
     fn = _emitter.get()
@@ -110,6 +113,7 @@ class AsyncAgent:
         limiter_key: Callable[[RunState], str | None] = lambda state: state.metadata.get("tenant_id"),
         limiter_timeout: float | None = None,
         max_threads: int = 32,
+        executor: AsyncToolExecutor | None = None,
     ):
         self.llm = llm
         self.registry = tools if isinstance(tools, ToolRegistry) else ToolRegistry(tools)
@@ -128,7 +132,14 @@ class AsyncAgent:
         self.limiter = limiter
         self.limiter_key = limiter_key
         self.limiter_timeout = limiter_timeout
-        self.executor = AsyncToolExecutor(self.registry, max_threads=max_threads)
+        # 可以注入共享的执行器：worker 为每个任务创建 AsyncAgent 时，不必每次都新建一个线程池
+        self.executor = executor or AsyncToolExecutor(self.registry, max_threads=max_threads)
+        self._owns_executor = executor is None
+        # 同一个 run 的检查点读写必须排队：被取消的运行会在后台（shield）把最后一次保存写完，
+        # 紧接着的 resume 必须等它写完再读，否则会读到旧状态、或和它撞同一个版本号
+        self._io_locks = KeyedLocks()
+        # 同一个 run 的恢复/审批必须串行：并发两次 approve 不能让高危工具执行两次
+        self._run_locks = KeyedLocks()
 
     # ------------------------------------------------------------------ 公共 API
 
@@ -139,7 +150,17 @@ class AsyncAgent:
         history: list[Message] | None = None,
         metadata: dict | None = None,
         run_id: str | None = None,
+        checkpointer=None,
     ) -> RunResult:
+        """checkpointer：只用于本次运行的检查点（例如带 fence 的视图），不传则用构造时的。"""
+        token = _run_checkpointer.set(checkpointer) if checkpointer is not None else None
+        try:
+            return await self._run(user_input, history=history, metadata=metadata, run_id=run_id)
+        finally:
+            if token is not None:
+                _run_checkpointer.reset(token)
+
+    async def _run(self, user_input: str, *, history, metadata, run_id) -> RunResult:
         state = RunState(metadata=dict(metadata or {}))
         if run_id:
             state.run_id = run_id
@@ -159,8 +180,17 @@ class AsyncAgent:
             pending = await self._drive(state, prepare, span, cost_before=0.0)
         return Agent._result(state, pending, span)
 
-    async def resume(self, run_id: str, approvals: dict[str, bool] | None = None) -> RunResult:
-        state = await maybe_await(self.checkpointer.load(run_id))
+    async def resume(self, run_id: str, approvals: dict[str, bool] | None = None, *, checkpointer=None) -> RunResult:
+        token = _run_checkpointer.set(checkpointer) if checkpointer is not None else None
+        try:
+            async with self._run_locks.hold(run_id):
+                return await self._resume(run_id, approvals)
+        finally:
+            if token is not None:
+                _run_checkpointer.reset(token)
+
+    async def _resume(self, run_id: str, approvals: dict[str, bool] | None) -> RunResult:
+        state = await self._load(run_id)
         if state is None:
             raise KeyError(f"找不到 run_id={run_id} 的检查点")
         if state.status == "completed":
@@ -173,8 +203,20 @@ class AsyncAgent:
             pending = await self._drive(state, None, span, cost_before=cost_before)
         return Agent._result(state, pending, span)
 
-    async def approve(self, run_id: str, approved: bool = True, *, by: str | None = None, comment: str = "") -> RunResult:
-        state = await maybe_await(self.checkpointer.load(run_id))
+    async def approve(
+        self, run_id: str, approved: bool = True, *, by: str | None = None, comment: str = "", checkpointer=None
+    ) -> RunResult:
+        token = _run_checkpointer.set(checkpointer) if checkpointer is not None else None
+        try:
+            async with self._run_locks.hold(run_id):
+                return await self._approve(run_id, approved, by=by, comment=comment)
+        finally:
+            if token is not None:
+                _run_checkpointer.reset(token)
+
+    async def _approve(self, run_id: str, approved: bool, *, by: str | None, comment: str) -> RunResult:
+        # 在锁内重新读取：如果另一个审批已经处理过（pending 已清空），这里会明确报错，而不是再执行一次高危工具
+        state = await self._load(run_id)
         if state is None or not state.pending:
             raise ValueError(f"run {run_id} 没有等待审批的操作")
         call_id = state.pending["id"]
@@ -182,7 +224,7 @@ class AsyncAgent:
             {"call_id": call_id, "tool": state.pending["name"], "approved": approved, "by": by, "comment": comment, "at": time.time()}
         )
         await self._save(state)
-        return await self.resume(run_id, {call_id: approved})
+        return await self._resume(run_id, {call_id: approved})
 
     def stream(self, user_input: str, **kwargs) -> AsyncIterator[AgentEvent]:
         """流式运行：逐步产出事件，最后一个事件是 RunFinished。
@@ -196,7 +238,8 @@ class AsyncAgent:
         return self._stream(lambda: self.resume(run_id, approvals))
 
     async def aclose(self) -> None:
-        self.executor.close()
+        if self._owns_executor:
+            self.executor.close()
         close = getattr(self.llm, "aclose", None)
         if close is not None:
             await close()
@@ -206,18 +249,19 @@ class AsyncAgent:
     async def _drive(self, state: RunState, prepare, span: Span, cost_before: float) -> ToolCall | None:
         pending: ToolCall | None = None
         state.segment_started_at = time.time()
-        slot = (
-            self.limiter.slot(self.limiter_key(state), timeout=self.limiter_timeout)
-            if self.limiter is not None
-            else contextlib.nullcontext()
-        )
+        # 手动进入/退出舱壁槽位：要一直持有到**收尾完成**（on_run_end + 最后一次保存）才释放，
+        # 否则下一个运行会在上一个运行真正结束前拿到槽位，同一租户的并发就会短暂超过上限
+        slot = self.limiter.slot(self.limiter_key(state), timeout=self.limiter_timeout) if self.limiter is not None else None
+        entered = False
         try:
-            async with slot:
-                body = self._prepare_and_loop(state, prepare)
-                if self.run_timeout is not None:
-                    await asyncio.wait_for(body, self.run_timeout)
-                else:
-                    await body
+            if slot is not None:
+                await slot.__aenter__()
+                entered = True
+            body = self._prepare_and_loop(state, prepare)
+            if self.run_timeout is not None:
+                await asyncio.wait_for(body, self.run_timeout)
+            else:
+                await body
         except StopRun as e:
             state.status, state.stop_reason, state.output = "stopped", e.reason, e.message
             self._close_dangling_calls(state, f"未执行：运行已中止（{e.reason}）")
@@ -232,21 +276,32 @@ class AsyncAgent:
         except asyncio.TimeoutError:
             state.status, state.stop_reason = "stopped", "timeout"
             state.output = f"（运行超过时限 {self.run_timeout}s，已停止。）"
-            self._close_dangling_calls(state, "未执行：运行超时")
+            self._close_dangling_calls(state, "未执行：运行超时", keep_side_effects=True)
         except LimitExceeded as e:
             state.status, state.stop_reason, state.output = "stopped", "rate_limited", f"当前并发已满，请稍后再试（{e}）"
         except asyncio.CancelledError:
             # 取消不是失败：记录下来、收好尾，然后**必须**继续向外抛，否则调用方的取消就失效了
             state.status, state.stop_reason, state.output = "cancelled", "cancelled", "（运行已取消）"
-            self._close_dangling_calls(state, "未执行：运行已取消")
+            self._close_dangling_calls(state, "未执行：运行已取消", keep_side_effects=True)
             raise
         finally:
             state.active_seconds += time.time() - state.segment_started_at
-            for h in self.hooks:
-                await _call_hook(h, "on_run_end", state)
-            await self._save(state)
-            Agent._annotate(span, state, cost_before)
+            # 收尾（on_run_end 钩子 + 最后一次保存）放进一个独立任务并用 shield 保护：
+            # Web 框架（例如 Starlette/AnyIO）断开连接时可能**反复**取消，第二次取消如果打断了这次保存，
+            # 检查点就会永远停在 running。shield 保证收尾任务跑完；外层照样收到取消并继续向外传播。
+            finish = asyncio.ensure_future(self._finish(state))
+            try:
+                await asyncio.shield(finish)
+            finally:
+                Agent._annotate(span, state, cost_before)
+                if entered:
+                    await slot.__aexit__(None, None, None)  # 只做同步的释放操作，被取消时也能完成
         return pending
+
+    async def _finish(self, state: RunState) -> None:
+        for h in self.hooks:
+            await _call_hook(h, "on_run_end", state)
+        await self._save(state)
 
     async def _prepare_and_loop(self, state: RunState, prepare) -> None:
         if prepare is not None:
@@ -359,7 +414,7 @@ class AsyncAgent:
             state.tool_log.append({"id": call.id, "name": call.name})
         with self.tracer.span(
             f"tool.{call.name}",
-            **{"tool.name": call.name, "tool.arguments": redact_pii(call.arguments)[:500], "tool.risk": t.risk if t else None},
+            **{"tool.name": call.name, "gen_ai.tool.call.id": call.id, "tool.arguments": redact_pii(call.arguments)[:500], "tool.risk": t.risk if t else None},
         ) as span:
             denial = None
             for h in self.hooks:
@@ -378,8 +433,10 @@ class AsyncAgent:
                     roles=tuple(state.metadata.get("roles", ())),
                     extra={k: v for k, v in state.metadata.items() if k not in ("tenant_id", "user_id", "roles")},
                 )
-                result = await self.executor.execute(call, ctx)
+                # 执行前就计数：并行的只读工具各自在自己的 task 里跑 before_tool，
+                # 如果执行完才 +1，它们都会看到"还没超预算"，预算形同虚设
                 state.tool_calls_count += 1
+                result = await self.executor.execute(call, ctx)
             for h in self.hooks:
                 new = await _call_hook(h, "after_tool", state, call, result)
                 if new is not None:
@@ -417,8 +474,9 @@ class AsyncAgent:
                 getter.cancel()
             if not task.done():
                 task.cancel()  # 消费方不再读取（断开连接、提前退出）→ 取消运行，别再花钱
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                # 用 wait 而不是 await task：如果这里再次被取消，await task 会把取消**转发**给运行任务，
+                # 打断它的收尾；wait 只是等待，不转发取消
+                await asyncio.wait({task})
 
     # ------------------------------------------------------------------ 辅助
 
@@ -436,10 +494,28 @@ class AsyncAgent:
             "agent.runtime": "asyncio",
         }
 
-    async def _save(self, state: RunState) -> None:
-        await maybe_await(self.checkpointer.save(state))  # 同步或异步的检查点都支持
+    def _checkpointer(self):
+        return _run_checkpointer.get() or self.checkpointer
 
-    @staticmethod
-    def _close_dangling_calls(state: RunState, note: str) -> None:
+    async def _save(self, state: RunState) -> None:
+        # 同步或异步的检查点都支持；同一个 run 的读写按顺序排队
+        async with self._io_locks.hold(state.run_id):
+            await maybe_await(self._checkpointer().save(state))
+
+    async def _load(self, run_id: str) -> RunState | None:
+        async with self._io_locks.hold(run_id):
+            return await maybe_await(self._checkpointer().load(run_id))
+
+    def _close_dangling_calls(self, state: RunState, note: str, *, keep_side_effects: bool = False) -> None:
+        """给没有结果的工具调用补一条"未执行"。
+
+        keep_side_effects=True（取消、超时）时，写/高危工具的调用**保持未回答**：
+        它可能已经在下游执行了一半。如果补上"未执行"，resume 后模型会发起一个 call_id 不同的新调用，
+        幂等键随之改变，副作用就会发生两次。保持未回答，resume 时会用**同一个 call_id** 重放，幂等键不变，
+        由幂等存储 / 下游的 Idempotency-Key 去重（第 08、13、26 课）。
+        """
         for call in Agent._unanswered_calls(state):
+            t = self.registry.get(call.name)
+            if keep_side_effects and t is not None and t.risk in ("write", "dangerous"):
+                continue
             state.messages.append(tool_message(call.id, note))

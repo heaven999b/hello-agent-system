@@ -1,0 +1,82 @@
+# 第 29 课：LiteLLM Proxy（模型网关）部署配置示例
+#
+# 启动（需要 proxy 额外依赖，本仓库默认没有安装）：
+#   pip install 'litellm[proxy]'
+#   litellm --config lessons/29_gateway_and_guardrails/configs/litellm-config.yaml
+#
+# ⚠️ 本机未启动 proxy 验证：.venv 里的 litellm 缺少 proxy 依赖（导入 proxy_server 报 "No module named 'backoff'"）。
+#    本文件的验证方式：pyyaml 解析语法；model_list + router_settings 用 litellm.Router 实际加载（tests/contrib/test_gateway.py）。
+#
+# 密钥一律用 os.environ/变量名 占位，proxy 启动时递归替换成环境变量的值。**绝不把 key 写进这个文件。**
+# 键名出处（均为官方文档）：
+#   https://docs.litellm.ai/docs/proxy/configs            整体结构
+#   https://docs.litellm.ai/docs/proxy/reliability        fallbacks / allowed_fails / cooldown_time
+#   https://docs.litellm.ai/docs/proxy/caching            Redis 缓存
+#   https://docs.litellm.ai/docs/proxy/users              预算与限流（按团队 / 按 key），多实例共享计数
+#   https://docs.litellm.ai/docs/proxy/virtual_keys       虚拟 key（需要 Postgres + master key）
+
+model_list:
+  # 同一个 model_name 的多个条目 = 一个"模型组"，Router 在组内做负载均衡；某个部署连续失败会被冷却。
+  - model_name: gpt-5.5
+    litellm_params:
+      model: openai/gpt-5.5                    # openai/ 前缀 = 按 OpenAI 兼容协议调用 api_base
+      api_base: os.environ/CLIPROXY_API_BASE   # 上游 1：学员本地的 OpenAI 兼容网关（如 cliproxyapi）
+      api_key: os.environ/CLIPROXY_API_KEY
+      rpm: 60                                  # 这个上游部署自己的限额，Router 选部署时参考
+      tpm: 200000
+  - model_name: gpt-5.5
+    litellm_params:
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_API_KEY       # 上游 2：OpenAI 官方（示例；不填 api_base 即官方地址）
+      rpm: 500
+  - model_name: gpt-5.6-luna                   # 备用模型组：主模型组重试耗尽后降级到这里
+    litellm_params:
+      model: openai/gpt-5.6-luna
+      api_base: os.environ/CLIPROXY_API_BASE
+      api_key: os.environ/CLIPROXY_API_KEY
+
+router_settings:
+  routing_strategy: simple-shuffle             # 默认策略；另有 latency-based-routing、least-busy 等
+  num_retries: 2                               # 每个模型组的重试次数（注意：失败的主模型会先重试再降级，用户多等几秒）
+  allowed_fails: 3                             # 一分钟内失败超过 3 次 → 该部署进入冷却
+  cooldown_time: 30                            # 冷却 30 秒（相当于熔断器的 open 状态）
+  fallbacks: [{"gpt-5.5": ["gpt-5.6-luna"]}]   # 一般错误的降级链
+  context_window_fallbacks: [{"gpt-5.6-luna": ["gpt-5.5"]}]   # 上下文超长时换一个窗口更大的模型组（示例）
+  # 多个 proxy 实例共享 rpm/tpm 计数与冷却状态：不配 Redis 时每个实例各算各的，N 个实例 = N 倍限额
+  redis_host: os.environ/REDIS_HOST
+  redis_port: os.environ/REDIS_PORT
+  redis_password: os.environ/REDIS_PASSWORD
+
+litellm_settings:
+  request_timeout: 60                          # 秒；不设时默认值很大，务必显式设置
+  drop_params: true                            # 上游不支持的参数静默丢弃（换厂商时少踩坑，但也可能悄悄丢掉你以为生效的参数）
+  cache: true                                  # 精确匹配缓存，存 Redis
+  cache_params:
+    type: redis                                # 连接信息读环境变量 REDIS_HOST / REDIS_PORT / REDIS_PASSWORD（或 REDIS_URL）
+    ttl: 600
+    supported_call_types: ["acompletion"]
+    # 不要对 Agent 流量开语义缓存（redis-semantic / qdrant-semantic）：
+    # 官方文档明确提醒它适合单轮问答，用在 agentic 流量上会"错得很离谱"。
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY    # 管理员 key（sk- 开头）；用它创建团队和虚拟 key
+  database_url: os.environ/DATABASE_URL        # 虚拟 key、团队、花费记录都存在 Postgres 里
+  fail_closed_rate_limit_enforcement: true     # Redis 不可达时直接 503，而不是退回"各实例各算各的"
+
+# ------------------------------------------------------------------------------------------------
+# 按团队 / 按 key 的预算与限流不写在这个文件里，而是由平台团队用管理 API 创建（存进 Postgres）：
+#
+#   # 1) 建团队：IT 服务台每月 200 美元、每分钟 120 次请求、40 万 token
+#   curl -X POST "$GATEWAY_URL/team/new" -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+#        -H "Content-Type: application/json" \
+#        -d '{"team_alias": "it-helpdesk", "models": ["gpt-5.5", "gpt-5.6-luna"],
+#             "max_budget": 200, "budget_duration": "30d", "rpm_limit": 120, "tpm_limit": 400000}'
+#
+#   # 2) 给团队里的某个服务发虚拟 key：每天 20 美元、每分钟 30 次
+#   curl -X POST "$GATEWAY_URL/key/generate" -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+#        -H "Content-Type: application/json" \
+#        -d '{"team_id": "<上一步返回的 team_id>", "max_budget": 20, "budget_duration": "1d",
+#             "rpm_limit": 30, "metadata": {"service": "itbuddy"}}'
+#
+# 业务服务拿到的只是这个虚拟 key：泄露了可以单独吊销，也拿不到任何厂商的真实 key。
+# 业务代码不用改：agentkit 的 OpenAICompatLLM(base_url=网关地址, api_key=虚拟 key) 就能直接用。
