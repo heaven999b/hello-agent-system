@@ -250,6 +250,10 @@ Found a mistake? Want to add a lesson or improve a translation? Please do! See [
 
 If this project helps you, a ⭐ helps others find it.
 
+## 🙏 Acknowledgements
+
+This project was initiated and is led by [heaven999b](https://github.com/heaven999b). **Claude Opus 5.5** (Anthropic) took part in designing the course architecture and writing the materials.
+
 ## 📜 License
 
 [MIT](LICENSE)

@@ -250,6 +250,10 @@ hello-agent-system/
 
 如果这个项目帮到了你，请给一个 ⭐ —— 这会让更多人看到它。
 
+## 🙏 致谢
+
+本项目由 [heaven999b](https://github.com/heaven999b) 发起和主导，**Claude Opus 5.5**（Anthropic）参与了课程架构设计与材料编写。
+
 ## 📜 License
 
 [MIT](LICENSE)
