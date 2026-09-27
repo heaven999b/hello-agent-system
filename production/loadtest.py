@@ -481,7 +481,7 @@ def verify(stack, load: Load, metrics: dict[str, float], worker_stats: list[dict
             "SELECT outcome, count(*) FROM side_effect_attempts WHERE kind = 'ticket' GROUP BY outcome").fetchall())
         resets = c.execute("SELECT count(*), count(DISTINCT idempotency_key) FROM it_password_resets").fetchone()
         jobs = dict(c.execute("SELECT status, count(*) FROM agent_jobs GROUP BY status").fetchall())
-        takeovers = c.execute("SELECT count(*) FROM agent_jobs WHERE fence > 1").fetchone()[0]
+        n_jobs = c.execute("SELECT count(*) FROM agent_jobs").fetchone()[0]
         ever_paused = c.execute(
             "SELECT count(*) FROM agent_runs WHERE status = 'paused' OR jsonb_array_length(state->'approval_log') > 0").fetchone()[0]
         completed_db = c.execute("SELECT count(*) FROM agent_runs WHERE status = 'completed'").fetchone()[0]
@@ -549,11 +549,13 @@ def verify(stack, load: Load, metrics: dict[str, float], worker_stats: list[dict
     }
     check("指标与实际数量一致", all(abs(a - b) < 0.5 for a, b in pairs.values()),
           pairs={k: {"metric": a, "actual": b} for k, (a, b) in pairs.items()},
-          # 信息项：取消被依赖库吞掉、由闸门补上的次数（Python < 3.12 上的 redis-py / psycopg_pool，见讲义 7.2）
-          cancellation_fence={r: metric_sum(metrics, "itdesk_cancellation_fence_total", reason=r)
-                              for r in ("pending_cancel", "abandoned")})
+          # 信息项：取消被依赖库吞掉、由 agentkit.aio 在步骤边界补抛的次数（Python < 3.12 上的 redis-py / psycopg_pool，讲义 3.6）
+          swallowed_cancellations=metric_sum(metrics, "itdesk_swallowed_cancellations_total"))
 
-    check("没有任务进入死信", jobs.get("dead", 0) == 0, jobs=jobs, reclaimed_jobs_fence_gt_1=takeovers)
+    # 被重新领取的次数 = 领取事件总数 - 任务数（kill -9 后被回收、停机时归还、被限流推迟的任务都会再领一次）。
+    # fence 来自全局序列，不能再用 "fence > 1" 判断"被接手过"
+    extra_claims = metric_sum(metrics, "itdesk_worker_job_events_total", event="claimed") - n_jobs
+    check("没有任务进入死信", jobs.get("dead", 0) == 0, jobs=jobs, extra_claims=extra_claims)
     return {"checks": checks, "all_ok": all(c["ok"] for c in checks), "approval_clicks": dict(load.approval_duplicates)}
 
 

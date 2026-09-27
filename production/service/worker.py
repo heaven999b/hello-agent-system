@@ -14,12 +14,11 @@ SIGTERM（K8s 删除 Pod、滚动发布）时间线：
     之后           flush 追踪、关连接池，退出码 0 —— 全部要在 terminationGracePeriodSeconds 之内完成
 kill -9 则什么都来不及做：任务留在 leased，租约过期后被 reap，别的 worker 从最后一次检查点接着跑。
 
-fence 的作用域（本课压测发现的问题，见讲义 7.2）：队列的 fence 是**每个任务**各自从 1 数起的，而检查点的 fence
-保护的是**一个 run**。同一个 run 会先后有好几个任务（run → 审批后的 resume → 用户点"继续"的 resume）。
-run 任务如果被接手过（fence=2），之后的 resume 任务从 fence=1 开始 → 被检查点当成"旧持有者"拒绝，
-只能等租约过期、重新领取把 fence 数到 2 才能继续（接手次数多于 max_attempts 时直接进死信）。
-这里用 RunScopedFences 把检查点 fence 换算成 job_id × 10^6 + job.fence：同一个 run 上，后入队的任务永远比先入队的大，
-同一个任务里，后领取的永远比先领取的大 —— fence 在"run"这个作用域里单调递增。
+fence（第 26 课）：每次领取任务，队列从**整张表共用的序列**里取一个新的 fence（nextval），全局单调递增。
+所以同一个 run 后来的任务（审批后的 resume、用户点"继续"的 resume）的 fence 一定比之前任何一次领取都大，
+可以直接接管检查点；被取代的旧持有者再写检查点会得到 CheckpointConflict，队列那一侧也会拒绝它的提交。
+（本课压测时 fence 还是"每个任务各自从 1 数起"，resume 任务会被当成旧持有者拒绝，服务里曾用换算绕行；
+框架改成全局序列之后绕行已删除，见讲义 3.6 与 7。）
 
 启动：python -m production.service.worker
 """
@@ -30,41 +29,14 @@ import asyncio
 import json
 import sys
 import time
-from contextvars import ContextVar
 
 from agentkit.aio import wait_for  # 取消安全的 wait_for（Python 3.12 之前的 asyncio.wait_for 会吞掉取消，gh-86296）
 from agentkit.contrib.otel import continue_trace, start_metrics_server
-from agentkit.contrib.postgres import (
-    AgentJobHandler,
-    AsyncPostgresCheckpointer,
-    CheckpointConflict,
-    Job,
-    LeaseLost,
-    PermanentJobError,
-    run_async_worker,
-    stop_on_signals,
-)
+from agentkit.contrib.postgres import AgentJobHandler, Job, LeaseLost, run_async_worker, stop_on_signals
 
 from .config import Settings
-from .runtime import RUNS_TABLE, Runtime
+from .runtime import Runtime
 from .telemetry import JOB_EVENTS, JOB_RELEASED, log
-
-CURRENT_JOB: ContextVar[Job | None] = ContextVar("itdesk_current_job", default=None)
-FENCE_STRIDE = 1_000_000  # 单个任务被重新领取的次数远小于这个数（max_attempts=5，redrive 也不会到 10^6）
-
-
-class RunScopedFences(AsyncPostgresCheckpointer):
-    """把"每个任务各自的 fence"换算成"在同一个 run 上单调递增的 fence"：job_id × 10^6 + job.fence。
-
-    AgentJobHandler 调用 fenced(job.fence) 创建本次领取的检查点视图；当前任务从 ContextVar 取（每个任务一个 asyncio Task）。
-    bigint 装得下：job_id 到 9×10^12 才会溢出。
-    """
-
-    def fenced(self, fence: int, writer: str | None = None) -> AsyncPostgresCheckpointer:
-        job = CURRENT_JOB.get()
-        scoped = job.id * FENCE_STRIDE + int(fence) if job is not None else int(fence)
-        return AsyncPostgresCheckpointer("", self.table, fence=scoped, writer=writer or self.writer, _db=self._db)
-
 
 class Worker:
     def __init__(self, rt: Runtime):
@@ -76,7 +48,7 @@ class Worker:
         # 整个进程共用**一个** AsyncAgent（它可以被并发复用）：模型客户端、工具执行器、Hook 都只有一份。
         # AgentJobHandler 每领到一个任务，就通过 run / resume / approve 的 checkpointer= 传入带本次 fence 的视图。
         self.agent = rt.new_agent()
-        self.handler = AgentJobHandler(self.agent, RunScopedFences(rt.pool, RUNS_TABLE), defer_seconds=1.0)
+        self.handler = AgentJobHandler(self.agent, rt.ckpt, defer_seconds=1.0)
 
     # ------------------------------------------------------------------ 每个任务
 
@@ -90,21 +62,14 @@ class Worker:
                 "messaging.operation.type": "process", "messaging.message.id": str(job.id), "run_id": run_id,
                 "job.attempt": job.attempts, "job.fence": job.fence,
             }):
-                token = CURRENT_JOB.set(job)
                 try:
                     return await self.handler(job)
-                except CheckpointConflict as e:
-                    # 这个任务还持有租约（否则队列那一侧会拒绝），但 run 已经被一个**更新的任务**接管了：
-                    # 它永远不会成功，明确地结束它（failed，不重试），而不是一轮轮等租约过期、最后进死信。
-                    raise PermanentJobError(f"superseded: run {run_id} 已被更新的任务接管（{e}）") from e
                 except asyncio.CancelledError:
                     # 停机宽限期到了还没做完：AsyncAgent 已经把检查点记为 cancelled。立刻归还任务，别让它空等一个租约。
                     # 安全性不靠"时机"：归还带 fence 校验；就算检查点的最后一次写入还在路上，接手者的 fence 接管会让它作废。
                     if self.s.release_on_cancel:
                         await asyncio.shield(self._release(job))
                     raise
-                finally:
-                    CURRENT_JOB.reset(token)
 
     async def _release(self, job: Job) -> None:
         try:
@@ -141,8 +106,6 @@ class Worker:
         elif name == "failed":
             status = info.get("status")
             event = "retrying" if status == "queued" else "failed"
-            if "superseded" in str(info.get("error")):
-                event = "superseded"  # 不是运行失败：run 由更新的任务继续，SSE 客户端不应该在这里结束
             self.rt.tasks.spawn(publish(run_id, event, job_status=status, error=str(info.get("error"))[:300]))
         elif name in ("deferred", "ownership_lost", "fence_rejected"):
             self.rt.tasks.spawn(publish(run_id, name, worker=self.worker_id))

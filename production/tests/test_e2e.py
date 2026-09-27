@@ -2,7 +2,7 @@
 
 每条测试都"证明"而不是"跑通"：
 - 取消用检查点里的 cancelled + 没有产生工单来证明；
-- 接手用任务表里的 fence / attempts、检查点的 writer、以及"副作用尝试"表里的 deduplicated 记录来证明；
+- 接手用任务表里的 fence（全局递增）/ attempts、检查点的 writer、以及"副作用尝试"表里的 deduplicated 记录来证明；
 - 跨队列 trace 用各进程导出的 span（JSONL）里的 trace_id 和父子关系来证明。
 
 运行：.venv/bin/python -m pytest production/tests -v   （约 40–60 秒；依赖缺失时整个文件跳过）
@@ -135,10 +135,11 @@ def test_background_run_with_approval_end_to_end(stack):
 
 
 def test_approval_resume_is_not_refused_after_the_run_job_was_taken_over(stack):
-    """压测里抓到的真实问题的回归测试：fence 是每个任务各自从 1 数起的，检查点的 fence 却保护整个 run。
+    """本课压测发现、已在框架修复的问题的回归测试（讲义 3.6 发现 2）。
 
-    run 任务被别的 worker 接手过（fence=2）之后，审批产生的 resume 任务从 fence=1 开始，会被检查点当成"旧持有者"拒绝，
-    只能等一个租约过期再重试。worker 用 RunScopedFences 把 fence 换算到 run 的作用域，resume 必须第一次就成功。
+    修复前：fence 按任务各自从 1 数起，而检查点的 fence 保护整个 run。run 任务被别的 worker 接手过（fence=2）之后，
+    审批产生的 resume 任务从 fence=1 开始，被检查点当成"旧持有者"拒绝，要空等一个租约才能继续。
+    修复后：claim 从整张队列表共用的序列取 fence（nextval），全局单调 —— resume 任务的 fence 一定更大，第一次领取就接手。
     """
     from agentkit.contrib.postgres import AsyncPostgresJobQueue
     from production.service.identity import DEMO_IDENTITIES
@@ -155,31 +156,34 @@ def test_approval_resume_is_not_refused_after_the_run_job_was_taken_over(stack):
                                                   "metadata": meta}, tenant_id="acme")
         db(stack, "UPDATE service_runs SET job_id = %s WHERE run_id = %s", (job_id, run_id))
         job = await q.claim("crashed-worker", lease_seconds=60, kinds=["held-by-test"])
-        assert job.id == job_id and job.fence == 1
+        assert job.id == job_id
         await q.close()
-        # 租约到期：真正的 worker 回收它并以 fence=2 接手
+        # 租约到期：真正的 worker 回收它，用一个更大的 fence 接手
         db(stack, "UPDATE agent_jobs SET kind = 'agent', lease_until = now() - interval '1 second' WHERE id = %s", (job_id,))
-        return job_id
+        return job_id, job.fence
 
     async def body():
-        job_id = await crash_while_holding_the_run_job()
+        job_id, crashed_fence = await crash_while_holding_the_run_job()
         c = ApiClient(stack.api_url, stack.keys)
         try:
             events = await watch(c, "acme-alice", run_id, is_event("awaiting_approval"))
-            assert [e["data"]["fence"] for e in events if e["event"] == "claimed"] == [2]
+            claims = [e["data"]["fence"] for e in events if e["event"] == "claimed"]
+            assert len(claims) == 1 and claims[0] > crashed_fence  # run 任务被接手（第二次领取）
             t0 = time.perf_counter()
             assert (await c.approve("acme-bob", run_id)).status_code == 202
             rest = await watch(c, "acme-alice", run_id, is_event("completed"), after=events[-1]["id"])
-            return job_id, rest, time.perf_counter() - t0
+            return job_id, claims[0], rest, time.perf_counter() - t0
         finally:
             await c.aclose()
 
-    job_id, rest, approve_to_done = run(body())
-    assert not any(e["event"] in ("ownership_lost", "superseded", "retrying") for e in rest)
+    job_id, takeover_fence, rest, approve_to_done = run(body())
+    assert not any(e["event"] in ("ownership_lost", "fence_rejected", "retrying") for e in rest)
     (op, attempts, fence), = db(stack, "SELECT payload->>'op', attempts, fence FROM agent_jobs "
                                        "WHERE payload->>'run_id' = %s AND id <> %s", (run_id, job_id))
-    assert (op, attempts, fence) == ("resume", 1, 1)  # 第一次领取就成功，没有空等一个租约
+    assert (op, attempts) == ("resume", 1) and fence > takeover_fence  # 第一次领取就接手，没有空等一个租约
+    assert db(stack, "SELECT fence FROM agent_runs WHERE run_id = %s", (run_id,))[0][0] == fence  # 检查点归最新的持有者
     assert approve_to_done < 2.5  # 租约是 3 秒：如果被拒绝过，至少要多等一个租约
+    print(f"\n接手后的审批 → 完成：{approve_to_done:.2f}s（resume 任务第一次领取即接手，fence {takeover_fence} → {fence}）")
     assert db(stack, "SELECT count(*) FROM it_password_resets WHERE run_id = %s", (run_id,))[0][0] == 1
 
 
@@ -336,7 +340,8 @@ def test_kill_minus_9_worker_job_is_taken_over_without_duplicate_ticket(stack):
         try:
             run_id = (await c.submit("acme-alice", "VPN 老断线，帮我诊断一下并提工单")).json()["run_id"]
             events = await watch(c, "acme-alice", run_id, is_event("tool_started", tool="create_ticket"))
-            victim_name = [e for e in events if e["event"] == "claimed"][-1]["data"]["worker"]
+            victim_claim = [e for e in events if e["event"] == "claimed"][-1]["data"]
+            victim_name = victim_claim["worker"]
             await asyncio.sleep(0.2)  # 工单已经插入，工具还在等下游响应（800ms）
             assert db(stack, "SELECT count(*) FROM it_tickets WHERE run_id = %s", (run_id,))[0][0] == 1
             t_kill = time.perf_counter()
@@ -344,15 +349,16 @@ def test_kill_minus_9_worker_job_is_taken_over_without_duplicate_ticket(stack):
             stack.start_worker()  # 相当于 ReplicaSet 补一个 Pod
             rest = await watch(c, "acme-alice", run_id, is_event("completed"), after=events[-1]["id"], timeout=30)
             takeover = next(e for e in rest if e["event"] == "claimed")
-            return run_id, victim_name, takeover, time.perf_counter() - t_kill
+            return run_id, victim_claim, takeover, time.perf_counter() - t_kill
         finally:
             await c.aclose()
 
     run_id, victim, takeover, recovered_s = run(body())
-    assert takeover["data"]["worker"] != victim and takeover["data"]["fence"] == 2
+    # fence 来自全局序列：接手者的 fence 一定比被杀的持有者大（具体数值取决于之前领取过多少次）
+    assert takeover["data"]["worker"] != victim["worker"] and takeover["data"]["fence"] > victim["fence"]
     (status, fence, attempts, last_error), = db(stack, "SELECT status, fence, attempts, last_error FROM agent_jobs "
                                                        "WHERE payload->>'run_id' = %s", (run_id,))
-    assert (status, fence, attempts) == ("succeeded", 2, 2) and "lease expired" in last_error
+    assert (status, attempts, fence) == ("succeeded", 2, takeover["data"]["fence"]) and "lease expired" in last_error
     assert db(stack, "SELECT writer FROM agent_runs WHERE run_id = %s", (run_id,))[0][0] == takeover["data"]["worker"]
     # 同一个 call_id 重放 → 同一个幂等键 → 数据库唯一约束挡住了第二张工单
     assert db(stack, "SELECT count(*) FROM it_tickets WHERE run_id = %s", (run_id,))[0][0] == 1
@@ -404,9 +410,13 @@ def test_rolling_restart_cancels_releases_and_replays_without_duplicates(stack):
         assert db(stack, "SELECT count(*) FROM it_tickets WHERE run_id = %s", (run_id,))[0][0] == 1
     dedup = db(stack, "SELECT count(*) FROM side_effect_attempts WHERE outcome = 'deduplicated' AND run_id = ANY(%s)", (run_ids,))[0][0]
     assert dedup >= 1  # 被取消的建单在接手后重放，并被唯一约束挡住
-    # 主动归还不消耗重试次数：fence 变成 2（换了持有者），attempts 仍是 1
-    handed = db(stack, "SELECT fence, attempts FROM agent_jobs WHERE payload->>'run_id' = ANY(%s) AND fence > 1", (run_ids,))
-    assert len(handed) == n_released and all(a == 1 for _, a in handed)
+    # 主动归还不消耗重试次数：被归还、又被别人领取的任务，attempts 仍是 1，而 fence 换成了接手者更大的那个
+    handed = [r for r, evs in zip(run_ids, results) if any(e["event"] == "released" for e in evs)]
+    for r, evs in zip(run_ids, results):
+        claims = [e["data"]["fence"] for e in evs if e["event"] == "claimed"]
+        assert claims == sorted(claims) and len(set(claims)) == len(claims)  # 同一个 run 的每次领取 fence 严格递增
+    rows = db(stack, "SELECT attempts FROM agent_jobs WHERE payload->>'run_id' = ANY(%s)", (handed,))
+    assert 1 <= len(handed) <= n_released and all(a == 1 for (a,) in rows)  # 同一个 run 可能被归还不止一次
     stats = [json.loads(line)["stats"] for p in old for line in p.log_path.read_text().splitlines() if '"worker_stopped"' in line]
     assert len(stats) == len(old) and sum(s["cancelled"] for s in stats) == n_released
     assert released <= {p.name for p in old}

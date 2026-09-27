@@ -973,3 +973,21 @@ def test_run_timeout_swallowed_by_a_dependency_still_times_out():
 
     res, swallowed, calls = run(main())
     assert (res.status, res.stop_reason, swallowed, calls) == ("stopped", "timeout", 1, 0)
+
+
+@needs_cancelling
+def test_swallowed_cancellation_is_logged_with_a_stable_event_field(caplog):
+    """运维按 extra 字段 agentkit_event 计数（例如 production/ 的 itdesk_swallowed_cancellations_total），不按措辞。"""
+
+    async def main():
+        hook = _SwallowingHook("llm")
+        agent = AsyncAgent(AsyncScriptedLLM([reply("x")]), [], hooks=[hook])
+        task = asyncio.create_task(agent.run("hi"))
+        await hook.entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    with caplog.at_level("WARNING", logger="agentkit.aio"):
+        run(main())
+    assert [getattr(r, "agentkit_event", None) for r in caplog.records] == ["swallowed_cancellation"]

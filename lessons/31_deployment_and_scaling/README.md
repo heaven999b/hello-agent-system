@@ -10,18 +10,18 @@
 
 **扩缩容的难点不在"多起几个进程"，而在"进程随时会被杀、会被替换、会被取消"时，系统依然不丢任务、不重复副作用、不白花钱。所以本课的交付物不是讲义，而是一个参考服务，外加一套能把它打到出错的压测和故障注入。**
 
-先诚实说明教学版的局限：`agentkit` 是单进程的。[第 12 课](../12_production_architecture/README.md)画了参考架构，[第 13 课](../13_distributed_concurrency/README.md)用 SQLite 讲清了租约和 fencing，[第 16 课](../16_release_ops/README.md)讲了灰度和回滚，第 26–30 课把每个组件换成了成熟实现。但没有任何一课把它们**装在一起、跑在多个进程里、再故意杀掉几个**。这一步最容易出问题：每个组件单独测试都对，组合起来却出现了四个单独测试发现不了的问题（第 3.6 节）。
+先诚实说明教学版的局限：`agentkit` 是单进程的。[第 12 课](../12_production_architecture/README.md)画了参考架构，[第 13 课](../13_distributed_concurrency/README.md)用 SQLite 讲清了租约和 fencing，[第 16 课](../16_release_ops/README.md)讲了灰度和回滚，第 26–30 课把每个组件换成了成熟实现。但没有任何一课把它们**装在一起、跑在多个进程里、再故意杀掉几个**。这一步最容易出问题：每个组件单独测试都对，组合起来却出现了四个单独测试发现不了的问题（第 3.6 节），其中三个在框架里，维护者已经修复并加了回归测试。
 
 打个比方：前几课造好了发动机、变速箱、刹车，各自在台架上测过。这一课把车装起来上路，还要在高速上故意爆一次胎。
 
 | 能力 | 组件出处 | 本课怎么装进服务 | 证据（第 3 节） |
 |---|---|---|---|
-| 多进程共享的检查点、队列 | 第 26 课 Postgres | API 和 3 个 worker 进程共用一个库；fence 按 run 的作用域换算 | kill -9 后任务被接手：e2e 里 3.4–3.8 秒完成（租约 3 秒） |
-| 异步运行时、流式、取消 | 第 30 课 `AsyncAgent` | 交互式 SSE 在 API 进程里跑，断开即取消 | 68 次断开全部记为 `cancelled`；断开到落盘约 30 毫秒 |
-| 幂等 | 第 08、26 课 | Redis 幂等缓存 + 工单表 `UNIQUE (tenant_id, idempotency_key)` | 368 张工单与调用一一对应，3 次重放被唯一约束挡住 |
+| 多进程共享的检查点、队列 | 第 26 课 Postgres | API 和 3 个 worker 进程共用一个库；fence 来自全局序列 | kill -9 后任务被接手：e2e 里 3.2–3.8 秒完成（租约 3 秒） |
+| 异步运行时、流式、取消 | 第 30 课 `AsyncAgent` | 交互式 SSE 在 API 进程里跑，断开即取消 | 70 次断开全部记为 `cancelled`；断开到落盘约 30 毫秒 |
+| 幂等 | 第 08、26 课 | Redis 幂等缓存 + 工单表 `UNIQUE (tenant_id, idempotency_key)` | 372 张工单与调用一一对应，3 次重放被唯一约束挡住 |
 | 限流、舱壁 | 第 26、30 课 | 按租户的 Redis 令牌桶（429 + `Retry-After`）+ `KeyedLimiter` | 吵闹租户 571 次提交中 510 次 429，其他租户 0 次 |
 | 追踪、指标 | 第 28 课 | traceparent 跟着任务穿过队列；Prometheus 多进程汇总 | API 与 worker 的 span 在同一条 trace；5 项指标和数据库完全一致 |
-| 策略、护栏、网关 | 第 29 课 | Cedar 判定审批、正则分类器拦输入、LiteLLM Router 接模型 | 审批双击 148 次全部只入队一次 |
+| 策略、护栏、网关 | 第 29 课 | Cedar 判定审批、正则分类器拦输入、LiteLLM Router 接模型 | 审批双击 149 次全部只入队一次 |
 
 ## 1. 教学实现为什么不够：从"跑通"到"扛住"
 
@@ -96,7 +96,7 @@ sequenceDiagram
 | [`service/config.py`](../../production/service/config.py) | 12-factor：全部配置来自环境变量，启动时校验（例如心跳必须 ≤ 租约的一半），出错就失败 |
 | [`service/runtime.py`](../../production/service/runtime.py) | API 和 worker 共用的装配：连接池、Redis、模型、工具、Hook、检查点、队列、事件 |
 | [`service/api.py`](../../production/service/api.py) | FastAPI：交互式 SSE、后台任务、审批、`/healthz`、`/readyz`、`/metrics` |
-| [`service/worker.py`](../../production/service/worker.py) | `run_async_worker` + `AgentJobHandler`，停机归还、fence 换算、健康探针 |
+| [`service/worker.py`](../../production/service/worker.py) | `run_async_worker` + `AgentJobHandler`，停机归还、健康探针 |
 | [`service/backend.py`](../../production/service/backend.py)、[`tools.py`](../../production/service/tools.py) | IT 服务台的业务表和工具（全部在 Postgres 里，多进程共享） |
 | [`run_local.py`](../../production/run_local.py) | 本机无 Docker 一键启动：嵌入式 Postgres + fakeredis + 1 个 API + N 个 worker |
 | [`loadtest.py`](../../production/loadtest.py) | 压测、故障注入、逐项验证 |
@@ -105,7 +105,7 @@ sequenceDiagram
 ```bash
 python production/run_local.py                          # 离线剧本模型，3 个 worker；打印地址、演示 key、curl 示例
 python production/loadtest.py --users 20 --duration 60  # 压测 + kill -9 + 滚动重启 + 验证
-.venv/bin/python -m pytest production/tests             # 22 个测试，约 20 秒
+.venv/bin/python -m pytest production/tests             # 21 个测试，约 19 秒
 ```
 
 ### 2.2 身份、限流、舱壁
@@ -129,16 +129,16 @@ python production/loadtest.py --users 20 --duration 60  # 压测 + kill -9 + 滚
 
 1. `continue_trace(payload["trace"])` 接上 API 那条 trace，外面包一个 CONSUMER span（[第 28 课](../28_production_observability/README.md)问题 6 的方案 B）。
 2. `AgentJobHandler` 把**进程里唯一的** `AsyncAgent` 和带本次 fence 的检查点视图组合起来（第 26 课最新版的推荐用法：共用 Agent、执行器、模型客户端，每次调用传 `checkpointer=`）。
-3. Hook 依次是：取消闸门 → `OTelTracer` → 输入护栏 → `PrometheusHook` → `AsyncRateLimitHook`（Redis 令牌桶，等不到就 `rate_limited` → `RetryLater`）→ `CedarPolicy`（高危工具暂停等审批）→ 事件推送。
+3. Hook 依次是：`OTelTracer` → 输入护栏 → `PrometheusHook` → `AsyncRateLimitHook`（Redis 令牌桶，等不到就 `rate_limited` → `RetryLater`）→ `CedarPolicy`（高危工具暂停等审批）→ 事件推送。
 4. 写工具的幂等分两层：Redis 幂等缓存（省一次调用）+ 工单表的唯一约束（兜底）。每次副作用尝试都记一行 `side_effect_attempts`，压测后能证明"重放发生过，而且被挡住了"。
 5. **停机时主动归还**：宽限期到了还没做完的任务被取消，`AsyncAgent` 把检查点记为 `cancelled`（写工具保持未回答），worker 立刻 `release`，别的 worker 马上接手，用同一个 call_id 重放。`run_async_worker` 默认"不提交、不归还、等租约过期"，那样更保守但更慢；归还带 fence 校验，所以是安全的。归还不消耗重试次数（e2e 断言 `attempts` 仍为 1）。
-6. **fence 换算**：见 3.6 的发现 2。
+6. **fence**：每次领取都从整张队列表共用的序列里取一个新值（`nextval`，全局单调），所以同一个 run 后来的任务（审批后的 resume、用户点"继续"的 resume）一定能接管检查点。写这节课时 fence 还是按任务各自计数，服务里曾经用换算绕开，框架修复后绕行已删除（3.6 的发现 2）。
 
 ### 2.5 健康检查与指标
 
 - API：`/healthz` 只说明进程和事件循环活着，**不查数据库**。数据库一抖，所有 Pod 的 liveness 一起失败、被一起重启，小故障就变成全站故障。`/readyz` 查 Postgres 和 Redis，失败时只摘流量不重启。K8s 文档对两者的区分是：liveness 只看应用本身是否健康，readiness 还要检查它依赖的后端服务是否可用。
 - worker：`/healthz`、`/readyz` 由**事件循环自己**应答（一个 30 行的 asyncio TCP 服务）。同步代码把事件循环卡死时应答超时，liveness 失败就重启。`/metrics` 由 prometheus_client 在另一个线程里提供，事件循环卡死时它照样返回 200，所以**不能拿它当 liveness**。停机排空时 `/readyz` 返回 503。
-- 指标：`PrometheusHook` 负责 Agent 级指标，服务自己再补 HTTP 请求数、429（按层）、SSE 连接数、worker 任务事件、取消闸门触发次数。本机多进程用 prometheus_client 的多进程模式汇总：计数器写在共享目录的 mmap 文件里，**进程被 kill -9 之后计数也不丢**（本课实测）；进程退出后由 `run_local` 调 `mark_process_dead` 清掉它的 live gauge。K8s 里每个 Pod 一个进程，由 Prometheus 分别抓取，`rate()` 处理重启后的归零。
+- 指标：`PrometheusHook` 负责 Agent 级指标，服务自己再补 HTTP 请求数、429（按层）、SSE 连接数、worker 任务事件，以及"被依赖库吞掉、由框架补抛的取消"次数（`itdesk_swallowed_cancellations_total`，由一个日志 Handler 统计框架打出的 warning）。本机多进程用 prometheus_client 的多进程模式汇总：计数器写在共享目录的 mmap 文件里，**进程被 kill -9 之后计数也不丢**（本课实测）；进程退出后由 `run_local` 调 `mark_process_dead` 清掉它的 live gauge。K8s 里每个 Pod 一个进程，由 Prometheus 分别抓取，`rate()` 处理重启后的归零。
 
 ### 2.6 12-factor 配置
 
@@ -164,56 +164,56 @@ python production/loadtest.py --users 20 --duration 60 --json report.json
 
 ### 3.1 测量环境
 
-Apple M1（8 核）、8 GB 内存、macOS 14.4.1、CPython 3.11.7；fastapi 0.141.1、uvicorn 0.54.0、starlette 1.7.0、psycopg 3.3.6、psycopg_pool 3.3.3、redis-py 8.1.0、fakeredis 2.38.0、pgserver 0.1.4（Postgres 16.2）。**如实说明**：所有进程（Postgres、fakeredis、API、3–5 个 worker、压测客户端）挤在同一台机器上，同时还有别的任务在跑，开始时 load average 在 4.4 到 6.4 之间。离线模型每次调用 300 ms ± 30%，诊断工具 1.5 秒，建单的下游响应 400 ms；本机的租约 6 秒、宽限期 1 秒（比生产短得多，为了让故障注入的效果在一分钟内看得见）。压测是**闭环**的：每个用户等上一个请求结束才发下一个（局限见问题卡片 6）。
+Apple M1（8 核）、8 GB 内存、macOS 14.4.1、CPython 3.11.7；fastapi 0.141.1、uvicorn 0.54.0、starlette 1.7.0、psycopg 3.3.6、psycopg_pool 3.3.3、redis-py 8.1.0、fakeredis 2.38.0、pgserver 0.1.4（Postgres 16.2）。**如实说明**：所有进程（Postgres、fakeredis、API、3–5 个 worker、压测客户端）挤在同一台机器上，同时还有别的任务在跑，开始时 load average 在 4.4 到 10.4 之间（每张表都注明了当时的负载）。离线模型每次调用 300 ms ± 30%，诊断工具 1.5 秒，建单的下游响应 400 ms；本机的租约 6 秒、宽限期 1 秒（比生产短得多，为了让故障注入的效果在一分钟内看得见）。压测是**闭环**的：每个用户等上一个请求结束才发下一个（局限见问题卡片 6）。
 
-### 3.2 端到端测试：22 个，约 20 秒
+### 3.2 端到端测试：21 个，约 19 秒
 
 [`production/tests/`](../../production/tests/test_e2e.py) 起的是**真实进程**：1 个 uvicorn API、3 个 worker、嵌入式 Postgres、fakeredis。每条测试都用状态来证明，而不是"跑通就算"。
 
 | 场景 | 怎么证明 | 实测 |
 |---|---|---|
 | 后台任务全流程 + 审批 | 批准前不执行；员工自己不能审批；审批人同时点两次，两个请求都返回 202，任务表里只有一个 resume | 通过 |
-| run 任务被接手后再审批 | 测试扮演一个"领了任务就崩溃"的 worker，真 worker 以 fence=2 接手；之后的 resume 任务必须第一次领取就成功 | 通过（修复前会被拒绝，见 3.6） |
-| SSE 断开 → 取消 | 读到 `run_diagnostics` 开始就断开；检查点记为 `cancelled`，再等 1.5 秒也没有建单；`POST /resume` 后由 worker 跑完，恰好一张单 | 断开到落盘 26–29 ms（多次运行） |
-| worker 被 kill -9 | 建单工具已经插入工单、正在等下游时 kill -9；另一个 worker 以 fence=2 接手 | 3.4–3.8 秒完成（租约 3 秒）；工单 1 张，`side_effect_attempts` 为 inserted 1、deduplicated 1 |
+| run 任务被接手后再审批 | 测试扮演一个"领了任务就崩溃"的 worker，真 worker 以更大的 fence 接手；之后的 resume 任务必须第一次领取就接手（fence 更大、`attempts=1`、没有 `ownership_lost`） | 审批到完成 0.91 s（框架修复前要多等一个租约，见 3.6） |
+| SSE 断开 → 取消 | 读到 `run_diagnostics` 开始就断开；检查点记为 `cancelled`，再等 1.5 秒也没有建单；`POST /resume` 后由 worker 跑完，恰好一张单 | 断开到落盘 26–31 ms（多次运行） |
+| worker 被 kill -9 | 建单工具已经插入工单、正在等下游时 kill -9；另一个 worker 以更大的 fence 接手 | 3.2–3.8 秒完成（租约 3 秒）；工单 1 张，`side_effect_attempts` 为 inserted 1、deduplicated 1 |
 | 滚动重启 | 3 个旧 worker 在"正在建单"时依次收到 SIGTERM（宽限期 0.3 秒 < 下游耗时 0.8 秒） | 全部退出码 0；被取消的任务立即归还、被接手重放、被唯一约束去重；每个运行恰好一张单；`attempts` 仍为 1 |
 | 租户隔离 | 别的租户读 run、读事件、审批都是 404；伪造的跨租户任务被 worker 拒绝 | 通过 |
 | 限流 | 吵闹租户连发 6 个，至少 3 个 429 且带 `Retry-After`；同一租户第 3 条交互式流 429 | 通过 |
 | 跨队列 trace | 客户端带 traceparent；API 的 PRODUCER span 和 worker 的 CONSUMER span 在同一条 trace 里，父子关系正确，而且跨了进程 | 通过 |
 
-另有 8 个部署配置检查、5 个取消测试（3.6 的发现 3）。
+另有 8 个部署配置检查、4 个取消测试（3.6 的发现 3）。
 
 ### 3.3 压测 + 故障注入（主场景）
 
-20 个用户压 60 秒，3 个 worker × 并发 8。35% 处对手上任务最多的 worker 发 kill -9，并补一个新的；65% 处滚动重启一个：先起新的，就绪后给旧的发 SIGTERM。
+20 个用户压 60 秒，3 个 worker × 并发 8。35% 处对手上任务最多的 worker 发 kill -9，并补一个新的；65% 处滚动重启一个：先起新的，就绪后给旧的发 SIGTERM。下面是框架修复（第 7 节）之后的重测，开始时 load average 6.7。
 
 | 类型 | n | 成功 | p50 | p95 | p99 | 首字 p50 | 排队 p50 |
 |---|---|---|---|---|---|---|---|
-| 交互式问答（SSE 读到 done） | 367 | 367 | 0.62 s | 0.74 s | 0.78 s | 0.61 s | — |
-| 交互式中途断开 | 68 | 68 | 0.30 s | 0.40 s | 0.41 s | — | — |
-| 后台建工单 | 214 | 214 | 1.08 s | 1.20 s | 1.25 s | — | 0.02 s |
-| 后台长任务（诊断 + 建单） | 154 | 154 | 3.49 s | 3.82 s | **9.68 s** | — | 0.02 s |
-| 后台重置密码（等审批 → 双击批准 → 完成） | 148 | 148 | 1.09 s | 1.26 s | 1.30 s | — | 0.02 s |
+| 交互式问答（SSE 读到 done） | 373 | 373 | 0.64 s | 0.76 s | 0.78 s | 0.63 s | — |
+| 交互式中途断开 | 70 | 70 | 0.32 s | 0.40 s | 0.44 s | — | — |
+| 后台建工单 | 216 | 216 | 1.05 s | 1.18 s | 1.22 s | — | 0.02 s |
+| 后台长任务（诊断 + 建单） | 156 | 156 | 3.49 s | 3.73 s | **9.26 s** | — | 0.02 s |
+| 后台重置密码（等审批 → 双击批准 → 完成） | 149 | 149 | 1.09 s | 1.24 s | 1.26 s | — | 0.02 s |
 | 吵闹租户提交（配额 1 个/秒） | 571 | 61 | — | — | — | — | — |
 
-总计 1522 个请求，吞吐 24.0 请求/秒，错误率 0%，429 占 33.5%（**全部**来自吵闹租户）。故障注入时间线：
+总计 1535 个请求，吞吐 24.2 请求/秒，错误率 0%，429 占 33.2%（**全部**来自吵闹租户）。故障注入时间线：
 
 | 时刻 | 事件 | 结果 |
 |---|---|---|
-| 21.0 s | kill -9 worker-0，它手上有 7 个任务 | 1.8 秒后替补就绪；这 7 个任务在租约（6 秒）过期后被接手。长任务的 p99 从 p50 的 3.5 秒拉到 9.7 秒，多出来的就是"等租约" |
-| 41.3 s | SIGTERM worker-3（手上 8 个任务） | 1.72 秒内退出，退出码 0：4 个在宽限期内做完，4 个被取消 → 立即归还 → 被接手 |
+| 21.0 s | kill -9 worker-1，它手上有 6 个任务 | 1.4 秒后替补就绪；这 6 个任务在租约（6 秒）过期后被接手。长任务的 p99 从 p50 的 3.5 秒拉到 9.3 秒，多出来的就是"等租约" |
+| 40.6 s | SIGTERM worker-0（手上 6 个任务） | 1.09 秒内退出，退出码 0：2 个在宽限期内做完，4 个被取消 → 立即归还 → 被接手 |
 
 验证（压测结束后直接查 Postgres + 读 `/metrics`）：
 
 | 检查 | 结果 |
 |---|---|
-| 所有运行到达终态或可解释的状态 | ✅ 944 个 completed，68 个 cancelled（全部是客户端断开的） |
-| 没有重复副作用：每个 `create_ticket` 调用恰好对应一张工单 | ✅ 368 张工单、368 次插入；**3 次重放被唯一约束挡住** |
-| 断开的交互式运行在检查点里记为 `cancelled` | ✅ 68/68；其中 2 次是被"取消闸门"补上的（3.6 的发现 3） |
-| 指标与实际数量一致 | ✅ completed 944=944、成功任务 725=725、暂停 148=148、cancelled 段 72=72（68 断开 + 4 停机取消）、429 510=510 |
-| 没有任务进入死信 | ✅ |
+| 所有运行到达终态或可解释的状态 | ✅ 955 个 completed，70 个 cancelled（全部是客户端断开的） |
+| 没有重复副作用：每个 `create_ticket` 调用恰好对应一张工单 | ✅ 372 张工单、372 次插入；**3 次重放被唯一约束挡住** |
+| 断开的交互式运行在检查点里记为 `cancelled` | ✅ 70/70 |
+| 指标与实际数量一致 | ✅ completed 955=955、成功任务 731=731、暂停 149=149、cancelled 段 74=74（70 断开 + 4 停机取消）、429 510=510 |
+| 没有任务进入死信 | ✅；领取事件比任务数多 10 次（kill -9 后回收 6 个、停机归还 4 个，都被重新领取） |
 
-审批双击 148 次，148 次都只入队一个 resume。
+审批双击 149 次，149 次都只入队一个 resume。框架修复前的同一场景（load average 4.4）数字几乎一样：1522 个请求、24.0 请求/秒、长任务 p99 9.68 秒，5 项验证全部通过。
 
 ### 3.4 容量：利特尔法则的实测
 
@@ -230,27 +230,44 @@ Apple M1（8 核）、8 GB 内存、macOS 14.4.1、CPython 3.11.7；fastapi 0.14
 
 ### 3.5 瓶颈在模型配额时
 
-把每个租户的模型调用速率压到 4 次/秒（`--env LLM_RATE_PER_SEC=4 --env LLM_BURST=4`），其他不变（3 × 4）：
+把每个租户的模型调用速率压到 4 次/秒（`--env LLM_RATE_PER_SEC=4 --env LLM_BURST=4`），其他不变（3 × 4）。框架修复后重测，开始时 load average 10.4（机器很忙，延迟偏高）：
 
 | 类型 | 成功 / 总数 | p50 | p95 | 说明 |
 |---|---|---|---|---|
-| 交互式问答 | 26 / 58 | 2.25 s | 5.73 s | 32 个等了约 2 秒还拿不到令牌，以 `rate_limited` 结束（对用户是错误） |
-| 后台建工单 | 35 / 35 | 6.48 s | 15.53 s | 全部完成；后台任务一共被推迟 52 次（`RetryLater`：回到队列，不占 worker） |
-| 后台长任务 | 18 / 19 | 11.29 s | 21.41 s | 1 个以 `max_steps` 结束：**推迟会消耗步数**（3.6 的发现 4） |
+| 交互式问答 | 35 / 57 | 1.70 s | 3.86 s | 22 个等了约 2 秒还拿不到令牌，以 `rate_limited` 结束（对用户是错误） |
+| 后台建工单 | 35 / 35 | 5.52 s | 13.95 s | 全部完成；后台任务一共被推迟 73 次（`RetryLater`：回到队列，不占 worker） |
+| 后台长任务 | 18 / 18 | 12.22 s | 25.48 s | 全部完成。修复前同样的负载下有 1 个以 `max_steps` 结束：**推迟会消耗步数**（3.6 的发现 4，已在框架修复） |
 
-同样是"变慢"，原因完全不同：3.4 的瓶颈在 worker 名额（排队 7 秒，加 worker 就好）；这里 worker 名额利用率 89%，可是任务大部分时间在等令牌，加 worker 没用，要去网关要配额，或者给交互式流量留出保底配额。练习 (c) 就是把这种判断写成代码。
+同样是"变慢"，原因完全不同：3.4 的瓶颈在 worker 名额（排队 7 秒，加 worker 就好）；这里 worker 名额利用率 88%，可是任务大部分时间在等令牌，加 worker 没用，要去网关要配额，或者给交互式流量留出保底配额。练习 (c) 就是把这种判断写成代码。
 
 ### 3.6 反直觉的发现：单独测都对，装到一起才出现的问题
 
 **发现 1：在 SSE 生成器里做鉴权，别的租户拿到的是"200 + 空流"。** FastAPI 的 SSE 端点是一个生成器，**函数体在响应头（200）发出之后才开始执行**。`GET /v1/runs/{id}/events` 最初在生成器里检查所有权，e2e 测试发现别的租户拿到的是 200 加一条空流，而不是 404。修法：所有权检查放进依赖（`Depends(visible_run)`），依赖在响应开始之前执行。
 
-**发现 2：fence 的作用域和被保护的资源不一致，审批后的 resume 会被当成"旧持有者"拒绝。** 队列的 fence 是**每个任务**各自从 1 数起的，检查点的 fence 却保护**整个 run**。压测日志里：run 任务被 kill -9 后以 fence=2 接手，检查点的 fence 变成 2；之后审批产生的 resume 任务从 fence=1 开始，加载检查点时被拒绝（`CheckpointConflict`）。`run_async_worker` 把它当成"所有权已转移"，什么都不提交，任务留在 leased，等一个租约过期、重新领取把 fence 数到 2 才成功。这次多等了 6 秒；如果 run 任务被接手的次数超过 `max_attempts`，resume 任务会直接进死信，审批就丢了。修法（在服务里，没有改 contrib）：`RunScopedFences` 把检查点的 fence 换算成 `job_id × 10^6 + job.fence`，同一个 run 上后入队的任务永远更大；再把"持有租约却遇到检查点冲突"明确判为"被更新的任务取代"（`PermanentJobError`，不重试）。回归测试 `test_approval_resume_is_not_refused_after_the_run_job_was_taken_over` 在修复前会超时失败。
+发现 2、3、4 在框架里，已经报告给维护者并在框架层修复，服务里原来的绕行随之删除。下面每一条都按"现象 → 根因 → 修复 → 回归测试 → 复测"记录，汇总见第 7 节。
 
-**发现 3：取消被第三方库吞掉了，用户关了页面，工单照样建了。** 修复前的二十多次压测（合计约 540 次断开）里，出现了 5 次"客户端已断开，运行却跑完了"，约 1%。日志显示服务端 1 毫秒内就发现了断开、也取消了运行，可运行还是跑完了。用 `Task.cancelling()` 在每个 Hook 边界打点，定位到取消是在 `AsyncRateLimitHook` 调 Redis 时丢的：redis-py 8.1.0 每条命令都经过 `send_packed_command` → `asyncio.wait_for`。Python 3.12 之前的 `asyncio.wait_for` 有已知竞态（[CPython gh-86296](https://github.com/python/cpython/issues/86296)）：被等待的东西刚好完成、外部取消又在同一轮事件循环到达时，它返回结果，把取消吞掉。3.12 用 `asyncio.timeout` 重写了 `wait_for`（[gh-96764](https://github.com/python/cpython/issues/96764)），但没有回移到旧版本。本机 3.11.7 上的微基准：在 redis-py 命令进行中取消，**约 20%–25% 被吞掉**；psycopg_pool 3.3.3 在"等连接"时交接连接和取消同时发生，**20/20 被吞掉**（它的 `ACondition.wait_timeout` 也用 `asyncio.wait_for`）。`agentkit.aio` 自己已经换成取消安全的 `wait_for`，但它管不了依赖库。修法分两层：
-1. 根本修法：生产镜像用 Python 3.12+（Dockerfile 已改）；
-2. 纵深防御：`CancellationFence` Hook 放在第一个。在每个步骤边界（调模型、调工具之前）检查两件事：`Task.cancelling() > 0`（取消已请求但没送达，3.11+），或者 run 已被 API 登记为"客户端已离开"。任一成立就抛 `CancelledError`，`AsyncAgent` 按取消处理。修复后连续 6 次压测（164 次断开）全部记为 `cancelled`，闸门补上了 2 次。它还有一个指标 `itdesk_cancellation_fence_total`：**不为 0 就说明有依赖在吞取消**。
+**发现 2：fence 的作用域和被保护的资源不一致，审批后的 resume 会被当成"旧持有者"拒绝（已在框架修复）。**
+- 现象：压测日志里，run 任务被 kill -9 后以 fence=2 接手，检查点的 fence 变成 2；之后审批产生的 resume 任务从 fence=1 开始，加载检查点时被拒绝（`CheckpointConflict`）。`run_async_worker` 把它当成"所有权已转移"，什么都不提交，任务留在 leased，要等一个租约过期、重新领取把 fence 数到 2 才成功。这次多等了 6 秒；如果 run 任务被接手的次数超过 `max_attempts`，resume 任务会直接进死信，审批就丢了。
+- 根因：队列的 fence 是**每个任务**各自从 1 数起的（`fence = fence + 1`），检查点的 fence 却保护**整个 run**，而同一个 run 会先后有好几个任务。
+- 修复（`agentkit/contrib/postgres.py`）：领取时 `fence = nextval('<表名>_fence_seq')`，整张队列表共用一个序列，全局单调；`setup()` 建序列，从旧表升级时序列从已有的最大 fence 往后发。
+- 回归测试：`test_fence_is_global_so_a_later_job_for_the_same_run_can_take_over`、`test_upgrading_from_per_job_fences_continues_after_the_largest_existing_fence`（`tests/contrib/test_postgres.py`）。
+- 服务侧：删掉了原来的绕行（`RunScopedFences` 把 fence 换算成 `job_id × 10^6 + job.fence`，以及把这类冲突判为"被取代"的特殊处理），worker 直接用 `job.fence`。
+- 复测：e2e 的 `test_approval_resume_is_not_refused_after_the_run_job_was_taken_over` 构造同样的场景，resume 任务第一次领取就接手（`attempts=1`，fence 比接手的 run 任务大），审批到完成 0.91 秒（租约 3 秒）；主场景压测没有出现 `ownership_lost`。
 
-**发现 4：被限流推迟也会消耗 `max_steps`。** `AsyncAgent` 先 `state.step += 1` 再调模型，`before_llm` 里的限流 Hook 抛 `StopRun("rate_limited")` 时，这一步没调模型也被算上了。配合 `AgentJobHandler` 的 `RetryLater`，每推迟一次就烧掉一步。复现：`max_steps=3`，限流 Hook 连续拒绝 3 次，第 4 次恢复时直接以 `max_steps` 结束，模型一次都没调用过。3.5 的压测里有 1 个长任务因此失败。这在 agentkit 核心里，已报告给维护者（第 7 节）。
+**发现 3：取消被依赖库吞掉了，用户关了页面，工单照样建了（已在框架修复）。**
+- 现象：修复前的二十多次压测（合计约 540 次断开）里，出现了 5 次"客户端已断开，运行却跑完了"，约 1%。日志显示服务端 1 毫秒内就发现了断开、也取消了运行，可运行还是跑完了。
+- 根因：用 `Task.cancelling()` 在每个 Hook 边界打点，定位到取消是在 `AsyncRateLimitHook` 调 Redis 时丢的：redis-py 8.1.0 每条命令都经过 `send_packed_command` → `asyncio.wait_for`。Python 3.12 之前的 `asyncio.wait_for` 有已知竞态（[CPython gh-86296](https://github.com/python/cpython/issues/86296)）：被等待的东西刚好完成、外部取消又在同一轮事件循环到达时，它返回结果，把取消吞掉。3.12 用 `asyncio.timeout` 重写了 `wait_for`（[gh-96764](https://github.com/python/cpython/issues/96764)），但没有回移到旧版本。本机 3.11.7 上的微基准：在 redis-py 命令进行中取消，**约 20%–25% 被吞掉**；psycopg_pool 3.3.3 在"等连接"时交接连接和取消同时发生，**20/20 被吞掉**（它的 `ACondition.wait_timeout` 也用 `asyncio.wait_for`）。`agentkit.aio` 自己已经换成取消安全的 `wait_for`，但管不了依赖库。
+- 修复（`agentkit/aio/agent.py` 的 `_raise_if_cancel_swallowed`）：进入运行时以 `Task.cancelling()` 为基线，在"调用模型前（`before_llm` 之后）"和"执行工具前（`before_tool` 之后）"检查，计数比基线大就说明有人吞了取消，补抛 `CancelledError` 并打一条 warning；`run_timeout` 的取消被吞时也会补抛，最后仍记为 timeout。3.10 没有 `cancelling()`，检查自动关闭。
+- 回归测试：`test_cancel_swallowed_by_a_dependency_is_re_raised_before_side_effects[llm/tool]`、`test_run_timeout_swallowed_by_a_dependency_still_times_out`（`tests/test_aio.py`）。
+- 服务侧：删掉了原来的 `CancellationFence` Hook（它做的就是同一件事，外加一个进程内的"已放弃"登记，现在都由框架负责）。服务只保留两件事：生产镜像用 Python 3.12+（Dockerfile），从根上避开这个竞态；一个日志 Handler 把框架的 warning 记成指标 `itdesk_swallowed_cancellations_total`，**不为 0 就说明有依赖在吞取消**。[`test_cancellation.py`](../../production/tests/test_cancellation.py) 保留了两个依赖库的复现，另有一对对照测试：同一个"会吞取消"的 Hook 下，有框架检查时运行停在下一个步骤边界、工单没建、指标加一；把检查换成空函数时运行跑完、工单照样建了。
+- 复测：修复后 7 次压测（主场景、demo、4 次短压测、配额压测）共 180 次断开，全部记为 `cancelled`，指标都是 0（约 1% 的竞态，这个样本量下没遇到并不意外）；专门的断开风暴 400 次（读到第一个工具结果就断开）全部 `cancelled`，框架补抛了 1 次。另外说明一处更正：本节旧版写过"服务侧闸门补上了 2 次"，那个计数把"登记为已放弃"也算进去了，其中可能包含"登记先于取消送达"的正常顺序，不能都算作被吞掉的取消；现在的指标只统计 `cancelling()` 真的变大的情况。
+
+**发现 4：被限流推迟也会消耗 `max_steps`（已在框架修复）。**
+- 现象：3.5 的压测里有 1 个长任务以 `max_steps` 结束。复现：`max_steps=3`，限流 Hook 连续拒绝 3 次，第 4 次恢复时直接以 `max_steps` 结束，模型一次都没调用过。
+- 根因：`AsyncAgent` 在循环开头就 `state.step += 1`，`before_llm` 里的限流 Hook 抛 `StopRun("rate_limited")` 时，这一步没调模型也被算上了；配合 `AgentJobHandler` 的 `RetryLater`，每推迟一次就烧掉一步。
+- 修复（`agentkit/agent.py` 与 `agentkit/aio/agent.py`）：`state.step += 1` 挪进 `_call_llm`，放在 `before_llm` 和 `visible_tools` 之后、真正调用模型之前。被 Hook 叫停的那一步不计数。
+- 回归测试：`test_deferred_steps_do_not_consume_max_steps`（`tests/test_agentkit.py` 与 `tests/test_aio.py` 各一个）。
+- 复测：同样的配额压测里，后台任务被推迟 73 次（比修复前的 52 次还多），长任务 18/18 全部完成，没有 `max_steps`（3.5）。
 
 ### 3.7 真实模型
 
@@ -330,7 +347,7 @@ sequenceDiagram
 | `terminationGracePeriodSeconds` | 35 | ≥ preStop + worker 宽限期 + 收尾时间（K8s 默认 30，**从 preStop 开始计时**） | 排空没结束就被 SIGKILL：任务既没记 cancelled 也没归还，只能等租约过期 |
 | preStop | API：`sleep 5`（K8s 1.34 起 GA 的原生 sleep 动作）；worker：无 | 摘流量和 SIGTERM 是**并行**的，要等各节点更新转发规则 | 进程已经不接新连接，负载均衡还在往这里转发，客户端收到连接错误 |
 | worker 宽限期 `WORKER_GRACE_SECONDS` | 20 | 覆盖大多数任务（p95），不必覆盖最长的 | 太短：每次发布都取消很多任务，白花一次模型调用；太长：发布慢 |
-| 租约 `WORKER_LEASE_SECONDS` | 30（心跳 10） | 与宽限期**无关**：排空期间心跳照常续租；它决定的是**硬崩溃**后多久被接手 | 太短：GC 停顿、网络抖动就被误判为死亡，任务两处同时执行；太长：kill -9 后恢复慢（3.3：p99 被拉到 9.7 秒） |
+| 租约 `WORKER_LEASE_SECONDS` | 30（心跳 10） | 与宽限期**无关**：排空期间心跳照常续租；它决定的是**硬崩溃**后多久被接手 | 太短：GC 停顿、网络抖动就被误判为死亡，任务两处同时执行；太长：kill -9 后恢复慢（3.3：p99 被拉到 9.3 秒） |
 | uvicorn `--timeout-graceful-shutdown` | 20 | API 的"宽限期"：SSE 长连接最多再给 20 秒 | 到点后被取消：交互式运行记 cancelled，客户端 `POST /resume` |
 | PDB `maxUnavailable: 1` | api、worker 各一个 | **只管自愿中断**（节点排空走 Eviction API），不管 Deployment 自己的滚动发布（由 `maxSurge` / `maxUnavailable` 管） | 节点排空时一次驱逐所有 worker |
 
@@ -355,7 +372,7 @@ sequenceDiagram
 
 **怎么选**：B。唯一"粘"的东西是一条正在进行的 SSE 连接，它天然只存在于一个副本上，断了就取消，重连后按 `run_id` 恢复，或者交给 worker。**不要**为 Agent 服务配置会话粘性：它会让扩缩容和发布都变得危险，而 Agent 的每一步本来就要落盘。
 
-**本课实现**：API 和 worker 进程里只有连接池、线程池、Hook 实例这些"可重建"的东西。一次交互式运行专用一个检查点视图（`fenced(0)`），版本号记录随运行结束回收。如果整个进程共用一个检查点对象，它记住的版本号会随 run 数量无限增长（第 7 节第 5 条）。
+**本课实现**：API 和 worker 进程里只有连接池、线程池、Hook 实例这些"可重建"的东西。一次交互式运行用一个专用的检查点视图（`fenced(0)`，writer 标成 API 实例）；之后任何 worker 任务的 fence 都比 0 大，可以接管它。共享的检查点对象记住的版本号，框架在保存非 running 状态时就丢掉（第 7 节第 5 条，修复前会随 run 数量无限增长）。
 
 ### 问题 5：流式与负载均衡 —— SSE 碰上代理超时、缓冲和连接数上限
 
@@ -389,7 +406,7 @@ sequenceDiagram
 | D. 故障注入下压测 | 压测的同时杀进程、滚动发布（问题 7） | 测出"发布日"和"故障日"的尾延迟 | 结果波动大，要多跑几次 |
 
 **怎么读结果**：
-- 看 **p99**，而不只是 p50：3.3 的长任务 p50 3.5 秒、p99 9.7 秒，多出来的正好是租约时长。
+- 看 **p99**，而不只是 p50：3.3 的长任务 p50 3.5 秒、p99 9.3 秒，多出来的正好是租约时长。
 - 百分位**只统计成功的请求**：失败的请求往往很快，混进来会让延迟"变好"。
 - **429 和错误分开算**：429 是按设计拒绝，要看它落在哪个租户、哪一层。
 - 拆耗时，找瓶颈：排队时间占大头 → worker 名额不够（3.4）；在等令牌 → 网关配额（3.5）；在等数据库连接 → 连接池太小（[第 26 课](../26_state_and_queues/README.md)问题 7）；事件循环调度延迟高 → CPU（[第 30 课](../30_async_runtime/README.md)：单核上限约每秒千个会话）。练习 (c) 把这套判断写成了代码。
@@ -460,19 +477,21 @@ AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/31_deployment_and_scaling
 - **liveness 不查依赖**；worker 的 liveness 由事件循环自己应答，`/metrics` 线程不算。
 - **队列表要清理**：`purge_finished` 定期删掉已完成的任务（第 26 课），否则表和索引一直膨胀。Redis Streams 用 `MAXLEN ~` + TTL。
 - **多个 API 副本都采样队列深度时**，查询要用 `max()` 聚合，不要用 `sum()`。
-- **生产镜像用 Python 3.12+**，并盯住 `itdesk_cancellation_fence_total`（3.6 发现 3）。
+- **生产镜像用 Python 3.12+**，并盯住 `itdesk_swallowed_cancellations_total`（3.6 发现 3）：框架会补抛被吞掉的取消，但它不为 0 说明有依赖在吞取消。
 - **常见反模式**：按 CPU 扩 worker；给 Agent 服务配会话粘性；用 `/metrics` 当 liveness；在 SSE 生成器里鉴权；把宽限期设得比 `terminationGracePeriodSeconds` 还长；在 Deployment 里写死副本数；压测报告只写平均值。
 
-## 7. 实测发现的问题（写作时的 `agentkit` 与依赖版本，已报告给维护者）
+## 7. 实测发现的问题与修复
 
-| # | 问题 | 在哪 | 怎么复现 | 本课的处理 |
+写这节课时，端到端测试和压测找出了 6 个问题。框架里的 4 个已由维护者修复（尚未发布），每个都有回归测试；服务里原来的绕行随之删除。按"现象 → 根因 → 修复 → 回归测试"记录（详细经过见 3.6）：
+
+| # | 现象（怎么发现的） | 根因 | 修复 | 回归测试 / 复测 |
 |---|---|---|---|---|
-| 1 | fence 按任务计数，检查点按 run 保护：run 任务被接手过之后，审批 / 恢复产生的新任务被拒绝，要等租约过期才能继续；run 任务被接手次数超过 `max_attempts` 时新任务直接进死信 | `agentkit/contrib/postgres.py`（`claim` 的 `fence = fence + 1` + `AgentJobHandler` 用 `job.fence` 建视图） | 同一个 run：任务 1 被领取两次（fence=2）后完成；再入队任务 2（op=resume），第一次领取 fence=1 → `CheckpointConflict` → `ownership_lost`，任务一直 leased 到租约过期 | 服务里用 `RunScopedFences`（`job_id × 10^6 + fence`）并把冲突判为"被取代"。建议 contrib 改成全局单调的 fence（例如 `nextval` 序列） |
-| 2 | 限流等推迟会消耗 `max_steps` | `agentkit/aio/agent.py` `_prepare_and_loop`：先 `state.step += 1` 再 `_call_llm` | `max_steps=3`，`before_llm` 连续 3 次抛 `StopRun("rate_limited")`，每次 `resume`：第 4 次直接 `max_steps`，模型调用 0 次 | 未处理（在核心里）。建议 `before_llm` 抛 `StopRun` 时回退这一步，或者只在模型真的返回后才计步 |
-| 3 | 取消被吞掉：redis-py 8.1.0（`send_packed_command`）和 psycopg_pool 3.3.3（`ACondition.wait_timeout`）内部用 `asyncio.wait_for`，在 Python < 3.12 上有 gh-86296 竞态 | 第三方库 | [`test_cancellation.py`](../../production/tests/test_cancellation.py) 前两个测试（3.11.7：redis 约 20%–25%，pool 20/20） | Python 3.12 镜像 + `CancellationFence`。建议 `AsyncAgent` 在步骤边界内置 `Task.cancelling()` 检查 |
-| 4 | SSE 端点在生成器里鉴权 → 200 + 空流 | FastAPI 的生成器端点语义（本服务自己的缺陷，e2e 抓到） | 别的租户 `GET /v1/runs/{id}/events` | 鉴权移到依赖 |
-| 5 | 长期共用一个 `AsyncPostgresCheckpointer` 时，`_versions` 按 run_id 只增不减 | `agentkit/contrib/postgres.py` `_CheckpointBase._remember` | 同一个检查点对象跑 N 个 run，`len(ckpt._versions) == N` | 每个运行用自己的 `fenced()` 视图 |
-| 6 | `AsyncScriptedLLM` 保存每次调用的深拷贝，长时间运行时内存只增不减 | `agentkit/aio/llm.py` | 离线服务跑 1 小时 | `calls` 换成 `deque(maxlen=200)` |
+| 1 | run 任务被接手过之后，审批产生的 resume 任务被拒绝，要空等一个租约；接手次数超过 `max_attempts` 时直接进死信（压测日志） | fence 按任务从 1 计数，检查点的 fence 却保护整个 run | **框架**：`claim` 的 fence 改为 `nextval` 全局序列（`contrib/postgres.py`）。服务删除 `RunScopedFences` 绕行 | `test_fence_is_global_so_a_later_job_for_the_same_run_can_take_over`、`test_upgrading_from_per_job_fences_continues_after_the_largest_existing_fence`；e2e：审批到完成 0.91 s，resume 第一次领取即接手 |
+| 2 | 配额压测里长任务以 `max_steps` 结束，模型一次都没调（3.5） | 循环开头就 `step += 1`，被 `before_llm` 叫停的步骤也计数 | **框架**：计步挪进 `_call_llm`，放在 `before_llm` 之后、调用模型之前（同步版、异步版都改） | `test_deferred_steps_do_not_consume_max_steps` × 2；复测：推迟 73 次，长任务 18/18 完成 |
+| 3 | 约 1% 的断开没有停下，工单照样建了（压测） | redis-py 8.1.0、psycopg_pool 3.3.3 内部用 `asyncio.wait_for`，3.12 之前有 gh-86296 竞态，取消被吞 | **框架**：`_raise_if_cancel_swallowed` 以 `Task.cancelling()` 为基线，在调模型、执行工具之前补抛（3.11+）。服务：删除 `CancellationFence`；镜像用 3.12；指标 `itdesk_swallowed_cancellations_total` | `test_cancel_swallowed_by_a_dependency_is_re_raised_before_side_effects[llm/tool]`、`test_run_timeout_swallowed_by_a_dependency_still_times_out`；服务侧 [`test_cancellation.py`](../../production/tests/test_cancellation.py)（依赖库复现 + 有 / 无框架检查的对照）；复测：180 次断开 + 400 次断开风暴全部 `cancelled` |
+| 4 | 别的租户读事件流得到"200 + 空流"，而不是 404（e2e） | FastAPI 的生成器端点在发出 200 之后才执行函数体，在里面鉴权为时已晚（服务自己的缺陷） | **服务**：所有权检查移到依赖 `Depends(visible_run)` | `test_tenant_isolation` |
+| 5 | 长期共用一个 `AsyncPostgresCheckpointer`，`_versions` 按 run_id 只增不减（读代码 + 计数） | 版本号只记不删 | **框架**：保存非 running 状态后丢掉该 run 的版本号（恢复和审批都会先 load） | `test_shared_checkpointer_forgets_versions_of_finished_runs` |
+| 6 | `AsyncScriptedLLM` 保存每次调用的深拷贝，长时间运行时内存只增不减 | 测试替身的设计（为了断言调用内容） | 框架不改（它是测试替身）。**服务**：离线模式把 `calls` 换成 `deque(maxlen=200)` | — |
 
 ## 8. 如何切换到托管服务
 
@@ -525,8 +544,8 @@ AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/31_deployment_and_scaling
 <summary>5. 为什么"已经调用了 task.cancel()"还不够？你会怎么兜底？</summary>
 
 - Python 3.12 之前 `asyncio.wait_for` 会在"结果和取消同时到达"时吞掉取消，依赖库里到处都是 `wait_for`（本课实测 redis-py、psycopg_pool）。
-- 根本办法是升级到 3.12+；兜底办法是在步骤边界检查 `Task.cancelling()` 或业务侧的"已放弃"标记，主动抛 `CancelledError`。
-- 同时要有指标，让"取消被吞掉"这件事可见。
+- 根本办法是升级到 3.12+；兜底办法是在步骤边界检查 `Task.cancelling()`（比进入运行时的基线大，就说明有人吞了取消），主动抛 `CancelledError`。本课发现后，`agentkit.aio` 已经内置了这个检查（3.6 发现 3）。
+- 同时要有指标，让"取消被吞掉"这件事可见：它不为 0，就该升级 Python 或换掉那个依赖。
 </details>
 
 <details>

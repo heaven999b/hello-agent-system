@@ -1,13 +1,19 @@
-"""取消被第三方库"吞掉"时，CancellationFence 在下一个步骤边界把运行停下来（本课压测抓到的真实问题）。
+"""取消被依赖库"吞掉"：先证明它真的会发生，再证明框架在步骤边界把它补回来（讲义 3.6 发现 3，已在框架修复）。
 
 背景：Python 3.12 之前的 asyncio.wait_for 有竞态（CPython gh-86296）：被等待的东西刚好就绪、外部取消又在同一轮事件循环
-到达时，它返回结果、吞掉取消。agentkit.aio 已经换成取消安全的 wait_for，但本服务依赖的两个库内部仍在用它：
+到达时，它返回结果、吞掉取消。agentkit.aio 自己用取消安全的 wait_for，但本服务依赖的两个库内部仍在用它：
   - redis-py 8.1.0：每条命令都经过 AbstractConnection.send_packed_command → asyncio.wait_for
   - psycopg_pool 3.3.3：等连接时 ACondition.wait_timeout → asyncio.wait_for
-压测里的表现：交互式运行在"限流 Hook 调 Redis"时被取消，取消被吞掉，客户端早已断开，运行照常跑完、照样建了工单。
+本课压测里的表现：交互式运行在"限流 Hook 调 Redis"时被取消，取消被吞掉，客户端早已断开，运行照常跑完、照样建了工单。
 
-前两条测试在本机的 Python 上证明这两个库确实会吞掉取消（3.12+ 上跳过）；后面三条用一个"会吞掉取消"的 Hook 把竞态
-确定性地复现出来，证明闸门有效。
+修复（框架层，agentkit/aio/agent.py 的 _raise_if_cancel_swallowed）：进入运行时记下 Task.cancelling() 作为基线，
+在"调用模型前（before_llm 之后）"和"执行工具前（before_tool 之后）"检查，计数变大就补抛 CancelledError（3.11+）。
+
+这里的测试：
+  1–2. 直接测 redis-py / psycopg_pool：证明"依赖库会吞取消"在本机 Python 上确实存在（3.12+ 上跳过）——这是框架要有这个检查的理由；
+  3.   用一个"会吞掉取消"的 Hook 确定性地复现竞态：不需要任何服务侧代码，框架就把运行停在下一个步骤边界，工单没建，
+       并且服务的 itdesk_swallowed_cancellations_total 计数 +1（运维据此知道该升级 Python / 换库）；
+  4.   对照组：把框架的检查换成空函数，同一个场景下运行照常跑完、工单照样建了 —— 说明第 3 条靠的正是这个检查。
 """
 
 from __future__ import annotations
@@ -32,7 +38,6 @@ from agentkit.aio import AsyncAgent, AsyncScriptedLLM, ToolFinished  # noqa: E40
 from agentkit.hooks import Hook  # noqa: E402
 from agentkit.state import InMemoryCheckpointer  # noqa: E402
 
-from production.service.runtime import CancellationFence  # noqa: E402
 
 needs_old_wait_for = pytest.mark.skipif(sys.version_info >= (3, 12), reason="3.12 起 asyncio.wait_for 已修复 gh-86296")
 
@@ -105,7 +110,7 @@ def test_psycopg_pool_swallows_cancellation_when_a_connection_arrives_at_the_sam
 
 
 class SwallowsCancellation(Hook):
-    """模拟"限流 Hook 调 Redis 时取消被吞掉"：before_llm 里等一会儿，期间的取消当作没发生。"""
+    """模拟"限流 Hook 调 Redis 时取消被吞掉"：before_llm 里等一会儿，期间的取消当作没发生（不调用 uncancel）。"""
 
     def __init__(self):
         self.swallowed = 0
@@ -118,7 +123,7 @@ class SwallowsCancellation(Hook):
                 self.swallowed += 1
 
 
-def make_agent(fence: CancellationFence | None):
+def make_agent():
     executed = []
 
     @tool(risk="write")
@@ -137,51 +142,52 @@ def make_agent(fence: CancellationFence | None):
         return call_tool("search_kb", q="vpn") if done == 0 else call_tool("create_ticket", title="VPN") if done == 1 else reply("好了")
 
     swallow = SwallowsCancellation()
-    hooks = ([fence] if fence else []) + [swallow]
     agent = AsyncAgent(AsyncScriptedLLM(responder=respond, latency=0.01), [search_kb, create_ticket],
-                       checkpointer=InMemoryCheckpointer(), hooks=hooks)
+                       checkpointer=InMemoryCheckpointer(), hooks=[swallow])
     return agent, swallow, executed
 
 
-async def disconnect_after_first_tool(agent, fence, run_id: str, register: bool):
-    """模拟 API：客户端读到第一个 tool_finished 就断开；API 登记 abandoned（可选）并取消运行。"""
+async def disconnect_after_first_tool(agent, run_id: str):
+    """模拟 API：客户端读到第一个 tool_finished 就断开 → aclosing 取消运行；此刻运行正卡在"会吞掉取消"的 Hook 里。"""
     async with contextlib.aclosing(agent.stream("VPN 连不上，帮我提工单", run_id=run_id)) as events:
         async for e in events:
             if isinstance(e, ToolFinished):
-                if register:
-                    fence.abandon(run_id)
-                break  # aclosing → 取消运行任务；此刻运行正卡在"会吞掉取消"的 Hook 里
+                break
     return agent.checkpointer.load(run_id)
 
 
-def test_without_the_fence_a_swallowed_cancellation_lets_the_run_finish():
+def swallowed_metric() -> float:
+    from production.service.telemetry import SWALLOWED_CANCELS
+
+    return SWALLOWED_CANCELS._value.get()
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="框架的检查依赖 Task.cancelling()（3.11 新增）；3.10 上检查关闭")
+def test_framework_re_raises_a_swallowed_cancellation_before_the_next_step():
+    from production.service.runtime import install_swallowed_cancel_counter
+
+    install_swallowed_cancel_counter()
+    before = swallowed_metric()
+
     async def main():
-        agent, swallow, executed = make_agent(None)
-        return await disconnect_after_first_tool(agent, None, "r-1", False), swallow, executed
+        agent, swallow, executed = make_agent()  # 注意：没有任何服务侧的"取消闸门"
+        return await disconnect_after_first_tool(agent, "r-fw"), swallow, executed
+
+    state, swallow, executed = asyncio.run(main())
+    assert swallow.swallowed == 1  # 取消确实被吞掉了
+    assert state.status == "cancelled" and executed == []  # 调模型之前就补抛了：工单没建
+    assert swallowed_metric() == before + 1  # 服务把框架的 warning 记成了指标
+
+
+def test_control_group_without_the_framework_check_the_run_finishes(monkeypatch):
+    import agentkit.aio.agent as aio_agent
+
+    monkeypatch.setattr(aio_agent, "_raise_if_cancel_swallowed", lambda: None)
+
+    async def main():
+        agent, swallow, executed = make_agent()
+        return await disconnect_after_first_tool(agent, "r-ctl"), swallow, executed
 
     state, swallow, executed = asyncio.run(main())
     assert swallow.swallowed == 1
-    assert state.status == "completed" and executed == ["VPN"]  # 用户早走了，工单照样建了
-
-
-@pytest.mark.skipif(sys.version_info < (3, 11), reason="Task.cancelling() 是 3.11 新增的")
-def test_fence_notices_the_pending_cancellation_by_itself():
-    async def main():
-        fence = CancellationFence()
-        agent, swallow, executed = make_agent(fence)
-        return await disconnect_after_first_tool(agent, fence, "r-2", register=False), swallow, executed, fence
-
-    state, swallow, executed, fence = asyncio.run(main())
-    assert swallow.swallowed == 1
-    assert state.status == "cancelled" and executed == []  # 下一个步骤边界（调工具前）就停了，工单没建
-
-
-def test_fence_stops_a_run_registered_as_abandoned():
-    async def main():
-        fence = CancellationFence()
-        agent, swallow, executed = make_agent(fence)
-        return await disconnect_after_first_tool(agent, fence, "r-3", register=True), swallow, executed, fence
-
-    state, swallow, executed, fence = asyncio.run(main())
-    assert state.status == "cancelled" and executed == []
-    assert fence.ids == {}  # 运行结束时清理，不会无限增长
+    assert state.status == "completed" and executed == ["VPN"]  # 用户早就走了，工单照样建了（修复前压测里看到的样子）

@@ -107,7 +107,9 @@ def _raise_if_cancel_swallowed() -> None:
     baseline = _cancel_baseline.get()
     now = _cancelling()
     if baseline is not None and now is not None and now > baseline:
-        logger.warning("取消请求被下游吞掉（Task.cancelling()=%d > 基线 %d），在步骤边界补抛", now, baseline)
+        # extra 里的 agentkit_event 是给运维用的稳定字段（例如计成指标），不要按日志措辞匹配
+        logger.warning("取消请求被下游吞掉（Task.cancelling()=%d > 基线 %d），在步骤边界补抛", now, baseline,
+                       extra={"agentkit_event": "swallowed_cancellation"})
         raise asyncio.CancelledError("取消请求被依赖库吞掉，在步骤边界补抛")
 
 

@@ -43,4 +43,4 @@ packages = ["agentkit", "agentkit.aio", "agentkit.contrib"]
 [tool.pytest.ini_options]
 # importlib 模式：允许多个课程目录里都有同名的 test_exercise.py
 addopts = "--import-mode=importlib -q"
-testpaths = ["tests", "lessons", "capstone"]
+testpaths = ["tests", "lessons", "capstone", "production"]

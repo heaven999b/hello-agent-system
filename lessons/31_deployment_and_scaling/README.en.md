@@ -10,18 +10,18 @@
 
 **Scaling isn't hard because you have to start more processes. It's hard because processes get killed, replaced, and cancelled at any moment, and the system still must not lose work, duplicate side effects, or waste money. So this lesson's deliverable isn't lecture notes: it's a reference service plus a load test and fault-injection harness that tries to break it.**
 
-First, an honest note on the teaching version's limits: `agentkit` is single-process. [Lesson 12](../12_production_architecture/README.en.md) drew the reference architecture, [Lesson 13](../13_distributed_concurrency/README.en.md) explained leases and fencing with SQLite, [Lesson 16](../16_release_ops/README.en.md) covered canaries and rollbacks, and Lessons 26–30 swapped each component for a mature implementation. But no lesson **put them together, ran them across several processes, and then deliberately killed some of them**. That step is where things break: every component passed its own tests, yet the assembled system showed four problems that no individual test could find (Section 3.6).
+First, an honest note on the teaching version's limits: `agentkit` is single-process. [Lesson 12](../12_production_architecture/README.en.md) drew the reference architecture, [Lesson 13](../13_distributed_concurrency/README.en.md) explained leases and fencing with SQLite, [Lesson 16](../16_release_ops/README.en.md) covered canaries and rollbacks, and Lessons 26–30 swapped each component for a mature implementation. But no lesson **put them together, ran them across several processes, and then deliberately killed some of them**. That step is where things break: every component passed its own tests, yet the assembled system showed four problems that no individual test could find (Section 3.6); three of them were in the framework, and the maintainers have fixed them and added regression tests.
 
 An analogy: the earlier lessons built the engine, the gearbox, and the brakes, and tested each on a bench. This lesson assembles the car, takes it on the highway, and blows a tire on purpose.
 
 | Capability | Where the component comes from | How this lesson wires it into the service | Evidence (Section 3) |
 |---|---|---|---|
-| Checkpoints and queue shared across processes | Lesson 26, Postgres | The API and 3 worker processes share one database; fences are converted to run scope | After kill -9 the job is taken over: finished in 3.4–3.8 s in e2e (lease 3 s) |
-| Async runtime, streaming, cancellation | Lesson 30, `AsyncAgent` | Interactive SSE runs inside the API process; disconnect means cancel | All 68 disconnects recorded as `cancelled`; about 30 ms from disconnect to checkpoint |
-| Idempotency | Lessons 08, 26 | Redis idempotency cache + `UNIQUE (tenant_id, idempotency_key)` on the ticket table | 368 tickets match their calls one to one; 3 replays stopped by the unique constraint |
+| Checkpoints and queue shared across processes | Lesson 26, Postgres | The API and 3 worker processes share one database; fences come from a global sequence | After kill -9 the job is taken over: finished in 3.2–3.8 s in e2e (lease 3 s) |
+| Async runtime, streaming, cancellation | Lesson 30, `AsyncAgent` | Interactive SSE runs inside the API process; disconnect means cancel | All 70 disconnects recorded as `cancelled`; about 30 ms from disconnect to checkpoint |
+| Idempotency | Lessons 08, 26 | Redis idempotency cache + `UNIQUE (tenant_id, idempotency_key)` on the ticket table | 372 tickets match their calls one to one; 3 replays stopped by the unique constraint |
 | Rate limits, bulkheads | Lessons 26, 30 | Per-tenant Redis token bucket (429 + `Retry-After`) + `KeyedLimiter` | 510 of the noisy tenant's 571 submissions got 429; other tenants got 0 |
 | Tracing, metrics | Lesson 28 | traceparent travels with the job through the queue; Prometheus multiprocess aggregation | API and worker spans share one trace; 5 metrics match the database exactly |
-| Policy, guardrails, gateway | Lesson 29 | Cedar decides approvals, a regex classifier blocks inputs, the LiteLLM Router calls the model | 148 double-clicked approvals, each enqueued once |
+| Policy, guardrails, gateway | Lesson 29 | Cedar decides approvals, a regex classifier blocks inputs, the LiteLLM Router calls the model | 149 double-clicked approvals, each enqueued once |
 
 ## 1. Why the teaching implementation isn't enough: from "it runs" to "it holds up"
 
@@ -96,7 +96,7 @@ sequenceDiagram
 | [`service/config.py`](../../production/service/config.py) | 12-factor: all configuration comes from environment variables and is validated at startup (for example, the heartbeat must be ≤ half the lease); fail fast on errors |
 | [`service/runtime.py`](../../production/service/runtime.py) | Wiring shared by the API and the worker: connection pool, Redis, model, tools, hooks, checkpointer, queue, events |
 | [`service/api.py`](../../production/service/api.py) | FastAPI: interactive SSE, background jobs, approvals, `/healthz`, `/readyz`, `/metrics` |
-| [`service/worker.py`](../../production/service/worker.py) | `run_async_worker` + `AgentJobHandler`, release on shutdown, fence conversion, health probes |
+| [`service/worker.py`](../../production/service/worker.py) | `run_async_worker` + `AgentJobHandler`, release on shutdown, health probes |
 | [`service/backend.py`](../../production/service/backend.py), [`tools.py`](../../production/service/tools.py) | The IT help desk's business tables and tools (all in Postgres, shared across processes) |
 | [`run_local.py`](../../production/run_local.py) | One-command local start without Docker: embedded Postgres + fakeredis + 1 API + N workers |
 | [`loadtest.py`](../../production/loadtest.py) | Load test, fault injection, item-by-item verification |
@@ -105,7 +105,7 @@ sequenceDiagram
 ```bash
 python production/run_local.py                          # offline scripted model, 3 workers; prints URLs, demo keys, curl examples
 python production/loadtest.py --users 20 --duration 60  # load test + kill -9 + rolling restart + verification
-.venv/bin/python -m pytest production/tests             # 22 tests, about 20 s
+.venv/bin/python -m pytest production/tests             # 21 tests, about 19 s
 ```
 
 ### 2.2 Identity, rate limits, bulkheads
@@ -129,16 +129,16 @@ Two details: a blocking read (`XREAD BLOCK`) holds a Redis connection, so it use
 
 1. `continue_trace(payload["trace"])` joins the trace started by the API and wraps the job in a CONSUMER span (option B of Problem 6 in [Lesson 28](../28_production_observability/README.en.md)).
 2. `AgentJobHandler` pairs the **single** `AsyncAgent` in the process with a checkpoint view carrying this claim's fence (the usage recommended by the latest Lesson 26 version: share the agent, the executor, and the model client, and pass `checkpointer=` on each call).
-3. Hooks, in order: cancellation fence → `OTelTracer` → input guardrail → `PrometheusHook` → `AsyncRateLimitHook` (Redis token bucket; if no token arrives in time it's `rate_limited` → `RetryLater`) → `CedarPolicy` (dangerous tools pause for approval) → event publisher.
+3. Hooks, in order: `OTelTracer` → input guardrail → `PrometheusHook` → `AsyncRateLimitHook` (Redis token bucket; if no token arrives in time it's `rate_limited` → `RetryLater`) → `CedarPolicy` (dangerous tools pause for approval) → event publisher.
 4. Write tools are idempotent in two layers: the Redis idempotency cache (saves a call) plus the unique constraint on the ticket table (the backstop). Every side-effect attempt writes a row to `side_effect_attempts`, so after a load test we can prove that "replays happened, and they were stopped".
 5. **Release on shutdown**: jobs still running when the grace period ends are cancelled, `AsyncAgent` records the checkpoint as `cancelled` (write tools stay unanswered), and the worker immediately calls `release`, so another worker takes over at once and replays with the same call_id. `run_async_worker` by default "neither commits nor releases, and waits for the lease to expire", which is more conservative but slower; release checks the fence, so it's safe. Releasing doesn't consume a retry attempt (the e2e test asserts `attempts` is still 1).
-6. **Fence conversion**: see Finding 2 in 3.6.
+6. **Fences**: every claim takes a fresh value from a sequence shared by the whole queue table (`nextval`, globally monotonic), so a later job for the same run (the resume after approval, or a user clicking "continue") can always take over the checkpoint. When this lesson was written, fences were still counted per job and the service worked around that with a conversion; after the framework fix the workaround was removed (Finding 2 in 3.6).
 
 ### 2.5 Health checks and metrics
 
 - API: `/healthz` only says the process and its event loop are alive and **doesn't check the database**. If the database hiccups, every Pod's liveness probe fails at once and they all restart together, turning a small incident into a full outage. `/readyz` checks Postgres and Redis; when it fails the Pod is taken out of the Service but not restarted. The Kubernetes docs draw the same line: liveness looks only at whether the app itself is healthy, while readiness also checks that the back-end services it depends on are available.
 - Worker: `/healthz` and `/readyz` are answered **by the event loop itself** (a 30-line asyncio TCP server). If synchronous code blocks the event loop, the probe times out, liveness fails, and the Pod restarts. `/metrics` is served by prometheus_client on a separate thread and keeps returning 200 even when the event loop is stuck, so **it can't be used for liveness**. While draining, `/readyz` returns 503.
-- Metrics: `PrometheusHook` covers agent-level metrics; the service adds HTTP requests, 429s (by layer), SSE connections, worker job events, and cancellation-fence firings. Locally, multiple processes are aggregated with prometheus_client's multiprocess mode: counters live in mmap files in a shared directory, so **counts survive kill -9** (measured in this lesson); when a process exits, `run_local` calls `mark_process_dead` to drop its live gauges. In Kubernetes each Pod runs one process, Prometheus scrapes each one, and `rate()` handles the reset after a restart.
+- Metrics: `PrometheusHook` covers agent-level metrics; the service adds HTTP requests, 429s (by layer), SSE connections, worker job events, and the number of "cancellations swallowed by a dependency and re-raised by the framework" (`itdesk_swallowed_cancellations_total`, counted by a logging handler from the framework's warning). Locally, multiple processes are aggregated with prometheus_client's multiprocess mode: counters live in mmap files in a shared directory, so **counts survive kill -9** (measured in this lesson); when a process exits, `run_local` calls `mark_process_dead` to drop its live gauges. In Kubernetes each Pod runs one process, Prometheus scrapes each one, and `rate()` handles the reset after a restart.
 
 ### 2.6 12-factor configuration
 
@@ -164,56 +164,56 @@ python production/loadtest.py --users 20 --duration 60 --json report.json
 
 ### 3.1 Test environment
 
-Apple M1 (8 cores), 8 GB RAM, macOS 14.4.1, CPython 3.11.7; fastapi 0.141.1, uvicorn 0.54.0, starlette 1.7.0, psycopg 3.3.6, psycopg_pool 3.3.3, redis-py 8.1.0, fakeredis 2.38.0, pgserver 0.1.4 (Postgres 16.2). **To be upfront**: every process (Postgres, fakeredis, the API, 3–5 workers, the load-test client) runs on the same machine, alongside other jobs; the load average at the start was between 4.4 and 6.4. The offline model takes 300 ms ± 30% per call, the diagnostics tool 1.5 s, and the ticket system's response 400 ms. Locally the lease is 6 s and the grace period 1 s (much shorter than production, so fault injection shows its effect within a minute). The load test is **closed-loop**: each user waits for the previous request to finish before sending the next one (see Problem card 6 for the limitation).
+Apple M1 (8 cores), 8 GB RAM, macOS 14.4.1, CPython 3.11.7; fastapi 0.141.1, uvicorn 0.54.0, starlette 1.7.0, psycopg 3.3.6, psycopg_pool 3.3.3, redis-py 8.1.0, fakeredis 2.38.0, pgserver 0.1.4 (Postgres 16.2). **To be upfront**: every process (Postgres, fakeredis, the API, 3–5 workers, the load-test client) runs on the same machine, alongside other jobs; the load average at the start was between 4.4 and 10.4 (each table states the load at the time). The offline model takes 300 ms ± 30% per call, the diagnostics tool 1.5 s, and the ticket system's response 400 ms. Locally the lease is 6 s and the grace period 1 s (much shorter than production, so fault injection shows its effect within a minute). The load test is **closed-loop**: each user waits for the previous request to finish before sending the next one (see Problem card 6 for the limitation).
 
-### 3.2 End-to-end tests: 22 tests, about 20 s
+### 3.2 End-to-end tests: 21 tests, about 19 s
 
 [`production/tests/`](../../production/tests/test_e2e.py) starts **real processes**: 1 uvicorn API, 3 workers, embedded Postgres, fakeredis. Every test proves its point with state rather than "it ran".
 
 | Scenario | How it's proven | Measured |
 |---|---|---|
 | Background run end to end + approval | Nothing runs before approval; an employee can't approve their own request; an approver clicks twice at once, both requests return 202, and the job table contains exactly one resume | Pass |
-| Approval after the run job was taken over | The test plays a worker that claims the job and crashes; a real worker takes over with fence=2; the later resume job must succeed on its first claim | Pass (refused before the fix; see 3.6) |
-| SSE disconnect → cancel | Disconnect as soon as `run_diagnostics` starts; the checkpoint says `cancelled`, and 1.5 s later still no ticket; after `POST /resume` a worker finishes it with exactly one ticket | 26–29 ms from disconnect to checkpoint (several runs) |
-| Worker killed with kill -9 | kill -9 while the ticket tool has inserted the ticket and is waiting on the downstream response; another worker takes over with fence=2 | Done in 3.4–3.8 s (lease 3 s); 1 ticket; `side_effect_attempts` shows inserted 1, deduplicated 1 |
+| Approval after the run job was taken over | The test plays a worker that claims the job and crashes; a real worker takes over with a larger fence; the later resume job must take over on its first claim (larger fence, `attempts=1`, no `ownership_lost`) | 0.91 s from approval to done (before the framework fix it waited an extra lease; see 3.6) |
+| SSE disconnect → cancel | Disconnect as soon as `run_diagnostics` starts; the checkpoint says `cancelled`, and 1.5 s later still no ticket; after `POST /resume` a worker finishes it with exactly one ticket | 26–31 ms from disconnect to checkpoint (several runs) |
+| Worker killed with kill -9 | kill -9 while the ticket tool has inserted the ticket and is waiting on the downstream response; another worker takes over with a larger fence | Done in 3.2–3.8 s (lease 3 s); 1 ticket; `side_effect_attempts` shows inserted 1, deduplicated 1 |
 | Rolling restart | 3 old workers get SIGTERM one by one "while creating a ticket" (grace 0.3 s < downstream 0.8 s) | All exit with code 0; cancelled jobs are released at once, taken over, replayed, and deduplicated by the unique constraint; exactly one ticket per run; `attempts` still 1 |
 | Tenant isolation | Another tenant reading the run, reading its events, or approving it gets 404; the forged cross-tenant job is rejected by the worker | Pass |
 | Rate limits | The noisy tenant fires 6 requests at once; at least 3 get 429 with `Retry-After`; the same tenant's third interactive stream gets 429 | Pass |
 | Trace across the queue | The client sends a traceparent; the API's PRODUCER span and the worker's CONSUMER span are in the same trace with the right parent-child link, across processes | Pass |
 
-Plus 8 deployment-config checks and 5 cancellation tests (Finding 3 in 3.6).
+Plus 8 deployment-config checks and 4 cancellation tests (Finding 3 in 3.6).
 
 ### 3.3 Load test + fault injection (main scenario)
 
-20 users for 60 s, 3 workers × concurrency 8. At 35% of the run, the worker holding the most jobs gets kill -9 and a replacement is started; at 65%, one worker is rolled: start a new one first, then send SIGTERM to the old one once the new one is ready.
+20 users for 60 s, 3 workers × concurrency 8. At 35% of the run, the worker holding the most jobs gets kill -9 and a replacement is started; at 65%, one worker is rolled: start a new one first, then send SIGTERM to the old one once the new one is ready. These are the numbers re-measured after the framework fixes (Section 7), with a load average of 6.7 at the start.
 
 | Kind | n | OK | p50 | p95 | p99 | TTFT p50 | Queue p50 |
 |---|---|---|---|---|---|---|---|
-| Interactive Q&A (SSE until done) | 367 | 367 | 0.62 s | 0.74 s | 0.78 s | 0.61 s | — |
-| Interactive, disconnect midway | 68 | 68 | 0.30 s | 0.40 s | 0.41 s | — | — |
-| Background ticket | 214 | 214 | 1.08 s | 1.20 s | 1.25 s | — | 0.02 s |
-| Background long job (diagnose + ticket) | 154 | 154 | 3.49 s | 3.82 s | **9.68 s** | — | 0.02 s |
-| Background password reset (wait for approval → double-click approve → done) | 148 | 148 | 1.09 s | 1.26 s | 1.30 s | — | 0.02 s |
+| Interactive Q&A (SSE until done) | 373 | 373 | 0.64 s | 0.76 s | 0.78 s | 0.63 s | — |
+| Interactive, disconnect midway | 70 | 70 | 0.32 s | 0.40 s | 0.44 s | — | — |
+| Background ticket | 216 | 216 | 1.05 s | 1.18 s | 1.22 s | — | 0.02 s |
+| Background long job (diagnose + ticket) | 156 | 156 | 3.49 s | 3.73 s | **9.26 s** | — | 0.02 s |
+| Background password reset (wait for approval → double-click approve → done) | 149 | 149 | 1.09 s | 1.24 s | 1.26 s | — | 0.02 s |
 | Noisy tenant submissions (quota 1/s) | 571 | 61 | — | — | — | — | — |
 
-1522 requests in total, 24.0 requests/s, 0% errors, 33.5% 429s (**all** from the noisy tenant). Fault-injection timeline:
+1535 requests in total, 24.2 requests/s, 0% errors, 33.2% 429s (**all** from the noisy tenant). Fault-injection timeline:
 
 | Time | Event | Result |
 |---|---|---|
-| 21.0 s | kill -9 worker-0, which held 7 jobs | Replacement ready 1.8 s later; the 7 jobs were taken over after the lease (6 s) expired. The long job's p99 went from a p50 of 3.5 s to 9.7 s, and the extra time is exactly "waiting for the lease" |
-| 41.3 s | SIGTERM worker-3 (holding 8 jobs) | Exited in 1.72 s with code 0: 4 finished within the grace period, 4 were cancelled → released at once → taken over |
+| 21.0 s | kill -9 worker-1, which held 6 jobs | Replacement ready 1.4 s later; the 6 jobs were taken over after the lease (6 s) expired. The long job's p99 went from a p50 of 3.5 s to 9.3 s, and the extra time is exactly "waiting for the lease" |
+| 40.6 s | SIGTERM worker-0 (holding 6 jobs) | Exited in 1.09 s with code 0: 2 finished within the grace period, 4 were cancelled → released at once → taken over |
 
 Verification (after the test, query Postgres directly + read `/metrics`):
 
 | Check | Result |
 |---|---|
-| Every run reached a terminal or explainable state | ✅ 944 completed, 68 cancelled (all disconnected by the client) |
-| No duplicated side effects: every `create_ticket` call maps to exactly one ticket | ✅ 368 tickets, 368 inserts; **3 replays stopped by the unique constraint** |
-| Disconnected interactive runs are `cancelled` in the checkpoint | ✅ 68/68; 2 of them were caught by the cancellation fence (Finding 3 in 3.6) |
-| Metrics match reality | ✅ completed 944=944, succeeded jobs 725=725, paused 148=148, cancelled segments 72=72 (68 disconnects + 4 shutdown cancels), 429s 510=510 |
-| No job in the dead-letter state | ✅ |
+| Every run reached a terminal or explainable state | ✅ 955 completed, 70 cancelled (all disconnected by the client) |
+| No duplicated side effects: every `create_ticket` call maps to exactly one ticket | ✅ 372 tickets, 372 inserts; **3 replays stopped by the unique constraint** |
+| Disconnected interactive runs are `cancelled` in the checkpoint | ✅ 70/70 |
+| Metrics match reality | ✅ completed 955=955, succeeded jobs 731=731, paused 149=149, cancelled segments 74=74 (70 disconnects + 4 shutdown cancels), 429s 510=510 |
+| No job in the dead-letter state | ✅; 10 more claim events than jobs (6 reclaimed after kill -9, 4 released on shutdown, all claimed again) |
 
-148 double-clicked approvals, each enqueued exactly one resume.
+149 double-clicked approvals, each enqueued exactly one resume. The same scenario before the framework fixes (load average 4.4) gave nearly identical numbers: 1522 requests, 24.0 requests/s, long-job p99 9.68 s, all 5 checks passing.
 
 ### 3.4 Capacity: Little's Law, measured
 
@@ -230,27 +230,44 @@ A "segment" is one claim-to-finish on a worker (the approval flow has two). W is
 
 ### 3.5 When the bottleneck is the model quota
 
-Cap each tenant's model calls at 4/s (`--env LLM_RATE_PER_SEC=4 --env LLM_BURST=4`), everything else unchanged (3 × 4):
+Cap each tenant's model calls at 4/s (`--env LLM_RATE_PER_SEC=4 --env LLM_BURST=4`), everything else unchanged (3 × 4). Re-measured after the framework fixes, with a load average of 10.4 at the start (a busy machine, so latencies run high):
 
 | Kind | OK / total | p50 | p95 | Notes |
 |---|---|---|---|---|
-| Interactive Q&A | 26 / 58 | 2.25 s | 5.73 s | 32 waited about 2 s, got no token, and ended `rate_limited` (an error for the user) |
-| Background ticket | 35 / 35 | 6.48 s | 15.53 s | All completed; background jobs were deferred 52 times in total (`RetryLater`: back to the queue, not holding a worker) |
-| Background long job | 18 / 19 | 11.29 s | 21.41 s | 1 ended with `max_steps`: **deferral consumes steps** (Finding 4 in 3.6) |
+| Interactive Q&A | 35 / 57 | 1.70 s | 3.86 s | 22 waited about 2 s, got no token, and ended `rate_limited` (an error for the user) |
+| Background ticket | 35 / 35 | 5.52 s | 13.95 s | All completed; background jobs were deferred 73 times in total (`RetryLater`: back to the queue, not holding a worker) |
+| Background long job | 18 / 18 | 12.22 s | 25.48 s | All completed. Before the fix, under the same load, 1 ended with `max_steps`: **deferral consumed steps** (Finding 4 in 3.6, now fixed in the framework) |
 
-Both runs are "slow", for completely different reasons: in 3.4 the bottleneck was worker slots (7 s of queueing; more workers fix it); here worker slot utilization is 89% but jobs spend most of their time waiting for tokens, so more workers won't help. You need more quota from the gateway, or a reserved share of the quota for interactive traffic. Exercise (c) turns this diagnosis into code.
+Both runs are "slow", for completely different reasons: in 3.4 the bottleneck was worker slots (7 s of queueing; more workers fix it); here worker slot utilization is 88% but jobs spend most of their time waiting for tokens, so more workers won't help. You need more quota from the gateway, or a reserved share of the quota for interactive traffic. Exercise (c) turns this diagnosis into code.
 
 ### 3.6 Counterintuitive findings: correct in isolation, broken once assembled
 
 **Finding 1: authorizing inside the SSE generator gives other tenants "200 + an empty stream".** A FastAPI SSE endpoint is a generator, and **its body starts running only after the response headers (200) have been sent**. `GET /v1/runs/{id}/events` originally checked ownership inside the generator; the e2e test found that another tenant got a 200 with an empty stream instead of a 404. Fix: move the ownership check into a dependency (`Depends(visible_run)`), which runs before the response starts.
 
-**Finding 2: the fence's scope doesn't match the resource it protects, so the resume job after approval is rejected as a "stale holder".** The queue's fence counts from 1 **per job**, but the checkpoint's fence protects **the whole run**. From the load-test log: after the run job was killed with kill -9 and taken over with fence=2, the checkpoint's fence became 2; the resume job created by the approval then started at fence=1 and was rejected when it loaded the checkpoint (`CheckpointConflict`). `run_async_worker` treats that as "ownership moved", commits nothing, and leaves the job leased until the lease expires; only when the job is reclaimed and its fence counts up to 2 does it succeed. That cost an extra 6 s here; if the run job had been taken over more times than `max_attempts`, the resume job would go straight to the dead-letter state and the approval would be lost. Fix (in the service, without changing contrib): `RunScopedFences` converts the checkpoint fence to `job_id × 10^6 + job.fence`, so a job enqueued later for the same run always wins; and "holding the lease but hitting a checkpoint conflict" is explicitly treated as "superseded by a newer job" (`PermanentJobError`, no retry). The regression test `test_approval_resume_is_not_refused_after_the_run_job_was_taken_over` times out and fails without the fix.
+Findings 2, 3, and 4 were in the framework. They were reported to the maintainers and fixed at the framework level, and the service's workarounds were removed. Each is recorded below as "symptom → root cause → fix → regression test → re-test"; Section 7 has the summary.
 
-**Finding 3: a third-party library swallowed the cancellation; the user closed the page and the ticket was created anyway.** Before the fix, across twenty-odd load tests (about 540 disconnects in total), "the client disconnected but the run finished" happened 5 times, about 1%. The logs showed that the server noticed the disconnect within 1 ms and cancelled the run, yet the run still finished. Instrumenting every hook boundary with `Task.cancelling()` located the loss inside `AsyncRateLimitHook` while it called Redis: redis-py 8.1.0 sends every command through `send_packed_command` → `asyncio.wait_for`. Before Python 3.12, `asyncio.wait_for` has a known race ([CPython gh-86296](https://github.com/python/cpython/issues/86296)): if the awaited operation finishes and an outside cancellation arrives in the same event-loop iteration, it returns the result and swallows the cancellation. 3.12 rewrote `wait_for` on top of `asyncio.timeout` ([gh-96764](https://github.com/python/cpython/issues/96764)), but the rewrite wasn't backported. Micro-benchmarks on 3.11.7: cancelling while a redis-py command is in flight is **swallowed about 20%–25% of the time**; in psycopg_pool 3.3.3, handing over a connection at the same moment the waiter is cancelled is **swallowed 20/20 times** (its `ACondition.wait_timeout` also uses `asyncio.wait_for`). `agentkit.aio` itself already switched to a cancellation-safe `wait_for`, but it can't fix its dependencies. The fix has two layers:
-1. The real fix: use Python 3.12+ in the production image (the Dockerfile now does);
-2. Defense in depth: a `CancellationFence` hook, first in the list. At every step boundary (before calling the model or a tool) it checks two things: `Task.cancelling() > 0` (a cancellation was requested but never delivered; 3.11+), or the API has marked the run as "client gone". If either holds, it raises `CancelledError` and `AsyncAgent` handles it as a cancellation. After the fix, 6 consecutive load tests (164 disconnects) all ended `cancelled`, and the fence caught 2 of them. It also exports a metric, `itdesk_cancellation_fence_total`: **if it's not 0, some dependency is swallowing cancellations**.
+**Finding 2: the fence's scope doesn't match the resource it protects, so the resume job after approval is rejected as a "stale holder" (fixed in the framework).**
+- Symptom: in the load-test log, after the run job was killed with kill -9 and taken over with fence=2, the checkpoint's fence became 2; the resume job created by the approval then started at fence=1 and was rejected when it loaded the checkpoint (`CheckpointConflict`). `run_async_worker` treats that as "ownership moved", commits nothing, and leaves the job leased; it succeeded only after a lease expired and a new claim counted its fence up to 2. That cost an extra 6 s here; if the run job had been taken over more times than `max_attempts`, the resume job would have gone straight to the dead-letter state and the approval would have been lost.
+- Root cause: the queue's fence counted from 1 **per job** (`fence = fence + 1`), but the checkpoint's fence protects **the whole run**, and one run has several jobs over its lifetime.
+- Fix (`agentkit/contrib/postgres.py`): claiming now sets `fence = nextval('<table>_fence_seq')`, one sequence shared by the whole queue table, globally monotonic; `setup()` creates the sequence, and when upgrading an old table the sequence continues after the largest existing fence.
+- Regression tests: `test_fence_is_global_so_a_later_job_for_the_same_run_can_take_over`, `test_upgrading_from_per_job_fences_continues_after_the_largest_existing_fence` (`tests/contrib/test_postgres.py`).
+- Service side: the workaround is gone (`RunScopedFences`, which converted the fence to `job_id × 10^6 + job.fence`, and the special handling that treated these conflicts as "superseded"); the worker uses `job.fence` directly.
+- Re-test: the e2e test `test_approval_resume_is_not_refused_after_the_run_job_was_taken_over` builds the same scenario; the resume job takes over on its first claim (`attempts=1`, a larger fence than the run job that took over), 0.91 s from approval to done (lease 3 s); no `ownership_lost` in the main load test.
 
-**Finding 4: being deferred by the rate limiter also consumes `max_steps`.** `AsyncAgent` does `state.step += 1` before calling the model, so when the rate-limit hook in `before_llm` raises `StopRun("rate_limited")`, the step counts even though the model was never called. Combined with `AgentJobHandler`'s `RetryLater`, every deferral burns a step. Reproduction: `max_steps=3`, the rate-limit hook refuses 3 times in a row, and the 4th resume ends immediately with `max_steps` without a single model call. One long job in the 3.5 load test failed this way. This is in the agentkit core and has been reported to the maintainers (Section 7).
+**Finding 3: a dependency swallowed the cancellation; the user closed the page and the ticket was created anyway (fixed in the framework).**
+- Symptom: across twenty-odd load tests before the fix (about 540 disconnects in total), "the client disconnected but the run finished" happened 5 times, about 1%. The logs showed that the server noticed the disconnect within 1 ms and cancelled the run, yet the run still finished.
+- Root cause: instrumenting every hook boundary with `Task.cancelling()` located the loss inside `AsyncRateLimitHook` while it called Redis: redis-py 8.1.0 sends every command through `send_packed_command` → `asyncio.wait_for`. Before Python 3.12, `asyncio.wait_for` has a known race ([CPython gh-86296](https://github.com/python/cpython/issues/86296)): if the awaited operation finishes and an outside cancellation arrives in the same event-loop iteration, it returns the result and swallows the cancellation. 3.12 rewrote `wait_for` on top of `asyncio.timeout` ([gh-96764](https://github.com/python/cpython/issues/96764)), but the rewrite wasn't backported. Micro-benchmarks on 3.11.7: cancelling while a redis-py command is in flight is **swallowed about 20%–25% of the time**; in psycopg_pool 3.3.3, handing over a connection at the same moment the waiter is cancelled is **swallowed 20/20 times** (its `ACondition.wait_timeout` also uses `asyncio.wait_for`). `agentkit.aio` itself already used a cancellation-safe `wait_for`, but it can't fix its dependencies.
+- Fix (`_raise_if_cancel_swallowed` in `agentkit/aio/agent.py`): on entering a run, record `Task.cancelling()` as a baseline; check it "before calling the model (after `before_llm`)" and "before executing a tool (after `before_tool`)". If the count has grown, someone swallowed a cancellation, so re-raise `CancelledError` and log a warning; a swallowed `run_timeout` cancellation is re-raised too and still ends as a timeout. 3.10 has no `cancelling()`, so the check turns itself off there.
+- Regression tests: `test_cancel_swallowed_by_a_dependency_is_re_raised_before_side_effects[llm/tool]`, `test_run_timeout_swallowed_by_a_dependency_still_times_out` (`tests/test_aio.py`).
+- Service side: the old `CancellationFence` hook is gone (it did the same thing, plus an in-process "abandoned" registry, and the framework now handles both). The service keeps only two things: a Python 3.12+ production image (Dockerfile), which removes the race at its root; and a logging handler that turns the framework's warning into the metric `itdesk_swallowed_cancellations_total`. **If it's not 0, some dependency is swallowing cancellations.** [`test_cancellation.py`](../../production/tests/test_cancellation.py) keeps the two dependency reproductions, plus a pair of control tests: with the same "swallowing" hook, the framework check stops the run at the next step boundary, no ticket is created, and the metric goes up by one; with the check replaced by a no-op, the run finishes and the ticket gets created anyway.
+- Re-test: after the fix, 7 load tests (main scenario, demo, 4 short runs, the quota run) with 180 disconnects in total all ended `cancelled`, and the metric stayed at 0 in each (for a ~1% race, not hitting it in a sample this size isn't surprising); a dedicated disconnect storm of 400 (disconnect after the first tool result) all ended `cancelled`, with the framework re-raising 1 swallowed cancellation. One correction: an earlier version of this section said "the service-side fence caught 2". That count included runs "registered as abandoned", which can also be the benign case where the registration simply arrived before the cancellation was delivered, so not all of them were swallowed cancellations. The current metric only counts cases where `cancelling()` actually grew.
+
+**Finding 4: being deferred by the rate limiter also consumed `max_steps` (fixed in the framework).**
+- Symptom: in the 3.5 load test, one long job ended with `max_steps`. Reproduction: `max_steps=3`, the rate-limit hook refuses 3 times in a row, and the 4th resume ends immediately with `max_steps` without a single model call.
+- Root cause: `AsyncAgent` did `state.step += 1` at the top of the loop, so when the rate-limit hook in `before_llm` raised `StopRun("rate_limited")`, the step counted even though the model was never called; combined with `AgentJobHandler`'s `RetryLater`, every deferral burned a step.
+- Fix (`agentkit/agent.py` and `agentkit/aio/agent.py`): `state.step += 1` moved into `_call_llm`, after `before_llm` and `visible_tools` and right before the model call. A step stopped by a hook doesn't count.
+- Regression tests: `test_deferred_steps_do_not_consume_max_steps` (one each in `tests/test_agentkit.py` and `tests/test_aio.py`).
+- Re-test: in the same quota load test, background jobs were deferred 73 times (even more than the 52 before the fix), and all 18 long jobs completed with no `max_steps` (3.5).
 
 ### 3.7 Real model
 
@@ -332,7 +349,7 @@ sequenceDiagram
 | `terminationGracePeriodSeconds` | 35 | ≥ preStop + worker grace period + cleanup (Kubernetes default 30, **counted from the start of preStop**) | SIGKILL before draining ends: jobs are neither recorded as cancelled nor released, and must wait for the lease to expire |
 | preStop | API: `sleep 5` (the native sleep action, GA since Kubernetes 1.34); worker: none | Removing traffic and SIGTERM happen **in parallel**, so wait for every node to update its forwarding rules | The process no longer accepts connections while the load balancer still sends traffic; clients see connection errors |
 | Worker grace period `WORKER_GRACE_SECONDS` | 20 | Covers most jobs (p95), not necessarily the longest | Too short: every release cancels many jobs and wastes a model call each; too long: slow releases |
-| Lease `WORKER_LEASE_SECONDS` | 30 (heartbeat 10) | **Independent** of the grace period: heartbeats keep renewing during the drain; the lease decides how soon work is taken over after a **hard crash** | Too short: a GC pause or network blip is mistaken for death and the job runs in two places; too long: slow recovery after kill -9 (3.3: p99 pushed to 9.7 s) |
+| Lease `WORKER_LEASE_SECONDS` | 30 (heartbeat 10) | **Independent** of the grace period: heartbeats keep renewing during the drain; the lease decides how soon work is taken over after a **hard crash** | Too short: a GC pause or network blip is mistaken for death and the job runs in two places; too long: slow recovery after kill -9 (3.3: p99 pushed to 9.3 s) |
 | uvicorn `--timeout-graceful-shutdown` | 20 | The API's "grace period": SSE connections get at most 20 more seconds | After that they're cancelled: the interactive run is recorded as cancelled, and the client can `POST /v1/runs/{id}/resume` |
 | PDB `maxUnavailable: 1` | One each for api and worker | **Only voluntary disruptions** (node drains through the Eviction API), not the Deployment's own rolling update (governed by `maxSurge` / `maxUnavailable`) | A node drain evicts every worker at once |
 
@@ -357,7 +374,7 @@ sequenceDiagram
 
 **How to choose**: B. The only "sticky" thing is an SSE connection in progress. It naturally lives on one replica; if it breaks, the run is cancelled, and after reconnecting you resume by `run_id` or hand the run to a worker. **Don't** configure session affinity for an agent service: it makes scaling and releases dangerous, and every agent step has to be persisted anyway.
 
-**This lesson's implementation**: the API and worker processes hold only rebuildable things like connection pools, thread pools, and hook instances. Each interactive run gets its own checkpoint view (`fenced(0)`), and its version bookkeeping is freed when the run ends. If the whole process shared one checkpointer object, the versions it remembers would grow without bound as runs accumulate (item 5 in Section 7).
+**This lesson's implementation**: the API and worker processes hold only rebuildable things like connection pools, thread pools, and hook instances. Each interactive run uses its own checkpoint view (`fenced(0)`, with the writer labeled as the API instance); any later worker job has a fence greater than 0 and can take it over. For a shared checkpointer object, the framework now forgets a run's version once it saves a non-running state (item 5 in Section 7; before the fix the map grew without bound as runs accumulated).
 
 ### Problem 5: Streaming and load balancing — SSE vs proxy timeouts, buffering, and connection limits
 
@@ -391,7 +408,7 @@ sequenceDiagram
 | D. Load under fault injection | Kill processes and roll releases during the load (Problem 7) | Measures the tail on "release day" and "incident day" | Noisy results; run several times |
 
 **How to read the results**:
-- Look at **p99**, not just p50: the long job in 3.3 has a p50 of 3.5 s and a p99 of 9.7 s, and the difference is exactly the lease.
+- Look at **p99**, not just p50: the long job in 3.3 has a p50 of 3.5 s and a p99 of 9.3 s, and the difference is exactly the lease.
 - Compute percentiles over **successful requests only**: failures are often fast and would make latency look "better".
 - **Count 429s separately from errors**: a 429 is a deliberate rejection; check which tenant and which layer it came from.
 - Break down the time to find the bottleneck: mostly queueing → not enough worker slots (3.4); waiting for tokens → gateway quota (3.5); waiting for a database connection → pool too small (Problem 7 in [Lesson 26](../26_state_and_queues/README.en.md)); high event-loop scheduling delay → CPU ([Lesson 30](../30_async_runtime/README.en.md): about a thousand sessions per second per core). Exercise (c) turns this diagnosis into code.
@@ -462,19 +479,21 @@ AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/31_deployment_and_scaling
 - **Liveness doesn't check dependencies**; a worker's liveness is answered by its event loop, not the `/metrics` thread.
 - **Clean up the queue table**: `purge_finished` periodically deletes finished jobs (Lesson 26), otherwise the table and its indexes keep growing. Redis Streams use `MAXLEN ~` + TTL.
 - **When several API replicas all sample queue depth**, aggregate with `max()` in queries, not `sum()`.
-- **Use Python 3.12+ in production images**, and watch `itdesk_cancellation_fence_total` (Finding 3 in 3.6).
+- **Use Python 3.12+ in production images**, and watch `itdesk_swallowed_cancellations_total` (Finding 3 in 3.6): the framework re-raises swallowed cancellations, but a non-zero value means some dependency is swallowing them.
 - **Common anti-patterns**: scaling workers on CPU; session affinity for an agent service; `/metrics` as liveness; authorizing inside an SSE generator; a grace period longer than `terminationGracePeriodSeconds`; a hard-coded replica count in the Deployment; a load-test report with only averages.
 
-## 7. Problems found while measuring (with the `agentkit` and dependency versions at the time of writing; reported to the maintainers)
+## 7. Problems found while measuring, and their fixes
 
-| # | Problem | Where | How to reproduce | What this lesson does |
+While writing this lesson, the end-to-end tests and load tests found 6 problems. The 4 in the framework have been fixed by the maintainers (not yet released), each with regression tests, and the service's workarounds were removed. They're recorded as "symptom → root cause → fix → regression test" (see 3.6 for the full story):
+
+| # | Symptom (how it was found) | Root cause | Fix | Regression test / re-test |
 |---|---|---|---|---|
-| 1 | Fences count per job while checkpoints protect per run: after a run job has been taken over, a new job from an approval or resume is rejected and must wait for its lease to expire; if the run job was taken over more than `max_attempts` times, the new job goes straight to dead letter | `agentkit/contrib/postgres.py` (`fence = fence + 1` in `claim` + `AgentJobHandler` building the view from `job.fence`) | Same run: job 1 is claimed twice (fence=2) and completes; enqueue job 2 (op=resume); its first claim has fence=1 → `CheckpointConflict` → `ownership_lost`, and the job stays leased until the lease expires | The service uses `RunScopedFences` (`job_id × 10^6 + fence`) and treats the conflict as "superseded". Suggest contrib switch to a globally monotonic fence (for example a `nextval` sequence) |
-| 2 | Deferral by the rate limiter consumes `max_steps` | `_prepare_and_loop` in `agentkit/aio/agent.py`: `state.step += 1` happens before `_call_llm` | `max_steps=3`, `before_llm` raises `StopRun("rate_limited")` 3 times in a row, `resume` each time: the 4th ends with `max_steps` after 0 model calls | Not handled (it's in the core). Suggest rolling back the step when `before_llm` raises `StopRun`, or counting a step only after the model returns |
-| 3 | Cancellation swallowed: redis-py 8.1.0 (`send_packed_command`) and psycopg_pool 3.3.3 (`ACondition.wait_timeout`) use `asyncio.wait_for` internally and hit the gh-86296 race on Python < 3.12 | Third-party libraries | The first two tests in [`test_cancellation.py`](../../production/tests/test_cancellation.py) (3.11.7: redis about 20%–25%, pool 20/20) | Python 3.12 image + `CancellationFence`. Suggest `AsyncAgent` check `Task.cancelling()` at step boundaries itself |
-| 4 | Authorizing inside the SSE generator → 200 + empty stream | FastAPI's generator-endpoint semantics (a defect in this service, caught by e2e) | Another tenant calls `GET /v1/runs/{id}/events` | Authorization moved into a dependency |
-| 5 | A long-lived shared `AsyncPostgresCheckpointer` keeps `_versions` per run_id and never shrinks it | `_CheckpointBase._remember` in `agentkit/contrib/postgres.py` | Run N runs through the same checkpointer object: `len(ckpt._versions) == N` | Each run uses its own `fenced()` view |
-| 6 | `AsyncScriptedLLM` keeps a deep copy of every call, so memory only grows in a long-running process | `agentkit/aio/llm.py` | Run the offline service for an hour | Replace `calls` with `deque(maxlen=200)` |
+| 1 | After a run job had been taken over, the resume job from an approval was rejected and waited out a lease; with more takeovers than `max_attempts` it went straight to dead letter (load-test log) | Fences counted from 1 per job, while the checkpoint fence protects the whole run | **Framework**: the fence in `claim` now comes from a global `nextval` sequence (`contrib/postgres.py`). The service removed its `RunScopedFences` workaround | `test_fence_is_global_so_a_later_job_for_the_same_run_can_take_over`, `test_upgrading_from_per_job_fences_continues_after_the_largest_existing_fence`; e2e: 0.91 s from approval to done, the resume takes over on its first claim |
+| 2 | In the quota load test a long job ended with `max_steps` without a single model call (3.5) | `step += 1` at the top of the loop, so steps stopped by `before_llm` still counted | **Framework**: step counting moved into `_call_llm`, after `before_llm` and before the model call (sync and async versions) | `test_deferred_steps_do_not_consume_max_steps` × 2; re-test: 73 deferrals, 18/18 long jobs completed |
+| 3 | About 1% of disconnects didn't stop the run, and the ticket was still created (load test) | redis-py 8.1.0 and psycopg_pool 3.3.3 use `asyncio.wait_for` internally; before 3.12 it has the gh-86296 race and swallows the cancellation | **Framework**: `_raise_if_cancel_swallowed` records `Task.cancelling()` as a baseline and re-raises before model calls and tool execution (3.11+). Service: removed `CancellationFence`; 3.12 image; metric `itdesk_swallowed_cancellations_total` | `test_cancel_swallowed_by_a_dependency_is_re_raised_before_side_effects[llm/tool]`, `test_run_timeout_swallowed_by_a_dependency_still_times_out`; service-side [`test_cancellation.py`](../../production/tests/test_cancellation.py) (dependency reproductions + with/without framework check); re-test: 180 disconnects + a 400-disconnect storm, all `cancelled` |
+| 4 | Another tenant reading the event stream got "200 + an empty stream" instead of 404 (e2e) | A FastAPI generator endpoint runs its body only after the 200 is sent, so authorizing inside it is too late (a defect in this service) | **Service**: the ownership check moved into the `Depends(visible_run)` dependency | `test_tenant_isolation` |
+| 5 | A long-lived shared `AsyncPostgresCheckpointer` keeps `_versions` per run_id and never shrinks it (code reading + counting) | Versions were remembered and never forgotten | **Framework**: after saving a non-running state, the run's version is dropped (resume and approve always load first) | `test_shared_checkpointer_forgets_versions_of_finished_runs` |
+| 6 | `AsyncScriptedLLM` keeps a deep copy of every call, so memory only grows in a long-running process | By design for a test double (so tests can assert on calls) | Framework unchanged (it's a test double). **Service**: offline mode replaces `calls` with `deque(maxlen=200)` | — |
 
 ## 8. Switching to managed services
 
@@ -527,8 +546,8 @@ AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/31_deployment_and_scaling
 <summary>5. Why isn't "we already called task.cancel()" enough? How would you add a safety net?</summary>
 
 - Before Python 3.12, `asyncio.wait_for` swallows the cancellation when the result and the cancellation arrive together, and dependencies use `wait_for` everywhere (this lesson measured redis-py and psycopg_pool).
-- The real fix is upgrading to 3.12+; the safety net is checking `Task.cancelling()` or an application-level "abandoned" flag at step boundaries and raising `CancelledError` yourself.
-- Also add a metric so that swallowed cancellations become visible.
+- The real fix is upgrading to 3.12+; the safety net is checking `Task.cancelling()` at step boundaries (if it's above the baseline recorded when the run started, someone swallowed a cancellation) and raising `CancelledError` yourself. After this lesson found the problem, `agentkit.aio` built that check in (Finding 3 in 3.6).
+- Also add a metric so that swallowed cancellations become visible: if it's not 0, upgrade Python or replace that dependency.
 </details>
 
 <details>

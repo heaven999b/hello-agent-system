@@ -158,9 +158,9 @@ async def stream_slot(request: Request, p: Principal = Depends(rate_limited)) ->
     try:
         yield guard
     finally:
-        for run_id, task in guard.tasks:
+        for _run_id, task in guard.tasks:
             if not task.done():
-                rt_of(request).fence.abandon(run_id)  # 兜底：取消万一被第三方库吞掉，下一个步骤边界再停（runtime.CancellationFence）
+                # 取消万一被依赖库吞掉（Python < 3.12），agentkit.aio 会在下一个步骤边界补抛（Task.cancelling() 检查）
                 task.cancel()  # 客户端断开 / 响应结束：运行还没完就取消它（AsyncAgent 会把检查点记为 cancelled）
         SSE_STREAMS.labels("chat").dec()
         await slot.__aexit__(None, None, None)  # 释放只做同步操作，取消过程中也能完成
@@ -265,7 +265,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Agent 在单独的 task 里运行（_relay）：它的 trace 上下文、span 都在那个 task 里进入和退出。
         # 客户端断开时由 stream_slot 的收尾代码取消它（确定性），生成器的 finally 只是第二道保险。
         queue: asyncio.Queue = asyncio.Queue()
-        view = rt.ckpt.fenced(0, writer=f"api:{settings.instance_id}")  # 本次运行专用的检查点视图（版本号记录随运行结束回收）
+        view = rt.ckpt.fenced(0, writer=f"api:{settings.instance_id}")  # 本次运行专用的检查点视图：writer 标成本 API 实例；fence=0，之后任何 worker 任务都能接管
         task = guard.track(run_id, asyncio.ensure_future(
             _relay(request.app.state.agent, rt, body.message, run_id, metadata, view, carrier, queue)))
         seq, t0, first_text = 0, time.perf_counter(), True

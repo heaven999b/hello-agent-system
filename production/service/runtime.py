@@ -4,7 +4,6 @@
 每次运行真正独立的东西（对话、步数、审批、fence）全在 RunState 和"本次运行的检查点视图"里（第 30 课 2.1）。
 
 Hook 顺序（Agent 按列表顺序调用）：
-    CancellationFence   放第一个：取消被第三方库吞掉时（Python < 3.12 的 asyncio.wait_for 竞态），在步骤边界把运行停下
     OTelTracer          放第一个：给根 span 补 conversation id、工具 call id（第 28 课）
     AsyncClassifierGuard  输入护栏：命中直接 StopRun，一次模型调用都不花（第 29 课）
     PrometheusHook      运行数、耗时、token、工具调用（第 28 课）
@@ -15,9 +14,8 @@ Hook 顺序（Agent 按列表顺序调用）：
 
 from __future__ import annotations
 
-import asyncio
+import logging
 import os
-import time
 from collections import deque
 
 from agentkit.aio import AsyncAgent, AsyncResilientLLM, AsyncToolExecutor, wait_for  # wait_for：取消安全版（gh-86296）
@@ -40,55 +38,27 @@ QUEUE_TABLE = "agent_jobs"
 RUNS_TABLE = "agent_runs"
 
 
-def _cancel_requested() -> bool:
-    """当前 asyncio 任务是否有"已经请求、但没有送达"的取消（Task.cancelling()，Python 3.11+）。"""
-    task = asyncio.current_task()
-    cancelling = getattr(task, "cancelling", None)
-    return bool(cancelling and cancelling())
+SWALLOWED_CANCEL_EVENT = "swallowed_cancellation"  # agentkit.aio 补抛被吞掉的取消时，warning 日志 extra 里的 agentkit_event
 
 
-class CancellationFence(Hook):
-    """取消闸门：在每个步骤边界（调模型、调工具之前）确认"这个运行是不是早就该停了"。
+class SwallowedCancelCounter(logging.Handler):
+    """把框架"补抛被吞掉的取消"这件事变成指标 itdesk_swallowed_cancellations_total。
 
-    本课压测抓到的问题：Python 3.12 之前的 asyncio.wait_for 有竞态（CPython gh-86296），被等待的东西刚好就绪、
-    外部取消又在同一轮事件循环到达时，它返回结果、**吞掉取消**。agentkit.aio 自己已经换成取消安全的 wait_for，
-    但第三方库里还有（本机 Python 3.11.7 实测，见讲义 7.2）：
-      - redis-py 8.1.0 每次发命令都走 asyncio.wait_for（AbstractConnection.send_packed_command）→ 限流 Hook、幂等存储、事件推送
-      - psycopg_pool 3.3.3 等连接时走 asyncio.wait_for（ACondition.wait_timeout）
-    取消被吞掉的运行会照常跑完：用户已经关了页面，工单照样建了；停机时被取消的任务也会继续跑到被 SIGKILL。
-
-    两种判断，任一成立就抛 CancelledError（AsyncAgent 按取消处理：检查点记 cancelled，写工具保持未回答）：
-      1. Task.cancelling() > 0：取消已经请求但没有送达 —— 正是"被吞掉"的样子（3.11+）；
-      2. run_id 被登记为 abandoned（API 在客户端断开时登记）：3.10 上没有 cancelling()，靠它兜底。
-    根本的修法是跑在 Python 3.12+（asyncio.wait_for 用 asyncio.timeout 重写，没有这个竞态）：deploy/Dockerfile 用 3.12。
-    放在 hooks 列表的第一个。
+    分工：检测和补抛由 agentkit.aio 负责（Task.cancelling() 比进入运行时的基线大 → 调模型、执行工具之前补抛，
+    Python 3.11+；3.10 上没有 cancelling()，检查关闭）。服务这边只负责让它**可见**：不为 0 就说明有依赖在吞取消
+    （Python < 3.12 的 asyncio.wait_for 竞态，本课实测 redis-py、psycopg_pool 都会），该升级 Python 或换库了。
+    按日志记录上的结构化字段 agentkit_event 匹配，而不是按措辞：框架改了文案，计数也不会悄悄停在 0。
     """
 
-    def __init__(self, ttl_s: float = 3600.0):
-        self.ids: dict[str, float] = {}  # run_id → 登记时间；运行结束时删除，极少数"登记晚于结束"的按 ttl 清理
-        self.ttl_s = ttl_s
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, "agentkit_event", None) == SWALLOWED_CANCEL_EVENT:
+            telemetry.SWALLOWED_CANCELS.inc()
 
-    def abandon(self, run_id: str) -> None:
-        now = time.monotonic()
-        self.ids[run_id] = now
-        if len(self.ids) > 1000:
-            self.ids = {k: t for k, t in self.ids.items() if now - t < self.ttl_s}
 
-    def _check(self, state) -> None:
-        reason = "abandoned" if state.run_id in self.ids else ("pending_cancel" if _cancel_requested() else None)
-        if reason is not None:
-            telemetry.CANCEL_FENCE.labels(reason).inc()  # 不为 0 就说明有依赖在吞取消：该升级 Python 或换库了
-            raise asyncio.CancelledError(f"cancellation fence ({reason}): run was cancelled earlier but the cancel was swallowed")
-
-    def before_llm(self, state, messages) -> None:
-        self._check(state)
-
-    def before_tool(self, state, call, tool) -> str | None:
-        self._check(state)
-        return None
-
-    def on_run_end(self, state) -> None:
-        self.ids.pop(state.run_id, None)
+def install_swallowed_cancel_counter() -> None:
+    logger = logging.getLogger("agentkit.aio")
+    if not any(isinstance(h, SwallowedCancelCounter) for h in logger.handlers):
+        logger.addHandler(SwallowedCancelCounter(level=logging.WARNING))
 
 
 class RunEventsHook(Hook):
@@ -194,12 +164,12 @@ class Runtime:
             context_fn=entity_args_context({"reset_password": {"target_user_id": ("target_user", "User")}}),
         )
         self.events_hook = RunEventsHook(self.bus)
-        self.fence = CancellationFence()
+        install_swallowed_cancel_counter()
 
     # ------------------------------------------------------------------ Agent
 
     def hooks(self) -> list:
-        return [self.fence, self.tracer, self.guard, self.prom, self.ratelimit, self.policy, self.events_hook]
+        return [self.tracer, self.guard, self.prom, self.ratelimit, self.policy, self.events_hook]
 
     def new_agent(self, checkpointer=None) -> AsyncAgent:
         """每个进程建一个，被所有会话 / 任务并发复用；每次运行通过 checkpointer= 传入自己的检查点视图。"""
