@@ -189,7 +189,7 @@ class ToolRegistry:
         ctx = ctx or ToolContext(call_id=call.id)
         t = self._tools.get(call.name)
         if t is None:
-            return ToolResult(False, f"错误：不存在名为 {call.name!r} 的工具。可用工具：{', '.join(self._tools)}", "not_found")
+            return self.not_found(call.name)
 
         # 1) 解析 JSON（模型可能输出不合法的 JSON）+ 2) 按 Schema 校验（缺字段、类型错、越界、多余字段）
         kwargs, error = t.parse_arguments(call.arguments)
@@ -214,28 +214,44 @@ class ToolRegistry:
         try:
             output = future.result(timeout=t.timeout_s)
         except FutureTimeout:
-            return ToolResult(False, f"错误：工具 {t.name} 执行超时（>{t.timeout_s}s）。可以稍后重试或换一种方式。", "timeout")
-        except ToolError as e:
-            return ToolResult(False, f"错误：{e}", "tool_error")
+            return timeout_result(t)
         except Exception as e:  # noqa: BLE001 —— 任何异常都要变成观察，不能让 Agent 崩溃
-            # 意外异常的原文（SQL、内网地址、堆栈……）不能给模型：模型可能把它转述给用户。
-            # 给模型一句可行动的提示 + 错误编号；原文放进 detail，由追踪/日志记录，工程师用编号关联排查。
-            error_id = uuid.uuid4().hex[:8]
-            return ToolResult(
-                False,
-                f"错误：工具 {t.name} 内部出错（错误编号 {error_id}）。这不是参数问题，可以稍后重试一次；"
-                f"如果仍然失败，请告诉用户该功能暂时不可用，并提供错误编号。不要猜测或透露内部技术细节。",
-                "exception",
-                detail=f"[{error_id}] {type(e).__name__}: {e}",
-            )
+            return exception_result(t, e)
         finally:
             pool.shutdown(wait=False)
 
-        # 5) 序列化 + 截断：防止一个巨大的返回值撑爆上下文窗口
-        text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, default=str)
-        if len(text) > t.max_output_chars:
-            text = text[: t.max_output_chars] + f"\n...[输出已截断，原始长度 {len(text)} 字符]"
-        result = ToolResult(True, text)
+        result = ToolResult(True, format_output(t, output))
         if use_idem:
             self.idempotency_store.put(ctx.idempotency_key, result)
         return result
+
+    def not_found(self, name: str) -> ToolResult:
+        return ToolResult(False, f"错误：不存在名为 {name!r} 的工具。可用工具：{', '.join(self._tools)}", "not_found")
+
+
+def timeout_result(t: Tool) -> ToolResult:
+    return ToolResult(False, f"错误：工具 {t.name} 执行超时（>{t.timeout_s}s）。可以稍后重试或换一种方式。", "timeout")
+
+
+def exception_result(t: Tool, e: Exception) -> ToolResult:
+    """把工具抛出的异常变成给模型看的观察（同步 / 异步执行器共用）。"""
+    if isinstance(e, ToolError):
+        return ToolResult(False, f"错误：{e}", "tool_error")
+    # 意外异常的原文（SQL、内网地址、堆栈……）不能给模型：模型可能把它转述给用户。
+    # 给模型一句可行动的提示 + 错误编号；原文放进 detail，由追踪/日志记录，工程师用编号关联排查。
+    error_id = uuid.uuid4().hex[:8]
+    return ToolResult(
+        False,
+        f"错误：工具 {t.name} 内部出错（错误编号 {error_id}）。这不是参数问题，可以稍后重试一次；"
+        f"如果仍然失败，请告诉用户该功能暂时不可用，并提供错误编号。不要猜测或透露内部技术细节。",
+        "exception",
+        detail=f"[{error_id}] {type(e).__name__}: {e}",
+    )
+
+
+def format_output(t: Tool, output) -> str:
+    """序列化 + 截断：防止一个巨大的返回值撑爆上下文窗口。"""
+    text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, default=str)
+    if len(text) > t.max_output_chars:
+        text = text[: t.max_output_chars] + f"\n...[输出已截断，原始长度 {len(text)} 字符]"
+    return text

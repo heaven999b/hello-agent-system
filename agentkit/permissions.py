@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Callable
 
 from .hooks import Hook, PauseRun
@@ -60,7 +61,12 @@ class PermissionPolicy(Hook):
                 return None  # 参数不合法：不打扰审批人，交给 registry 返回校验错误让模型自己改
             decision = state.approvals.get(call.id)
             if decision is None and self.approver is not None:
-                decision = bool(self.approver(call, state))
+                raw = self.approver(call, state)
+                if inspect.isawaitable(raw):
+                    # bool(协程) 恒为 True —— 如果不拦下来，会把高危操作静默批准。异步审批请走 PauseRun + resume。
+                    raw.close()
+                    raise TypeError("approver 不能是 async 函数：异步场景请不传 approver，用 PauseRun + agent.approve() 走异步审批")
+                decision = bool(raw)
                 state.approvals[call.id] = decision
             if decision is None:
                 raise PauseRun(call, f"操作 {call.name}({call.arguments}) 风险等级为 {tool.risk}，已提交人工审批。")

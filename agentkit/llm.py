@@ -69,42 +69,54 @@ class OpenAICompatLLM:
         params.update(kwargs)
         try:
             resp = self._client.chat.completions.create(**params)
-        except self._openai.APIStatusError as e:
-            code = e.status_code
-            # 429 限流、408 超时、5xx 服务端错误：重试可能成功；400/401/403/404：重试没用。
-            # 但 429 有两种：限流（等一等就好）和额度用完（insufficient_quota，重试一万次也没用）。
-            retryable = code in (408, 409, 429) or code >= 500
-            if code == 429 and "insufficient_quota" in str(e):
-                retryable = False
-            retry_after = None
-            try:
-                retry_after = float(e.response.headers.get("retry-after"))
-            except (TypeError, ValueError, AttributeError):
-                pass
-            raise LLMError(str(e), status_code=code, retryable=retryable, retry_after=retry_after) from e
-        except self._openai.APIConnectionError as e:  # 包含超时
-            raise LLMError(f"连接模型失败：{e}", retryable=True) from e
+        except (self._openai.APIStatusError, self._openai.APIConnectionError) as e:
+            raise map_openai_error(e, self._openai) from e
+        return response_from_openai(resp, self.model)
 
-        choice = resp.choices[0]
-        msg = choice.message
-        calls = [
-            ToolCall(id=tc.id or new_call_id(), name=tc.function.name, arguments=tc.function.arguments or "{}")
-            for tc in (msg.tool_calls or [])
-        ]
-        usage = Usage()
-        if resp.usage:
-            details = getattr(resp.usage, "prompt_tokens_details", None)
-            cached = (getattr(details, "cached_tokens", 0) or 0) if details else 0
-            out_details = getattr(resp.usage, "completion_tokens_details", None)
-            reasoning = (getattr(out_details, "reasoning_tokens", 0) or 0) if out_details else 0
-            usage = Usage(resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0, cached, reasoning)
-        return LLMResponse(
-            content=msg.content,
-            tool_calls=calls,
-            usage=usage,
-            model=resp.model or self.model,
-            finish_reason=choice.finish_reason or "stop",
-        )
+
+def map_openai_error(e: Exception, openai_module) -> LLMError:
+    """把 OpenAI SDK 的异常统一成 LLMError（同步 / 异步客户端共用）。"""
+    if isinstance(e, openai_module.APIStatusError):
+        code = e.status_code
+        # 429 限流、408 超时、5xx 服务端错误：重试可能成功；400/401/403/404：重试没用。
+        # 但 429 有两种：限流（等一等就好）和额度用完（insufficient_quota，重试一万次也没用）。
+        retryable = code in (408, 409, 429) or code >= 500
+        if code == 429 and "insufficient_quota" in str(e):
+            retryable = False
+        retry_after = None
+        try:
+            retry_after = float(e.response.headers.get("retry-after"))
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return LLMError(str(e), status_code=code, retryable=retryable, retry_after=retry_after)
+    return LLMError(f"连接模型失败：{e}", retryable=True)  # APIConnectionError，包含超时
+
+
+def usage_from_openai(raw_usage) -> Usage:
+    if not raw_usage:
+        return Usage()
+    details = getattr(raw_usage, "prompt_tokens_details", None)
+    cached = (getattr(details, "cached_tokens", 0) or 0) if details else 0
+    out_details = getattr(raw_usage, "completion_tokens_details", None)
+    reasoning = (getattr(out_details, "reasoning_tokens", 0) or 0) if out_details else 0
+    return Usage(raw_usage.prompt_tokens or 0, raw_usage.completion_tokens or 0, cached, reasoning)
+
+
+def response_from_openai(resp, default_model: str) -> LLMResponse:
+    """把 Chat Completions 响应转换成 LLMResponse（同步 / 异步客户端共用）。"""
+    choice = resp.choices[0]
+    msg = choice.message
+    calls = [
+        ToolCall(id=tc.id or new_call_id(), name=tc.function.name, arguments=tc.function.arguments or "{}")
+        for tc in (msg.tool_calls or [])
+    ]
+    return LLMResponse(
+        content=msg.content,
+        tool_calls=calls,
+        usage=usage_from_openai(resp.usage),
+        model=resp.model or default_model,
+        finish_reason=choice.finish_reason or "stop",
+    )
 
 
 ScriptItem = Union[LLMResponse, Exception, Callable[[list[Message]], LLMResponse]]
