@@ -872,3 +872,104 @@ def test_tool_executor_cancel_at_tool_completion_is_not_lost():
         return lost
 
     assert run(main()) == 0
+
+
+# ---------------------------------------------------------------- 第 31 课压测中发现的问题（已修复）
+
+from agentkit.hooks import Hook, StopRun  # noqa: E402
+
+
+class _DeferTimes(Hook):
+    """模拟限流 Hook：前 n 次在调用模型之前叫停（"稍后再试"），之后放行。"""
+
+    def __init__(self, n: int):
+        self.left = n
+
+    def before_llm(self, state, messages):
+        if self.left > 0:
+            self.left -= 1
+            raise StopRun("rate_limited", "限流，稍后重试")
+
+
+def test_deferred_steps_do_not_consume_max_steps():
+    """以前先 step += 1 再跑 before_llm：被限流推迟 3 次的运行，第 4 次一次模型都没调就以 max_steps 结束。"""
+
+    async def main():
+        llm = AsyncScriptedLLM([reply("好了")])
+        agent = AsyncAgent(llm, [], max_steps=3, hooks=[_DeferTimes(3)])
+        res = await agent.run("hi", run_id="r")
+        for _ in range(3):
+            assert (res.status, res.stop_reason) == ("stopped", "rate_limited")
+            res = await agent.resume("r")
+        return res, len(llm.calls)
+
+    res, calls = run(main())
+    assert (res.status, res.output, calls) == ("completed", "好了", 1)
+
+
+class _SwallowingHook(Hook):
+    """模拟 3.12 之前的依赖库（redis-py / psycopg_pool 内部的 asyncio.wait_for）：取消到达时吞掉它、照常返回。"""
+
+    def __init__(self, where: str):
+        self.where, self.swallowed = where, 0
+        self.entered = asyncio.Event()
+
+    async def _io(self):
+        self.entered.set()
+        try:
+            await asyncio.sleep(10)  # 一次 Redis 往返
+        except asyncio.CancelledError:
+            self.swallowed += 1  # 吞掉取消，而且没有调用 uncancel()
+
+    async def before_llm(self, state, messages):
+        if self.where == "llm":
+            await self._io()
+
+    async def before_tool(self, state, call, tool):
+        if self.where == "tool":
+            await self._io()
+        return None
+
+
+needs_cancelling = pytest.mark.skipif(not hasattr(asyncio.Task, "cancelling"), reason="Task.cancelling() 需要 Python 3.11+")
+
+
+@needs_cancelling
+@pytest.mark.parametrize("where", ["llm", "tool"])
+def test_cancel_swallowed_by_a_dependency_is_re_raised_before_side_effects(where):
+    executed = []
+
+    @tool(risk="write")
+    def create_ticket(title: str) -> str:
+        """建单"""
+        executed.append(title)
+        return "T-1"
+
+    async def main():
+        hook = _SwallowingHook(where)
+        llm = AsyncScriptedLLM([call_tool("create_ticket", title="VPN"), reply("建好了")])
+        agent = AsyncAgent(llm, [create_ticket], hooks=[hook])
+        task = asyncio.create_task(agent.run("帮我建单", run_id="r"))
+        await hook.entered.wait()
+        task.cancel()  # 用户断开：取消恰好落在 Hook 的 Redis 调用里，被吞掉了
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        state = await agent._load("r")
+        return hook.swallowed, len(llm.calls), state.status
+
+    swallowed, llm_calls, status = run(main())
+    assert swallowed == 1 and status == "cancelled"
+    assert executed == []  # 没有产生副作用
+    assert llm_calls == (0 if where == "llm" else 1)  # 吞在 before_llm 里时，连模型都没调
+
+
+@needs_cancelling
+def test_run_timeout_swallowed_by_a_dependency_still_times_out():
+    async def main():
+        hook = _SwallowingHook("llm")
+        llm = AsyncScriptedLLM([reply("晚了")])
+        res = await AsyncAgent(llm, [], hooks=[hook], run_timeout=0.05).run("hi")
+        return res, hook.swallowed, len(llm.calls)
+
+    res, swallowed, calls = run(main())
+    assert (res.status, res.stop_reason, swallowed, calls) == ("stopped", "timeout", 1, 0)

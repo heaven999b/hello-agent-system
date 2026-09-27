@@ -84,6 +84,33 @@ _emitter: ContextVar[Callable[[AgentEvent], None] | None] = ContextVar("agentkit
 _run_checkpointer: ContextVar[object | None] = ContextVar("agentkit_aio_run_checkpointer", default=None)
 
 
+# 进入本次运行时，当前任务身上已有的"未消化的取消请求"数（Task.cancelling()，3.11+）。
+_cancel_baseline: ContextVar[int | None] = ContextVar("agentkit_aio_cancel_baseline", default=None)
+
+
+def _cancelling() -> int | None:
+    task = asyncio.current_task()
+    fn = getattr(task, "cancelling", None)  # 3.10 没有这个 API：检查自动关闭
+    return fn() if fn is not None else None
+
+
+def _raise_if_cancel_swallowed() -> None:
+    """在步骤边界补抛被下游吞掉的取消。
+
+    agentkit.aio 自己用取消安全的 wait_for（timeouts.py），但管不到依赖库：3.12 之前，redis-py、
+    psycopg_pool 等在内部用 asyncio.wait_for，同样会在"结果和取消同时到达"时吞掉取消（CPython gh-86296；
+    第 31 课压测中实测：限流 Hook 调 Redis 时约 1/4 的这类取消被吞，断开的运行照样跑完、照样建单）。
+    被吞掉的取消在 Task.cancelling() 里还留着计数：按 asyncio 的约定，正规地压制取消必须调用 uncancel()。
+    所以只要计数比进入运行时大，就说明有人吞了取消，在调用模型、执行工具之前补抛。
+    和 asyncio.timeout() 一样以进入时的计数为基线，不会误伤调用方自己的状态；
+    run_timeout 到期时的取消被吞了也会在这里补抛，再由 timeout 转成 TimeoutError。"""
+    baseline = _cancel_baseline.get()
+    now = _cancelling()
+    if baseline is not None and now is not None and now > baseline:
+        logger.warning("取消请求被下游吞掉（Task.cancelling()=%d > 基线 %d），在步骤边界补抛", now, baseline)
+        raise asyncio.CancelledError("取消请求被依赖库吞掉，在步骤边界补抛")
+
+
 def _emit(event: AgentEvent) -> None:
     fn = _emitter.get()
     if fn is not None:
@@ -326,12 +353,21 @@ class AsyncAgent:
                 await slot.__aexit__(None, None, None)
 
     async def _prepare_and_loop(self, state: RunState, prepare) -> None:
+        # 进入时记下基线。3.11+ 上本体和 _drive 在同一个任务里，进入 asyncio.timeout 不改变 cancelling() 计数；
+        # 3.10 没有 cancelling()，检查自动关闭
+        token = _cancel_baseline.set(_cancelling())
+        try:
+            await self._loop_body(state, prepare)
+        finally:
+            _cancel_baseline.reset(token)
+
+    async def _loop_body(self, state: RunState, prepare) -> None:
         if prepare is not None:
             await prepare()
         await self._run_pending_tools(state)
         while state.step < self.max_steps:
-            state.step += 1
-            response = await self._call_llm(state)
+            _raise_if_cancel_swallowed()
+            response = await self._call_llm(state)  # 步数在里面、真正调用模型之前才加一
             state.messages.append(response.to_message())
             await self._save(state)
             if not response.tool_calls:
@@ -364,6 +400,10 @@ class AsyncAgent:
             visible = await _call_hook(h, "visible_tools", state, visible)
         tools = self.registry.schemas(visible) or None
 
+        _raise_if_cancel_swallowed()  # Hook 里的 Redis / 数据库调用可能吞掉了取消：花钱之前再确认一次
+        # 步数 = 真正发出的模型调用次数，所以在 before_llm 之后才计数：Hook 在调用前叫停（限流推迟、预算用完）
+        # 的那一步没有发生。以前在循环开头就加一，被限流推迟 max_steps 次的运行一次模型都没调就以 max_steps 结束
+        state.step += 1
         streaming = _emitter.get() is not None and hasattr(self.llm, "stream")
         with self.tracer.span(
             "llm.chat",
@@ -443,6 +483,7 @@ class AsyncAgent:
                 denial = await _call_hook(h, "before_tool", state, call, t)
                 if denial:
                     break
+            _raise_if_cancel_swallowed()  # 产生副作用之前再确认一次：取消可能被 before_tool 里的调用吞掉
             _emit(ToolStarted(call))
             if denial:
                 result = ToolResult(False, denial, "denied")

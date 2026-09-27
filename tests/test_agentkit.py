@@ -708,3 +708,25 @@ def test_resilient_llm_final_error_keeps_retryable_when_all_failures_are_transie
     with pytest.raises(LLMError) as info:
         llm.chat([])
     assert info.value.retryable is False
+
+
+def test_deferred_steps_do_not_consume_max_steps():
+    """步数 = 真正发出的模型调用次数：before_llm 在调用前叫停（限流推迟、预算用完）的那一步不计数。
+    以前先 step += 1 再跑 before_llm，被推迟 max_steps 次的运行一次模型都没调就以 max_steps 结束（第 31 课发现）。"""
+    from agentkit.hooks import Hook, StopRun
+
+    class DeferTwice(Hook):
+        left = 2
+
+        def before_llm(self, state, messages):
+            if self.left:
+                self.left -= 1
+                raise StopRun("rate_limited", "限流，稍后重试")
+
+    llm = ScriptedLLM([reply("好了")])
+    agent = Agent(llm, [], max_steps=2, hooks=[DeferTwice()])
+    res = agent.run("hi", run_id="r")
+    for _ in range(2):
+        assert res.stop_reason == "rate_limited" and res.steps == 0
+        res = agent.resume("r")
+    assert (res.status, res.output, res.steps) == ("completed", "好了", 1)

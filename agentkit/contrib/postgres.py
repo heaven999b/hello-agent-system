@@ -322,9 +322,17 @@ class _CheckpointBase:
         with self._vlock:
             return self._versions.get(run_id)
 
-    def _remember(self, run_id: str, version: int) -> None:
+    def _remember(self, run_id: str, version: int, status: str | None = None) -> None:
+        """记住版本号，供下一次 CAS 使用。
+
+        保存了非 running 的状态（完成、暂停、中止……）说明这次运行已经告一段落，版本号随即丢掉：
+        恢复和审批都会先 load（重新记住最新版本），而一个共享的检查点实例要服务成千上万个运行，
+        只增不减的字典就是内存泄漏（第 31 课压测中发现）。"""
         with self._vlock:
-            self._versions[run_id] = version
+            if status is None or status == "running":
+                self._versions[run_id] = version
+            else:
+                self._versions.pop(run_id, None)
 
     def _save_params(self, state: RunState) -> tuple[str, dict]:
         expected = self.version_of(state.run_id)
@@ -378,7 +386,8 @@ class PostgresCheckpointer(_CheckpointBase):
     **fence 接管**（fenced(fence) 返回的视图）：纯 CAS 是"先写者赢" —— 僵尸 worker 和新 worker 读到同一个
     版本时，谁先写谁赢，输的可能恰恰是新 worker。带 fence 的 load 会把表里的 fence 更新为自己的 fence，
     并把 version 加一（"接管"），于是旧持有者从这一刻起的任何写入都会冲突；fence 比表里小的 load 直接被拒绝。
-    队列每次领取都会让 fence +1，所以 AgentJobHandler 用 job.fence 创建视图：**最新的租约持有者总是赢家**。
+    队列每次领取都从全局序列拿一个更大的 fence（同一个 run 后续的 resume 任务也一样），所以 AgentJobHandler
+    用 job.fence 创建视图：**最新的租约持有者总是赢家**。
     """
 
     def __init__(
@@ -426,7 +435,7 @@ class PostgresCheckpointer(_CheckpointBase):
         rows = self._db.rows(self._sql[kind], params)
         if not rows:
             raise self._conflict(state.run_id, params["expected"], self._db.rows(self._sql["select"], {"run_id": state.run_id}))
-        self._remember(state.run_id, rows[0]["version"])
+        self._remember(state.run_id, rows[0]["version"], state.status)
 
     def get_run(self, run_id: str) -> dict | None:
         """只读地取一条记录（摘要 + 完整 state dict），不"接管"、不记版本号。给 API / 运维看。"""
@@ -499,7 +508,7 @@ class AsyncPostgresCheckpointer(_CheckpointBase):
         if not rows:
             current = await self._db.rows(self._sql["select"], {"run_id": state.run_id})
             raise self._conflict(state.run_id, params["expected"], current)
-        self._remember(state.run_id, rows[0]["version"])
+        self._remember(state.run_id, rows[0]["version"], state.status)
 
     async def get_run(self, run_id: str) -> dict | None:
         rows = await self._db.rows(self._sql["get_run"], {"run_id": run_id})
@@ -554,9 +563,17 @@ _JOB_COLS = sql.SQL(
 )
 
 
+def _fence_seq(table: str) -> str:
+    return f"{table}_fence_seq"
+
+
 def _queue_ddl(table: str) -> list:
-    t = sql.Identifier(table)
+    t, seq = sql.Identifier(table), _fence_seq(table)
     return [
+        # fence 来自整张队列表共用的序列，全局单调递增。不能按任务各自从 1 数起：检查点的 fence 保护的是
+        # 整个 run，而同一个 run 会先后对应多个任务（run → 审批后的 resume）。按任务计数时，
+        # resume 任务第一次领取拿到 fence=1，会被检查点当成"比 fence=2 更旧的持有者"拒绝（第 31 课压测中发现）。
+        sql.SQL("CREATE SEQUENCE IF NOT EXISTS {s}").format(s=sql.Identifier(seq)),
         sql.SQL(
             """CREATE TABLE IF NOT EXISTS {t} (
                 id              bigserial PRIMARY KEY,
@@ -589,6 +606,11 @@ def _queue_ddl(table: str) -> list:
         sql.SQL("CREATE INDEX IF NOT EXISTS {i} ON {t} (status, finished_at)").format(
             i=sql.Identifier(f"{table}_status_idx"), t=t
         ),
+        # 从旧版本（按任务计数）升级：序列至少要从表里已有的最大 fence 往后发，否则新 fence 可能比旧的小
+        sql.SQL(
+            "SELECT setval({seq}::regclass, m) FROM (SELECT max(fence) AS m FROM {t}) x "
+            "WHERE m > (SELECT last_value FROM {s})"
+        ).format(seq=sql.Literal(seq), t=t, s=sql.Identifier(seq)),
     ]
 
 
@@ -625,7 +647,7 @@ def _queue_sql(table: str) -> dict:
         "claim": sql.SQL(
             """UPDATE {t} SET status = 'leased', worker_id = %(worker)s,
                    lease_until = now() + make_interval(secs => %(lease)s),
-                   attempts = attempts + 1, fence = fence + 1, updated_at = now()
+                   attempts = attempts + 1, fence = nextval({seq}::regclass), updated_at = now()
                WHERE id = (SELECT id FROM {t}
                            WHERE status = 'queued' AND run_at <= now()
                              AND (%(kinds)s::text[] IS NULL OR kind = ANY(%(kinds)s::text[]))
@@ -633,7 +655,7 @@ def _queue_sql(table: str) -> dict:
                            LIMIT 1
                            FOR UPDATE SKIP LOCKED)
                RETURNING {c}"""
-        ).format(t=t, c=c),
+        ).format(t=t, c=c, seq=sql.Literal(_fence_seq(table))),
         "heartbeat": sql.SQL(
             "UPDATE {t} SET lease_until = now() + make_interval(secs => %(lease)s), updated_at = now() "
             "WHERE id = %(id)s AND fence = %(fence)s AND status = 'leased' RETURNING lease_until"
@@ -739,7 +761,7 @@ class PostgresJobQueue(_QueueBase):
     """基于 `FOR UPDATE SKIP LOCKED` 的任务队列：至少一次投递 + 租约 + fencing token + 退避重试 + 死信。
 
     状态机（与第 13 课相同）：
-        queued ──claim（attempts+1, fence+1）──► leased ──complete──► succeeded
+        queued ──claim（attempts+1, fence↑）───► leased ──complete──► succeeded   （fence↑：取全局序列的下一个值）
           ▲  ▲                                     │ ├──fail(retryable=False)──► failed
           │  └──── fail(可重试，退避) / release ───┘ └──fail 且次数用尽──► dead ──redrive──► queued
           └──────── 租约过期被回收（reap）──────────┘（次数用尽则直接 dead：毒消息）
@@ -806,7 +828,7 @@ class PostgresJobQueue(_QueueBase):
         return [(r["id"], r["status"]) for r in rows]
 
     def claim(self, worker_id: str, lease_seconds: float = 30, kinds: Iterable[str] | None = None) -> Job | None:
-        """原子领取一个任务：写租约，attempts+1，fence+1。没有可领取的任务返回 None。"""
+        """原子领取一个任务：写租约，attempts+1，fence 取全局序列的下一个值。没有可领取的任务返回 None。"""
         self.reap_expired()
         rows = self._db.rows(self._sql["claim"], self._claim_params(worker_id, lease_seconds, kinds))
         return Job._from_row(rows[0]) if rows else None

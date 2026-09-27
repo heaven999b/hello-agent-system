@@ -217,8 +217,7 @@ class Agent:
         # 断点续跑：如果上次停在"模型已发起工具调用、但工具还没执行完"，先把它们补完
         self._run_pending_tools(state)
         while state.step < self.max_steps:
-            state.step += 1
-            response = self._call_llm(state)
+            response = self._call_llm(state)  # 步数在里面、真正调用模型之前才加一
             state.messages.append(response.to_message())
             self._save(state)
 
@@ -251,6 +250,8 @@ class Agent:
             visible = h.visible_tools(state, visible)
         tools = self.registry.schemas(visible) or None
 
+        # 步数 = 真正发出的模型调用次数：before_llm 叫停（限流推迟、预算用完）的那一步没有发生，不计数
+        state.step += 1
         with self.tracer.span(
             "llm.chat",
             **{"gen_ai.request.model": getattr(self.llm, "model", "?"), "step": state.step, "messages": len(state.messages)},

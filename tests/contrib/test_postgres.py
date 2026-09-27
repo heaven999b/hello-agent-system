@@ -259,7 +259,8 @@ def test_claim_respects_priority_run_at_and_kinds(queue):
     assert queue.claim("w", kinds=["agent"]).id == low
     assert queue.claim("w", kinds=["agent"]) is None  # later 还没到时间
     job = queue.claim("w")
-    assert job.id == other and (job.status, job.attempts, job.fence, job.worker_id) == ("leased", 1, 1, "w")
+    assert job.id == other and (job.status, job.attempts, job.worker_id) == ("leased", 1, "w")
+    assert job.fence == 3  # fence 来自整张表共用的序列：这是本表的第 3 次领取，而不是"这个任务的第 1 次"
     assert queue.get(later).status == "queued"
 
 
@@ -820,8 +821,9 @@ def test_async_shutdown_cancels_stragglers_after_grace_period_and_lets_leases_ex
             assert (counts["succeeded"], counts["leased"]) == (2, 2)  # 被取消的任务没有提交、也没有归还
             with psycopg.connect(pg_uri, autocommit=True) as c:  # 租约自然过期后……
                 c.execute("UPDATE agent_jobs SET lease_until = now() - interval '1 second' WHERE status = 'leased'")
+                old_max = c.execute("SELECT max(fence) FROM agent_jobs").fetchone()[0]
             taken = [await q.claim("another-pod", 30), await q.claim("another-pod", 30)]
-            assert all(j is not None and j.fence == 2 for j in taken)  # ……由别的 worker 接手
+            assert all(j is not None and j.attempts == 2 and j.fence > old_max for j in taken)  # ……由别的 worker 以更大的 fence 接手
 
     asyncio.run(main())
 
@@ -967,7 +969,8 @@ def test_one_shared_async_agent_serves_many_concurrent_jobs(pg_uri):
         assert sum(type(h).__name__ == "_LeaseGuard" for h in agent.hooks) == 1
         assert llm.max_in_flight > 1  # 同一个 Agent 实例上真的有多个任务在并发
         rows = await ckpt.list_runs(limit=100)
-        assert len(rows) == 20 and all(r["fence"] == 1 and r["writer"] == "w" for r in rows)  # 每个任务用的是自己的 fenced 视图
+        # 每个任务用的是自己的 fenced 视图：20 个任务各领取一次，fence 是全局序列发出的 1..20，各不相同
+        assert len(rows) == 20 and sorted(r["fence"] for r in rows) == list(range(1, 21)) and all(r["writer"] == "w" for r in rows)
         await q.close()
         await ckpt.close()
 
@@ -1127,3 +1130,55 @@ def test_write_cancelled_at_shutdown_is_replayed_with_the_same_key_and_not_dupli
         await ckpt.close()
 
     asyncio.run(main())
+
+
+# ---------------------------------------------------------------- 第 31 课压测中发现的问题（已修复）
+
+
+def test_fence_is_global_so_a_later_job_for_the_same_run_can_take_over(queue, ckpt, pg_uri):
+    """fence 以前按任务从 1 数起：run 任务被接手过（fence=2）之后，审批产生的 resume 任务第一次领取拿到 fence=1，
+    被检查点当成"比 fence=2 更旧的持有者"拒绝（CheckpointConflict → ownership_lost，一直卡到租约过期）。"""
+    first = queue.enqueue("agent", {"op": "run", "run_id": "r"}, tenant_id="t")
+    a = queue.claim("w1", 30)
+    ckpt.fenced(a.fence, "w1").save(state_with("r"))
+    with psycopg.connect(pg_uri, autocommit=True) as c:  # w1 卡死：租约过期、被回收，由 w2 接手
+        c.execute("UPDATE agent_jobs SET lease_until = now() - interval '1 second' WHERE id = %s", (first,))
+    assert queue.reap_expired() == [(first, "queued")]
+    b = queue.claim("w2", 30)
+    assert b.id == first and b.fence > a.fence
+    view_b = ckpt.fenced(b.fence, "w2")
+    s = view_b.load("r")
+    s.status = "paused"
+    view_b.save(s)
+    queue.complete(b)
+
+    queue.enqueue("agent", {"op": "resume", "run_id": "r"}, tenant_id="t")  # 审批通过：一个新任务，第一次领取
+    c = queue.claim("w3", 30)
+    assert c.attempts == 1 and c.fence > b.fence
+    assert ckpt.fenced(c.fence, "w3").load("r").status == "paused"  # 以前这里抛 CheckpointConflict
+
+
+def test_upgrading_from_per_job_fences_continues_after_the_largest_existing_fence(queue, pg_uri):
+    """从旧版本（fence = fence + 1）升级：序列必须从表里已有的最大 fence 往后发，否则新 fence 可能比旧的小。"""
+    job = queue.enqueue("agent", {}, tenant_id="t")
+    with psycopg.connect(pg_uri, autocommit=True) as c:  # 模拟旧版本留下的数据：没有序列，fence 已经数到 41
+        c.execute("UPDATE agent_jobs SET fence = 41 WHERE id = %s", (job,))
+        c.execute("DROP SEQUENCE agent_jobs_fence_seq")
+    queue.setup()  # 发布新版本时执行
+    queue.setup()  # 再执行一次也不会把序列往回拨
+    assert queue.claim("w", 30).fence == 42
+
+
+def test_shared_checkpointer_forgets_versions_of_finished_runs(ckpt):
+    """一个共享的检查点实例服务成千上万个运行：只增不减的版本号字典就是内存泄漏。
+    运行告一段落（非 running）就忘掉；恢复和审批都会先 load，重新记住最新版本。"""
+    for i in range(50):
+        s = state_with(f"r{i}")
+        ckpt.save(s)
+        s.status = "completed" if i % 2 else "paused"
+        ckpt.save(s)
+    assert ckpt._versions == {}
+    resumed = ckpt.load("r0")  # 暂停的运行被审批后恢复：先 load……
+    resumed.status = "running"
+    ckpt.save(resumed)  # ……CAS 照常工作
+    assert ckpt.version_of("r0") == 3
