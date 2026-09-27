@@ -12,7 +12,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Tests](https://img.shields.io/badge/tests-offline%20%26%20deterministic-brightgreen)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-orange)](CONTRIBUTING.md)
-[![Built with Claude Opus 5.5](https://img.shields.io/badge/built%20with-Claude%20Opus%205.5-D97757)](#-致谢)
+![Built with Claude Opus 5.5](https://img.shields.io/badge/built%20with-Claude%20Opus%205.5-D97757)
 
 本项目由 **Claude Opus 5.5** 协助架构设计
 
@@ -279,10 +279,6 @@ hello-agent-system/
 发现错误、想补充一节课、想改进翻译？非常欢迎！请看 [CONTRIBUTING.md](CONTRIBUTING.md)、[课程编写规范](docs/lesson-template.md) 与 [翻译规范](docs/translation-guide.md)。
 
 如果这个项目帮到了你，请给一个 ⭐ —— 这会让更多人看到它。
-
-## 🙏 致谢
-
-本项目由 [heaven999b](https://github.com/heaven999b) 发起和主导，使用 **Claude Opus 5.5**（Anthropic）协助完成课程架构设计与材料编写：从 `agentkit` 框架、17 节课的结构，到用真实模型逐课验证 demo、发现并修复框架缺陷，Claude Opus 5.5 全程参与。
 
 ## 📜 License
 

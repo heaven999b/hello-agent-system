@@ -12,7 +12,7 @@ No agent framework. You build every layer of an enterprise agent yourself: tools
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Tests](https://img.shields.io/badge/tests-offline%20%26%20deterministic-brightgreen)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-orange)](CONTRIBUTING.en.md)
-[![Built with Claude Opus 5.5](https://img.shields.io/badge/built%20with-Claude%20Opus%205.5-D97757)](#-acknowledgements)
+![Built with Claude Opus 5.5](https://img.shields.io/badge/built%20with-Claude%20Opus%205.5-D97757)
 
 This project's architecture was co-designed with **Claude Opus 5.5**
 
@@ -279,10 +279,6 @@ Its **design patterns** are production-grade, but the implementation is for teac
 Found a mistake? Want to add a lesson or improve a translation? Please do! See [CONTRIBUTING.en.md](CONTRIBUTING.en.md), the [lesson template](docs/lesson-template.en.md), and the [translation guide](docs/translation-guide.md).
 
 If this project helps you, a ⭐ helps others find it.
-
-## 🙏 Acknowledgements
-
-This project was initiated and is led by [heaven999b](https://github.com/heaven999b), with **Claude Opus 5.5** (Anthropic) helping design the course architecture and write the materials. Claude Opus 5.5 was involved throughout: the `agentkit` framework, the structure of the 17 lessons, validating every demo against a real model, and finding and fixing framework defects along the way.
 
 ## 📜 License
 
