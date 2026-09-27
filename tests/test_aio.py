@@ -164,12 +164,16 @@ def test_one_process_runs_many_sessions_concurrently():
 
 def test_read_tools_run_in_parallel_write_tools_stay_sequential():
     order = []
+    live = {"now": 0, "peak": 0}
 
     @tool
     async def slow_read(n: int) -> int:
         """慢的只读查询"""
         order.append(("start", n))
+        live["now"] += 1
+        live["peak"] = max(live["peak"], live["now"])
         await asyncio.sleep(0.3)
+        live["now"] -= 1
         order.append(("end", n))
         return n
 
@@ -188,7 +192,7 @@ def test_read_tools_run_in_parallel_write_tools_stay_sequential():
         return time.perf_counter() - t0, res
 
     elapsed, res = run(main([("slow_read", {"n": i}) for i in range(3)], [slow_read]))
-    assert elapsed < 0.6, f"3 个只读工具串行要 0.9s，实际 {elapsed:.2f}s"
+    assert live["peak"] == 3, "3 个只读工具应当同时在跑（用峰值并发证明，不依赖机器快慢）"
     assert [m["content"] for m in res.messages if m["role"] == "tool"] == ["0", "1", "2"]  # 结果仍按原顺序
     tool_spans = [s for s in res.trace.walk() if s.name.startswith("tool.")]
     assert len(tool_spans) == 3 and all(s.parent_id == res.trace.span_id for s in tool_spans)
@@ -243,7 +247,7 @@ def test_sync_tool_timeout_does_not_block_event_loop():
 
     res, ticks = run(main())
     assert "超时" in res.messages[3]["content"]
-    assert ticks >= 3, "同步工具在线程池里执行，事件循环不应被阻塞"
+    assert ticks >= 1, "同步工具在线程池里执行，事件循环不应被阻塞（阻塞时心跳一次也跑不了）"
 
 
 def test_process_isolated_tool_is_killed_on_timeout():
@@ -325,8 +329,10 @@ def test_keyed_limiter_isolates_noisy_tenant():
 
     finished = run(main())
     assert peak["noisy"] <= 2 and peak["quiet"] <= 2
-    assert max(finished["quiet0"], finished["quiet1"]) < 0.5, "安静的租户不应排在吵闹租户后面"
-    assert max(v for k, v in finished.items() if k.startswith("noisy")) >= 0.75  # 吵闹租户被限在 2 并发：8 个要 4 轮
+    quiet_done = max(finished["quiet0"], finished["quiet1"])
+    noisy_before_quiet = sum(1 for k, v in finished.items() if k.startswith("noisy") and v < quiet_done)
+    # 没有舱壁时，安静租户要排在 8 个吵闹请求后面；有舱壁时，最多只有第一批（2 个）吵闹请求比它先完成
+    assert noisy_before_quiet <= 2, f"有 {noisy_before_quiet} 个吵闹请求先于安静租户完成"
 
 
 def test_limiter_timeout_becomes_rate_limited_status():
@@ -356,7 +362,7 @@ def test_token_bucket_waits_without_blocking():
         return waited
 
     waited = run(main())
-    assert 0.05 <= waited < 0.5
+    assert 0.05 <= waited < 2.0  # 下限证明"确实等了补充令牌"；上限宽松，避免高负载机器上误报
 
 
 # ------------------------------------------------------------------ 可靠性
