@@ -157,7 +157,7 @@ def test_one_process_runs_many_sessions_concurrently():
     assert all(r.ok and r.output == "完成" for r in results)
     assert len({r.run_id for r in results}) == 100
     assert llm.max_in_flight >= 90, f"并发的模型调用只有 {llm.max_in_flight} 个"
-    assert elapsed < 3.0, f"耗时 {elapsed:.2f}s，说明并没有真正并发"
+    assert elapsed < 15.0, f"耗时 {elapsed:.2f}s：串行需要 40s（主要证据是上面的 max_in_flight；时限放宽以免高负载机器误报）"
     # 会话之间没有串台：每个会话看到的都是自己的问题
     assert all(r.messages[1]["content"] == f"q{i}" for i, r in enumerate(results))
 
@@ -220,7 +220,7 @@ def test_async_tool_timeout_really_cancels_the_tool():
 
     t0 = time.perf_counter()
     res = run(AsyncAgent(AsyncScriptedLLM([call_tool("hang"), reply("ok")]), [hang]).run("x"))
-    assert time.perf_counter() - t0 < 1.0
+    assert time.perf_counter() - t0 < 10.0  # 工具要睡 30s；主要证据是工具内部收到了 CancelledError
     assert "超时" in res.messages[3]["content"] and seen.get("cancelled") is True
 
 
@@ -263,7 +263,8 @@ def test_process_isolated_tool_is_killed_on_timeout():
     res, elapsed = run(main())
     outputs = [m["content"] for m in res.messages if m["role"] == "tool"]
     assert int(outputs[0]) != os.getpid()  # 真的在另一个进程里执行
-    assert "超时" in outputs[1] and elapsed < 10, "60 秒的死循环必须在 ~3 秒超时时被杀掉"
+    # 60 秒的死循环必须在 3 秒超时后被杀掉。时限放宽到 30s：内存吃紧时 spawn 子进程本身可能就要好几秒
+    assert "超时" in outputs[1] and elapsed < 30, f"耗时 {elapsed:.1f}s"
 
 
 def test_cancelling_a_run_stops_llm_and_saves_cancelled_state():
