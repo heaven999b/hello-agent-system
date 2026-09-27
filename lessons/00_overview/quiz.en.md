@@ -250,4 +250,30 @@ None of these is always best: conflict frequency, latency requirements, and your
 
 ---
 
+### 16. (Matching) ITBuddy is moving from one machine to a multi-instance, multi-worker deployment and runs into the problems below. Which Part 4 lesson should you turn to for each?
+
+1. A worker gets kill -9'd while running "create ticket," another worker picks the job up again, and the same ticket is created twice
+2. Approval for a high-risk action takes three days, the service is deployed twice in the meantime, and the run must resume exactly where it left off once approved
+3. A user says "it's slow," but the trace breaks in two at the queue between the API and the worker, so you can't see where the time went
+4. When the primary model provider goes down, calls should switch to a backup model automatically; the security team wants to change permission rules without a code change and a deploy every time
+5. The sync version needs 200 threads to serve 200 sessions at once, and one tenant flooding requests pushes every other tenant to the back of the line
+6. Every rolling deploy interrupts runs in progress, and every morning at 9 the queue backs up and needs more workers automatically
+
+<details>
+<summary>Answer</summary>
+
+| Problem | Lesson | Key idea |
+|---|---|---|
+| 1 | [26 State, queues, and distributed coordination](../26_state_and_queues/README.en.md) | Leases plus fencing tokens reject writes from zombie workers; write operations are deduplicated with idempotency keys |
+| 2 | [27 Durable workflows](../27_durable_workflows/README.en.md) | Wait for the approval with a Temporal Signal/Update while the engine persists workflow state; mind determinism and versioning when you deploy |
+| 3 | [28 Production observability](../28_production_observability/README.en.md) | Put the trace context into the queue along with the job, so the worker continues the same trace |
+| 4 | [29 Model gateways, policy as code, and guardrail services](../29_gateway_and_guardrails/README.en.md) | A model gateway handles routing and fallback; Cedar turns permissions into policy files and denies when evaluation fails (fail closed) |
+| 5 | [30 Async runtime and high-concurrency serving](../30_async_runtime/README.en.md) | One event loop runs hundreds of sessions concurrently; per-tenant bulkheads (KeyedLimiter) isolate noisy tenants |
+| 6 | [31 Deployment and scaling](../31_deployment_and_scaling/README.en.md) | On SIGTERM, stop taking new jobs and finish or hand back the ones in hand; scale on queue depth rather than CPU |
+
+(README 1.6)
+</details>
+
+---
+
 Got them all right? Move on to [Lesson 01: LLM essentials for agent developers](../01_llm_essentials/README.en.md).

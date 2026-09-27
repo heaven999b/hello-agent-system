@@ -475,6 +475,8 @@ no, created = tickets.create(title, priority, job_id=job.id, created_by=worker_i
 | `fence` | 同左 | 没有严格的等价物：官方文档说明，用旧的 receipt handle 删除，请求照样成功，但消息不一定被删掉。所以"提交结果"的 fencing 要在你自己的存储层实现 |
 | `SessionStore` CAS | `UPDATE ... WHERE version = $n` | 例如 DynamoDB 的条件写入 |
 
+> 🏭 **生产版**：本课用 SQLite 模拟分布式协调。[第 26 课](../26_state_and_queues/README.md)用真实的 Postgres（`SKIP LOCKED` 队列、版本号 CAS 检查点、fencing 接管）和 Redis（幂等、Lua 令牌桶、带 fencing token 的锁）把这张表的中间一列实现了一遍，并用多进程 kill -9 实测没有重复的副作用；[第 30 课](../30_async_runtime/README.md)把 worker 换成异步运行时，一个进程可以同时跑几十上百个任务。
+
 ## 4. 动手：运行 Demo
 
 ```bash
@@ -613,7 +615,7 @@ row = conn.execute(f"""
 
 ### 6.4 优雅停机：发版时别制造"僵尸"
 
-滚动发布时，K8s 先给 Pod 发 SIGTERM，等待一段宽限期后再 SIGKILL。worker 收到 SIGTERM 时应该：① 立刻停止领取新任务；② 在宽限期内尽量完成手头的任务；③ 做不完的，主动把任务放回队列（或者干脆等租约过期）。放回时不应计入 `attempts`，否则每次发版都会消耗一次重试机会。本课的 `JobQueue` 没有实现"主动归还"，你可以试着加一个 `release(job_id, fence)`：校验 fence，把状态改回 `queued`，并把 `attempts` 减一。
+滚动发布时，K8s 先给 Pod 发 SIGTERM，等待一段宽限期后再 SIGKILL。worker 收到 SIGTERM 时应该：① 立刻停止领取新任务；② 在宽限期内尽量完成手头的任务；③ 做不完的，主动把任务放回队列（或者干脆等租约过期）。放回时不应计入 `attempts`，否则每次发版都会消耗一次重试机会。本课的 `JobQueue` 没有实现"主动归还"，你可以试着加一个 `release(job_id, fence)`：校验 fence，把状态改回 `queued`，并把 `attempts` 减一。 生产版 worker 的完整停机时间线（停止领取 → 排空 → 交还 → 退出）和实测见[第 31 课](../31_deployment_and_scaling/README.md)。
 
 ### 6.5 Saga 的最小骨架（示意代码）
 

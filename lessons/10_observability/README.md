@@ -357,6 +357,8 @@ flowchart LR
     E --> F["告警"]
 ```
 
+> 🏭 **生产版**：本课的 `Tracer` 把 span 写进 JSONL 文件，只适合单进程。把它桥接到 OpenTelemetry SDK、用 OTLP 导出到任意后端、让 trace 跨任务队列串起来、做尾部采样和脱敏、把运行指标暴露给 Prometheus 并配燃尽率告警，见[第 28 课](../28_production_observability/README.md)。
+
 ## 4. 动手：运行 Demo
 
 ```bash

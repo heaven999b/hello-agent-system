@@ -63,15 +63,18 @@ To run: `python lessons/NN_topic/demo.py [--offline]`, `make lesson N=NN`, `make
 4. **Don't make things up**: cited papers, blog posts, and incidents must be real; if you're not sure, leave it out.
 5. **Code must run**: every command and code snippet in the docs must actually have been run.
 
-## The course has three parts
+## The course has four parts
 
 | Part | Lessons | Share | Approach |
 |---|---|---|---|
-| Part 1: Building Blocks | 00–07 | ~27% (~140 min) | Concepts → build from scratch → exercises |
-| Part 2: Enterprise Problems and Solutions | 08–16 | ~31% (~160 min) | **Problem-driven**: a real problem → compare several solutions → when each one fits → recommended choice → code |
-| Part 3: Advanced — Building Blocks in Depth, the ML Loop, and the Application Frontier | 17–25 | ~41% (~210 min) | Concepts → build from scratch → exercises + trade-off comparison |
+| Part 1: Building Blocks | 00–07 | ~20% (~140 min) | Concepts → build from scratch → exercises |
+| Part 2: Enterprise Problems and Solutions | 08–16 | ~23% (~160 min) | **Problem-driven**: a real problem → compare several solutions → when each one fits → recommended choice → code |
+| Part 3: Advanced — Building Blocks in Depth, the ML Loop, and the Application Frontier | 17–25 | ~31% (~210 min) | Concepts → build from scratch → exercises + trade-off comparison |
+| Part 4: Production on Mature Components | 26–31 | ~26% (~175 min) | Why the teaching version falls short → compare mature components (2–5 options: build / open source / managed) → how the adapter plugs in → operations and common pitfalls → how to switch to a managed service |
 
 Part 3 is advanced, optional material for learners who have finished the first two parts and the capstone. Each lesson keeps the README structure above, implements the core mechanisms from scratch (they can live in lesson-local modules such as `xxx_kit.py`), and compares the trade-offs between industry solutions (in the relevant section or in "Going deeper") rather than presenting just one approach.
+
+Part 4 is also advanced and optional. Each lesson opens §0 with one or two honest sentences on the teaching agentkit's limits in that area; adapters live in `agentkit/contrib/` (the async runtime in `agentkit/aio/`) and keep the teaching interfaces; demos run for real on embedded infrastructure (real Postgres via pgserver, fakeredis, the Temporal dev server) and, when optional dependencies are missing, print the install command and exit with code 0; every number in the lesson must come from a measurement, and the lesson must spell out how the embedded infrastructure differs from a production cluster.
 
 ## Enterprise problem cards (the main format of every Part 2 lesson)
 

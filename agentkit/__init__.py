@@ -14,6 +14,14 @@
 第三部分（17–25 课）在 agentkit 之上构建进阶能力，代码在各课目录中：
     检索质量（17）、记忆系统（18）、MCP 与沙箱（19）、框架对照（20）、
     Agent 的数据（21）、评估方法论（22）、优化（23）、编码 Agent（24）、主动式 Agent（25）
+
+注意：本包（agentkit 核心）是同步、单进程、状态在内存或本地文件里的教学实现，不要原样上线。
+第四部分（26–31 课）给出生产路径，接口与核心一致：
+    agentkit.aio       生产异步运行时：AsyncAgent（并发会话、真取消、run_timeout、舱壁、流式事件）、
+                       AsyncOpenAICompatLLM、AsyncResilientLLM、AsyncToolExecutor、KeyedLimiter（第 30 课）
+    agentkit.contrib   成熟组件适配器：Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar（第 26–29 课）
+    production/        把它们组装起来的参考服务：API + 多 worker + 压测 + 故障注入（第 31 课）
+逐模块的差距与迁移方法见 docs/production-readiness.md。
 """
 
 from .agent import Agent, RunResult

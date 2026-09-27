@@ -357,6 +357,8 @@ flowchart LR
     E --> F["Alerts"]
 ```
 
+> 🏭 **In production**: this lesson's `Tracer` writes spans to a JSONL file, which only works for a single process. For bridging it to the OpenTelemetry SDK, exporting over OTLP to any backend, stitching traces across the job queue, tail sampling and redaction, and exposing run metrics to Prometheus with burn-rate alerts, see [Lesson 28](../28_production_observability/README.en.md).
+
 ## 4. Hands-on: run the demo
 
 ```bash

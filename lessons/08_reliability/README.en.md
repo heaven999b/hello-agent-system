@@ -298,6 +298,8 @@ Note the last row: **every approach requires side-effecting operations to be ide
 
 > Checkpoints handle "the same task gets interrupted within minutes to hours." When a task is too long to fit in one context window (hours to days), you need a different kind of durability: a feature list, a progress file, and git, so that a brand-new session can read the handoff notes and take over. See [Lesson 24's long-running harness](../24_coding_agents/README.en.md#13-long-running-work-the-agent-wakes-up-with-amnesia-every-time).
 
+> 🏭 **In production**: this lesson's file checkpoints and in-memory idempotency store are single-process teaching versions. For multi-instance deployments, checkpoints move to Postgres with version-number CAS and fencing, and the idempotency store moves to Redis — see [Lesson 26](../26_state_and_queues/README.en.md). Flows that wait days for approval or need timed wake-ups belong in a durable execution engine such as Temporal — see [Lesson 27](../27_durable_workflows/README.en.md). This lesson's timeouts only stop the caller from waiting; the thread itself can't be killed. For an async runtime with real cancellation, see [Lesson 30](../30_async_runtime/README.en.md).
+
 ### Problem 5: After recovery, the customer got two refunds
 
 **Scenario**: A refund agent calls the payment API successfully, and just before the checkpoint is written, the process is OOM-killed. The new process resumes from the checkpoint, sees "the model decided to call refund, but there's no result", and calls it again. If 0.01% of 50,000 daily refunds land in this window, that's 5 duplicate refunds a day.

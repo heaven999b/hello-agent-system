@@ -254,6 +254,8 @@ agentkit's **design patterns** are production-grade, but agentkit itself is a te
 
 The exercise's `TenantRateLimiter` keeps each tenant's bucket in an in-memory dict that only ever grows. In production, watch out for two things: evict tenants that have been inactive for a long time (LRU / TTL), or memory will grow without bound; and with multiple replicas, move the state into shared storage.
 
+> 🏭 **In production**: for a cross-instance token bucket kept in Redis and made atomic with a Lua script, plus checkpoints and a job queue on Postgres, see [Lesson 26](../26_state_and_queues/README.en.md). For a model gateway built on LiteLLM Router, permissions written as Cedar policy files, and tiered classifier guardrails, see [Lesson 29](../29_gateway_and_guardrails/README.en.md). For the reference architecture actually assembled into an API + multi-worker service, with load tests, failure injection, and scaling, see [Lesson 31](../31_deployment_and_scaling/README.en.md).
+
 ## 4. Hands-on: run the demo
 
 ```bash

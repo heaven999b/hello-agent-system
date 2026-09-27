@@ -310,6 +310,7 @@ ITBuddy's structure carries over directly to an HR assistant, an expense-report 
 3. **Redo the permissions**: fill in the tool risk table and permission matrix in DESIGN.en.md first, then write `ROLE_TOOLS` and the argument-level rules. **Tables first, code second.**
 4. **Write evals before tuning the prompt**: at least 2 normal cases per scenario, plus at least 3 attack cases per dangerous tool.
 5. **Leave the hook order mostly alone**: input guardrail → budget → argument-level authorization → RBAC/approval → output isolation → audit → output guardrail.
+6. **Swap the runtime and storage when you ship**: ITBuddy is a single-process teaching implementation. To deploy it as a multi-instance service, follow the [`production/`](../production/) reference service ([Lesson 31](../lessons/31_deployment_and_scaling/README.en.md)): separate API and workers, checkpoints and the job queue on Postgres, rate limits and idempotency on Redis, sessions run concurrently with `AsyncAgent`, approvals via "pause → resume," plus load tests and failure injection.
 
 ## 12. Your own project: evaluation criteria
 

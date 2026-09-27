@@ -60,6 +60,8 @@ Each stage guards against something different. The eval gate catches "known regr
 - **Release**: through traffic configuration, some users start using v2, and that share grows step by step.
 - **Rollback**: point the traffic configuration back at v1. No version is ever deleted or modified, so a rollback just "moves a pointer." It finishes in seconds, and the rollback itself can be rolled back.
 
+> 🏭 In this lesson, "release" mainly means changes to prompts, models, and configuration. For rolling out the service code itself — on SIGTERM, stop claiming new jobs, finish or hand back the ones in hand, and let the readiness probe pull traffic first — and for scaling on queue depth, see [Lesson 31](../31_deployment_and_scaling/README.en.md).
+
 ## 2. Enterprise problem cards
 
 ### Problem 1: One line of the prompt changed, and production broke

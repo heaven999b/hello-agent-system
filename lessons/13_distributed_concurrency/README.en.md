@@ -475,6 +475,8 @@ One more easy-to-miss point: agentkit's built-in `IdempotencyStore` lives in pro
 | `fence` | Same | No strict equivalent: per the docs, deleting with an old receipt handle still returns success, but the message might not be deleted. So fencing for "commit the result" has to live in your own storage layer |
 | `SessionStore` CAS | `UPDATE ... WHERE version = $n` | e.g. DynamoDB conditional writes |
 
+> 🏭 **In production**: this lesson simulates distributed coordination with SQLite. [Lesson 26](../26_state_and_queues/README.en.md) implements the middle column of this table on real Postgres (a `SKIP LOCKED` queue, version-number CAS checkpoints, fencing takeover) and Redis (idempotency, a Lua token bucket, locks with fencing tokens), and verifies with multi-process kill -9 that no side effect runs twice. [Lesson 30](../30_async_runtime/README.en.md) swaps the worker for an async runtime, so one process can run dozens to hundreds of tasks at once.
+
 ## 4. Hands-on: run the demo
 
 ```bash
@@ -615,7 +617,7 @@ We tested it: with 50 `batch-team` tasks enqueued first and 3 `helpdesk` tasks a
 
 ### 6.4 Graceful shutdown: don't create zombies during deploys
 
-During a rolling deploy, Kubernetes sends the pod SIGTERM, waits out a grace period, then sends SIGKILL. On SIGTERM, a worker should: ① stop claiming new tasks immediately; ② try to finish its current task within the grace period; ③ put back anything it can't finish (or just let the lease expire). Putting a task back shouldn't count against `attempts`, or every deploy burns a retry. This lesson's `JobQueue` doesn't implement voluntary release; try adding a `release(job_id, fence)` yourself: check the fence, set the status back to `queued`, and decrement `attempts`.
+During a rolling deploy, Kubernetes sends the pod SIGTERM, waits out a grace period, then sends SIGKILL. On SIGTERM, a worker should: ① stop claiming new tasks immediately; ② try to finish its current task within the grace period; ③ put back anything it can't finish (or just let the lease expire). Putting a task back shouldn't count against `attempts`, or every deploy burns a retry. This lesson's `JobQueue` doesn't implement voluntary release; try adding a `release(job_id, fence)` yourself: check the fence, set the status back to `queued`, and decrement `attempts`. For the full shutdown timeline of a production worker (stop claiming → drain → hand back → exit) with measurements, see [Lesson 31](../31_deployment_and_scaling/README.en.md).
 
 ### 6.5 A minimal saga skeleton (sketch)
 

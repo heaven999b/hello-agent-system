@@ -254,6 +254,8 @@ agentkit 的**设计模式**是生产级的，但它是教学实现：同步、�
 
 练习里的 `TenantRateLimiter` 把每个租户的桶放在内存 dict 里，而且只增不减。生产中要注意两点：长期不活跃的租户要淘汰（LRU / TTL），否则内存会无限增长；多副本部署时，状态要放到共享存储里。
 
+> 🏭 **生产版**：放在 Redis 里、用 Lua 脚本保证原子性的跨实例令牌桶，以及 Postgres 上的检查点和任务队列，见[第 26 课](../26_state_and_queues/README.md)；用 LiteLLM Router 落地的模型网关、用 Cedar 写成策略文件的权限、分级的分类器护栏，见[第 29 课](../29_gateway_and_guardrails/README.md)；把参考架构真正组装起来的 API + 多 worker 服务、压测、故障注入和扩缩容，见[第 31 课](../31_deployment_and_scaling/README.md)。
+
 ## 4. 动手：运行 Demo
 
 ```bash

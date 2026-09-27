@@ -125,7 +125,7 @@ Three design decisions:
 2. **Escalation rate is the key metric**: in production, monitor the escalation rate per task type. A sudden rise means the traffic distribution has shifted, or the vendor has updated the small model (Lesson 16).
 3. **It escalates per step**: in an agent, the cascade applies to every model call. The small model can handle step 1's tool call while step 2's summary gets escalated. The alternative is **per-task escalation**: once any step escalates, the rest of the run uses the large model, because the task is clearly hard. `CascadeLLM` doesn't know where a run starts and ends, so per-task escalation has to live in a hook or in the service layer.
 
-In production: manage "which model to use" and "the escalation rules" centrally in a **model gateway** (Lesson 12), and feed escalation rates and per-model usage into your monitoring dashboards.
+In production: manage "which model to use" and "the escalation rules" centrally in a **model gateway** (Lesson 12), and feed escalation rates and per-model usage into your monitoring dashboards. For a model gateway built on LiteLLM Router (routing by model group, fallback on failure, per-team budgets), see [Lesson 29](../29_gateway_and_guardrails/README.en.md).
 
 ---
 
