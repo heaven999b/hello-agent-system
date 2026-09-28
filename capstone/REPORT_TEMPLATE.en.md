@@ -45,7 +45,7 @@
 
 **Questions to answer**:
 
-- **Environment**: where does the agent run: real systems, a sandbox, or a simulated backend? Which tools does it have, and what risk tier is each one?
+- **Environment**: where does the agent run: real systems, a sandbox, or a simulated backend? Which tools does it have, and what risk tier is each one? **Which parts are real and which are simulated?** Put it in a table (see how ITBuddy does it in [README Section 2.3](README.en.md#23-whats-real-and-whats-simulated): processes, crashes, and leases are real; the 5 enterprise systems are simulated external services).
 - **Where the data comes from and how it was collected**: sampled from production logs (how was it redacted, was it authorized)? Written by experts? Synthesized by a model (which model, what prompt, how was it filtered)? A public benchmark? How many cases from each source?
 - **How it's split**: how are the development set and the held-out test set divided? How do you make sure you didn't tune your prompts against the test set?
 - **Labeling**: who labeled it, following what guidelines? Did two people label a sample independently so you could measure agreement?
@@ -63,9 +63,12 @@
 - What are the key design decisions, **why** did you make them, and which alternatives did you reject? (You can cite your ADRs directly.)
 - Which models, prompts, and tools did you use? How were the key parameters chosen?
 - Approaches you tried that failed. This is often the most valuable part of the report.
+- **Deployment shape**: single process, multiple processes on one machine, or multiple machines? Of the concurrency, fault tolerance, and crash takeover you claim, which actually happened, and which test or failure injection proves it? Anything without proof should say "not verified".
 
 - ✅ "The hook order is: input guardrail → budget → argument-level authorization → RBAC and approval → output isolation → audit → output guardrail. Argument-level authorization must come before approval; otherwise requests that are bound to be rejected, like an employee resetting a colleague's password, land in the approval queue and cause approval fatigue. The ablation study confirmed it: without argument-level authorization, the approval queue grew from 1 request to 6. We tried summarization to compress context, but summaries lose the isolation tags around untrusted data, so we chose a sliding window instead (ADR-004)."
 - ❌ "We used the ReAct framework and state-of-the-art prompt engineering." (Which decisions? Why?)
+- ✅ (deployment shape) "The API process only enqueues and returns 202; the agent runs in 2 worker processes, and all state lives in shared SQLite. The end-to-end tests start real processes: the pause and the resume are handled by workers with different pids; a worker killed with kill -9 after the downstream created the ticket but before the result was recorded is taken over, the new holder replays the call, the downstream deduplicates by Idempotency-Key, and there is exactly 1 ticket. Limitation: every process runs on one machine; multiple machines are not verified."
+- ❌ (deployment shape) "The system supports high concurrency and distributed deployment, with comprehensive fault tolerance." (How much concurrency? How many processes? Has anything ever crashed? How do you know?)
 
 ## 5. Results
 
@@ -156,6 +159,7 @@ Reviewers will follow your README on a clean machine and run at least one task e
 - [ ] One "quick start" command runs a complete task, and the expected output is documented
 - [ ] Every number in the report maps to a command and a result file (for example, `run_evals.py` → `runs/eval_report.json`)
 - [ ] Everything that doesn't need an API key (offline tests, scripted mode) runs with a single command
+- [ ] Every concurrency / fault-tolerance claim has a real process-level test or demo (for example, one command that starts the deployment and injects kill -9), and the parts that are simulated are stated
 - [ ] The model snapshot version, run date, sampling parameters, and number of runs per configuration are documented
 - [ ] Eval data ships with the repository or comes with a download script, and its license is stated
 - [ ] The report says roughly how much money and time one full eval run takes to reproduce

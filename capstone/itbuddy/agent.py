@@ -11,25 +11,27 @@
       ▼  visible_tools         ④ PermissionPolicy RBAC：模型根本看不到无权使用的工具
       ▼  LLM（ResilientLLM：重试 → 熔断 → 降级到备用模型）
       ▼  before_tool           ② BudgetHook → ③ ArgumentPolicy → ④ PermissionPolicy（RBAC → 审批）
-      ▼  工具执行（ToolRegistry：参数校验 / 超时 / 截断 / 幂等）
+      ▼  工具执行（ToolExecutor：参数校验 / 超时 / 截断 / 幂等）
       ▼  after_tool            ⑤ ToolOutputGuard（包裹不可信数据）→ ⑥ AuditLog（记录）
       ▼  on_final              ⑦ CanaryGuard（提示词泄露）→ ⑧ OutputGuard（PII 脱敏）
       ▼  on_run_end            ⑥ AuditLog（run_end 含待审批操作 / 安全事件）
     最终回答
+
+build_agent 是 async 的：它可能要打开数据库、建表、播种（真实的 IO）。组装出来的 Agent 是 async 的，
+一个实例可以在一个进程里同时推进很多会话；多个 worker 进程共享同一份检查点 / 幂等记录 / 审计 / 企业后端（都在 SQLite 里），
+由 agentkit.distributed 的任务队列分活、用 fence 保证接手安全（见 worker_app.py、deploy.py）。
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Callable, Sequence, TypeVar
+from typing import Awaitable, Callable, Sequence, TypeVar, Union
 
 from agentkit import (
     Agent,
     BudgetHook,
-    FileCheckpointer,
     Hook,
-    IdempotencyStore,
     InputGuard,
     OutputGuard,
     PermissionPolicy,
@@ -44,13 +46,14 @@ from agentkit import (
     jsonl_exporter,
 )
 from agentkit.config import env
+from agentkit.distributed import SQLiteDB
 from agentkit.llm import LLM
-from agentkit.state import Checkpointer
 from agentkit.types import Message
 
 from .backend import Backend
 from .policies import ArgumentPolicy, CanaryGuard, ITBuddyAuditLog, reset_password_rule
 from .prompts import PROMPT_CANARY, SYSTEM_PROMPT
+from .storage import ITBuddyStores
 from .tools import make_tools
 
 DEFAULT_RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"  # capstone/runs（已被 .gitignore 忽略）
@@ -62,14 +65,22 @@ ROLE_TOOLS: dict[str, set[str]] = {
     "it_admin": {"*"},
 }
 
-Approver = Callable[[ToolCall, RunState], bool]
+# 同步审批函数（脚本里直接问一句）；可以是 async 函数。None = 暂停等异步审批（服务端的做法）
+Approver = Callable[[ToolCall, RunState], Union[bool, Awaitable[bool]]]
 H = TypeVar("H", bound=Hook)
 
 
-def build_llm(llm: LLM | None = None, fallback_llms: Sequence[LLM] | None = None) -> ResilientLLM:
-    """模型层：主模型 + 可选备用模型，外面套一层 ResilientLLM（重试 → 熔断 → 降级）。
+def build_llm(
+    llm: LLM | None = None,
+    fallback_llms: Sequence[LLM] | None = None,
+    *,
+    breaker_factory: Callable[[str], object] | None = None,
+) -> ResilientLLM:
+    """模型层：主模型 + 可选备用模型，外面套一层 ResilientLLM（重试 → 熔断 → 降级）。纯装配，不做 IO，所以是普通函数。
 
     传入 llm 时（比如测试用的 ScriptedLLM）也会被包一层，保证测试和生产走的是同一条代码路径。
+    breaker_factory：多个 worker 进程共享熔断状态时传 lambda model: SQLiteCircuitBreaker(db, model)
+    （一个进程发现模型挂了，所有进程立刻都知道，见 worker_app.py）。默认每个进程一个内存熔断器。
     """
     if isinstance(llm, ResilientLLM):
         return llm
@@ -79,19 +90,39 @@ def build_llm(llm: LLM | None = None, fallback_llms: Sequence[LLM] | None = None
             name = env("LLM_FALLBACK_MODEL")
             # 备用模型名和主模型相同就没有意义：同一个模型宕了，"降级"到它自己也没用
             fallback_llms = [default_llm(name)] if name and name != llm.model else []
-    return ResilientLLM(llm, list(fallback_llms or []), max_attempts=3, failure_threshold=5, reset_timeout=30)
+    return ResilientLLM(llm, list(fallback_llms or []), max_attempts=3, failure_threshold=5, reset_timeout=30,
+                        breaker_factory=breaker_factory)
 
 
-def build_agent(
+class ITBuddyAgent(Agent):
+    """ITBuddy 的 Agent：多带 backend 和 stores 两个属性（命令行、测试要用），
+    aclose() 时顺带关闭 build_agent 替你打开的数据库连接（你自己传进来的，由你自己关闭）。"""
+
+    def __init__(self, *args, backend: Backend, stores: ITBuddyStores, owned: Sequence = (), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.backend, self.stores = backend, stores
+        self._owned = list(owned)
+
+    @property
+    def audit(self) -> ITBuddyAuditLog | None:
+        return find_hook(self, ITBuddyAuditLog)
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        while self._owned:
+            await self._owned.pop().close()
+
+
+async def build_agent(
     llm: LLM | None = None,
     *,
-    backend: Backend | None = None,
+    backend: Backend | str | Path | None = None,
+    stores: ITBuddyStores | SQLiteDB | str | Path | None = None,
     runs_dir: str | Path | None = None,
-    checkpointer: Checkpointer | None = None,
     approver: Approver | None = None,
     tracer: Tracer | None = None,
-    idempotency_store: IdempotencyStore | None = None,
     fallback_llms: Sequence[LLM] | None = None,
+    breaker_factory: Callable[[str], object] | None = None,
     deny_tools: set[str] | None = None,
     max_steps: int = 8,
     max_tokens: int = 60_000,
@@ -99,20 +130,35 @@ def build_agent(
     max_tool_calls: int = 8,
     max_seconds: float = 120,
     context_max_tokens: int = 6000,
-) -> Agent:
+) -> ITBuddyAgent:
     """组装 ITBuddy。所有"外部依赖"都可以注入，这样测试可以做到离线、零成本、互不干扰。
 
     llm:        None → 按 .env 用真实模型（+ LLM_FALLBACK_MODEL 备用）；测试时传 ScriptedLLM。
-    backend:    None → 新建一份种子数据。调用方需要查看后端状态（测试、评估）时自己创建再传进来。
-    runs_dir:   审计 / 追踪 / 检查点的根目录，默认 capstone/runs；测试传 pytest 的 tmp_path。
-    approver:   None → 高危操作抛 PauseRun、状态落盘，等外部审批后 agent.approve()（异步审批）；
-                传函数 → 同步审批（适合脚本场景）。
+    backend:    模拟的企业后端。Backend 对象 → 直接用（由你关闭）；文件路径 → 打开这个文件（多进程共享）；
+                None → 一个私有的内存数据库（全新的种子数据）。后两种由 agent.aclose() 关闭。
+    stores:     检查点 / 幂等记录 / 审计所在的数据库。ITBuddyStores → 直接用；SQLiteDB 或路径 → 在上面建表；
+                None → runs_dir/itbuddy.db。worker 进程传任务队列的那个 SQLiteDB（同一个文件、同一个连接）。
+    runs_dir:   默认数据库和追踪文件的目录，默认 capstone/runs；测试传 pytest 的 tmp_path。
+    approver:   None → 高危操作抛 PauseRun、状态落盘，等外部审批后 agent.approve()（异步审批，可以在另一个进程里）；
+                传函数（同步或 async）→ 当场审批（适合脚本场景）。
     deny_tools: 紧急开关（kill switch）。默认读环境变量 ITBUDDY_DISABLED_TOOLS（逗号分隔），
                 发现某个工具有漏洞时无需发版就能全局禁用它。
     """
-    backend = backend or Backend()
+    model = build_llm(llm, fallback_llms, breaker_factory=breaker_factory)  # 先做可能失败的纯装配（例如没配置 .env）
     runs = Path(runs_dir) if runs_dir is not None else DEFAULT_RUNS_DIR
     runs.mkdir(parents=True, exist_ok=True)
+    owned: list = []  # build_agent 替调用方打开的资源：agent.aclose() 时关闭
+    try:
+        if not isinstance(stores, ITBuddyStores):
+            stores = await ITBuddyStores.open(stores if stores is not None else runs / "itbuddy.db")
+            owned.append(stores)
+        if not isinstance(backend, Backend):
+            backend = await Backend.open(backend)
+            owned.append(backend)
+    except BaseException:
+        for resource in reversed(owned):
+            await resource.close()
+        raise
     if deny_tools is None:
         deny_tools = {t.strip() for t in (os.environ.get("ITBUDDY_DISABLED_TOOLS") or "").split(",") if t.strip()}
 
@@ -143,15 +189,19 @@ def build_agent(
         ToolOutputGuard(),
         # ⑥ 审计放在 after_tool 链的最后：它记录的是"最终真正进入模型上下文的那个结果"。
         #    审计本身只写 ok / error_type / 脱敏后的参数，不写工具输出全文（避免审计日志变成数据泄露源）。
-        ITBuddyAuditLog(runs / "audit.jsonl"),
+        #    写进所有进程共享的审计表（storage.AuditStore），每条带上写入它的进程。
+        ITBuddyAuditLog(stores.audit),
         # ⑦ 先查提示词泄露（看原始输出），⑧ 再做 PII 脱敏。两者都只作用于最终回答。
         CanaryGuard(PROMPT_CANARY),
         OutputGuard(),
     ]
 
-    return Agent(
-        build_llm(llm, fallback_llms),
+    return ITBuddyAgent(
+        model,
         make_tools(backend),
+        backend=backend,
+        stores=stores,
+        owned=owned,
         system_prompt=SYSTEM_PROMPT,
         name="itbuddy",
         max_steps=max_steps,
@@ -159,13 +209,16 @@ def build_agent(
         # 选 SlidingWindow 而不是 SummarizingCompactor：IT 服务台对话很短（实测单轮最多 3 步），截断几乎没有损失；
         # 摘要要多一次模型调用，而且摘要是模型对不可信工具输出的"转述"，会丢掉 <untrusted_data> 标签（见 DESIGN.md ADR-004）。
         context_strategy=SlidingWindow(max_tokens=context_max_tokens),
-        # 检查点落盘：进程重启后仍能恢复；异步审批时状态就存在这里。
-        checkpointer=checkpointer or FileCheckpointer(runs / "checkpoints"),
+        # 检查点（SQLite，版本号 CAS）：进程重启后仍能恢复；异步审批时状态就存在这里，审批可以由另一个进程恢复。
+        # 在 worker 里，AgentJobHandler 每领取一次任务就传入一个带 fence 的视图（checkpointer=...），
+        # 被取代的旧持有者（"诈尸"的 worker）写不进来。
+        checkpointer=stores.checkpointer,
         # 追踪：agentkit 在写入 span 前已对 tool.arguments / tool.result_preview 做 PII 脱敏
         # （这是 ITBuddy 构建过程中发现并推动框架修复的问题，见 README 第 9 节）。
+        # 追踪文件按进程分开写（worker_app.py 传 traces/<worker>.jsonl）：追踪量大、可以丢，不值得跨进程加锁。
         tracer=tracer or Tracer(exporter=jsonl_exporter(runs / "traces.jsonl")),
-        # 第一层幂等（进程内）。第二层在后端（见 tools.create_ticket）。
-        idempotency_store=idempotency_store or IdempotencyStore(),
+        # 第一层幂等（所有进程共享的 SQLite 表）。第二层在下游后端（见 tools.create_ticket）。
+        idempotency_store=stores.idempotency,
     )
 
 

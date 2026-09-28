@@ -4,8 +4,9 @@
    agentkit 的 PermissionPolicy 做的是 RBAC："这个角色能不能用这个工具"。
    但 reset_password 的风险取决于**参数**：重置自己 ≠ 重置同事 ≠ 重置别家公司的人。
    这种"看参数 + 看身份"的判断叫 ABAC（基于属性的访问控制），必须单独做。
+   它要查员工目录（一次数据库读），所以是 async 的 —— Hook 方法可以是 async，Agent 会 await。
 
-2. ITBuddyAuditLog —— 在 AuditLog 基础上补记：安全事件、审批决定（含审批意见）。
+2. ITBuddyAuditLog —— 在 AuditLog 基础上补记：安全事件、审批决定（含审批意见），并写进所有进程共享的审计表。
    审计的核心问题是"出事后能不能回答：谁、何时、以什么身份、批准了什么"。
    agentkit 的 AuditLog 已经记录了 run_end.pending_approval（在等谁批什么）和 tool_call.approved_by（谁批的）；
    这里再补两类：安全事件单独成条，方便安全团队订阅告警；审批决定在恢复执行之前就落审计（含意见）。
@@ -17,17 +18,19 @@
 from __future__ import annotations
 
 import time
-from typing import Callable
+from contextvars import ContextVar
+from typing import Awaitable, Callable
 
-from agentkit import AuditLog, Hook
+from agentkit import AuditLog, Hook, maybe_await
 from agentkit.state import RunState
 
 from .backend import Backend
+from .storage import AuditStore
 
 # ---------------------------------------------------------------------------- 参数级授权
 
 
-def check_reset_permission(
+async def check_reset_permission(
     backend: Backend, tenant_id: str | None, actor_id: str | None, roles: list[str] | tuple[str, ...],
     target_user_id: str | None,
 ) -> str | None:
@@ -42,32 +45,32 @@ def check_reset_permission(
     target = target_user_id or actor_id
     if target != actor_id and "it_admin" not in roles:
         return "拒绝：普通员工只能重置自己的密码。如需帮同事重置，请让本人发起，或联系 IT 管理员。"
-    if backend.get_employee(tenant_id, target) is None:
+    if await backend.get_employee(tenant_id, target) is None:
         # 注意措辞：不说"该用户属于其他公司"，只说"本公司找不到"。
         # 否则攻击者可以用这个工具探测别的租户里有哪些人（枚举攻击）。
         return f"拒绝：本公司员工目录中找不到用户 {target!r}。"
     return None
 
 
-ArgRule = Callable[[RunState, dict], "str | None"]
+ArgRule = Callable[[RunState, dict], "str | None | Awaitable[str | None]"]
 
 
 class ArgumentPolicy(Hook):
-    """按工具名配置参数级规则：rules = {tool_name: rule(state, args) -> 拒绝原因 | None}。"""
+    """按工具名配置参数级规则：rules = {tool_name: rule(state, args) -> 拒绝原因 | None}（rule 可以是 async 函数）。"""
 
     def __init__(self, rules: dict[str, ArgRule]):
         self.rules = rules
 
-    def before_tool(self, state, call, tool) -> str | None:
+    async def before_tool(self, state, call, tool) -> str | None:
         rule = self.rules.get(call.name)
-        return rule(state, call.parsed_args()) if rule else None
+        return await maybe_await(rule(state, call.parsed_args())) if rule else None
 
 
 def reset_password_rule(backend: Backend) -> ArgRule:
-    def rule(state: RunState, args: dict) -> str | None:
+    async def rule(state: RunState, args: dict) -> str | None:
         m = state.metadata
-        return check_reset_permission(backend, m.get("tenant_id"), m.get("user_id"), m.get("roles", []),
-                                      args.get("target_user_id"))
+        return await check_reset_permission(backend, m.get("tenant_id"), m.get("user_id"), m.get("roles", []),
+                                            args.get("target_user_id"))
 
     return rule
 
@@ -75,14 +78,49 @@ def reset_password_rule(backend: Backend) -> ArgRule:
 # ---------------------------------------------------------------------------- 审计
 
 
+# 基类 AuditLog 的 after_tool / on_run_end 是同步方法，最后调用 self._write(record) 落盘。
+# 这里要写数据库（async），所以在调用基类方法时用一个 ContextVar"接住"它生成的记录，再 await 写入。
+# 基类方法里没有 await，接住的过程不会和别的会话交错；用 ContextVar 而不是实例属性，
+# 是因为一个 worker 进程里同一个 Agent（同一个 Hook 实例）同时在跑几十个任务。
+_captured: ContextVar[list | None] = ContextVar("itbuddy_audit_capture", default=None)
+
+
 class ITBuddyAuditLog(AuditLog):
-    """AuditLog 的增强版。继承而不是修改框架代码：框架给通用能力，业务在外面扩展。"""
+    """AuditLog 的增强版。继承而不是修改框架代码：框架给通用能力，业务在外面扩展。
 
-    def record(self, event: str, **fields) -> None:
-        """公开的写入口：给 app / server 记录 Agent 之外发生的事（如审批决定和审批意见）。"""
-        self._write({"ts": time.time(), "event": event, **fields})
+    记录写进 AuditStore（所有进程共享的只追加表），每条自动带上写入它的进程（writer、pid）。
+    """
 
-    def on_run_end(self, state) -> None:
+    def __init__(self, store: AuditStore):
+        super().__init__(None)  # 不写文件：完整记录在共享表里；基类的 self.records 只在内存里留最近 1000 条
+        self.store = store
+
+    def _write(self, record: dict) -> None:
+        buf = _captured.get()
+        if buf is None:
+            raise RuntimeError("ITBuddyAuditLog 只能在 async 钩子里写入（请用 await audit.record(...)）")
+        super()._write(record)  # path=None：只进有界的 self.records
+        buf.append(record)
+
+    async def _emit(self, method, *args, **extra) -> None:
+        buf: list[dict] = []
+        token = _captured.set(buf)
+        try:
+            method(*args)
+        finally:
+            _captured.reset(token)
+        for record in buf:
+            await self.store.append({**record, **extra})
+
+    async def record(self, event: str, **fields) -> bool:
+        """公开的写入口：给 API / 命令行记录 Agent 之外发生的事（如审批决定和审批意见）。返回是否真的写入。"""
+        return await self.store.append({"ts": time.time(), "event": event, **fields})
+
+    async def after_tool(self, state, call, result) -> None:
+        await self._emit(super().after_tool, state, call, result, call_id=call.id)
+        return None
+
+    async def on_run_end(self, state) -> None:
         base = {"run_id": state.run_id, "tenant_id": state.metadata.get("tenant_id"),
                 "user_id": state.metadata.get("user_id")}
         security = {k: state.metadata[k] for k in
@@ -90,8 +128,8 @@ class ITBuddyAuditLog(AuditLog):
                     if k in state.metadata}
         if security:
             # 安全事件单独成条，方便 SIEM / 安全团队按 event 字段订阅告警
-            self.record("security_event", **base, **security)
-        super().on_run_end(state)
+            await self.record("security_event", **base, **security)
+        await self._emit(super().on_run_end, state)
 
 
 # ---------------------------------------------------------------------------- 提示词泄露检测

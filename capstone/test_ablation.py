@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import sys
@@ -20,7 +21,7 @@ sys.path.insert(0, str(HERE))
 
 from agentkit import InputGuard, OutputGuard, PermissionPolicy, ScriptedLLM, ToolOutputGuard, reply  # noqa: E402
 from agentkit.evals import CaseResult, Check, load_cases  # noqa: E402
-from itbuddy import ArgumentPolicy, Backend, CanaryGuard, build_agent, visible_tools_for  # noqa: E402
+from itbuddy import ArgumentPolicy, CanaryGuard, build_agent, visible_tools_for  # noqa: E402
 
 # 用独一无二的模块名加载，避免和其他目录里可能存在的同名模块冲突（pytest 用 importlib 模式）
 _spec = importlib.util.spec_from_file_location("capstone_ablation", HERE / "ablation.py")
@@ -34,9 +35,11 @@ SECURITY_CASES = [c for c in load_cases(HERE / "evals" / "cases.jsonl") if "secu
 
 @pytest.fixture(scope="module")
 def offline(tmp_path_factory):
-    """全部 8 组配置 × 10 条安全用例，离线跑一遍（不到 1 秒），供下面的测试共用。"""
+    """全部 8 组配置 × 10 条安全用例，离线跑一遍（不到 1 秒），供下面的测试共用。
+    模块级的同步 fixture：在它自己的事件循环里跑完（asyncio.run），测试函数只读结果。"""
     runs = tmp_path_factory.mktemp("ablation")
-    results = ab.run_ablation(SECURITY_CASES, list(ab.CONFIGS), runs, llm_factory=lambda c: ab.CompromisedLLM(c.id))
+    results = asyncio.run(ab.run_ablation(SECURITY_CASES, list(ab.CONFIGS), runs,
+                                          llm_factory=lambda c: ab.CompromisedLLM(c.id), workers=8))
     return {cfg: ab.summarize(cfg, rs) for cfg, rs in results.items()}
 
 
@@ -44,11 +47,17 @@ def hook_types(agent) -> list[type]:
     return [type(h) for h in agent.hooks]
 
 
+@pytest.fixture
+async def agent(tmp_path):
+    agent = await build_agent(ScriptedLLM([reply("ok")]), runs_dir=tmp_path)
+    yield agent
+    await agent.aclose()
+
+
 # ---------------------------------------------------------------------------- ablate() 本身
 
 
-def test_ablate_removes_only_the_requested_hook(tmp_path):
-    agent = build_agent(ScriptedLLM([]), backend=Backend(), runs_dir=tmp_path)
+def test_ablate_removes_only_the_requested_hook(agent):
     before = hook_types(agent)
     ab.ablate(agent, {"input_guard"})
     after = hook_types(agent)
@@ -56,15 +65,13 @@ def test_ablate_removes_only_the_requested_hook(tmp_path):
     assert [t for t in before if t is not InputGuard] == after  # 其余 Hook 一个不少，顺序不变
 
 
-def test_ablate_output_guard_does_not_touch_other_output_hooks(tmp_path):
-    agent = ab.ablate(build_agent(ScriptedLLM([]), backend=Backend(), runs_dir=tmp_path), {"output_guard"})
-    types = hook_types(agent)
+def test_ablate_output_guard_does_not_touch_other_output_hooks(agent):
+    types = hook_types(ab.ablate(agent, {"output_guard"}))
     assert OutputGuard not in types
     assert CanaryGuard in types and ToolOutputGuard in types  # 按"精确类型"匹配，不会误伤
 
 
-def test_ablate_approval_keeps_rbac(tmp_path):
-    agent = build_agent(ScriptedLLM([]), backend=Backend(), runs_dir=tmp_path)
+def test_ablate_approval_keeps_rbac(agent):
     visible = visible_tools_for(agent, ALICE)
     ab.ablate(agent, {"approval"})
     policy = next(h for h in agent.hooks if isinstance(h, PermissionPolicy))
@@ -72,8 +79,7 @@ def test_ablate_approval_keeps_rbac(tmp_path):
     assert visible_tools_for(agent, ALICE) == visible and "lookup_employee" not in visible  # RBAC 照旧
 
 
-def test_ablate_rejects_unknown_component(tmp_path):
-    agent = build_agent(ScriptedLLM([reply("ok")]), backend=Backend(), runs_dir=tmp_path)
+def test_ablate_rejects_unknown_component(agent):
     with pytest.raises(ValueError):
         ab.ablate(agent, {"firewall"})
 
@@ -142,9 +148,19 @@ def test_tool_internal_checks_still_hold_when_every_hook_is_removed(offline):
         assert case not in s.failed_cases
 
 
-def test_main_offline_writes_a_report(tmp_path, capsys):
+def test_results_do_not_depend_on_concurrency(tmp_path):
+    """每个任务互相独立（自己的后端、自己的模型）：串行跑和 8 个并发跑，逐条结果完全一样。"""
+    cases = SECURITY_CASES[:5]
+    runs = [asyncio.run(ab.run_ablation(cases, ["full", "no_approval"], tmp_path / f"w{w}",
+                                        llm_factory=lambda c: ab.CompromisedLLM(c.id), workers=w)) for w in (1, 8)]
+    key = [[(r.id, r.passed, r.status, r.tools, [(c.name, c.passed) for c in r.checks]) for r in rs]
+           for rs in (runs[0]["full"] + runs[0]["no_approval"], runs[1]["full"] + runs[1]["no_approval"])]
+    assert key[0] == key[1]
+
+
+async def test_main_offline_writes_a_report(tmp_path, capsys):
     out = tmp_path / "report.json"
-    assert ab.main(["--offline", "--out", str(out)]) == 0
+    assert await ab.amain(["--offline", "--out", str(out)]) == 0
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["mode"] == "offline"
     assert [s["config"] for s in data["summaries"]][0] == "full"

@@ -1,25 +1,39 @@
 """模拟的企业后端：员工目录、工单系统、知识库、账号系统、系统状态。
 
 真实公司里这些是 5 个不同的系统（HR/IdP 目录、ServiceNow/Jira、Confluence、AD/Okta、状态页），
-各有自己的 API 和权限。这里用内存数据模拟，但**保留了真实系统里最关键的约束**：
+各有自己的 API 和数据库。这里用**一个 SQLite 文件**模拟它们（所以叫"模拟的外部系统"），
+但它们是真正**跨进程共享**的：API 进程和每个 worker 进程各自打开同一个文件，谁建的工单别的进程立刻看得到。
+以前这里是进程内的 dict + threading.Lock —— 换成多进程部署，每个 worker 各有一份 dict，
+"同一个幂等键只建一张单"只在各自进程里成立，kill -9 之后接手的 worker 会再建一张。
+
+保留了真实系统里最关键的约束：
 
 1. 多租户：每个方法都必须传 tenant_id，没有任何"跨租户查询"的入口。
    隔离做在数据访问层，而不是指望上层（更不是指望模型）记得加过滤条件。
-2. 幂等：create_ticket 接受 idempotency_key，同一个 key 只会建一张单
-   （和 Stripe 的 Idempotency-Key 请求头是同一个思路）。
+2. 下游幂等（Idempotency-Key）：create_ticket / reset_password 接受 idempotency_key，
+   表上有 UNIQUE (tenant_id, idempotency_key)，"查重 + 插入"在同一个写事务（BEGIN IMMEDIATE）里完成：
+   两个进程同时拿同一个 key 来建单，只有一个能插进去 —— 和 Stripe 的 Idempotency-Key 请求头是同一个思路。
+   Agent 这边的幂等记录（SQLiteIdempotencyStore）只记"成功之后"的结果；worker 在"下游已提交、结果还没记下"
+   的瞬间被 kill -9，接手者重放同一个调用时，挡住第二张工单的是这里（test_server.py 用真实进程验证）。
 3. 敏感操作不回传秘密：reset_password 不返回新密码，只返回"链接已发到哪个邮箱（打码）"。
    新密码永远不进入 Agent 的上下文 —— 进了上下文就等于进了日志、追踪、模型供应商。
+4. 每次副作用尝试都记一行 side_effect_attempts（inserted / deduplicated + 进程号）：
+   事后能证明"重放确实发生过、而且被挡住了"，而不只是"最后只有一张单"。
 
 所有数据都是虚构的：公司、人名、域名（.example 是 RFC 2606 保留的示例域名）、手机号。
 """
 
 from __future__ import annotations
 
-import itertools
-import threading
+import json
+import os
+import sqlite3
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
+from typing import Any, Callable
 
+from agentkit.distributed import SQLiteDB
 from agentkit.memory import tokenize  # 复用 agentkit 的中文二元组分词，零依赖
 
 # ---------------------------------------------------------------------------- 数据模型
@@ -50,6 +64,8 @@ class Ticket:
     status: str = "open"  # open / in_progress / resolved
     created_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M"))
     last_update: str = "已受理，等待 IT 工程师处理"
+    idempotency_key: str | None = None  # 调用方带来的 Idempotency-Key（Agent 里是 run_id:call_id）
+    created_by_pid: int | None = None  # 哪个进程建的单（种子数据为空）
 
 
 @dataclass
@@ -69,6 +85,8 @@ class PasswordReset:
     requested_by: str
     delivered_to: str
     at: float = field(default_factory=time.time)
+    idempotency_key: str | None = None
+    performed_by_pid: int | None = None
 
 
 # ---------------------------------------------------------------------------- 种子数据
@@ -197,49 +215,152 @@ def mask_phone(phone: str) -> str:
 
 # ---------------------------------------------------------------------------- 后端
 
+_SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS employees (
+        tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, name TEXT NOT NULL, department TEXT NOT NULL,
+        title TEXT NOT NULL, roles TEXT NOT NULL, email TEXT NOT NULL, phone TEXT NOT NULL,
+        account_status TEXT NOT NULL DEFAULT 'active',
+        PRIMARY KEY (tenant_id, user_id))""",
+    """CREATE TABLE IF NOT EXISTS kb_articles (
+        tenant_id TEXT NOT NULL, id TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+        updated_at TEXT NOT NULL, author TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, id))""",
+    """CREATE TABLE IF NOT EXISTS system_status (
+        tenant_id TEXT NOT NULL, system TEXT NOT NULL, info TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, system))""",
+    # NULL 互不相等：种子工单没有幂等键，不受 UNIQUE 约束
+    """CREATE TABLE IF NOT EXISTS tickets (
+        id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, requester TEXT NOT NULL, title TEXT NOT NULL,
+        description TEXT NOT NULL, category TEXT NOT NULL, priority TEXT NOT NULL, status TEXT NOT NULL,
+        created_at TEXT NOT NULL, last_update TEXT NOT NULL, idempotency_key TEXT, created_by_pid INTEGER,
+        UNIQUE (tenant_id, idempotency_key))""",
+    "CREATE INDEX IF NOT EXISTS tickets_requester_idx ON tickets (tenant_id, requester)",
+    "CREATE TABLE IF NOT EXISTS ticket_seq (tenant_id TEXT PRIMARY KEY, next INTEGER NOT NULL)",
+    """CREATE TABLE IF NOT EXISTS password_resets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, target_user_id TEXT NOT NULL,
+        requested_by TEXT NOT NULL, delivered_to TEXT NOT NULL, at REAL NOT NULL,
+        idempotency_key TEXT, performed_by_pid INTEGER,
+        UNIQUE (tenant_id, idempotency_key))""",
+    """CREATE TABLE IF NOT EXISTS side_effect_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, tenant_id TEXT NOT NULL,
+        idempotency_key TEXT, outcome TEXT NOT NULL, pid INTEGER NOT NULL, at REAL NOT NULL)""",
+]
+
+_FIRST_TICKET_NO = {"acme": 1004, "globex": 2002}
+
+
+def _create_and_seed(conn: sqlite3.Connection) -> None:
+    """建表 + 种子数据。全部 INSERT OR IGNORE：几个进程先后（或同时）启动都只会得到同一份数据，
+    已经发生的变化（新工单、被解锁的账号、递增的工单号）不会被"重新播种"覆盖。"""
+    for ddl in _SCHEMA:
+        conn.execute(ddl)
+    conn.executemany(
+        "INSERT OR IGNORE INTO employees VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(e.tenant_id, e.user_id, e.name, e.department, e.title, json.dumps(e.roles), e.email, e.phone, e.account_status)
+         for e in EMPLOYEES],
+    )
+    conn.executemany("INSERT OR IGNORE INTO kb_articles VALUES (?, ?, ?, ?, ?, ?)",
+                     [(a.tenant_id, a.id, a.title, a.body, a.updated_at, a.author) for a in ARTICLES])
+    conn.executemany("INSERT OR IGNORE INTO system_status VALUES (?, ?, ?)",
+                     [(t, name, json.dumps(info, ensure_ascii=False)) for t, systems in SYSTEM_STATUS.items()
+                      for name, info in systems.items()])
+    conn.executemany(
+        "INSERT OR IGNORE INTO tickets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+        [(t.id, t.tenant_id, t.requester, t.title, t.description, t.category, t.priority, t.status, t.created_at,
+          t.last_update) for t in SEED_TICKETS],
+    )
+    conn.executemany("INSERT OR IGNORE INTO ticket_seq VALUES (?, ?)", list(_FIRST_TICKET_NO.items()))
+
+
+def _row_to(cls, row: sqlite3.Row):
+    names = {f.name for f in fields(cls)}
+    d = {k: row[k] for k in row.keys() if k in names}
+    if cls is Employee:
+        d["roles"] = json.loads(d["roles"])
+    return cls(**d)
+
 
 class Backend:
-    """一个进程内的"企业后端"。每次 Backend() 都得到一份全新的种子数据，测试和评估之间互不影响。"""
+    """模拟的企业后端，数据在 SQLite 里。
 
-    def __init__(self):
-        self._lock = threading.Lock()  # server.py 会在多个线程里并发调用
-        self.employees = {(e.tenant_id, e.user_id): Employee(**asdict(e)) for e in EMPLOYEES}
-        self.tickets: dict[str, Ticket] = {t.id: Ticket(**asdict(t)) for t in SEED_TICKETS}
-        self.articles = list(ARTICLES)
-        self.status = {t: {k: dict(v) for k, v in s.items()} for t, s in SYSTEM_STATUS.items()}
-        self.password_resets: list[PasswordReset] = []
-        self._idempotency: dict[tuple[str, str], str] = {}  # (tenant_id, key) -> ticket_id
-        self._seq = {t: itertools.count(1004 if t == "acme" else 2002) for t in TENANTS}
+    Backend()            → 一个私有的内存数据库：每次都是全新的种子数据（单元测试、评估用，用例之间互不影响）
+    Backend("x.db")      → 一个文件：多个进程各自打开同一个文件，看到的是同一份数据（部署用）
+    Backend(sqlite_db)   → 借用已有的 SQLiteDB 连接（不负责关闭它）
+
+    所有方法都是 async：SQLite 调用在 SQLiteDB 的专用线程里执行，不会卡住事件循环。
+    用法：backend = await Backend.open(path)；用完 await backend.close()（或 async with）。
+    """
+
+    def __init__(self, path_or_db: str | Path | SQLiteDB | None = None):
+        if isinstance(path_or_db, SQLiteDB):
+            self.db, self._owns_db = path_or_db, False
+        else:
+            self.db, self._owns_db = SQLiteDB(":memory:" if path_or_db is None else path_or_db), True
+        self._ready = False
+
+    @classmethod
+    async def open(cls, path_or_db: str | Path | SQLiteDB | None = None) -> "Backend":
+        backend = cls(path_or_db)
+        await backend.setup()
+        return backend
+
+    async def setup(self) -> None:
+        await self.db.write(_create_and_seed)
+        self._ready = True
+
+    async def close(self) -> None:
+        if self._owns_db:
+            await self.db.close()
+
+    async def __aenter__(self) -> "Backend":
+        await self.setup()
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.close()
+
+    async def _read(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        if not self._ready:  # 忘了 setup 也能用：第一次访问时建表 + 播种（幂等）
+            await self.setup()
+        return await self.db.run(fn)
+
+    async def _write(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        """在一个写事务（BEGIN IMMEDIATE）里执行：开始就拿写锁，"读-判断-写"对别的进程是原子的。"""
+        if not self._ready:
+            await self.setup()
+        return await self.db.write(fn)
 
     # ---------------------------------------------------------------- 员工目录
 
-    def get_employee(self, tenant_id: str, user_id: str | None) -> Employee | None:
-        return self.employees.get((tenant_id, user_id or ""))
+    async def get_employee(self, tenant_id: str, user_id: str | None) -> Employee | None:
+        row = await self._read(lambda c: c.execute(
+            "SELECT * FROM employees WHERE tenant_id = ? AND user_id = ?", (tenant_id, user_id or "")).fetchone())
+        return _row_to(Employee, row) if row else None
 
-    def identity(self, tenant_id: str, user_id: str) -> dict | None:
+    async def identity(self, tenant_id: str, user_id: str) -> dict | None:
         """把"谁登录了"转换成 Agent 需要的可信 metadata。角色来自目录，而不是来自客户端。"""
-        e = self.get_employee(tenant_id, user_id)
+        e = await self.get_employee(tenant_id, user_id)
         if e is None or e.account_status == "disabled":
             return None
         return {"tenant_id": tenant_id, "user_id": user_id, "roles": list(e.roles)}
 
-    def find_employees(self, tenant_id: str, query: str, limit: int = 5) -> list[Employee]:
+    async def find_employees(self, tenant_id: str, query: str, limit: int = 5) -> list[Employee]:
         q = query.strip().lower()
-        hits = [
-            e for (t, _), e in self.employees.items()
-            if t == tenant_id and (q in e.user_id.lower() or q in e.name.lower() or q in e.department.lower())
-        ]
+        rows = await self._read(lambda c: c.execute(
+            "SELECT * FROM employees WHERE tenant_id = ? ORDER BY rowid", (tenant_id,)).fetchall())
+        people = [_row_to(Employee, r) for r in rows]
+        hits = [e for e in people if q in e.user_id.lower() or q in e.name.lower() or q in e.department.lower()]
         return hits[:limit]
 
     # ---------------------------------------------------------------- 知识库
 
-    def search_kb(self, tenant_id: str, query: str, k: int = 3) -> list[Article]:
+    async def search_kb(self, tenant_id: str, query: str, k: int = 3) -> list[Article]:
         """关键词检索（标题命中权重 3，正文命中权重 1）。生产中换成向量 + BM25 混合检索。"""
+        rows = await self._read(lambda c: c.execute(  # 租户隔离：别家的文章根本不会被读出来参与打分
+            "SELECT * FROM kb_articles WHERE tenant_id = ? ORDER BY rowid", (tenant_id,)).fetchall())
         q = {t for t in tokenize(query) if t not in _STOP_TOKENS}
         scored = []
-        for a in self.articles:
-            if a.tenant_id != tenant_id:  # 租户隔离：别家的文章根本不参与打分
-                continue
+        for a in (_row_to(Article, r) for r in rows):
             title, body = set(tokenize(a.title)), set(tokenize(a.body))
             score = sum(3 for t in q if t in title) + sum(1 for t in q if t in body)
             if score >= 2:
@@ -249,40 +370,120 @@ class Backend:
 
     # ---------------------------------------------------------------- 工单
 
-    def list_tickets(self, tenant_id: str, requester: str) -> list[Ticket]:
-        return [t for t in self.tickets.values() if t.tenant_id == tenant_id and t.requester == requester]
+    async def list_tickets(self, tenant_id: str, requester: str) -> list[Ticket]:
+        rows = await self._read(lambda c: c.execute(
+            "SELECT * FROM tickets WHERE tenant_id = ? AND requester = ? ORDER BY rowid", (tenant_id, requester)).fetchall())
+        return [_row_to(Ticket, r) for r in rows]
 
-    def create_ticket(
+    async def create_ticket(
         self, tenant_id: str, requester: str, title: str, description: str, category: str, priority: str,
         idempotency_key: str | None = None,
     ) -> tuple[Ticket, bool]:
-        """返回 (工单, 是否为重复请求)。同一个 idempotency_key 永远只对应一张工单。"""
-        with self._lock:  # "查重 + 插入"必须是原子的，否则两个并发重试会各建一张
-            if idempotency_key and (tenant_id, idempotency_key) in self._idempotency:
-                return self.tickets[self._idempotency[(tenant_id, idempotency_key)]], True
-            tid = f"{TICKET_PREFIX[tenant_id]}-{next(self._seq[tenant_id])}"
-            ticket = Ticket(tid, tenant_id, requester, title, description, category, priority)
-            self.tickets[tid] = ticket
+        """返回 (工单, 是否为重复请求)。同一个 idempotency_key 永远只对应一张工单 —— 不管请求来自哪个进程。"""
+        pid = os.getpid()
+
+        def op(conn: sqlite3.Connection) -> tuple[Ticket, bool]:
+            now = time.time()
             if idempotency_key:
-                self._idempotency[(tenant_id, idempotency_key)] = tid
+                row = conn.execute("SELECT * FROM tickets WHERE tenant_id = ? AND idempotency_key = ?",
+                                   (tenant_id, idempotency_key)).fetchone()
+                if row is not None:
+                    _attempt(conn, "create_ticket", tenant_id, idempotency_key, "deduplicated", pid, now)
+                    return _row_to(Ticket, row), True
+            # 工单号在同一个写事务里分配：两个进程同时建单不会拿到同一个号
+            seq = conn.execute("SELECT next FROM ticket_seq WHERE tenant_id = ?", (tenant_id,)).fetchone()
+            if seq is None:
+                raise KeyError(f"未知租户 {tenant_id!r}")
+            conn.execute("UPDATE ticket_seq SET next = next + 1 WHERE tenant_id = ?", (tenant_id,))
+            ticket = Ticket(f"{TICKET_PREFIX[tenant_id]}-{seq['next']}", tenant_id, requester, title, description,
+                            category, priority, idempotency_key=idempotency_key, created_by_pid=pid)
+            d = asdict(ticket)
+            conn.execute(f"INSERT INTO tickets ({', '.join(d)}) VALUES ({', '.join('?' * len(d))})", tuple(d.values()))
+            _attempt(conn, "create_ticket", tenant_id, idempotency_key, "inserted", pid, now)
             return ticket, False
+
+        return await self._write(op)
 
     # ---------------------------------------------------------------- 系统状态
 
-    def system_status(self, tenant_id: str) -> dict[str, dict]:
-        return self.status.get(tenant_id, {})
+    async def system_status(self, tenant_id: str) -> dict[str, dict]:
+        rows = await self._read(lambda c: c.execute(
+            "SELECT system, info FROM system_status WHERE tenant_id = ? ORDER BY rowid", (tenant_id,)).fetchall())
+        return {r["system"]: json.loads(r["info"]) for r in rows}
 
     # ---------------------------------------------------------------- 账号
 
-    def reset_password(self, tenant_id: str, target_user_id: str, requested_by: str) -> PasswordReset:
-        """发起密码重置：生成一次性重置链接并发到员工的企业邮箱（这里只记录，不真的发）。
-        注意返回值里没有任何密码或链接 —— 调用方（也就是 Agent）只需要知道"发出去了"。"""
-        e = self.get_employee(tenant_id, target_user_id)
-        if e is None:
-            raise KeyError(target_user_id)
-        with self._lock:
-            record = PasswordReset(tenant_id, target_user_id, requested_by, mask_email(e.email))
-            self.password_resets.append(record)
-            if e.account_status == "locked":
-                e.account_status = "active"  # 重置密码的同时解锁
-        return record
+    async def reset_password(
+        self, tenant_id: str, target_user_id: str, requested_by: str, idempotency_key: str | None = None,
+    ) -> tuple[PasswordReset, bool]:
+        """发起密码重置：生成一次性重置链接并发到员工的企业邮箱（这里只记录，不真的发）。返回 (记录, 是否为重复请求)。
+        注意返回值里没有任何密码或链接 —— 调用方（也就是 Agent）只需要知道"发出去了"。
+        同一个 idempotency_key 只发一次链接：重放不会让员工收到两封重置邮件。"""
+        pid = os.getpid()
+
+        def op(conn: sqlite3.Connection) -> tuple[PasswordReset, bool]:
+            now = time.time()
+            if idempotency_key:
+                row = conn.execute("SELECT * FROM password_resets WHERE tenant_id = ? AND idempotency_key = ?",
+                                   (tenant_id, idempotency_key)).fetchone()
+                if row is not None:
+                    _attempt(conn, "reset_password", tenant_id, idempotency_key, "deduplicated", pid, now)
+                    return _row_to(PasswordReset, row), True
+            emp = conn.execute("SELECT email FROM employees WHERE tenant_id = ? AND user_id = ?",
+                               (tenant_id, target_user_id)).fetchone()
+            if emp is None:
+                raise KeyError(target_user_id)
+            record = PasswordReset(tenant_id, target_user_id, requested_by, mask_email(emp["email"]), now,
+                                   idempotency_key, pid)
+            d = asdict(record)
+            conn.execute(f"INSERT INTO password_resets ({', '.join(d)}) VALUES ({', '.join('?' * len(d))})",
+                         tuple(d.values()))
+            # 重置密码的同时解锁
+            conn.execute("UPDATE employees SET account_status = 'active' WHERE tenant_id = ? AND user_id = ? "
+                         "AND account_status = 'locked'", (tenant_id, target_user_id))
+            _attempt(conn, "reset_password", tenant_id, idempotency_key, "inserted", pid, now)
+            return record, False
+
+        return await self._write(op)
+
+    # ---------------------------------------------------------------- 观测（给测试、评估、运维看，不是 Agent 的工具）
+
+    async def all_tickets(self, tenant_id: str | None = None) -> list[Ticket]:
+        sql, params = "SELECT * FROM tickets", ()
+        if tenant_id is not None:
+            sql, params = sql + " WHERE tenant_id = ?", (tenant_id,)
+        rows = await self._read(lambda c: c.execute(sql + " ORDER BY rowid", params).fetchall())
+        return [_row_to(Ticket, r) for r in rows]
+
+    async def password_resets(self, tenant_id: str | None = None) -> list[PasswordReset]:
+        sql, params = "SELECT * FROM password_resets", ()
+        if tenant_id is not None:
+            sql, params = sql + " WHERE tenant_id = ?", (tenant_id,)
+        rows = await self._read(lambda c: c.execute(sql + " ORDER BY id", params).fetchall())
+        return [_row_to(PasswordReset, r) for r in rows]
+
+    async def side_effect_attempts(self, idempotency_key: str | None = None) -> list[dict]:
+        sql, params = "SELECT * FROM side_effect_attempts", ()
+        if idempotency_key is not None:
+            sql, params = sql + " WHERE idempotency_key = ?", (idempotency_key,)
+        rows = await self._read(lambda c: c.execute(sql + " ORDER BY id", params).fetchall())
+        return [dict(r) for r in rows]
+
+    async def side_effects_of_run(self, run_id: str) -> dict[str, int]:
+        """某一次运行真正产生的副作用：幂等键是 run_id:call_id，按前缀数（不用 LIKE：run_id 里的 _ 会被当成通配符）。"""
+        prefix = f"{run_id}:"
+
+        def op(conn):
+            n = len(prefix)
+            tickets = conn.execute("SELECT count(*) FROM tickets WHERE substr(idempotency_key, 1, ?) = ?",
+                                   (n, prefix)).fetchone()[0]
+            resets = conn.execute("SELECT count(*) FROM password_resets WHERE substr(idempotency_key, 1, ?) = ?",
+                                  (n, prefix)).fetchone()[0]
+            return {"tickets_created": tickets, "password_resets": resets}
+
+        return await self._read(op)
+
+
+def _attempt(conn, kind: str, tenant_id: str, key: str | None, outcome: str, pid: int, at: float) -> None:
+    conn.execute("INSERT INTO side_effect_attempts (kind, tenant_id, idempotency_key, outcome, pid, at) "
+                 "VALUES (?, ?, ?, ?, ?, ?)", (kind, tenant_id, key, outcome, pid, at))
