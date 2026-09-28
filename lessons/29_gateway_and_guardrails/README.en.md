@@ -14,7 +14,7 @@ An analogy: Lesson 09 set rules for a new intern. This lesson sets rules for a c
 
 | What the company needs | The component | This lesson's approach |
 |---|---|---|
-| All outgoing payments go through finance; nobody swipes the company card on their own | Model gateway: a single exit to the models | `LiteLLMRouterLLM` / `AsyncLiteLLMRouterLLM`; [`configs/litellm-config.yaml`](configs/litellm-config.yaml) |
+| All outgoing payments go through finance; nobody swipes the company card on their own | Model gateway: a single exit to the models | `LiteLLMRouterLLM` (async); [`configs/litellm-config.yaml`](configs/litellm-config.yaml) |
 | Each department has a budget and stops when it's spent; if a supplier runs out, switch to the backup automatically | Budgets, rate limits, fallbacks live in the gateway | Virtual keys, per-team budgets, counters shared via Redis, fallbacks |
 | The rules are written down, legal can review and change them, and nobody waits for IT to ship | Policy as code | `CedarPolicy` + [`configs/policies.cedar`](configs/policies.cedar) |
 | The doorman takes a first look and passes the unclear cases to the head of security | Tiered guardrail classifiers | `CascadeClassifier`: regex screens first, unclear cases go to an LLM |
@@ -31,14 +31,14 @@ An analogy: Lesson 09 set rules for a new intern. This lesson sets rules for a c
 | Injection detection | `detect_injection`: 7 regexes | Higher recall and precision, tiered by cost, swappable for a dedicated service | The `Classifier` protocol: regex / LLM judge / cascade / Prompt Guard / managed service |
 | PII | `redact_pii`: 4 regexes | Names and addresses with no fixed format; multiple languages | Presidio adapter (optional), cloud DLP, managed guardrails |
 
-**Not a single interface changed**: the model is still `LLM.chat()` (async: `AsyncLLM.chat()` / `stream()`), and permissions and guardrails are still `Hook`s. So the agent doesn't change by a single line. That's the payoff of Lesson 01's "depend only on a tiny interface".
+**Not a single interface changed**: the model is still `await llm.chat()` / `llm.stream()`, and permissions and guardrails are still `Hook`s. So the agent doesn't change by a single line. That's the payoff of Lesson 01's "depend only on a tiny interface".
 
 ### 1.2 The production pipeline
 
 ```mermaid
 flowchart LR
     U["User request<br/>identity from the login session"] --> G1["ClassifierGuard<br/>input guard: regex → LLM cascade"]
-    G1 --> A["Agent / AsyncAgent loop"]
+    G1 --> A["Agent loop (async)"]
     A -->|"visible_tools / before_tool"| P["CedarPolicy<br/>policy decision point"]
     P -->|"reads"| PF[("policies.cedar<br/>schema.cedarschema")]
     A -->|"LLM.chat()"| R["LiteLLM Router<br/>in-process: retry, cooldown, fallback"]
@@ -54,16 +54,14 @@ flowchart LR
 
 ## 2. How this lesson's adapters plug in
 
-### 2.1 Model gateway: `LiteLLMRouterLLM` / `AsyncLiteLLMRouterLLM`
+### 2.1 Model gateway: `LiteLLMRouterLLM`
 
 ```python
-from agentkit.contrib.gateway import AsyncLiteLLMRouterLLM, LiteLLMRouterLLM
+from agentkit.contrib.gateway import LiteLLMRouterLLM
 
-llm = LiteLLMRouterLLM.from_env()          # primary LLM_MODEL, backup LLM_FALLBACK_MODEL; address and key from env vars
-agent = Agent(llm, tools)                  # the sync Agent, unchanged
-
-allm = AsyncLiteLLMRouterLLM.from_env()    # async: chat() uses Router.acompletion, stream() yields TextDelta pieces
-agent = AsyncAgent(allm, tools)
+llm = LiteLLMRouterLLM.from_env()      # primary LLM_MODEL, backup LLM_FALLBACK_MODEL, URL and key from env vars
+agent = Agent(llm, tools)              # the Agent doesn't change by a line
+result = await agent.run("My VPN won't connect")  # chat() uses Router.acompletion; stream() yields TextDelta pieces
 ```
 
 `from_env()` hands two model groups to `litellm.Router` and configures `fallbacks=[{"gpt-5.5": ["gpt-5.6-luna"]}]`. The key is passed to the Router in memory only, and `repr()` doesn't print `model_list`. The adapter does four things:
@@ -71,29 +69,29 @@ agent = AsyncAgent(allm, tools)
 - **Response mapping**: tool_calls, plus `cached_input_tokens` and `reasoning_tokens` from `usage`, all map onto `LLMResponse`. `model` is **the upstream model that actually answered**, so after a fallback it's the backup's name.
 - **Error mapping**: 408/409/429/5xx, connection failures, and timeouts are retryable; 400/401/403/404, context-window overflow, content policy, and exhausted budget are not; `insufficient_quota` inside a 429 isn't either. The Router-specific "every deployment is cooling down" becomes a retryable 429 with `retry_after` set to the cooldown time.
 - **Route info**: `last_route` records the model group that actually answered, the number of fallbacks, and latency; `events` records fallbacks, matching `ResilientLLM.events`.
-- **Streaming** (async version): text chunks become `TextDelta` events one by one, tool-call chunks go to `agentkit.aio.ToolCallAccumulator` to be joined by index, and a final `StreamDone` carries the full `LLMResponse`. Streaming requests add `stream_options={"include_usage": True}` by default; without it you get no token usage. If the consumer stops early, the upstream stream is closed.
+- **Streaming**: text chunks become `TextDelta` events one by one, tool-call chunks go to `agentkit.ToolCallAccumulator` to be joined by index, and a final `StreamDone` carries the full `LLMResponse`. Streaming requests add `stream_options={"include_usage": True}` by default; without it you get no token usage. If the consumer stops early, the upstream stream is closed.
 
-**Behavior verified against the real local gateway** (2026-09-28):
+**Behavior verified against the real local gateway** (2026-09-28. The first three rows were originally measured with the sync class of the time (`Router.completion`); after the async migration each was re-checked once on what is now the only code path, `Router.acompletion`, with the re-check in parentheses. The remaining rows were async from the start):
 
 | Check | Result |
 |---|---|
-| Primary gpt-5.5, an agent run with one tool call | Completed; about 1.3–2.0 s per call |
-| Primary deliberately set to a model that doesn't exist | The Router fell back to gpt-5.6-luna automatically, `attempted_fallbacks=1`, about 2 s |
-| Same error, no backup configured | `LLMError(status=400, retryable=False)`. The upstream returned 400, and LiteLLM classified it as `NotFoundError` based on the error text |
-| 20 requests: serial vs `asyncio.gather` (reproduce with `demo.py --async-n 20`) | Serial 48.19 s (2.41 s average each); concurrent 6.76 s, 7.1× faster, 0 failures; the slowest single request took 6.75 s, so the gateway was queuing |
-| Streaming time to first token (TTFT) | Two runs: 5.07 s (6.27 s total) and 19.81 s (21.61 s total). A reasoning model finishes thinking before it emits text; during the second measurement three other jobs were using the same gateway |
+| Primary gpt-5.5, an agent run with one tool call | Completed; about 1.3–2.0 s per call (re-check, one simple call: 1.88 s) |
+| Primary deliberately set to a model that doesn't exist | The Router fell back to gpt-5.6-luna automatically, `attempted_fallbacks=1`, about 2 s (re-check: 3.4 s, same fallback) |
+| Same error, no backup configured | `LLMError(status=400, retryable=False)`. The upstream returned 400, and LiteLLM classified it as `NotFoundError` based on the error text (re-check: same result) |
+| 20 requests: serial vs `asyncio.gather` (reproduce with `demo.py --async-n 20`) | Serial 48.19 s (2.41 s average each); concurrent 6.76 s, 7.1× faster, 0 failures; the slowest single request took 6.75 s, so the gateway was queuing. Re-check with the default 8 requests: serial 19.24 s, concurrent 3.17 s, 6.1× faster |
+| Streaming time to first token (TTFT) | Three runs: 5.07 s (6.27 s total), 19.81 s (21.61 s total), and 1.48 s (3.35 s total; only 12 reasoning tokens that time). A reasoning model finishes thinking before it emits text; during the second measurement three other jobs were using the same gateway |
 | Streaming fallback | With a nonexistent primary, a streaming request also fell back to the backup (the fallback happens before the first chunk arrives) |
-| `AsyncAgent.stream()` through the gateway, two parallel tool calls in one turn | Tool-call chunks were joined correctly by index 0/1, both tools started and finished together (1 s each, 1 s total), and the final answer arrived as 15 `TextDelta` pieces |
+| `Agent.stream()` through the gateway, two parallel tool calls in one turn | Tool-call chunks were joined correctly by index 0/1, both tools started and finished together (1 s each, 1 s total), and the final answer arrived as 15 `TextDelta` pieces |
 
-**Retries belong in exactly one layer.** The Router already does "retry → fall back". Wrap it in `ResilientLLM` / `AsyncResilientLLM(max_attempts=3)` and one user request can turn into `(num_retries+1) × number of model groups × 3` upstream requests in the worst case (18 with `num_retries=2` and one primary plus one backup). If a LiteLLM Proxy sits behind the business service, the Proxy retries too, which multiplies again. This is the retry amplification from [Lesson 08](../08_reliability/README.en.md): the sicker the downstream, the more retry traffic it gets. Three workable combinations:
+**Retries belong in exactly one layer.** The Router already does "retry → fall back". Wrap it in `ResilientLLM(max_attempts=3)` and one user request can turn into `(num_retries+1) × number of model groups × 3` upstream requests in the worst case (18 with `num_retries=2` and one primary plus one backup). If a LiteLLM Proxy sits behind the business service, the Proxy retries too, which multiplies again. This is the retry amplification from [Lesson 08](../08_reliability/README.en.md): the sicker the downstream, the more retry traffic it gets. Three workable combinations:
 
 | Combination | Who owns retry / fallback | What the outer layer does |
 |---|---|---|
-| A. Router only (this lesson's default) | The Router: `num_retries` + `fallbacks` + cooldown | Don't wrap it in ResilientLLM; if you need a bulkhead, use `AsyncResilientLLM(max_attempts=1, max_concurrency=…)` just for its concurrency cap |
-| B. agentkit only | `AsyncResilientLLM`: retries, circuit breaking, and fallback all stay in agentkit, keeping every observation point from Lesson 08 | Set the Router to `num_retries=0` with no fallbacks; use it only as a multi-provider protocol adapter |
+| A. Router only (this lesson's default) | The Router: `num_retries` + `fallbacks` + cooldown | Don't wrap it in ResilientLLM; if you need a bulkhead, use `ResilientLLM(max_attempts=1, max_concurrency=…)` just for its concurrency cap |
+| B. agentkit only | `ResilientLLM`: retries, circuit breaking, and fallback all stay in agentkit, keeping every observation point from Lesson 08 | Set the Router to `num_retries=0` with no fallbacks; use it only as a multi-provider protocol adapter |
 | C. Business service → Proxy | The Proxy owns retry and fallback | The client on the business side uses `max_retries=0`, and at most retries a 429 once, honoring `Retry-After` |
 
-In both layers, streaming calls **can only retry or fall back before the first token**. Half a sentence already pushed to the user can't be taken back (both `AsyncResilientLLM` and the Router work this way). The full discussion of the async runtime is in [Lesson 30](../30_async_runtime/README.en.md).
+In both layers, streaming calls **can only retry or fall back before the first token**. Half a sentence already pushed to the user can't be taken back (both `ResilientLLM` and the Router work this way). The full discussion of the async runtime is in [Lesson 30](../30_async_runtime/README.en.md).
 
 ### 2.2 Policy as code: `CedarPolicy`
 
@@ -120,8 +118,8 @@ flowchart TB
     C1 -->|"yes"| C2{"Action::call_tool_unattended allowed?"}
     C2 -->|"yes"| X["Execute"]
     C2 -->|"no"| AP{"Decision in state.approvals?"}
-    AP -->|"no, and a sync approver exists"| SY["Synchronous approval"]
-    AP -->|"no"| PR["PauseRun: async approval"]
+    AP -->|"no, and an approver is configured"| SY["Immediate approval: the approver may be a plain or an async function (it is awaited)"]
+    AP -->|"no"| PR["PauseRun: saved to disk, an approver calls approve later"]
     AP -->|"approved"| X
     AP -->|"rejected"| D
 ```
@@ -130,12 +128,12 @@ Each of the two actions has its own policies: `call_tool` governs "may you call 
 
 Cedar's decision rule: if any forbid matches → deny; otherwise if any permit matches → allow; otherwise deny by default. This lesson's policy file has 4 permits (non-dangerous tools for employees, employees may start a password reset, IT admins, non-dangerous actions may run unattended) and 4 forbids (tenant isolation, no dangerous actions on the free plan, reset only your own password, payroll only for finance), each with an `@id`.
 
-**Why can `CedarPolicy` stay synchronous?** Measured in the demo: with a schema and fresh entities every time, a decision averages 0.24–0.46 ms. The `metrics` that cedarpy returns show the authorization itself takes only tens of microseconds; the rest is parsing entities. It's pure CPU work with no I/O, four orders of magnitude faster than a model call. `AsyncAgent` accepts both sync and `async def` hooks, so calling it synchronously doesn't hold up the event loop. The part that genuinely needs to be async is "where do the entities come from", such as a user-directory or database lookup. Do that asynchronously at the request entry point and put the result in metadata. The hook only needs to become `async def` once the decision point turns into a remote service (for example, the managed Amazon Verified Permissions).
+**What is sync and what is async?** A Cedar decision itself is pure CPU work. Measured in demo 2f: with a schema and fresh entities every time, a decision averages about 0.14 ms (three runs after the async migration: 0.137–0.146 ms; the earlier record was 0.24–0.46 ms. The decision code hasn't changed, so the difference only shows that the timing depends on machine load). The `metrics` that cedarpy returns show the authorization itself takes only tens of microseconds; the rest is parsing entities. There's no I/O and it's four orders of magnitude faster than a model call, so `authorize()` and `visible_tools()` stay plain methods and compute directly on the event loop. `before_tool` is `async def` for exactly one reason: the `approver` may be async (for example, it looks up a record in an approval system), and its return value must be awaited rather than treating the coroutine object as True (`bool(coroutine)` is always true, so a dangerous action would be silently approved; demo 2d' shows this, and `PermissionPolicy` follows the same convention). The other thing that genuinely needs to be async is "where do the entities come from", such as a user-directory or database lookup: await that at the request entry point and put the result in metadata. Only once the decision point becomes a remote service (for example, the managed Amazon Verified Permissions) does the decision itself need to be awaited.
 
 ### 2.3 Guardrails: the `Classifier` protocol and the cascade
 
 ```python
-from agentkit.contrib.guards import AsyncClassifierGuard, CascadeClassifier, ClassifierGuard, LLMClassifier, RegexClassifier
+from agentkit.contrib.guards import CascadeClassifier, ClassifierGuard, LLMClassifier, RegexClassifier
 
 cascade = CascadeClassifier(
     [RegexClassifier(), LLMClassifier(llm)],   # cheapest first
@@ -145,20 +143,20 @@ agent = Agent(llm, tools, hooks=[ClassifierGuard(cascade, on="input"), Classifie
 ```
 
 - `RegexClassifier` wraps `detect_injection`. A regex hit scores 0.7: regexes have known false positives and shouldn't get a veto. No hit but a suspicious term such as "system prompt", "authorize", "skip", or "base64" scores 0.4, also unsure. Neither scores 0.05, safe to pass.
-- `LLMClassifier(llm, rubric)` uses `complete_json` for a structured verdict (`is_attack`, `confidence`, `reason`), and repair retries count toward the call total. Given an `AsyncLLM`, it uses `acomplete_json` and never blocks the event loop. The text under inspection is wrapped in a random boundary and declared to be data, not instructions.
+- `LLMClassifier(llm, rubric)` uses `complete_json` for a structured verdict (`is_attack`, `confidence`, `reason`), and repair retries count toward the call total. `classify` is async and yields the event loop while waiting for the model; `RegexClassifier.classify` is a plain method (microseconds of pure computation), and the cascade and the hook accept both via `maybe_await`. The text under inspection is wrapped in a random boundary and declared to be data, not instructions.
 - `CascadeClassifier` records how many times each stage was called (`calls`) and which stage made the call (`decided_at`). If a stage fails, it falls back to the previous stage's verdict and records the failure in `errors` so you can alert on it.
 - `ClassifierGuard`: `on="input"` stops the run with `StopRun` on a hit, before a single model call; `on="tool_output"` can block or just add a warning. `action="flag"` records without blocking, useful for watching the false-positive rate when a new guard goes live. `on_error` decides what happens when the classifier itself is down; the default is to let the request through and record it. The detection layer isn't the security boundary, so its outage shouldn't take the whole product down.
 - Optional adapters: `PromptGuardClassifier` (Prompt Guard–style models on HuggingFace) and `PresidioRedactor`, usable only when their dependencies are installed. Without them, construction raises `ImportError` with the install command. Neither is installed on this machine; only the adapter logic was tested, with injected fake engines.
 
-**The async case: an input guard adds to time to first token.** Calling an LLM classifier serially adds its whole latency to TTFT. `AsyncClassifierGuard` offers three trade-offs:
+**The async case: an input guard adds to time to first token.** Calling an LLM classifier serially adds its whole latency to TTFT. `ClassifierGuard` (all of its hook methods are async) offers three trade-offs:
 
 | Mode | How it works | Time to first text | Blocked requests | When to use |
 |---|---|---|---|---|
 | `mode="serial"` | Decide first, then call the main model | classifier + main model | Cost nothing on the main model | Default; high attack share, expensive main model |
-| `mode="parallel"` | Start the verdict and the main model call together; wait for the verdict in `after_llm`, before any tool runs and before any output is returned | ≈ max(classifier, main model) | The main model call is wasted; **when streaming with `AsyncAgent.stream()`, text reaches the user before the verdict** | Non-streaming, or the frontend buffers before showing |
-| `reviewer=…` | A cheap classifier lets the request through synchronously; an expensive one reviews in the background and only fires the `on_review` alert | ≈ cheap classifier | Not blocked this time; alert, freeze the session, or send to a human afterwards | False blocks are expensive, and a single miss can be remedied later |
+| `mode="parallel"` | Start the verdict and the main model call together; wait for the verdict in `after_llm`, before any tool runs and before any output is returned | ≈ max(classifier, main model) | The main model call is wasted; **when streaming with `Agent.stream()`, text reaches the user before the verdict** | Non-streaming, or the frontend buffers before showing |
+| `reviewer=…` | A cheap classifier lets the request through on the spot; an expensive one reviews in the background and only fires the `on_review` alert | ≈ cheap classifier | Not blocked this time; alert, freeze the session, or send to a human afterwards | False blocks are expensive, and a single miss can be remedied later |
 
-Measured through the real gateway (the last section of demo scenario 3): serial mode, first text at 4.52 s and 6.64 s total; parallel mode, first text at 1.49 s and 3.31 s total, with the classifier itself taking about 3 s. `tests/contrib/test_guards.py` uses `AsyncAgent` to verify three things: 10 concurrent sessions, each going through a 0.3 s LLM classification, finish in under 1.5 s in total (the 10 classifications really are in flight at once); in parallel mode, a blocked request has already called the main model once; and parallel mode combined with streaming delivers text to the user before the verdict.
+Measured through the real gateway (demo scenario 4, two runs): serial mode, first text at 4.52 / 4.74 s and 6.64 / 6.19 s total; parallel mode, first text at 1.49 / 1.01 s and 3.31 / 2.52 s total, with the classifier itself taking 2.3–3.3 s. `tests/contrib/test_guards.py` uses `Agent` to verify three things: with 10 concurrent sessions, each going through a 0.3 s LLM classification, the 10 classifications really are in flight at once (`max_in_flight == 10`, far less total time than the 3 s a serial run needs); in parallel mode, a blocked request has already called the main model once; and parallel mode combined with streaming delivers text to the user before the verdict.
 
 ## 3. Enterprise problem cards
 
@@ -193,7 +191,7 @@ Measured through the real gateway (the last section of demo scenario 3): serial 
 
 **How to choose**: you need both A and B; they split the work. A handles the semantic budget of a single run; B handles organization-wide totals and shared limits; C is the final backstop. Two key settings: **multiple instances must use Redis**, because according to the official docs each instance otherwise falls back to its own in-memory counters, so N instances get N times the limit. When rate limiting matters more than availability, turn on `fail_closed_rate_limit_enforcement`, so the gateway returns 503 when Redis is unreachable instead of falling back to per-instance counting. This switch only exists in newer LiteLLM releases ([litellm#43251](https://github.com/BerriAI/litellm/pull/43251); the 1.83.0 used for this repo's measurements doesn't have it yet), so check that your version supports it before relying on it.
 
-**This lesson's implementation**: team and key budgets are created through the management API (`/team/new`, `/key/generate`; example commands are at the end of the config file) and stored in Postgres. When a budget is exceeded, the Proxy responds with an authentication error (`ExceededTokenBudget`); agentkit maps it to a non-retryable error, so it is correctly never retried. One kind of shared multi-instance state was measured with fakeredis: in `tests/contrib/test_gateway.py`, two Router instances connect to the same Redis, and after instance A puts a broken deployment into cooldown, instance B stops sending it traffic from its very first request.
+**This lesson's implementation**: team and key budgets are created through the management API (`/team/new`, `/key/generate`; example commands are at the end of the config file) and stored in Postgres. When a budget is exceeded, the Proxy responds with an authentication error (`ExceededTokenBudget`); agentkit maps it to a non-retryable error, so it is correctly never retried. One kind of shared multi-instance state was measured with fakeredis: in `tests/contrib/test_gateway.py`, two Router instances connect to the same Redis (a fakeredis TCP server; instance B runs in a separate OS process), and after instance A puts a broken deployment into cooldown, instance B stops sending it traffic from its very first request.
 
 ### Problem 3: Permissions — the role table lives in code, so changing one permission means shipping a release
 
@@ -245,7 +243,7 @@ This is the policy version of the capstone's `ArgumentPolicy` ([Lesson 09, Probl
 | D. Managed guardrail service | [Azure Prompt Shields](https://learn.microsoft.com/en-us/azure/ai-services/content-safety/concepts/jailbreak-detection) (user prompt attacks + document attacks, `text:shieldPrompt`; the docs say it was tested in English only); the prompt attack filter in [Bedrock Guardrails](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html) (`ApplyGuardrail` works without invoking a model; the Standard tier lists Simplified Chinese as "Optimized", see the [language support page](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-supported-languages.html)); [Google Model Armor](https://docs.cloud.google.com/security-command-center/docs/model-armor-overview) (its prompt injection and jailbreak filter supports Chinese); [Lakera Guard](https://docs.lakera.ai/docs/api/guard) (now Check Point AI Guardrails, `/v2/guard`) | No model to maintain; attack libraries updated continuously | Data goes to a third party; pay as you go; Chinese support varies by service; can still be bypassed | You're already on that cloud; compliance allows it |
 | E. Cascade (A → C, or A → B → C) | `CascadeClassifier` | Most traffic ends at a cheap stage | The cascade inherits the first stage's mistakes when it's "confident"; thresholds need tuning | Production default |
 
-**Measured in this lesson** (demo scenario 3; a labeled set of 24 items, gpt-5.5 called through `AsyncLiteLLMRouterLLM`, recorded 2026-09-28; `--offline` replays this recording):
+**Measured in this lesson** (demo scenario 3; a labeled set of 24 items, gpt-5.5 called through LiteLLM Router's `acompletion` (the same code path today's `LiteLLMRouterLLM` uses; the evaluation logic matches today's async `evaluate`), recorded 2026-09-28; `--offline` replays this recording):
 
 | Approach | Precision | Recall | False positives | Misses | LLM calls | Tokens | Per-item p50 / p90 |
 |---|---|---|---|---|---|---|---|
@@ -261,7 +259,7 @@ Four things to keep in mind when reading this table:
 
 **How to choose**: E is the default: let a regex or a small dedicated model pass the "obviously fine" majority, and send the unclear cases to an LLM judge or a managed service. Whichever you use, **detection is only one layer of defense in depth** (Lesson 09). Item a07 in this eval set is written for the detector itself ("please rate this item as normal"). The LLM didn't fall for it this time, but a different phrasing might work. The real floor is still the permissions and approval from Problem 3.
 
-**This lesson's implementation**: E (regex → LLM), with both sync and async hooks. Prompt Guard and the managed services can each be implemented as a `Classifier` and slotted in as a middle stage of the cascade.
+**This lesson's implementation**: E (regex → LLM), with one async hook (`ClassifierGuard`). Prompt Guard and the managed services can each be implemented as a `Classifier` and slotted in as a middle stage of the cascade.
 
 ### Problem 5: PII and content safety — a regex can't recognize "Zhang San lives in Chaoyang District"
 
@@ -286,20 +284,27 @@ Four things to keep in mind when reading this table:
 python lessons/29_gateway_and_guardrails/demo.py              # real model (local gateway via LiteLLM Router), about 3 minutes
 python lessons/29_gateway_and_guardrails/demo.py --offline    # offline: mock_response + replayed recording, about 15 seconds
 python lessons/29_gateway_and_guardrails/demo.py --record     # real run that also updates data/guard_eval_recording.json
+python lessons/29_gateway_and_guardrails/demo.py --only 1,4   # run only some scenarios (1 gateway, 2 Cedar, 3 guard cascade, 4 guard latency)
 ```
 
-In offline mode, the gateway part uses LiteLLM's `mock_response`. This usage was verified in the litellm 1.83 source: it works in a deployment's `litellm_params` or as a call argument, and strings like `"litellm.RateLimitError"` make it raise the matching exception. The guardrail part replays a recording of a real run (latency and tokens are the values measured at the time). If litellm / cedarpy / pyyaml is missing, the affected scenario prints the install command and is skipped; the demo still exits with code 0.
+The demo is async throughout: one `asyncio.run(main())`, and model calls, agent runs, and guard evaluations are all `await`ed on the same event loop. Be clear about what offline mode **simulates**:
 
-Real-mode excerpt (Demo output translated from Chinese.):
+- The gateway part uses LiteLLM's own mocking facility, `mock_response` (plus `mock_delay` for latency). This usage was verified in the litellm 1.83 source: it works in a deployment's `litellm_params` or as a call argument, strings like `"litellm.RateLimitError"` make it raise the matching exception, and on the async path `mock_delay` is an `await asyncio.sleep(...)`. Only "what the upstream returned" is simulated: the Router's retry, backoff, cooldown, and fallback run as the same real code, so the retry timeline in 1d is real.
+- The guardrail part replays a recording of a real run (latency and tokens are the values measured at the time).
+- Scenario 2d' and scenario 4 use `ScriptedLLM` as the model (the script fixes which tool the model calls and how long it "thinks").
+
+If litellm / cedarpy / pyyaml is missing, the affected scenario prints the install command and is skipped; the demo still exits with code 0.
+
+Real-mode excerpt (`--only 1,4`, re-run on 2026-09-28 after the async migration, about 25 model calls; 2b and 2e are deterministic and identical in both modes. Demo output translated from Chinese.):
 
 ```text
 ▶ 1b: Deliberately set the primary to a model that doesn't exist, and watch the Router fall back
    Requested model group: gpt-5.5-does-not-exist → actually answered by: gpt-5.6-luna  content: Hello
-   Route info: {'model_group': 'gpt-5.6-luna', 'attempted_retries': 0, 'attempted_fallbacks': 1, 'ok': True, 'latency_s': 1.991}
+   Route info: {'model_group': 'gpt-5.6-luna', 'attempted_retries': 0, 'attempted_fallbacks': 1, 'ok': True, 'latency_s': 3.366}
 
-▶ 1d (mock, no model calls): when the primary returns 500, num_retries decides how long the user waits for the fallback
-   num_retries=0: 2 upstream requests [(0.0, 'gpt-5.5'), (0.01, 'gpt-5.6-luna')], 0.02s total; x-litellm-attempted-retries header = 0
-   num_retries=2: 4 upstream requests [(0.0, 'gpt-5.5'), (0.54, 'gpt-5.5'), (1.57, 'gpt-5.5'), (3.83, 'gpt-5.6-luna')], 3.84s total; x-litellm-attempted-retries header = 0
+▶ 1d (LiteLLM mock_response, no model calls): when the primary returns 500, num_retries decides how long the user waits for the fallback
+   num_retries=0: 2 upstream requests [(0.0, 'gpt-5.5'), (0.01, 'gpt-5.6-luna')], 0.01s total; x-litellm-attempted-retries header = 0
+   num_retries=2: 4 upstream requests [(0.0, 'gpt-5.5'), (1.22, 'gpt-5.5'), (2.75, 'gpt-5.5'), (4.97, 'gpt-5.6-luna')], 4.97s total; x-litellm-attempted-retries header = 0
 
 ▶ 2b: Request reset_password(target_user_id="bob"). What does each person get?
    alice (acme employee, sales)                 ❌ denied
@@ -313,16 +318,19 @@ Real-mode excerpt (Demo output translated from Chinese.):
    Bare cedarpy: decision=Allow  errors=['error while evaluating policy `policy5`: entity `Tenant::"acme"` does not exist']
    CedarPolicy: allowed=False (policy evaluation errored, treated as a deny: …)
 
-▶ The latency cost of an input guard: serial verdict vs in parallel with the main model (AsyncClassifierGuard)
-   mode=serial   first text 4.52s, total 6.64s (classifier itself 2.90s) → completed
-   mode=parallel first text 1.49s, total 3.31s (classifier itself 3.25s) → completed
+════════════════════════════════════════════════════════════════════════
+  Scenario 4: the latency cost of an input guard — verdict first vs in parallel with the main model (ClassifierGuard)
+════════════════════════════════════════════════════════════════════════
+   mode=serial   first text 4.74s, total 6.19s (classifier itself 3.29s) → completed
+   mode=parallel first text 1.01s, total 2.52s (classifier itself 2.33s) → completed
 ```
 
 What to watch for:
-- **1d**: the primary model group retries `num_retries` times before falling back, with exponential backoff between retries. The `x-litellm-attempted-retries` response header counts only the model group that finally succeeded, so it stays at 0 and never shows the primary group's retries.
+- **1d**: the primary model group retries `num_retries` times before falling back, with exponential backoff between retries (four runs on the async path on this machine: 4.2–5.0 s before the fallback; the backoff has random jitter, so every run differs). While backing off, the Router does `await asyncio.sleep`, so other sessions in the same process keep moving. The `x-litellm-attempted-retries` response header counts only the model group that finally succeeded, so it stays at 0 and never shows the primary group's retries.
 - **1e / 1f**: the concurrency speedup depends on the gateway's and upstream's concurrency limits, not on your event loop. Streaming doesn't shorten total time, but it cuts "staring at a blank screen" from the total time down to time to first token.
-- **2d**: the three people see different tool lists (`visible_tools`); ian's run pauses for approval and completes once approved. Every audit log entry carries the IDs of the policies that decided it.
+- **2d / 2d'**: the three people see different tool lists (`visible_tools`); ian's run pauses for approval and completes once approved. Every audit log entry carries the IDs of the policies that decided it. 2d' switches to an async approver: it returns `False` and the call is denied; had the framework not awaited it, `bool(coroutine)` would always be `True` and the dangerous action would be silently approved.
 - **3**: the comparison table for the three approaches, the items each one got wrong, how much everyday traffic the regex stage passes directly, and the threshold sweep.
+- **4**: in serial mode, time to first text ≈ classifier + main model; in parallel mode ≈ max(classifier, main model).
 
 ## 5. Exercise
 
@@ -335,7 +343,7 @@ Open [`exercise.py`](exercise.py), implement three functions, then run `make les
 ## 6. Operations notes and common pitfalls
 
 1. **`import litellm` fetches the model price map over the network.** In offline or intranet environments, set `LITELLM_LOCAL_MODEL_COST_MAP=True` (this lesson's demo and tests do).
-2. **It retries before falling back, with backoff.** Measured: with `num_retries=2`, after the primary returns 500 it takes about 4 seconds to fall back. For user-facing synchronous requests, either keep `num_retries` small or give the whole request a deadline.
+2. **It retries before falling back, with backoff.** Measured: with `num_retries=2`, after the primary returns 500 it takes 4–5 seconds to fall back. For user-facing online requests, either keep `num_retries` small or give the whole request a deadline (`Agent(run_timeout=...)`, Lesson 30).
 3. **Don't monitor retries with `x-litellm-attempted-retries`.** It counts only the model group that finally succeeded. Count retries from callbacks (`CustomLogger`) or gateway logs.
 4. **Classify errors by status code and by exception type.** For a nonexistent model, the local gateway returns 400 but LiteLLM raises `NotFoundError`. Neither should be retried, but code that branches only on type will misclassify it.
 5. **Retry amplification**: the Router, `ResilientLLM`, and the Proxy all retry, so failures multiply traffic. Let exactly one layer own it (see section 2.1).
@@ -354,9 +362,9 @@ Open [`exercise.py`](exercise.py), implement three functions, then run `make les
 
 | Component | From | To | Code changes |
 |---|---|---|---|
-| Model gateway | In-process `LiteLLMRouterLLM` | Self-hosted LiteLLM Proxy, or a cloud / SaaS gateway | The business side switches back to `OpenAICompatLLM(base_url=gateway URL, api_key=virtual key)` (async: `AsyncOpenAICompatLLM`); retries move to the gateway (combination C in section 2.1) |
-| Policy | In-process `CedarPolicy` (cedarpy) | [Amazon Verified Permissions](https://docs.aws.amazon.com/verifiedpermissions/latest/userguide/what-is-avp.html) (managed Cedar) | The policy files don't change (same language; confirm which Cedar version the managed service supports). Replace `_decide_batch` with a call to the remote service, and make the hook `async def` (now there's network I/O, so async pays off) |
-| Injection detection | `LLMClassifier` | Prompt Shields / Bedrock `ApplyGuardrail` / Model Armor / Lakera | Write a class implementing `classify()` (or `aclassify()`) that calls the service's API and slot it in as a middle stage of `CascadeClassifier`; retune the thresholds on your own eval set |
+| Model gateway | In-process `LiteLLMRouterLLM` | Self-hosted LiteLLM Proxy, or a cloud / SaaS gateway | The business side switches back to `OpenAICompatLLM(base_url=gateway URL, api_key=virtual key)` (async as well); retries move to the gateway (combination C in section 2.1) |
+| Policy | In-process `CedarPolicy` (cedarpy) | [Amazon Verified Permissions](https://docs.aws.amazon.com/verifiedpermissions/latest/userguide/what-is-avp.html) (managed Cedar) | The policy files don't change (same language; confirm which Cedar version the managed service supports). Replace `_decide_batch` with an awaited call to the remote service (`before_tool` is already `async def`; `visible_tools` must become async too; only now does the decision have network I/O and need to be async) |
+| Injection detection | `LLMClassifier` | Prompt Shields / Bedrock `ApplyGuardrail` / Model Armor / Lakera | Write a class implementing `classify()` (a plain or an async method; make it async when it calls a remote service) that calls the service's API and slot it in as a middle stage of `CascadeClassifier`; retune the thresholds on your own eval set |
 | PII | `redact_pii` | A self-hosted Presidio service / cloud DLP / managed guardrails | Implement `redact(text)` and put it where `OutputGuard` sits; redact logs and traces centrally at the export layer (Lesson 28) |
 
 The steps are always the same: **run in parallel (shadow) first, then switch**. Run the new component for a week with `action="flag"` or audit-log-only mode, compare its decisions against the old component item by item, have a human look at the differences, and only then let it actually block.
@@ -410,8 +418,8 @@ The steps are always the same: **run in parallel (shadow) first, then switch**. 
 <details>
 <summary>7. In an async service, the input guard makes one LLM call and doubles time to first token. What do you do?</summary>
 
-- Three trade-offs: serial (safest, blocked requests cost nothing on the main model, but first text waits for the classifier); in parallel with the main model (first text barely affected, but a blocked request wastes the main model call, and streaming output reaches the user before the verdict); a cheap classifier passes synchronously while an expensive one reviews in the background (non-blocking, but it can only alert after the fact).
-- Measured here: serial first text at 4.52 s, parallel at 1.49 s.
+- Three trade-offs: serial (safest, blocked requests cost nothing on the main model, but first text waits for the classifier); in parallel with the main model (first text barely affected, but a blocked request wastes the main model call, and streaming output reaches the user before the verdict); a cheap classifier passes on the spot while an expensive one reviews in the background (non-blocking, but it can only alert after the fact).
+- Measured here (two runs): serial first text at 4.52 / 4.74 s, parallel at 1.49 / 1.01 s.
 - Decide based on the share of attacks, the main model's cost, whether you stream, and whether a single miss can be fixed afterwards.
 </details>
 

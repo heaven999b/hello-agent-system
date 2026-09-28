@@ -1,8 +1,12 @@
 """第 30 课练习：写对 async 代码的三项基本功。
 
-(a) bounded_gather   有上限的并发 + 结构化并发的出错 / 取消语义（AsyncAgent 并行工具、批量评估都要用）
+(a) bounded_gather   有上限的并发 + 结构化并发的出错 / 取消语义（Agent 的并行工具、批量评估、批量入队都要用）
 (b) with_deadline    截止时间：超时就取消内部协程，但**绝不吞掉**外部的取消
 (c) detect_blocking  用 ast 找出 async 函数里的阻塞调用（一个简化版的 lint，对应场景 3 的事故）
+
+三个函数的接口都已经定好：(a)(b) 是 async 函数（async def，调用方 await 它们），(c) 是普通函数（纯计算，分析源码）。
+只用标准库 asyncio，不依赖 agentkit —— 它们是 agentkit 运行时里对应机制的"最小版"，写完再去对照
+agentkit/agent.py 的 _run_pending_tools、agentkit/timeouts.py 的 wait_for。
 
 运行测试：make lesson N=30    或    .venv/bin/python -m pytest lessons/30_async_runtime -v
 
@@ -61,7 +65,8 @@ async def with_deadline(coro: Awaitable[T], seconds: float, on_timeout: Callable
     - 调用方被取消（外部取消）：内部协程也要被取消，并且 CancelledError **必须**继续往外抛 ——
       绝不能把外部取消当成超时，返回一个默认值；
     - 内部结果和外部取消在同一轮事件循环里同时到达时，也以取消为准。Python 3.11 及更早的 asyncio.wait_for
-      在这里有竞态（CPython gh-86296）：它返回结果、吞掉取消。第 30 课在 AsyncAgent 里实测到了这个问题。
+      在这里有竞态（CPython gh-86296）：它返回结果、吞掉取消。第 30 课在 Agent 的工具执行器里实测到了这个问题
+      （agentkit 因此改用 agentkit.timeouts.wait_for）。
 
     提示：常见的错误写法是
         try: return await asyncio.wait_for(coro, seconds)

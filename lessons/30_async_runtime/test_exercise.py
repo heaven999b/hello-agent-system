@@ -205,7 +205,7 @@ def test_with_deadline_keeps_cancel_when_inner_finishes_at_the_same_moment():
     """内部结果和外部取消在同一轮事件循环里到达：以取消为准。
 
     Python 3.10/3.11 的 asyncio.wait_for 在这里有竞态（CPython gh-86296）：它会返回结果、吞掉取消。
-    第 30 课在 AsyncAgent 的工具执行器里实测到了它：同步工具执行完的那一刻用户断开，运行照样跑完。
+    第 30 课在 Agent 的工具执行器里实测到了它：同步工具执行完的那一刻用户断开，运行照样跑完（后来 agentkit 改用 timeouts.wait_for）。
     """
 
     async def main():
