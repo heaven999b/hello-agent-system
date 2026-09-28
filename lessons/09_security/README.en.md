@@ -164,7 +164,7 @@ agent = Agent(
         AuditLog("runs/audit.jsonl"),                            # layer 5: audit
     ],
 )
-agent.run("...", metadata={"tenant_id": "acme", "user_id": "u1", "roles": ["employee"]})  # identity is filled in by the server
+await agent.run("...", metadata={"tenant_id": "acme", "user_id": "u1", "roles": ["employee"]})  # identity is filled in by the server
 ```
 
 ### 1.6 The eight problem cards in this lesson
@@ -321,10 +321,10 @@ Four principles: **explicit deny wins** (adding another role can't "launder" a f
 
 **How to choose**: B is the baseline. Add C for high-frequency, low-value operations, and use D for large amounts and permission changes. Whatever the option, always: **make approval requests specific down to the arguments, phrased in plain language, with anomalies flagged** ("Will send an email to the **external address** audit@evil.example; the body contains **the mobile numbers and annual purchase totals of 3 customers**"); **bind the approval to the exact arguments**, so nothing can change after approval; **treat approval timeouts as rejections**; and **monitor each approver's approval rate** — a rate near 100% over time means either the scope is too broad or they're already rubber-stamping.
 
-**What this lesson implements**: B. Every tool declares `risk="read" | "write" | "dangerous"`, and `PermissionPolicy(ask_risks={"dangerous"})` requires approval only for dangerous operations. If an `approver` function is provided, approval is synchronous (the CLI case); if not, it raises `PauseRun` for asynchronous approval. Approvals are bound to `tool_call_id`, and the arguments are saved with the checkpoint (for how pause and resume work, see [Lesson 08, Problem 6](../08_reliability/README.en.md)). Two more details cut pointless approvals and make accountability easier:
+**What this lesson implements**: B. Every tool declares `risk="read" | "write" | "dangerous"`, and `PermissionPolicy(ask_risks={"dangerous"})` requires approval only for dangerous operations. If an `approver` function is provided, approval happens on the spot (asking at the command line, or calling an approval service's API); if not, it raises `PauseRun`: the state is persisted, the run ends, and the approver calls `await agent.approve(...)` hours later. Approvals are bound to `tool_call_id`, and the arguments are saved with the checkpoint (for how pause and resume work, see [Lesson 08, Problem 6](../08_reliability/README.en.md)). The `approver` can be a plain function or an `async` function (for example, one that `await`s an approval service's HTTP API while other sessions in the same process keep going). When `PermissionPolicy` sees that it returned a coroutine, it hands it to the agent to `await` instead of calling `bool(...)` on it — **`bool(coroutine)` is always `True`**, which would silently approve every dangerous operation. This is the most dangerous kind of bug in async code: no error, just quietly doing the wrong thing. Two more details cut pointless approvals and make accountability easier:
 
 - **Invalid calls never go to approval**: `PermissionPolicy` first validates the arguments against the tool's schema. If validation fails, the call goes straight to the tool layer, which returns an error for the model to fix. The approver isn't bothered (otherwise they'd be approving a call that's doomed to fail).
-- **Record who approved**: `agent.approve(run_id, approved=False, by="sec-oncall", comment="Recipient is on an external domain")` is written to the approval log, and every tool-call record in `AuditLog` carries `approved` and `approved_by`.
+- **Record who approved**: `await agent.approve(run_id, approved=False, by="sec-oncall", comment="Recipient is on an external domain")` is written to the approval log, and every tool-call record in `AuditLog` carries `approved` and `approved_by`.
 
 Exercise (a)'s plan × risk matrix extends option B: beyond the risk level, it also looks at a tenant attribute. For the same write operation, a free-plan tenant must confirm, while a paying tenant goes straight through.
 
@@ -383,7 +383,7 @@ Three commonly overlooked exits:
 
 **How to choose**: A if the needs can be enumerated; B for internal, low-risk use; at least C for external users or multi-tenant setups. Whichever you pick, you must have: **the network off by default** (otherwise the sandbox itself becomes an "external communication" channel and completes the lethal trifecta); **no secrets in the sandbox**; **a fresh filesystem every time**; and **processes that are actually killed on timeout**.
 
-**What this lesson implements**: agentkit has no built-in sandbox, so this card offers principles only. One related fact: `ToolRegistry.execute`'s timeout is thread-based, and Python threads can't be forcibly killed. A timeout only means "stop waiting"; the code may still be running in the background (the comments in [agentkit/tools.py](../../agentkit/tools.py) call this out explicitly). That's why untrusted code must run in a separate process or sandbox that can be killed as a whole.
+**What this lesson implements**: agentkit has no built-in sandbox, so this card offers principles only. One related fact: tool timeouts come in three flavors (see the module docstring of [agentkit/tools.py](../../agentkit/tools.py)): an `async def` tool that times out is truly cancelled; a plain synchronous function runs in a thread pool, and Python threads can't be forcibly killed, so a timeout only means "stop waiting" and the code may still be running in the background; `@tool(isolation="process")` runs in a child process that is killed outright on timeout. That's why untrusted code must at least run in a separate process that can be killed as a whole — but process isolation only solves "can we kill it", not "what can it reach" (the network, files, secrets in environment variables); that's the sandbox's job.
 
 [Lesson 19](../19_mcp_and_sandbox/README.en.md) builds a process-level sandbox from scratch and measures what it can't stop and when you must move to containers or microVMs; [Lesson 24](../24_coding_agents/README.en.md) puts code execution inside a coding agent, with path boundaries, test protection, and diff review.
 
@@ -584,7 +584,7 @@ Open [exercise.py](exercise.py) and complete three tasks:
 **(a) `PolicyEngine.decide`: the permission decision matrix (Problems 2 and 3)**
 
 - Task: return `allow / ask / deny` following the order "globally disabled → explicitly denied by a role → unknown risk → role allowlist → plan × risk lookup".
-- Hints: take the **union** of the allowlists when there are multiple roles; an explicit deny from any single role is a **veto**; every "unknown" case gets the strictest treatment. Once you're done, the prewritten `PolicyHook` wires your decisions into the agent (the tests include an integration case).
+- Hints: take the **union** of the allowlists when there are multiple roles; an explicit deny from any single role is a **veto**; every "unknown" case gets the strictest treatment. Once you're done, the prewritten `PolicyHook` wires your decisions into the agent (the tests include an integration case that runs a real agent with `await agent.run(...)` / `await agent.approve(...)`). All three tasks are plain functions: permission decisions, redaction, and capability analysis are pure computation and don't need `async`.
 
 **(b) `redact`: extended PII redaction (Problem 4)**
 

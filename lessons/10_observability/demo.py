@@ -1,7 +1,8 @@
 """第 10 课 Demo：给 Agent 装上"黑匣子"。
 
-一个电商客服 Agent 处理 4 个任务（其中一个会遇到物流接口故障、一个带手机号），我们：
-  1. 每次运行打印 Span 树 —— 看见 Agent 每一步做了什么、花了多久、用了多少 token
+一个电商客服 Agent 处理 5 个任务（一个会遇到物流接口故障、一个带手机号、一个在同一轮里并行调用 3 个只读工具），我们：
+  1. 每次运行打印 Span 树 —— 看见 Agent 每一步做了什么、花了多久、用了多少 token；
+     并行的只读工具调用在 trace 里是时间上重叠的 span（Agent 用 asyncio 并发执行它们）
   2. 把所有 Span 导出为 JSONL —— 这就是发给可观测性后端的原始数据
   3. 从 JSONL 算出监控看板上的指标 —— 成功率、p50/p95、token、工具错误率……
   4. 复盘坏案例 —— 从"工具错误率高"一路定位到具体的 trace 和最慢路径
@@ -15,9 +16,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
-import time
 import unicodedata
 from pathlib import Path
 from typing import Annotated
@@ -29,7 +30,9 @@ from agentkit import (
     ScriptedLLM,
     ToolError,
     Tracer,
+    Usage,
     call_tool,
+    call_tools,
     default_llm,
     jsonl_exporter,
     redact_pii,
@@ -54,6 +57,8 @@ def pad(text: str, width: int) -> str:
 
 
 # ---------------------------------------------------------------- 模拟的业务系统
+# 工具都是 async 函数：查数据库、调物流接口的等待用 await asyncio.sleep 表示，
+# 等待期间事件循环去推进别的事（同一轮里的其他只读工具、同一进程里的其他会话）。
 
 ORDERS = {
     "A1001": {"status": "已发货", "tracking_no": "SF1001", "item": "降噪耳机", "phone": "13812345678"},
@@ -67,9 +72,9 @@ POLICIES = {
 
 
 @tool
-def lookup_order(order_id: Annotated[str, Field(description="订单号，例如 A1001")]) -> dict:
+async def lookup_order(order_id: Annotated[str, Field(description="订单号，例如 A1001")]) -> dict:
     """查询订单状态、商品和物流单号。"""
-    time.sleep(0.05)  # 模拟数据库查询耗时
+    await asyncio.sleep(0.05)  # 数据库查询耗时
     order = ORDERS.get(order_id.strip().upper())
     if order is None:
         raise ToolError(f"订单 {order_id} 不存在，请让用户核对订单号。")
@@ -77,9 +82,9 @@ def lookup_order(order_id: Annotated[str, Field(description="订单号，例如 
 
 
 @tool
-def track_shipment(tracking_no: Annotated[str, Field(description="物流单号，例如 SF1001")]) -> str:
+async def track_shipment(tracking_no: Annotated[str, Field(description="物流单号，例如 SF1001")]) -> str:
     """查询物流轨迹。"""
-    time.sleep(0.15)  # 外部物流接口通常比内部数据库慢
+    await asyncio.sleep(0.15)  # 外部物流接口通常比内部数据库慢
     if tracking_no.upper().startswith("YT"):
         # 模拟真实故障：某家物流商的接口持续超时
         raise ToolError("物流商接口超时（YT 网关返回 504），暂时无法查询该物流单。")
@@ -87,17 +92,17 @@ def track_shipment(tracking_no: Annotated[str, Field(description="物流单号�
 
 
 @tool
-def search_policy(query: Annotated[str, Field(description="要检索的售后问题关键词")]) -> str:
+async def search_policy(query: Annotated[str, Field(description="要检索的售后问题关键词")]) -> str:
     """检索售后政策知识库（退货、运费等）。"""
-    time.sleep(0.03)
+    await asyncio.sleep(0.03)
     hits = [f"【{k}】{v}" for k, v in POLICIES.items() if k in query] or list(POLICIES.values())
     return "\n".join(hits)
 
 
 @tool
-def find_orders_by_phone(phone: Annotated[str, Field(description="用户手机号")]) -> list:
+async def find_orders_by_phone(phone: Annotated[str, Field(description="用户手机号")]) -> list:
     """按手机号查询用户名下的订单号列表。"""
-    time.sleep(0.05)
+    await asyncio.sleep(0.05)
     return [oid for oid, o in ORDERS.items() if o["phone"] == phone]
 
 
@@ -112,42 +117,89 @@ TASKS = [
     ("t2-问政策", "耳机买了 10 天了，还能无理由退货吗？"),
     ("t3-工具故障", "帮我看看订单 A1002 的物流进度"),
     ("t4-含手机号", "我的手机号是 13812345678，帮我查一下我名下有哪些订单"),
+    ("t5-并行查询", "订单 A1001 和 A1003 现在分别是什么状态？另外退货的运费谁出？"),
 ]
+PARALLEL_TASK = "t5-并行查询"
 
 
 # ---------------------------------------------------------------- 离线剧本
-# 每一项是一个函数：先 sleep 模拟模型耗时，再返回剧本里的响应。token 数取真实量级。
+# 每一步是 (模型耗时秒数, 模型的响应)。耗时交给 ScriptedLLM(latency=...)：它用 asyncio.sleep 等待，
+# 和真实的网络等待一样不占 CPU、不阻塞事件循环。token 数取真实量级。
 
-def after(seconds: float, response):
-    def step(_messages):
-        time.sleep(seconds)
-        return response
-
-    return step
+def with_usage(response, input_tokens: int, output_tokens: int):
+    response.usage = Usage(input_tokens, output_tokens)
+    return response
 
 
-def offline_scripts() -> dict[str, list]:
+def offline_scripts() -> dict[str, list[tuple[float, object]]]:
     return {
         "t1-查物流": [
-            after(0.35, call_tool("lookup_order", order_id="A1001", input_tokens=410, output_tokens=22)),
-            after(0.30, call_tool("track_shipment", tracking_no="SF1001", input_tokens=480, output_tokens=24)),
-            after(0.55, reply("您的订单 A1001（降噪耳机）已到达上海浦东转运中心，预计明天送达。", 560, 38)),
+            (0.35, call_tool("lookup_order", order_id="A1001", input_tokens=410, output_tokens=22)),
+            (0.30, call_tool("track_shipment", tracking_no="SF1001", input_tokens=480, output_tokens=24)),
+            (0.55, reply("您的订单 A1001（降噪耳机）已到达上海浦东转运中心，预计明天送达。", 560, 38)),
         ],
         "t2-问政策": [
-            after(0.30, call_tool("search_policy", query="退货", input_tokens=405, output_tokens=18)),
-            after(0.60, reply("已超过 7 天无理由退货期限；如果是质量问题，15 天内仍可申请退换。", 520, 45)),
+            (0.30, call_tool("search_policy", query="退货", input_tokens=405, output_tokens=18)),
+            (0.60, reply("已超过 7 天无理由退货期限；如果是质量问题，15 天内仍可申请退换。", 520, 45)),
         ],
         "t3-工具故障": [
-            after(0.30, call_tool("lookup_order", order_id="A1002", input_tokens=408, output_tokens=22)),
-            after(0.35, call_tool("track_shipment", tracking_no="YT2002", input_tokens=470, output_tokens=24)),
-            after(0.40, call_tool("track_shipment", tracking_no="YT2002", input_tokens=530, output_tokens=24)),
-            after(0.70, reply("抱歉，物流商接口暂时超时，无法查询 YT2002 的进度。订单已发货，建议稍后再查。", 600, 52)),
+            (0.30, call_tool("lookup_order", order_id="A1002", input_tokens=408, output_tokens=22)),
+            (0.35, call_tool("track_shipment", tracking_no="YT2002", input_tokens=470, output_tokens=24)),
+            (0.40, call_tool("track_shipment", tracking_no="YT2002", input_tokens=530, output_tokens=24)),
+            (0.70, reply("抱歉，物流商接口暂时超时，无法查询 YT2002 的进度。订单已发货，建议稍后再查。", 600, 52)),
         ],
         "t4-含手机号": [
-            after(0.40, call_tool("find_orders_by_phone", phone="13812345678", input_tokens=420, output_tokens=26)),
-            after(0.50, reply("您名下有 2 个订单：A1001（已发货）和 A1003（待发货）。", 470, 30)),
+            (0.40, call_tool("find_orders_by_phone", phone="13812345678", input_tokens=420, output_tokens=26)),
+            (0.50, reply("您名下有 2 个订单：A1001（已发货）和 A1003（待发货）。", 470, 30)),
+        ],
+        # 同一轮里 3 个只读工具：Agent 用 asyncio.gather 并发执行它们（有写操作时才会逐个执行）
+        PARALLEL_TASK: [
+            (0.45, with_usage(call_tools(("lookup_order", {"order_id": "A1001"}), ("lookup_order", {"order_id": "A1003"}),
+                                         ("search_policy", {"query": "运费"})), 430, 64)),
+            (0.60, reply("A1001（降噪耳机）已发货，A1003（显示器支架）待发货。质量问题退货运费由商家承担，"
+                         "无理由退货由您承担。", 590, 48)),
         ],
     }
+
+
+def scripted_llm(steps: list[tuple[float, object]]) -> ScriptedLLM:
+    delays = [d for d, _ in steps]
+    return ScriptedLLM([r for _, r in steps], latency=lambda n: delays[n - 1], model="scripted")
+
+
+def waterfall(root, cell_ms: float) -> list[str]:
+    """把一次运行的直接子 span 画成时间线（相对 agent.run 的开始时间）：看得出哪些 span 在时间上重叠。"""
+    lines = []
+    for s in root.children:
+        a = (s.start - root.start) * 1000
+        b = (s.end - root.start) * 1000
+        bar = " " * int(a / cell_ms) + "█" * max(1, round((b - a) / cell_ms))
+        lines.append(f"{pad(s.name, 22)}{pad(bar, 44)}{a:5.0f} → {b:5.0f}ms")
+    return lines
+
+
+def show_parallel_tools(root) -> None:
+    """找到"同一轮里调用了多个工具"的那一组 span，证明它们在时间上重叠（真的并发了）。"""
+    tools = [s for s in root.children if s.name.startswith("tool.")]
+    groups: dict[int, list] = {}
+    for s in tools:  # 按"紧跟在哪次模型调用之后"分组
+        step_idx = sum(1 for c in root.children if c.name == "llm.chat" and c.start <= s.start)
+        groups.setdefault(step_idx, []).append(s)
+    batch = max(groups.values(), key=len) if groups else []
+    cell = max(25.0, root.duration_ms / 40)  # 整条时间线最多 40 格左右
+    print(f"  时间线（每格 {cell:.0f}ms，相对 agent.run 开始）：")
+    for line in waterfall(root, cell):
+        print("    " + line)
+    if len(batch) < 2:
+        print("  这次模型把工具分在几轮里依次调用，没有同一轮的多个工具可以并行（真实模型的行为每次可能不同）。")
+        return
+    overlap = max(s.start for s in batch) < min(s.end for s in batch)
+    total = sum(s.duration_ms for s in batch)
+    wall = (max(s.end for s in batch) - min(s.start for s in batch)) * 1000
+    names = ", ".join(s.name.removeprefix("tool.") for s in batch)
+    print(f"  同一轮的 {len(batch)} 个只读工具（{names}）："
+          f"{'时间上互相重叠 → 并发执行' if overlap else '没有重叠'}；"
+          f"各自耗时加起来 {total:.0f}ms，实际只占了 {wall:.0f}ms 墙钟。")
 
 
 def load_metrics_impl():
@@ -167,7 +219,7 @@ def load_metrics_impl():
 
 # ---------------------------------------------------------------- 主流程
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--offline", action="store_true", help="用 ScriptedLLM 剧本代替真实模型")
     args = parser.parse_args()
@@ -178,17 +230,19 @@ def main() -> None:
     # 所有任务共用一个 Tracer：生产中一个进程通常只有一个全局 Tracer
     tracer = Tracer(exporter=jsonl_exporter(RAW_PATH))
     scripts = offline_scripts() if args.offline else {}
-    mode = "离线剧本（ScriptedLLM，模拟了模型耗时）" if args.offline else "真实模型（.env 配置）"
+    mode = "离线剧本（ScriptedLLM，latency 模拟模型耗时）" if args.offline else "真实模型（.env 配置）"
 
     section(f"1. 运行 {len(TASKS)} 个任务，每次运行都会生成一棵 Span 树    模式：{mode}")
     print("读法：每行一个 Span（名称  耗时  关键属性），缩进表示父子关系。FAIL(...) 是工具失败。")
     for task_id, text in TASKS:
-        llm = ScriptedLLM(scripts[task_id], model="scripted") if args.offline else default_llm()
+        llm = scripted_llm(scripts[task_id]) if args.offline else default_llm()
         agent = Agent(llm, TOOLS, system_prompt=SYSTEM_PROMPT, name="support", max_steps=6, tracer=tracer)
-        result = agent.run(text, metadata={"tenant_id": "shop-01", "user_id": "u-42"})
+        result = await agent.run(text, metadata={"tenant_id": "shop-01", "user_id": "u-42"})
         print(f"\n▶ [{task_id}] 用户：{text}")
         print(f"  助手：{' '.join((result.output or '').split())[:160]}")
         print("  " + render_tree(result.trace).replace("\n", "\n  "))
+        if task_id == PARALLEL_TASK:
+            show_parallel_tools(result.trace)
 
     # ------------------------------------------------------------ 2. JSONL
     section("2. 导出：扁平的 JSONL —— 这就是发给可观测性后端的原始数据")
@@ -290,4 +344,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

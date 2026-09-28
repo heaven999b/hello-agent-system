@@ -204,9 +204,12 @@ async def run_eval(
         res = await agent.run(case.input, metadata=case.metadata)
         latency = (time.perf_counter() - t0) * 1000
         checks = [c for g in graders for c in await maybe_await(g(case, res))]
+        infra = res.status == "failed" and (res.stop_reason or "").startswith("llm_error")
         return CaseResult(
             id=case.id,
-            passed=all(c.passed for c in checks),
+            # 模型 / 网关故障的用例一律不算通过：Agent 根本没跑起来，"没调用危险工具"之类的规则会被碰巧满足，
+            # 把通过率抬高（第 11 课实测：4 个 429 里 3 个被判为通过，报告 86%）
+            passed=not infra and all(c.passed for c in checks),
             checks=checks,
             status=res.status,
             output=res.output or "",
@@ -216,7 +219,7 @@ async def run_eval(
             cost_usd=res.cost_usd,
             latency_ms=latency,
             tags=case.tags,
-            infra_error=res.status == "failed" and (res.stop_reason or "").startswith("llm_error"),
+            infra_error=infra,
         )
 
     return EvalReport(await parallel([lambda c=c: one(c) for c in cases], max_concurrency=concurrency))

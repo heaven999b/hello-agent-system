@@ -98,24 +98,24 @@ def reset_password(username: str) -> str:
     return f"{username} 的密码已重置"
 
 
-def test_policy_hook_in_agent_hides_denied_tools_and_pauses_on_ask():
+async def test_policy_hook_in_agent_hides_denied_tools_and_pauses_on_ask():
     tools = [search_kb, create_ticket, reset_password]
     llm = ScriptedLLM([call_tool("create_ticket", title="打印机坏了"), reply("工单已提交")])
     agent = Agent(llm, tools, hooks=[ex.PolicyHook(_engine(), tools)])
-    res = agent.run("报修", metadata={"roles": ["employee"], "tenant_plan": "free"})
+    res = await agent.run("报修", metadata={"roles": ["employee"], "tenant_plan": "free"})
     # 员工看不到 reset_password
     assert [t["function"]["name"] for t in llm.calls[0]["tools"]] == ["search_kb", "create_ticket"]
     # 免费版的写操作 → ask → 暂停等审批
     assert res.status == "paused" and res.pending_approval.name == "create_ticket"
-    res2 = agent.approve(res.run_id, approved=True)
+    res2 = await agent.approve(res.run_id, approved=True)
     assert res2.ok and any(m["role"] == "tool" and "工单已创建" in m["content"] for m in res2.messages)
 
 
-def test_policy_hook_blocks_invisible_tool_called_anyway():
+async def test_policy_hook_blocks_invisible_tool_called_anyway():
     """模型被注入诱导，去调用一个它"看不见"的工具：before_tool 这道保险要拦住。"""
     tools = [search_kb, create_ticket, reset_password]
     llm = ScriptedLLM([call_tool("reset_password", username="ceo"), reply("好的")])
-    res = Agent(llm, tools, hooks=[ex.PolicyHook(_engine(), tools)]).run(
+    res = await Agent(llm, tools, hooks=[ex.PolicyHook(_engine(), tools)]).run(
         "x", metadata={"roles": ["employee"], "tenant_plan": "enterprise"}
     )
     assert res.ok and res.messages[3]["content"].startswith("拒绝")

@@ -5,11 +5,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
-import threading
 import time
-from typing import Callable, TypeVar
+from typing import Awaitable, Callable, TypeVar
 
 from agentkit.hooks import Hook, StopRun
 from agentkit.reliability import CircuitBreaker, CircuitOpenError, backoff_delay, is_retryable
@@ -99,7 +99,11 @@ class RetryBudget:
     - initial_tokens 保证低流量时（比如刚启动）也有少量重试机会；
       max_tokens 防止长时间健康时攒下海量令牌，一出故障就全部用来重试（那又是一场风暴）。
 
-    一个 RetryBudget 应该被"同一个下游"的所有请求共享（例如每个模型供应商一个），所以要加锁。
+    一个 RetryBudget 应该被"同一个下游"的所有并发请求共享（例如每个模型供应商一个）。
+
+    为什么不用锁？所有请求都是同一个事件循环里的协程，而协程只会在 await 处切换。
+    on_request / try_acquire 里没有 await，"读令牌 → 判断 → 扣减"不可能被别的协程插进来，天然是原子的。
+    （多线程共享才需要 threading.Lock；多个进程共享要把桶放进数据库，见 agentkit.distributed.SQLiteTokenBucket。）
     """
 
     SCALE = 1000  # 内部以 1/1000 个令牌为单位做整数运算
@@ -114,7 +118,6 @@ class RetryBudget:
         self._ratio = round(ratio * self.SCALE)
         self._tokens = round(initial_tokens * self.SCALE)
         self._max = round(max_tokens * self.SCALE)
-        self._lock = threading.Lock()
         self.requests = 0  # 统计：新请求数
         self.retries = 0  # 统计：批准的重试数
         self.rejected = 0  # 统计：因预算不足被拒绝的重试数
@@ -125,26 +128,24 @@ class RetryBudget:
 
     def on_request(self) -> None:
         """记录一个新请求：存入 ratio 个令牌（不超过 max_tokens）。"""
-        with self._lock:
-            self.requests += 1
-            self._tokens = min(self._max, self._tokens + self._ratio)
+        self.requests += 1
+        self._tokens = min(self._max, self._tokens + self._ratio)
 
     def try_acquire(self) -> bool:
         """为一次重试申请 1 个令牌。成功返回 True 并扣减；不足返回 False 并记一次 rejected。"""
-        with self._lock:
-            if self._tokens >= self.SCALE:
-                self._tokens -= self.SCALE
-                self.retries += 1
-                return True
-            self.rejected += 1
-            return False
+        if self._tokens >= self.SCALE:
+            self._tokens -= self.SCALE
+            self.retries += 1
+            return True
+        self.rejected += 1
+        return False
 
 
 EventFn = Callable[[str, int, Exception, float], None]
 
 
-def retry_with_budget(
-    fn: Callable[[], T],
+async def retry_with_budget(
+    fn: Callable[[], Awaitable[T]],
     budget: RetryBudget,
     *,
     max_attempts: int = 3,
@@ -153,7 +154,7 @@ def retry_with_budget(
     retry_if: Callable[[Exception], bool] = is_retryable,
     deadline: float | None = None,
     clock: Callable[[], float] = time.monotonic,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: random.Random | None = None,
     on_event: EventFn | None = None,
 ) -> T:
@@ -162,6 +163,9 @@ def retry_with_budget(
     - max_attempts：单个请求最多尝试几次（每个请求自己的上限）；
     - budget：所有请求共享的重试预算（整体的上限，防止故障时流量翻倍）；
     - deadline：绝对截止时间（按 clock 计）。剩余时间不够再等一次退避，就别重试了。
+
+    fn 是"每次调用都返回一个新协程"的函数（例如 lambda: llm.chat(messages)）：协程只能 await 一次，重试要重新创建。
+    等待用 await sleep(delay)：等的时候事件循环去推进别的请求，而不是整个进程停下来。
     """
     if deadline is not None and clock() >= deadline:
         raise DeadlineExceeded("调用前截止时间就已经过了，放弃执行（别让下游做注定白做的工作）")
@@ -169,8 +173,8 @@ def retry_with_budget(
     budget.on_request()  # 每个新请求只存一次，无论成功失败
     for attempt in range(1, max_attempts + 1):
         try:
-            return fn()
-        except Exception as e:
+            return await fn()
+        except Exception as e:  # CancelledError 是 BaseException，不会被捕获：调用方取消时不重试，直接穿透
             if not retry_if(e) or attempt == max_attempts:
                 raise
             delay = backoff_delay(attempt, base_delay, max_delay, rng)
@@ -185,7 +189,7 @@ def retry_with_budget(
                 raise
             if on_event:
                 on_event("retry", attempt, e, delay)
-            sleep(delay)
+            await sleep(delay)
     raise AssertionError("unreachable")
 
 
@@ -195,42 +199,42 @@ def retry_with_budget(
 
 
 class SingleProbeCircuitBreaker(CircuitBreaker):
-    """agentkit 自带的 CircuitBreaker 在 half_open 时会放行"所有"请求。
+    """half_open 时只放行 1 个试探请求（probe），试探进行中其余请求一律快速失败（CircuitOpenError）。
 
-    如果此时有 500 个并发请求涌进来，它们会同时打到刚刚恢复（或根本没恢复）的下游上 ——
-    这正是熔断器想避免的事。改进：half_open 时只允许 1 个试探请求（probe），
-    试探进行中其他请求一律快速失败（CircuitOpenError），由调用方走降级。
+    否则下游刚恢复一点，500 个并发请求同时涌向它，又把它压垮 —— 这正是熔断器想避免的事。
+    （agentkit 的 CircuitBreaker.call 就是这样实现的；这里自己写一遍，并用并发协程证明它成立。）
+
+    为什么一个普通的布尔标志就够了、不需要锁？
+      "检查 _probing → 置位"之间没有 await：同一个事件循环里的协程只会在 await 处切换，
+      所以不可能有两个协程同时看到 _probing == False。唯一的 await 是 await fn() —— 这时标志早已置位。
+      多线程共享同一个熔断器才需要 threading.Lock；多个**进程**共享要把"谁在试探"放进数据库，
+      并且要带过期时间（试探者可能崩溃），见 agentkit.distributed.SQLiteCircuitBreaker 的 probe_until。
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._lock = threading.Lock()
         self._probing = False
 
-    def call(self, fn: Callable[[], T]) -> T:
-        with self._lock:
-            state = self.state
-            if state == "open":
+    async def call(self, fn: Callable[[], Awaitable[T]]) -> T:
+        state = self.state
+        if state == "open":
+            raise CircuitOpenError(self.name)
+        is_probe = state == "half_open"
+        if is_probe:
+            if self._probing:  # 已经有一个试探请求在路上了
                 raise CircuitOpenError(self.name)
-            is_probe = state == "half_open"
-            if is_probe:
-                if self._probing:  # 已经有一个试探请求在路上了
-                    raise CircuitOpenError(self.name)
-                self._probing = True
+            self._probing = True  # 检查和置位之间没有 await：别的协程插不进来
         try:
-            result = fn()
+            result = await fn()  # 唯一的切换点：慢请求在这里等，别的协程照常推进（并被上面的检查挡住）
         except Exception:
-            with self._lock:
-                self.failures += 1
-                if is_probe or self.failures >= self.failure_threshold:
-                    self.opened_at = self.clock()  # 试探失败：重新打开，重新计时
+            self.failures += 1
+            if is_probe or self.failures >= self.failure_threshold:
+                self.opened_at = self.clock()  # 试探失败：重新打开，重新计时
             raise
         else:
-            with self._lock:
-                self.failures = 0
-                self.opened_at = None
+            self.failures = 0
+            self.opened_at = None
             return result
         finally:
             if is_probe:
-                with self._lock:
-                    self._probing = False
+                self._probing = False  # 成功、失败、被取消（CancelledError）都要复位，否则熔断器永远卡在半开

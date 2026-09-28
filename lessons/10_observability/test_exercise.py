@@ -1,16 +1,18 @@
-"""第 10 课练习测试：离线、确定性。span 数据全部手工构造，最后一个测试用真实的 Agent + jsonl_exporter 做集成验证。
+"""第 10 课练习测试：离线、确定性。span 数据大多手工构造，最后几个测试用真实的 Agent + jsonl_exporter 做集成验证
+（包括同一轮里并发执行的只读工具：它们的 span 在时间上重叠，指标照样要算对）。
 
 运行：make lesson N=10
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 
 import pytest
 
-from agentkit import Agent, ScriptedLLM, ToolError, Tracer, call_tool, jsonl_exporter, reply, tool
+from agentkit import Agent, ScriptedLLM, ToolError, Tracer, call_tool, call_tools, jsonl_exporter, reply, tool
 from agentkit.testing import load_exercise
 
 ex = load_exercise(__file__)
@@ -214,7 +216,7 @@ def test_slowest_path_tie_breaks_by_earliest_start():
 # ------------------------------------------------------------------ 集成：真实 Agent 导出的数据
 
 
-def test_works_on_real_jsonl_export(tmp_path):
+async def test_works_on_real_jsonl_export(tmp_path):
     @tool
     def lookup_order(order_id: str) -> str:
         """查询订单"""
@@ -234,7 +236,7 @@ def test_works_on_real_jsonl_export(tmp_path):
         [reply("你好", input_tokens=30, output_tokens=5)],
     ]
     for script in scripts:
-        Agent(ScriptedLLM(script), [lookup_order, track_shipment], tracer=tracer).run("x")
+        await Agent(ScriptedLLM(script), [lookup_order, track_shipment], tracer=tracer).run("x")
 
     spans = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     m = ex.compute_metrics(spans)
@@ -246,7 +248,7 @@ def test_works_on_real_jsonl_export(tmp_path):
     assert ex.slowest_path(spans, first_trace)[0] == "agent.run"
 
 
-def test_nested_sub_agent_from_real_export(tmp_path):
+async def test_nested_sub_agent_from_real_export(tmp_path):
     """多 Agent：主管通过 agent_as_tool 调用专家，两者共用一个 Tracer。
     专家的 agent.run 嵌套在主管的 tool span 下 —— 只算 1 次运行，但专家的 token 要算进总数。"""
     from agentkit.workflows import agent_as_tool
@@ -257,7 +259,7 @@ def test_nested_sub_agent_from_real_export(tmp_path):
     boss = Agent(ScriptedLLM([call_tool("ask_expert", task="x", input_tokens=100, output_tokens=10),
                               reply("完成", input_tokens=120, output_tokens=12)]),
                  [agent_as_tool(expert, "ask_expert", "专家")], name="boss", tracer=tracer)
-    boss.run("hi")
+    await boss.run("hi")
 
     spans = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     m = ex.compute_metrics(spans)
@@ -266,3 +268,50 @@ def test_nested_sub_agent_from_real_export(tmp_path):
     assert m["tools"]["ask_expert"]["calls"] == 1
     path_names = ex.slowest_path(spans, spans[0]["trace_id"])
     assert path_names[0] == "agent.run" and len(path_names) >= 2
+
+
+async def test_parallel_read_only_tools_from_real_export(tmp_path):
+    """同一轮里 3 个只读工具：Agent 并发执行它们，导出的 3 个 tool span 在时间上重叠。
+    这时"子 span 耗时之和"会超过父 span 的墙钟时间 —— 指标要按次数和状态算，而不是把时间加起来。"""
+    in_flight = peak = 0
+
+    async def busy():
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(0.01)  # 等待期间让出事件循环：并发执行时，另外两个工具这时也已经开始了
+        finally:
+            in_flight -= 1
+
+    @tool
+    async def lookup_order(order_id: str) -> str:
+        """查询订单"""
+        await busy()
+        return "已发货"
+
+    @tool
+    async def search_policy(query: str) -> str:
+        """检索政策"""
+        await busy()
+        return "7 天无理由"
+
+    path = tmp_path / "traces.jsonl"
+    tracer = Tracer(exporter=jsonl_exporter(path))
+    script = [call_tools(("lookup_order", {"order_id": "A1"}), ("lookup_order", {"order_id": "A3"}),
+                         ("search_policy", {"query": "运费"})),
+              reply("都查到了", input_tokens=50, output_tokens=5)]
+    await Agent(ScriptedLLM(script), [lookup_order, search_policy], tracer=tracer).run("x")
+    assert peak == 3  # 确定性的并发证据：3 个工具同时在执行
+
+    spans = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    tools = [s for s in spans if s["name"].startswith("tool.")]
+    root = next(s for s in spans if s["parent_id"] is None)
+    assert len(tools) == 3 and all(t["parent_id"] == root["span_id"] for t in tools)
+    assert max(t["start"] for t in tools) < min(t["end"] for t in tools)  # 时间上两两重叠
+
+    m = ex.compute_metrics(spans)
+    assert m["runs"] == 1 and m["success_rate"] == 1.0
+    assert m["tools"]["lookup_order"] == {"calls": 2, "errors": 0, "error_rate": 0.0}
+    assert m["tools"]["search_policy"]["calls"] == 1
+    assert m["total_tokens"] == 30 + 55  # 两次模型调用；根 span 上的汇总值不能重复算

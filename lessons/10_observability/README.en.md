@@ -208,7 +208,7 @@ How much to record, how to store it, and who gets to see it are the trade-offs t
 
 **Scenario**: A supervisor agent calls a specialist agent (deployed in a separate service), which in turn calls an MCP server. While investigating a 40-second slow request, you find three unrelated traces in the backend, and have to guess from timestamps which ones belong to the same request.
 
-**Why it's hard**: Trace context can get lost at every boundary: thread pools (Python's `contextvars` are **not** propagated automatically into `ThreadPoolExecutor` worker threads), async tasks, HTTP calls, message queues, and waits of several hours for approval.
+**Why it's hard**: Trace context can get lost at every boundary: thread pools (`loop.run_in_executor` does **not** carry `contextvars` into worker threads; `asyncio.to_thread` does), async tasks (`asyncio.create_task` copies the current context at creation time, but a task created elsewhere sees that other place's context), HTTP calls, message queues, another worker process, and waits of several hours for approval.
 
 | Option | How | Pros | Cons | Best for |
 |---|---|---|---|---|
@@ -219,7 +219,13 @@ How much to record, how to store it, and who gets to see it are the trade-offs t
 
 **How to choose**: A + B are the foundation: they guarantee one trace_id per request. Always have C, because users who complain report a run_id, not a trace_id. Use D for queues and long pauses. Before launch, run an end-to-end check: send one complete request and confirm that exactly one trace_id shows up in the backend.
 
-**In this lesson**: agentkit's `Tracer` keeps a span stack in `contextvars` (option A). When `ToolRegistry.execute` runs a tool in a thread pool, it calls `pool.submit(contextvars.copy_context().run, t.fn, **kwargs)` to carry the context into the tool thread, so a sub-agent called via `agent_as_tool` nests under the parent span (see [agentkit/tools.py](../../agentkit/tools.py)). A run resumed from a checkpoint gets a new root span, `agent.resume`, correlated by run_id (option C), and the viewer stitches together all traces with the same run_id. You can check this yourself with the code below:
+**In this lesson**: agentkit's `Tracer` keeps a span stack in `contextvars` (option A). It handles all three in-process boundaries:
+
+- **Async tools and sub-agents**: `agent_as_tool` produces an async tool, and the sub-agent is `await`ed in the same task, so it naturally nests under the parent span;
+- **Concurrent read-only tools**: several read-only tools in the same turn run concurrently via `asyncio.gather`, each in its own task; a task copies the current context when it's created, so all 3 tool spans find the same parent — and they overlap in time (task t5 in the demo);
+- **Synchronous tools**: plain functions run in a thread pool, and the executor calls `loop.run_in_executor(pool, functools.partial(contextvars.copy_context().run, t.fn, **kwargs))` to carry the context into the tool thread (see [agentkit/tools.py](../../agentkit/tools.py)).
+
+A run resumed from a checkpoint gets a new root span, `agent.resume`, correlated by run_id (option C), and the viewer stitches together all traces with the same run_id. You can check this yourself with the code below:
 
 ```python
 from agentkit import Agent, ScriptedLLM, Tracer, call_tool, reply
@@ -229,9 +235,11 @@ t = Tracer()
 expert = Agent(ScriptedLLM([reply("Expert answer")]), [], name="expert", tracer=t)
 boss = Agent(ScriptedLLM([call_tool("ask_expert", task="x"), reply("Done")]),
              [agent_as_tool(expert, "ask_expert", "Expert")], name="boss", tracer=t)
-boss.run("hi")
-print(len(t.traces))  # agentkit prints 1: the sub-agent nests inside the parent trace; 2 means the context broke at the thread boundary
+await boss.run("hi")
+print(len(t.traces))  # agentkit prints 1: the sub-agent nests inside the parent trace; 2 means the context broke at a task or thread boundary
 ```
+
+**What happens across processes?** `Tracer` is an in-process object. Once the service is deployed as several worker processes (Lesson 13), each process has its own `Tracer` and exports its own spans: "request received, job enqueued" in the API process is one tree, `agent.run` in a worker process is another, and their trace_ids are unrelated; a run that pauses for approval in process A and is `resume`d by process B becomes yet another new tree in B. This lesson's implementation stops there and can only correlate them by run_id (option C). Stitching them into one tree takes option B: the producer writes the current trace context into the job payload (W3C `traceparent`), and the consumer process takes it out and "continues" that trace. Lesson 28's `agentkit.contrib.otel` provides the two functions: `payload["trace"] = inject_context({})` when enqueuing, and `async with continue_trace(job.payload["trace"]): await agent.run(...)` in the worker — see [Lesson 28, section 2.4](../28_production_observability/README.en.md#24-propagation-across-queues-inject_context--continue_trace).
 
 ## 3. From toy to production: building it layer by layer
 
@@ -272,7 +280,7 @@ def span(self, name: str, **attrs) -> Iterator[Span]:
                 self.exporter(s)
 ```
 
-1. **`contextvars` holds the "current span stack."** Nested `with tracer.span(...)` blocks find their parent automatically, so you never pass `parent` down by hand. It isolates correctly across threads and asyncio: two concurrent requests each get their own stack. The OTel Python SDK works the same way.
+1. **`contextvars` holds the "current span stack."** Nested `with tracer.span(...)` blocks find their parent automatically, so you never pass `parent` down by hand. It isolates correctly across threads and asyncio: hundreds of concurrent sessions in one process each run as a separate asyncio task with its own stack, and nobody's spans get attached to someone else's run. The OTel Python SDK works the same way.
 2. **Pauses and stops are not errors** (see Problem 4).
 3. **Record the exception, then re-`raise` it.** Tracing only observes; it must never change program behavior.
 4. **When the root span ends, the whole tree goes to the exporter.** That's simple, but a run that waits 3 hours for approval stays completely invisible to the backend until it finishes. The OTel SDK's `BatchSpanProcessor` instead queues each span as soon as it ends and exports in async batches.
@@ -286,7 +294,7 @@ with self.tracer.span(
     "llm.chat",
     **{"gen_ai.request.model": getattr(self.llm, "model", "?"), "step": state.step, "messages": len(state.messages)},
 ) as span:
-    response = self.llm.chat(state.messages, tools=tools)
+    response = await self.llm.chat(state.messages, tools=tools)   # while waiting for the model, the event loop advances other sessions
     span.set(
         **{
             "gen_ai.response.model": response.model,
@@ -307,9 +315,10 @@ with self.tracer.span(
 ```python
 with self.tracer.span(
     f"tool.{call.name}",
-    **{"tool.name": call.name, "tool.arguments": redact_pii(call.arguments)[:500], "tool.risk": t.risk if t else None},
+    **{"tool.name": call.name, "gen_ai.tool.call.id": call.id, "tool.arguments": redact_pii(call.arguments)[:500],
+       "tool.risk": t.risk if t else None},
 ) as span:
-    ...  # permission hooks → run the tool → after_tool hooks
+    ...  # permission hooks → await the tool → after_tool hooks
     span.set(**{"tool.ok": result.ok, "tool.error_type": result.error_type, "tool.result_preview": redact_pii(result.content)[:200]})
 ```
 
@@ -357,31 +366,46 @@ flowchart LR
     E --> F["Alerts"]
 ```
 
-> 🏭 **In production**: this lesson's `Tracer` writes spans to a JSONL file, which only works for a single process. For bridging it to the OpenTelemetry SDK, exporting over OTLP to any backend, stitching traces across the job queue, tail sampling and redaction, and exposing run metrics to Prometheus with burn-rate alerts, see [Lesson 28](../28_production_observability/README.en.md).
+> 🏭 **In production**: this lesson's `Tracer` is in-process: it correctly separates hundreds of concurrent sessions within one process, but several worker processes each export their own spans, and traces that cross processes don't get stitched together (see "What happens across processes?" in Problem 6); a JSONL file is also only good for local viewing. For bridging it to the OpenTelemetry SDK, exporting over OTLP to any backend, stitching traces across the job queue and across processes with `inject_context` / `continue_trace`, tail sampling and redaction, and exposing run metrics to Prometheus with burn-rate alerts, see [Lesson 28](../28_production_observability/README.en.md).
 
 ## 4. Hands-on: run the demo
 
 ```bash
-python lessons/10_observability/demo.py --offline   # scripted offline run, no API key needed (about 6 seconds)
-python lessons/10_observability/demo.py             # real model (about 25 seconds)
+python lessons/10_observability/demo.py --offline   # scripted offline run, no API key needed (about 7 seconds)
+python lessons/10_observability/demo.py             # real model (about 35 seconds)
 ```
 
-The demo's e-commerce customer-service agent handles 4 tasks: a normal shipping lookup, a question about the return policy, **a shipping API outage**, and **a lookup that includes a phone number**. Here is an excerpt from the offline run. (Demo output translated from Chinese.)
+The demo's e-commerce customer-service agent handles 5 tasks: a normal shipping lookup, a question about the return policy, **a shipping API outage**, **a lookup that includes a phone number**, and **one turn that looks up 3 things in parallel**. The tools are all `async def` (waits on the database and the carrier's API are `await asyncio.sleep`), and in offline mode the model's latency comes from `ScriptedLLM(latency=...)` — also `asyncio.sleep`, not `time.sleep`. Here is an excerpt from the offline run (MacBook, 8 cores / 8 GB). (Demo output translated from Chinese.)
 
 ```
 ▶ [t3-tool-failure] User: Can you check the shipping status of order A1002?
   Assistant: Sorry, the carrier's API is timing out right now, so I can't check the status of YT2002. The order has shipped; please check again later.
-  agent.run  2147ms  tokens=2008→122  status=completed steps=4 cost=$0.00250
-  ├─ llm.chat  308ms  tokens=408→22  → tool_calls: lookup_order
-  ├─ tool.lookup_order  56ms  ok
-  ├─ llm.chat  351ms  tokens=470→24  → tool_calls: track_shipment
-  ├─ tool.track_shipment  156ms  FAIL(tool_error)
-  ├─ llm.chat  404ms  tokens=530→24  → tool_calls: track_shipment
-  ├─ tool.track_shipment  159ms  FAIL(tool_error)
-  └─ llm.chat  701ms  tokens=600→52  → final_answer
+  agent.run  2119ms  tokens=2008→122  status=completed steps=4 cost=$0.00250
+  ├─ llm.chat  303ms  tokens=408→22  → tool_calls: lookup_order
+  ├─ tool.lookup_order  52ms  ok
+  ├─ llm.chat  352ms  tokens=470→24  → tool_calls: track_shipment
+  ├─ tool.track_shipment  153ms  FAIL(tool_error)
+  ├─ llm.chat  402ms  tokens=530→24  → tool_calls: track_shipment
+  ├─ tool.track_shipment  152ms  FAIL(tool_error)
+  └─ llm.chat  703ms  tokens=600→52  → final_answer
+
+▶ [t5-parallel-lookup] User: What's the status of orders A1001 and A1003? And who pays the shipping for a return?
+  agent.run  1109ms  tokens=1020→112  status=completed steps=2 cost=$0.00147
+  ├─ llm.chat  453ms  tokens=430→64  → tool_calls: lookup_order, lookup_order, search_policy
+  ├─ tool.lookup_order  53ms  ok
+  ├─ tool.lookup_order  53ms  ok
+  ├─ tool.search_policy  32ms  ok
+  └─ llm.chat  602ms  tokens=590→48  → final_answer
+  Timeline (one cell = 28ms, relative to the start of agent.run):
+    llm.chat              ████████████████                                0 →   453ms
+    tool.lookup_order                     ██                            454 →   506ms
+    tool.lookup_order                     ██                            454 →   506ms
+    tool.search_policy                    █                             454 →   486ms
+    llm.chat                                ██████████████████████      507 →  1109ms
+  The 3 read-only tools in the same turn (lookup_order, lookup_order, search_policy): they overlap in time → executed concurrently; their durations add up to 138ms but they took only 53ms of wall-clock time.
 ...
   Success rate (status=completed)   100%
-  Run latency p50 / p95             0.97s / 2.15s
+  Run latency p50 / p95             1.11s / 2.12s
   ...
   Tool                    Calls  Failed  Error rate
   track_shipment          3      2       67%   ← needs attention
@@ -397,9 +421,10 @@ But regex redaction has blind spots: it catches fixed formats, not free text.
 **What to look for:**
 
 1. **A 100% success rate alongside a 67% tool error rate**: the Problem 5 scenario.
-2. **In the offline script, the model retries the failed tool once**, wasting a model call. In our real-model run, the model followed the system prompt's instruction not to keep retrying, but a real model may behave differently each time. The trace tells you whether a prompt constraint actually took effect.
-3. **Model calls account for more than 80% of total latency** (97% in real mode).
-4. **The phone number in the tool arguments is replaced at the instrumentation point, but the name and address slip past the regex.** This is why Problem 2 recommends not recording content by default.
+2. **In the offline script, the model retries the failed tool once**, wasting a model call. In our real-model run, the model followed the system prompt's instruction not to keep retrying (t3 called `track_shipment` only once), but a real model may behave differently each time. The trace tells you whether a prompt constraint actually took effect.
+3. **Parallel tool calls show up in the trace as overlapping spans.** In t5 the model asks for 3 read-only tools in one turn, and the agent runs them concurrently with `asyncio.gather`: the three spans start at the same moment, and their durations add up to 138ms while taking only 53ms of wall-clock time. In that case "the sum of child span durations" exceeds the corresponding stretch of the parent, so latency analysis has to look at the timeline (the waterfall), not add child durations together. In our real-model run, gpt-5.5 also issued these 3 calls in a single turn, and the trace again showed three overlapping spans. When there's a write operation, the agent falls back to running them one by one (Lesson 08: every write is persisted right after it runs).
+4. **Model calls account for more than 80% of total latency** (t3: 83% offline, 96% in real mode).
+5. **The phone number in the tool arguments is replaced at the instrumentation point, but the name and address slip past the regex.** This is why Problem 2 recommends not recording content by default.
 
 **Viewing traces in the browser**: agentkit's built-in viewer, [agentkit/viewer.py](../../agentkit/viewer.py), renders the JSONL into an HTML page:
 
@@ -430,7 +455,7 @@ make lesson N=10
 # equivalent to .venv/bin/python -m pytest lessons/10_observability
 ```
 
-Tip: run the demo first and open `traces/demo.jsonl` to see what real data looks like. Every rule listed in the docstrings has a matching test, and each one comes from a real pitfall. When you're done, run the demo again: Section 3 will report that the metric functions come from exercise.py (your implementation).
+Tip: run the demo first and open `traces/demo.jsonl` to see what real data looks like. Every rule listed in the docstrings has a matching test, and each one comes from a real pitfall. When you're done, run the demo again: Section 3 will report that the metric functions come from exercise.py (your implementation). All three are plain functions (pure computation over a list of span dicts). One integration test has a real agent run 3 read-only tools concurrently in one turn, so the 3 exported tool spans overlap in time — count by occurrences and status, and don't assume child spans follow one another end to end.
 
 ## 6. Going deeper (if you have time)
 
@@ -537,8 +562,8 @@ flowchart TD
 <details>
 <summary>Q6: How do you stitch calls across multiple agents and services into a single trace? How do you verify it?</summary>
 
-- In-process, rely on contextvars, and copy the context manually at thread pool and async task boundaries.
-- Across services, rely on W3C Trace Context's `traceparent`, propagated through HTTP, MCP, and message queues.
+- In-process, rely on contextvars: asyncio tasks copy the context automatically when created; thread pools (`run_in_executor`) need a manual `copy_context().run`.
+- Across services and worker processes, rely on W3C Trace Context's `traceparent`, propagated through HTTP, MCP, and message queues (the job payload).
 - For long pauses and queue consumers, correlate with span links or run_id.
 - Verify: send one end-to-end request and check that the backend shows exactly one trace_id.
 </details>

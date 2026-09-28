@@ -2,7 +2,7 @@
 
 # Lesson 08: Reliability engineering — keeping agents alive through failure
 
-> 🕐 Suggested time: 20 minutes | 🎯 After this lesson you can: take the six failures enterprises hit most often — rate limits, outages, runaway loops, crashes, duplicate side effects, and approvals that take hours — weigh 2–4 solutions for each, and pick the right one | 📦 Source code: `agentkit/reliability.py`, `agentkit/budget.py`, `agentkit/state.py`, `agentkit/tools.py` (idempotency), `agentkit/agent.py` (recovery)
+> 🕐 Suggested time: 20 minutes | 🎯 After this lesson you can: take the six failures enterprises hit most often — rate limits, outages, runaway loops, crashes, duplicate side effects, and approvals that take hours — weigh 2–4 solutions for each, and pick the right one | 📦 Source code: `agentkit/reliability.py`, `agentkit/budget.py`, `agentkit/state.py`, `agentkit/tools.py` (idempotency), `agentkit/agent.py` (recovery), `agentkit/distributed/sqlite.py` (cross-process circuit breaker and idempotency store)
 >
 > 📖 Primary reading: [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) (Mike Ulrich, 2016) — Chapter 22 of Google's SRE book explains how failures amplify along a call chain, and the "retries multiply across layers" example in Problem 1 of this lesson comes from it; focus on the "Retries" and "Latency and Deadlines" sections to see why retries need a budget and deadlines need to propagate down the chain.
 
@@ -75,10 +75,10 @@ flowchart LR
 | # | Enterprise problem | Key techniques | agentkit | Exercise |
 |---|---|---|---|---|
 | 1 | Frequent 429s from the model API at peak hours | Backoff + jitter, retry budget, deadlines | `retry_call`, `backoff_delay` | (b) `retry_with_budget` |
-| 2 | The primary model provider goes down | Circuit breaker, fallback chain | `CircuitBreaker`, `ResilientLLM` | (c) Single probe while half-open |
+| 2 | The primary model provider goes down | Circuit breaker, fallback chain, breaker state shared across processes | `CircuitBreaker`, `ResilientLLM`, `SQLiteCircuitBreaker` | (c) Single probe while half-open |
 | 3 | A runaway agent loop burns money | Multi-dimensional budgets, loop detection | `BudgetHook` | (a) `LoopGuard` |
 | 4 | Process crashes and deploy restarts | Checkpoints, durable execution | `FileCheckpointer`, `Agent.resume` | — |
-| 5 | Duplicate refunds / duplicate tickets after recovery | Idempotency keys | `IdempotencyStore`, `ToolContext.idempotency_key` | — |
+| 5 | Duplicate refunds / duplicate tickets after recovery | Idempotency keys | `SQLiteIdempotencyStore`, `ToolContext.idempotency_key` | — |
 | 6 | Approvals take hours | Persist on pause, resume asynchronously | `PauseRun`, `Agent.approve` | — |
 
 ## 2. Enterprise problem cards
@@ -90,12 +90,16 @@ flowchart LR
 **Why it's hard**:
 
 - **Retrying everything is wrong.** A 400 (bad parameters, context too long) or a 401 (invalid key) returns the same result after ten thousand retries, and may even trip the provider's abuse detection. Only **transient errors** — 429s, 5xx, timeouts, dropped connections — are worth retrying.
-- **Fixed-interval retries create a synchronized stampede.** If 1,000 clients get a 429 at the same moment and each waits exactly 1 second before retrying, the server receives another 1,000 requests in a single instant (the **thundering herd**). The simulation from demo scenario 1:
+- **Fixed-interval retries create a synchronized stampede.** When a large batch of clients gets a 429 at the same moment and every one of them waits the same amount of time before retrying, the server receives another whole batch in a single instant (the **thundering herd**) — so most of them are rejected again, wait in lockstep again, and charge again. Demo scenario 1 runs a real experiment (not a histogram drawn from random numbers): 500 concurrent clients hit a gateway running in **a separate process**; the gateway handles at most 50 requests at a time, 100 ms each, and returns 429 immediately when full. Every number below comes from the gateway's own log (MacBook, 8 cores / 8 GB, load average about 4, one run):
 
   ```text
-  No jitter (every client retries after exactly 1.0s):          → 1000 retries arrive in the busiest 100ms
-  Full jitter (every client waits a random time in [0, 1.0s]):  → 120 retries arrive in the busiest 100ms
+  Strategy                   Requests  429s  Densest 10 ms of retries  All done  Half done  Gateway utilization
+  Fixed 0.5s                 2750      2250  324                       4.67s     2.64s      21%
+  Exponential, no jitter     2750      2250  340                       6.66s     2.64s      15%
+  Exponential + full jitter  2001      1501  76                        1.64s     0.61s      61%
   ```
+
+  With a fixed interval there is a "wall" every 0.5 seconds: hundreds of retries land in the same 10 ms, the gateway accepts 50, the rest get 429s — and between walls the gateway sits idle (21% utilization). Exponential backoff without jitter just stretches the gaps between walls. Full jitter spreads the same retries along the time axis: a third fewer 429s, and everyone is done in about a third of the time.
 
 - **Retries amplify traffic.** The Google SRE book gives an example: when a database is overloaded and the backend, frontend, and JavaScript layers each retry 3 times (4 attempts per layer), a single user action can generate up to $4^3=64$ requests against the database. Agent systems are layered the same way: frontend → gateway → agent service → model gateway.
 - **When demand stays above the limit, retries only postpone failure.** Demand is 1.8× the limit. No amount of retrying will squeeze it in; it only adds latency.
@@ -118,13 +122,17 @@ flowchart LR
 
 **What this lesson implements**: Option A.
 
-1. **Errors are classified in the LLM adapter layer** ([agentkit/llm.py](../../agentkit/llm.py)). The layers above only look at a single boolean, `retryable`, so switching vendors doesn't touch the retry logic:
+1. **Errors are classified in the LLM adapter layer** (`map_openai_error` in [agentkit/llm.py](../../agentkit/llm.py)). The layers above only look at a single boolean, `retryable`, so switching vendors doesn't touch the retry logic:
 
    ```python
-   except self._openai.APIStatusError as e:
-       code = e.status_code
-       # 429 rate limit, 408 timeout, 5xx server error: a retry may succeed; 400/401/403/404: retrying won't help
-       raise LLMError(str(e), status_code=code, retryable=code in (408, 409, 429) or code >= 500) from e
+   code = e.status_code
+   # 429 rate limit, 408 timeout, 5xx server error: a retry may succeed; 400/401/403/404: retrying won't help.
+   # But there are two kinds of 429: rate limiting (just wait) and quota exhausted (insufficient_quota, retrying never helps).
+   retryable = code in (408, 409, 429) or code >= 500
+   if code == 429 and "insufficient_quota" in str(e):
+       retryable = False
+   retry_after = float(e.response.headers.get("retry-after"))   # the server's suggested wait in seconds (None without the header)
+   return LLMError(str(e), status_code=code, retryable=retryable, retry_after=retry_after)
    ```
 
    This matches the default retry rules of the official OpenAI Python SDK. Note that `OpenAICompatLLM` creates its client with `max_retries=0`: **it deliberately turns off the SDK's built-in retries**. Otherwise the SDK retries 2 times, your code retries 3 times on top of that, a single call can turn into as many as 9 requests — and you never see the SDK's internal retries. **Retry in exactly one layer, and do it where you can see it.**
@@ -137,11 +145,32 @@ flowchart LR
        return (rng or random).uniform(0, upper)         # full jitter: uniformly random in [0, upper]
    ```
 
-   Marc Brooker of AWS used simulations to compare no jitter, full jitter, equal jitter, and decorrelated jitter. No jitter did the most work and took the longest; full jitter made the fewest total calls and is also the simplest to implement. `rng`, `sleep`, and `clock` are all injectable, so every test in this lesson is deterministic and never actually sleeps.
+   Marc Brooker of AWS used simulations to compare no jitter, full jitter, equal jitter, and decorrelated jitter. No jitter did the most work and took the longest; full jitter made the fewest total calls and is also the simplest to implement. The demo's real experiment above reaches the same conclusion (the full-jitter row uses exactly `backoff_delay(n, base=0.1, cap=1.0)`).
 
-3. **Exercise (b)** adds the two gates agentkit doesn't have: a **global retry budget** (a token bucket: each new request deposits 0.1 tokens and each retry spends 1 — the same idea as Google SRE's "retries must stay under 10% of requests" and gRPC's `retryThrottling`) and a **deadline** (stop retrying once the remaining time can't cover another backoff). The tests prove the effect: when the downstream is completely down, 100 requests with "at most 3 attempts each" would have made 300 calls; with the budget, they make only 113.
+   The retry loop itself is async (`retry_call`, which `ResilientLLM` uses internally):
 
-> Production upgrades: honor the `Retry-After` response header first (the official OpenAI SDK does; agentkit skips it for brevity); share global rate limits and retry budgets through the model gateway or Redis; agree across layers on an error code that means "already retried, don't retry again".
+   ```python
+   async def retry_call(fn, *, max_attempts=3, base_delay=0.5, max_delay=8.0, retry_if=is_retryable, sleep=asyncio.sleep, on_retry=None):
+       for attempt in range(1, max_attempts + 1):
+           try:
+               return await fn()            # fn returns a new coroutine each time: a coroutine can be awaited only once
+           except Exception as e:           # CancelledError is a BaseException: a caller's cancellation passes straight through, never retried
+               if attempt == max_attempts or not retry_if(e):
+                   raise
+               delay = backoff_delay(attempt, base_delay, max_delay)
+               server_hint = getattr(e, "retry_after", None)   # if the server said "retry in N seconds", listen to it
+               if server_hint is not None:
+                   delay = max(delay, min(server_hint, max_delay * 4))
+               await sleep(delay)           # yields the event loop while waiting: other sessions in this process keep going
+   ```
+
+   Usage: `await retry_call(lambda: llm.chat(messages))`. `rng`, `sleep`, and `clock` are all injectable, so every exercise test in this lesson is deterministic and never actually sleeps.
+
+3. **Exercise (b)** adds the two gates agentkit doesn't have: a **global retry budget** (a token bucket: each new request deposits 0.1 tokens and each retry spends 1 — the same idea as Google SRE's "retries must stay under 10% of requests" and gRPC's `retryThrottling`) and a **deadline** (stop retrying once the remaining time can't cover another backoff). The test fires 100 requests truly concurrently with `asyncio.gather`, all sharing one budget: when the downstream is completely down, "at most 3 attempts each" would have made 300 calls; with the budget, they make only 110. Why 110 rather than the 113 you get when sending them one by one? Concurrently, all 100 first attempts deposit their tokens before any failure comes back, so the bucket hits its cap `max_tokens=10` — which is exactly what the cap is for: limiting how many retries can charge out at once when an outage starts.
+
+   The budget needs no lock: the 100 requests are coroutines on one event loop, and coroutines switch only at `await`. There's no `await` inside `try_acquire`, so "read tokens → check → deduct" can't be interrupted. When several **processes** share a budget, an in-memory bucket is no longer enough; it has to live somewhere every process can see (one machine: `agentkit.distributed.SQLiteTokenBucket`; many machines: Redis or the model gateway).
+
+> Production upgrades: `Retry-After` is already wired up (`OpenAICompatLLM` parses the header into `LLMError.retry_after`, and `retry_call` uses whichever is larger, that or its own backoff); share global rate limits and retry budgets through the model gateway or Redis; agree across layers on an error code that means "already retried, don't retry again".
 
 ### Problem 2: The primary model provider was down for 25 minutes
 
@@ -212,12 +241,53 @@ agent = Agent(llm, tools)
 
 Design notes: each model gets **its own** breaker. The breaker wraps **around** the retries, so one call that exhausted all its retries counts as one failure. When every model fails, it raises `LLMError`, and the agent turns that into `status="failed"` plus a "service temporarily unavailable" message instead of a 500. Option D belongs in the business layer that calls the agent, driven by this status.
 
-agentkit makes two simplifications, and a production implementation needs to address both:
+Two more breaker details that production implementations (such as Java's Resilience4j) have, and agentkit implements too:
 
-- `CircuitBreaker` counts **every** exception as a failure (demo scenario 2 trips the breaker with exactly that kind of error: a 400 for a model that doesn't exist). Production-grade implementations, such as Java's Resilience4j, let you configure which exceptions count and which are ignored.
-- In half_open, it lets **every** request through, so 500 concurrent requests stampede the freshly recovered downstream. Exercise (c) (bonus) has you implement "let exactly one probe request through while half-open".
+- **Which exceptions count toward the breaker**: `CircuitBreaker(record_if=...)` (same parameter on `ResilientLLM`). By default everything counts — demo scenario 2 trips the breaker with exactly that kind of error, a 400 for a model that doesn't exist. In production you can count only errors that reflect an unhealthy downstream, so one user's oversized context can't push everyone onto the backup model.
+- **Only one probe request gets through while half-open**; other concurrent requests keep failing fast. Otherwise, the moment the downstream recovers a little, 500 concurrent requests stampede it and knock it over again:
 
-> At scale: should the breaker live in-process (each instance decides on its own — simple, no dependencies, and the industry norm) or be shared through Redis (the whole fleet trips faster, but you add a dependency)? Questions like this are covered in [Lesson 13](../13_distributed_concurrency/README.en.md).
+  ```python
+  async def call(self, fn):
+      state = self.state
+      if state == "open":
+          raise CircuitOpenError(self.name)
+      probe = state == "half_open"
+      if probe:
+          if self._probing:              # a probe request is already in flight
+              raise CircuitOpenError(self.name)
+          self._probing = True           # no await between the check and the set: no other coroutine on this loop can slip in
+      try:
+          result = await fn()            # the only switch point: the probe waits here, other coroutines are stopped by the check above
+      except Exception as e:
+          ...                            # count the failure; a failed probe reopens the breaker and restarts the timer
+      finally:
+          if probe:
+              self._probing = False      # reset on success, failure, or cancellation
+      ...
+  ```
+
+  Why is a plain boolean flag enough, with no lock? Coroutines switch only at `await`. Exercise (c) (bonus) has you implement it yourself; the test fires 50 requests at once with `asyncio.gather` while half-open and proves that only 1 reaches the downstream.
+
+**Several worker processes sharing one breaker.** The breaker above lives in process memory. A service usually runs many worker processes: process A has already failed repeatedly and tripped, while processes B and C each still have to fail `failure_threshold` times before they trip — the downstream is already dead and you keep hitting it with another batch of requests; every freshly scaled-out process also starts closed and learns the hard way again. `agentkit.distributed.SQLiteCircuitBreaker` is the same state machine, except that the failure count, the time it opened, and "who is probing" all live in a SQLite file shared by every process:
+
+```python
+from agentkit.distributed import SQLiteCircuitBreaker
+
+llm = ResilientLLM(primary, [backup], max_attempts=2,
+                   breaker_factory=lambda model: SQLiteCircuitBreaker("runs/breakers.db", model,
+                                                                      failure_threshold=3, reset_timeout=30))
+```
+
+Part B of demo scenario 2 verifies it with real processes: the broken primary model is another process (`services.py`, which returns 503 every time and counts its own calls), and each worker is another `demo.py` process (`OpenAICompatLLM` → the primary, at most 2 attempts per request). The call counts recorded by the primary model service:
+
+| Process | Breaker | Calls to the broken primary |
+|---|---|---|
+| A (the first to see the outage) | Shared | 6 (3 requests × 2 attempts, then it trips; request 4 fails fast) |
+| B (starts after A has exited) | Shared | **0**: its very first call fails fast and goes straight to the backup |
+| B′ (control) | Its own in-memory `CircuitBreaker` | 6: it has to hit the wall with 3 requests itself before tripping |
+| C (after the primary is fixed and `reset_timeout` has passed) | Shared | 4: its first request is the half-open probe; on success the breaker closes |
+
+"Only one probe while half-open" has to hold across processes too, and an in-memory flag is invisible to other processes. So `SQLiteCircuitBreaker` uses a **probe lease** with an expiry (`probe_until`): the process that checks and claims it inside one write transaction does the probing, and every other process keeps failing fast; if the prober crashes midway, the lease expires and another process can take over probing, so the breaker never gets stuck half-open. `tests/test_distributed.py` has two matching tests: after a real child process trips the breaker, this process's very first call fails fast with zero calls to the primary; and two instances with their own connections (sharing state only through the file, just like two processes) let exactly one probe through while half-open. Limitation: SQLite can only be shared on one machine; across machines, put the breaker in the model gateway layer (Lesson 29) or in Redis.
 
 ### Problem 3: A looping agent burns through a pile of money overnight
 
@@ -279,10 +349,13 @@ C is **Exercise (a), `LoopGuard`**. The most important takeaway: **counts must l
 ```python
 def save(self, state: RunState) -> None:
     path = self._path(state.run_id)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    # the temp file name must be unique: if two processes save the same run at once, a fixed .tmp name gets trampled
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    tmp.write_text(state.to_json(indent=2), encoding="utf-8")
     os.replace(tmp, path)   # atomic replace: after a crash the file is either the complete old version or the complete new one
 ```
+
+Atomic replace only guarantees that the file is never half-written, not that it's never overwritten: when two processes both believe they're handling the same run, whoever writes last silently overwrites the other. So `FileCheckpointer` fits "only one process handles a given run at a time" (demo scenario 3 in this lesson: process 1 dies, and only then does process 2 take over). When several workers might grab the same run, you need checkpoints with version numbers and fencing tokens (see "Who triggers recovery?" below).
 
 This is the core idea behind **durable execution**. How it compares with industry solutions:
 
@@ -294,11 +367,36 @@ This is the core idea behind **durable execution**. How it compares with industr
 
 Note the last row: **every approach requires side-effecting operations to be idempotent.** Why? See the next card.
 
-> Production upgrades: swap files for Postgres / Redis; have a background job find runs whose status is running but whose heartbeat has expired and trigger recovery, with a lease guaranteeing that only one instance recovers a given run at a time ([Lesson 13](../13_distributed_concurrency/README.en.md)); drain before shutting down during a deploy ([Lesson 16: Release and operations](../16_release_ops/README.en.md)).
+**Who triggers recovery?** In the demo, we start process 2 by hand. In production this must be automatic — "a process died, so someone else picks up its runs" — and only one process may recover a given run at a time. `agentkit.distributed` implements this for real (covered in depth in [Lesson 13](../13_distributed_concurrency/README.en.md)), and the core idea is a **lease**:
+
+- Runs go into a durable queue as jobs. A worker doesn't "take" a job, it "borrows it for a while" (a lease), and `run_worker` starts a heartbeat coroutine per job that keeps renewing it;
+- If the holder crashes, hangs, or is paused, the heartbeat stops. The next time any worker claims a job, `SQLiteJobQueue.claim` first reaps expired leases **inside the same write transaction**:
+
+  ```python
+  rows = conn.execute("SELECT id, attempts, max_attempts, worker_id FROM agent_jobs "
+                      "WHERE status = 'leased' AND lease_until < ?", (now,)).fetchall()
+  # attempts left → back in the queue after a backoff; none left → dead letter (a "poison message" that crashes
+  # every worker that touches it can kill at most max_attempts workers)
+  ```
+
+- The worker that takes over runs the job through `AgentJobHandler`: if the run already has a checkpoint, it calls `agent.resume(run_id)` and continues from where it stopped instead of starting over;
+- An old holder that was paused and wakes up again (a "zombie") still thinks it owns the job. Every claim issues a globally increasing fencing token, and checkpoint and job-status writes carry it; mismatches are rejected — which is why checkpoints switch to `SQLiteCheckpointer`, with version-number CAS and fences.
+
+  ```python
+  # in each worker process (python -m agentkit.distributed.worker ..., or WorkerPool starting N of them):
+  db = SQLiteDB("runs/jobs.db")                   # objects in one process share one connection
+  queue, ckpt, idem = SQLiteJobQueue(db), SQLiteCheckpointer(db), SQLiteIdempotencyStore(db)
+  for x in (queue, ckpt, idem):
+      await x.setup()                             # create the tables
+  agent = Agent(llm, tools, checkpointer=ckpt, idempotency_store=idem)
+  await run_worker(queue, AgentJobHandler(agent, ckpt), worker_id="w1", stop_event=stop, lease_seconds=30)
+  ```
+
+`tests/test_distributed.py` verifies these with real processes and signals: after `kill -9` on the worker holding a job, another process takes over once the lease expires, continues from the checkpoint, and the tool is not executed again; a zombie frozen with `SIGSTOP` has its lease renewals, checkpoint writes, and commit all rejected after it wakes up. For draining before shutdown during a deploy, see [Lesson 16: Release and operations](../16_release_ops/README.en.md).
 
 > Checkpoints handle "the same task gets interrupted within minutes to hours." When a task is too long to fit in one context window (hours to days), you need a different kind of durability: a feature list, a progress file, and git, so that a brand-new session can read the handoff notes and take over. See [Lesson 24's long-running harness](../24_coding_agents/README.en.md#13-long-running-work-the-agent-wakes-up-with-amnesia-every-time).
 
-> 🏭 **In production**: this lesson's file checkpoints and in-memory idempotency store are single-process teaching versions. For multi-instance deployments, checkpoints move to Postgres with version-number CAS and fencing, and the idempotency store moves to Redis — see [Lesson 26](../26_state_and_queues/README.en.md). Flows that wait days for approval or need timed wake-ups belong in a durable execution engine such as Temporal — see [Lesson 27](../27_durable_workflows/README.en.md). This lesson's timeouts only stop the caller from waiting; the thread itself can't be killed. For an async runtime with real cancellation, see [Lesson 30](../30_async_runtime/README.en.md).
+> 🏭 **In production**: on a single machine with several processes, the `SQLiteIdempotencyStore` and `SQLiteCircuitBreaker` used in this lesson's demo, plus Lesson 13's `SQLiteCheckpointer` / `SQLiteJobQueue`, are already real cross-process implementations. Across machines, checkpoints move to Postgres with version-number CAS and fencing, and the idempotency store moves to Redis, behind the same interfaces — see [Lesson 26](../26_state_and_queues/README.en.md). Flows that wait days for approval or need timed wake-ups belong in a durable execution engine such as Temporal — see [Lesson 27](../27_durable_workflows/README.en.md). On timeouts: an `async def` tool that times out is truly cancelled; a plain synchronous function runs in a thread pool, and on timeout the caller stops waiting but the thread can't be killed; `@tool(isolation="process")` runs in a child process that is killed outright on timeout ([Lesson 30](../30_async_runtime/README.en.md) covers cancellation semantics in depth).
 
 ### Problem 5: After recovery, the customer got two refunds
 
@@ -344,30 +442,46 @@ def idempotency_key(self) -> str:
 
 The `tool_call_id` is generated by the model and stored in the checkpoint, so it stays the same after recovery and the replay hits the stored entry. If the model decides to create another ticket in a later step, that's a new `call_id`, so it won't be deduplicated by mistake. Temporal's official documentation gives the same advice: combine the Workflow Run ID and the Activity ID into an idempotency key. **Never generate the idempotency key with `uuid4()` inside the tool**: every execution gets a fresh one, the key changes on replay, and you have no protection at all.
 
-`ToolRegistry.execute` enables idempotency only for `write` / `dangerous` tools. Reads are naturally idempotent, and caching them would actually serve stale data after recovery:
+The tool executor enables idempotency only for `write` / `dangerous` tools (reads are naturally idempotent, and caching them would actually serve stale data after recovery): `get(key)` before executing, returning the previous result on a hit; `put(key, result)` after success.
 
 ```python
-agent = Agent(llm, tools, checkpointer=FileCheckpointer("runs"), idempotency_store=IdempotencyStore())
+from agentkit.distributed import SQLiteIdempotencyStore
+
+store = SQLiteIdempotencyStore("runs/idempotency.db")
+await store.setup()   # create the table
+agent = Agent(llm, tools, checkpointer=FileCheckpointer("runs/checkpoints"), idempotency_store=store)
 ```
 
-Demo scenario 3 **actually kills a child process** (`os._exit`, no cleanup at all) to reproduce this window. Without idempotency protection, two identical tickets show up in the ticketing system; with a durable idempotency store, there's only one. Note that agentkit's built-in `IdempotencyStore` lives in memory and dies with the process, failing precisely when you need it most. That's why the demo uses a file-backed `FileIdempotencyStore`.
+**The idempotency store must live somewhere the process that takes over can also see.** agentkit's built-in `IdempotencyStore` is a dict in memory; it dies with the process, failing precisely when you need it most. A homemade "read a JSON file → modify → write it back" version doesn't work either: two processes read the same old content, each adds an entry and writes it back, and the later write overwrites the earlier one (a lost update); a fixed `.tmp` temp file name even lets the two processes trample each other's temp file. `SQLiteIdempotencyStore` keeps the records in a SQLite table, and `put` is an `INSERT OR IGNORE` inside a transaction (when two processes succeed almost simultaneously, the first write wins).
 
-What option B looks like (illustrative code; `payments` stands in for your payment service client):
+Demo scenario 3 reproduces this window with real processes: the external ticketing system is another process (`services.py`); the agent in process 1 calls `create_ticket` (a real HTTP request that creates a ticket) and then **actually dies** (`os._exit(137)`, no cleanup at all); process 2 is a brand-new process that resumes from the checkpoint with the same `run_id`. Ticket counts come from the ticketing system's own records:
+
+| Case | Where process 1 dies | Protection | Tickets |
+|---|---|---|---|
+| 1 | After the tool ran, before the checkpoint write | None | 2 ❌ |
+| 2 | Same (idempotency record already written) | `SQLiteIdempotencyStore` | 1 ✅ process 2 hits the idempotency record; the tool doesn't run again |
+| 3 | Inside the tool: downstream already created the ticket, idempotency record not yet written | `SQLiteIdempotencyStore` | 2 ❌ the caller-side store can't help |
+| 4 | Same | Also pass `ctx.idempotency_key` downstream as an `Idempotency-Key` header | 1 ✅ the ticketing system recognizes the key and returns the original ticket |
+
+Case 3 is exactly the weakness listed for option A in the table: "a crash after the side effect but before the record is written still duplicates". Case 4 is option B — the downstream "performs the operation + records the key" in its own storage, and a second request with the same key gets the previous result back:
 
 ```python
 @tool(risk="write")
-def create_refund(order_id: str, amount: float, ctx: ToolContext) -> str:
-    """Issue a refund"""
-    return payments.refund(order_id, amount, idempotency_key=ctx.idempotency_key)
+async def create_ticket(title: str, ctx: ToolContext) -> str:
+    """Create a ticket"""
+    async with httpx.AsyncClient() as http:
+        r = await http.post(f"{TICKETS_URL}/tickets", json={"title": title},
+                            headers={"Idempotency-Key": ctx.idempotency_key})   # the key stays the same when this call is replayed
+    return f"Ticket created: {r.json()['id']}"
 ```
 
 This is exactly why payment APIs such as Stripe's support an `Idempotency-Key` request header.
 
-> Production upgrades: back the idempotency store with Redis (`SET key value NX` with an expiry) or a database unique index. For deduplication, distributed locks, and optimistic concurrency under concurrent load, see [Lesson 13](../13_distributed_concurrency/README.en.md).
+> Production upgrades: `SQLiteIdempotencyStore` for several processes on one machine (this lesson's demo); Redis (`SET key value NX` with an expiry) or a database unique index across machines (Lesson 26). Note that it only records results *after* success: when two processes execute the same call **at the same time** (a zombie worker colliding with its replacement), neither finds a record and both execute, so any downstream with real side effects still has to honor the idempotency key itself. For deduplication, leases, and fencing under concurrency, see [Lesson 13](../13_distributed_concurrency/README.en.md).
 
 ### Problem 6: Approvals take hours
 
-**Scenario**: An expense agent needs a manager's approval for any claim over 5,000 yuan. Managers take 3 hours on average to respond, and at peak, 300 new claims per hour need approval. If every claim blocks a thread while it waits, about 900 threads sit parked at steady state. And if the service deploys even once during those 3 hours, every pending approval is lost.
+**Scenario**: An expense agent needs a manager's approval for any claim over 5,000 yuan. Managers take 3 hours on average to respond, and at peak, 300 new claims per hour need approval. If every claim waits in memory (a thread or a coroutine), about 900 of them sit parked at steady state. Coroutines are cheap, so 900 of them isn't the problem in itself; the real problem is that if the service deploys even once during those 3 hours, every pending approval is lost.
 
 **Why it's hard**: Wait times are unpredictable (anywhere from 5 minutes to the next day). The service restarts and scales while you wait. And once approved, the operation that runs must be **exactly** the one submitted for approval, with no changed parameters.
 
@@ -403,14 +517,14 @@ In code, it takes just two steps:
 
 ```python
 agent = Agent(llm, [refund], hooks=[PermissionPolicy()], checkpointer=FileCheckpointer("runs/approvals"))
-res = agent.run("Refund 99 yuan for order A1")
+res = await agent.run("Refund 99 yuan for order A1")
 res.status            # 'paused'
 res.pending_approval  # ToolCall(id='call_1', name='refund', arguments='{"order_id": "A1", "amount": 99.0}')
 
 # ...the approval system notifies the manager. Hours later, possibly in another process on another machine:
 agent2 = Agent(llm, [refund], hooks=[PermissionPolicy()], checkpointer=FileCheckpointer("runs/approvals"))
-res2 = agent2.approve(res.run_id, approved=True,   # execute the refund and continue; approved=False tells the model "not approved"
-                      by="zhang.manager", comment="Order checked, all correct")   # who approved and why, written to the approval log
+res2 = await agent2.approve(res.run_id, approved=True,   # execute the refund and continue; approved=False tells the model "not approved"
+                            by="zhang.manager", comment="Order checked, all correct")   # who approved and why, written to the approval log
 ```
 
 Approvals are recorded by `tool_call_id`, and the call's arguments are saved with the checkpoint, so what gets approved is exactly the original call. The model has no chance to change the arguments after approval. "What needs approval, who approves it, and how to avoid approval fatigue" is covered in Lesson 09.
@@ -422,66 +536,108 @@ Approvals are recorded by `tool_call_id`, and the call's arguments are saved wit
 ## 3. Hands-on: run the demo
 
 ```bash
-python lessons/08_reliability/demo.py --offline   # offline script, no API key needed, deterministic results
-python lessons/08_reliability/demo.py             # real model (about 30 seconds, a dozen or so model calls)
+python lessons/08_reliability/demo.py --offline            # offline script, no API key needed (about 20 seconds)
+python lessons/08_reliability/demo.py                      # real model (about 1 minute, roughly twenty model calls)
+python lessons/08_reliability/demo.py --offline --only 1   # scenario 1 only; --keep leaves checkpoints and SQLite files in runs/08_reliability/
 ```
 
-In real mode, scenario 1 wraps the real model in a fault-injection layer (`FlakyLLM`: the first two calls raise a 429). Scenario 2 simulates an unavailable primary model with a model name that deliberately doesn't exist, and the backup model is read from `LLM_FALLBACK_MODEL` in `.env`. Below are excerpts of real-model output. (Demo output translated from Chinese.)
+The demo starts by launching [services.py](services.py) as **a separate process** that plays three downstreams: a capacity-limited model gateway (scenario 1), a broken primary model (scenario 2B), and a ticketing system (scenario 3); it's shut down when the demo ends. Scenarios 2B and 3 also start several more `demo.py` child processes as workers — the processes share no memory and interact only over HTTP and through SQLite files. The numbers in the thundering-herd experiment, the cross-process breaker, and crash recovery all come from "another process's" own records, and they're the same in both modes.
 
-**Scenario 1: Retries (Problem 1)**
+In real mode, scenario 1 wraps the real model in a fault-injection layer (`FlakyLLM`: the first two calls raise a 429). Scenario 2A simulates an unavailable primary model with a model name that deliberately doesn't exist, and the backup model is read from `LLM_FALLBACK_MODEL` in `.env`. Below are excerpts from one real-model run (MacBook, 8 cores / 8 GB, load average about 4). (Demo output translated from Chinese.)
+
+**Scenario 1: Retries + the thundering-herd experiment (Problem 1)**
 
 ```text
 ▶ Agent → ResilientLLM → FlakyLLM (first two calls raise 429) → model
-   📝 retry gpt-5.5 #1 after 0.37s: Error code: 429 - Rate limit reached, please retry later
-   📝 retry gpt-5.5 #2 after 0.47s: Error code: 429 - Rate limit reached, please retry later
-   ✅ status=completed, 3 underlying calls, 3.6s total elapsed
+   📝 retry gpt-5.5 #1 after 0.29s: Error code: 429 - Rate limit reached, please retry later
+   📝 retry gpt-5.5 #2 after 0.49s: Error code: 429 - Rate limit reached, please retry later
+   ✅ status=completed, 3 underlying calls, 4.4s total elapsed
 ▶ Control: if the error is a 400 (bad parameters), does retrying help?
    Underlying calls: 1 (no retries), status=failed, reply to the user: Sorry, the service is temporarily unavailable. Please try again later.
+▶ Why jitter is a must: a real experiment with 500 clients hitting one gateway process at the same moment
+   Requests reaching the gateway per 100 ms (one character = 100 ms, █ = 500, · = 0; from the gateway's log):
+     Fixed 0.5s                 █····█····▇····▆····▅····▄····▄····▃····▂····▁
+                                first second: 500 0 0 0 0 450 0 0 0 0
+     Exponential, no jitter     ██·▇···▆·······▅·········▄·········▄·········▃·········▂·········▁
+                                first second: 500 450 0 400 0 0 0 350 0 0
+     Exponential + full jitter  █▆▄▂▂▂▁▁▁▁▁▁▁▁▁▁
+                                first second: 948 343 197 112 115 75 58 23 36 34
+
+   Strategy                   Requests  429s  Densest 10 ms of retries  All done  Half done  Gateway utilization
+   Fixed 0.5s                 2750      2250  324                       4.67s     2.64s      21%
+   Exponential, no jitter     2750      2250  340                       6.66s     2.64s      15%
+   Exponential + full jitter  2001      1501  76                        1.64s     0.61s      61%
 ```
 
-👀 Observe: the agent never notices the two 429s, and the 400 isn't retried even once. The demo then shows a histogram from a jitter simulation with 1,000 clients.
+👀 Observe: the agent never notices the two 429s, and the 400 isn't retried even once. In the herd experiment, the fixed-interval row is a series of neat "walls": each one is hundreds of retries squeezed into the same 10 ms, and the gateway can only take 50 of them; the full-jitter row is one continuously falling curve. Full jitter's first 100 ms actually has the most requests (948): with `base=0.1s`, the wait before the first retry is random in [0, 0.1s], so most first retries land inside those same 100 ms — but they arrive spread out, and the densest 10 ms holds only 76.
+
+Two design details of the experiment: ① the clients don't use httpx; each client is one keep-alive connection with hand-built request bytes. Measured on this machine, httpx sends only one or two hundred requests per second from a single process, so 500 "simultaneous" requests get smeared across several seconds by its own CPU overhead — the herd is flattened by the client before it ever reaches the gateway; ② the gateway is hand-written on the standard-library asyncio rather than FastAPI, for the same reason: if the server spends an extra 1 ms per request, 500 requests arriving together get spread over half a second by the server itself. **The measuring instrument must not become part of the phenomenon being measured.**
 
 **Scenario 2: Circuit breaker + fallback (Problem 2)**
 
 ```text
+▶ A. In-process breaker (CircuitBreaker): real clock — actually waiting reset_timeout seconds instead of winding a fake clock forward
 ▶ Request 1: Explain in one sentence: what is a circuit breaker?
-   Breaker: closed → closed    Answered by: gpt-5.6-luna    3.9s
+   Breaker: closed → closed    primary called 1 time    answered by: gpt-5.6-luna    3.8s
 ▶ Request 2: Explain in one sentence: what is a fallback?
-   Breaker: closed → open    Answered by: gpt-5.6-luna    1.6s
+   Breaker: closed → open    primary called 1 time    answered by: gpt-5.6-luna    3.5s
 ▶ Request 3: Explain in one sentence: what is a retry budget?
-   Breaker: open → open    Answered by: gpt-5.6-luna    2.4s
+   Breaker: open → open    primary called 0 times    answered by: gpt-5.6-luna    3.1s
    📝 fallback from gpt-5.5-does-not-exist: circuit breaker [gpt-5.5-does-not-exist] is open, failing fast
-▶ ⏩ 31 seconds later, the primary model is fixed. The breaker enters half_open and lets one probe request through...
+▶ ⏳ Actually waiting for the breaker to go half-open (reset_timeout=8.0s, counted from the moment it opened)...
+   Waited another 1.4s; the primary model is fixed. The breaker is now half_open; letting one probe request through...
 ▶ Request 4: Explain in one sentence: what is idempotency?
-   Breaker: half_open → closed    Answered by: gpt-5.5    2.1s
+   Breaker: half_open → closed    primary called 1 time    answered by: gpt-5.5    1.6s
+
+▶ B. A circuit breaker shared across processes (SQLiteCircuitBreaker): every worker is a separate OS process
+▶ Process A: the first worker to discover the outage
+      [process A pid=43836] request 3: breaker closed → open    answered by backup-model
+      [process A pid=43836] request 4: breaker open → open    answered by backup-model
+▶ Process B: another worker (A has exited; all B can see is that SQLite file)
+      [process B pid=43839] request 1: breaker open → open    answered by backup-model
+      ...
+▶ Call counts recorded by the primary model service itself (at most 2 attempts per request)
+   Process A (shared breaker)          hit the primary 6 times: after 3 consecutive failed requests (2 attempts each) the breaker opened, and later requests stopped hitting it
+   Process B (shared breaker)          hit the primary 0 times ✅ its very first call failed fast and went straight to the backup
+   Process B′ (own in-memory breaker)  hit the primary 6 times: it had to fail 3 more requests itself before tripping
+   Process C (after recovery)          hit the primary 4 times: once per request; the first was the probe, and on success the breaker closed (final state: closed)
 ```
 
-👀 Observe: request 3 never calls the primary model at all. After request 4's probe succeeds, traffic returns to the primary. The breaker uses an injected fake clock, so you don't actually wait 30 seconds.
+👀 Observe: request 3 never calls the primary model at all; after request 4's probe succeeds, traffic returns to the primary. Part A uses the real clock: `reset_timeout=1.5` seconds offline and 8 seconds with the real model — it has to be longer than one backup-model answer. The first time we ran the real model with 1.5 seconds, a backup answer took 2–3 seconds, so the breaker had already gone half-open before request 2 finished; request 3 became yet another (failed) probe, and "failing fast while open" never showed up at all. **Tests that only use a fake clock can't catch this.**
 
 **Scenario 3: Crash recovery (Problems 4 and 5)**
 
 ```text
-▶ [No idempotency protection] Start a child process running the agent
-      [child] Tool executed: ticket created: T-1001 (printer jam on the 3rd floor, priority high)
-      [child] 💥 Process killed with kill -9 right here — the tool result never made it into the checkpoint
-   Child exit code: 137 (killed)
-▶ New process takes over: resume from the checkpoint with the same run_id (agent.resume)
-   ❌ The external ticketing system now has 2 tickets in total: T-1001, T-1002
-▶ [With idempotency protection (durable IdempotencyStore)] Start a child process running the agent
-   ...
-   ✅ The external ticketing system now has 1 ticket in total: T-1001
+▶ Case 1: no idempotency protection
+      [process 1 pid=43846] Tool executed: ticket created: T-1001 (printer jam on the 3rd floor, priority high)
+      [process 1] 💥 The process dies right here (os._exit(137)) — the tool result never made it into the checkpoint
+   Process 1 exit code: 137 (killed)
+   The ticketing system (another process) already has 1 ticket; the last message in the checkpoint is role=assistant with 1 tool call and no tool result → it looks "not yet executed"
+      [process 2 pid=43860] status after resume: completed    🤖 Your IT ticket has been submitted: T-1002.
+   Process 2 exit code: 0    ❌ The ticketing system now has 2 tickets in total: T-1001, T-1002
+▶ Case 2: SQLiteIdempotencyStore (idempotency records shared by every process)
+      ...
+      [process 2] ♻️  Idempotency store hit ticket-demo:call_1eC2O6CQMKzwWpZBgOAlgCZv → returning the previous result; the tool didn't run again
+   Process 2 exit code: 0    ✅ The ticketing system now has 1 ticket in total: T-1001
+▶ Case 3: same, but crashing in a narrower window: downstream already created the ticket, idempotency record not yet written
+      ...
+   Process 2 exit code: 0    ❌ The ticketing system now has 2 tickets in total: T-1001, T-1002
+▶ Case 4: also pass the idempotency key downstream (Idempotency-Key request header)
+      ...
+      [process 2] The ticketing system recognized the same Idempotency-Key (ticket-demo:call_PZrV9sxB7ErMCVyiQwnredPU) → returned the original T-1001, created nothing new
+   Process 2 exit code: 0    ✅ The ticketing system now has 1 ticket in total: T-1001
 ```
 
-👀 Observe: open `runs/08_reliability/crash_plain/checkpoints/ticket-demo.json` and look at the last message in the checkpoint at the moment of the crash. Then see what the keys in `crash_idempotent/idempotency.json` look like.
+👀 Observe: run with `--keep`, open `runs/08_reliability/crash_1/checkpoint_at_crash.json` (a copy of the checkpoint at the moment process 1 died; the one under `checkpoints/` has since been overwritten by process 2's completed state), and look at the last message. Then run `sqlite3 runs/08_reliability/crash_2/idempotency.db "select key from idempotency"` to see what the idempotency keys look like (`run_id:call_id`).
 
 **Scenario 4: Budget (Problem 3)**
 
 ```text
    status=stopped  stop_reason=budget_exceeded  4 model calls  3 tool executions
 ▶ Tracing (covered in Lesson 10) — you can see at a glance that it's spinning in place:
-   agent.run  8411ms  tokens=1978→88  status=stopped steps=4 cost=$0.00335
-   ├─ llm.chat  1622ms  tokens=409→22  → tool_calls: check_report_status
-   ├─ tool.check_report_status  3ms  ok
+   agent.run  6762ms  tokens=1978→88  status=stopped steps=4 cost=$0.00335
+   ├─ llm.chat  1724ms  tokens=409→22  → tool_calls: check_report_status
+   ├─ tool.check_report_status  0ms  ok
    ...
    Input tokens per step: 409 → 466 → 523 → 580
 ```
@@ -495,16 +651,17 @@ Open [exercise.py](exercise.py) and complete three tasks:
 **(a) `LoopGuard`: detect agent loops (Problem 3)**
 
 - Task: implement `normalize_arguments` (normalize argument JSON) and `LoopGuard.before_tool`. When the same tool + same arguments appear `>= max_repeats` times within the last `window` calls, the first time, return a rejection reason that nudges the model to change approach; if the limit is exceeded again after that, raise `StopRun("loop_detected")`.
-- Hints: store the counts in `state.metadata`; the rejected call also counts toward the window; `'{"a":1,"b":2}'` and `'{"b": 2, "a": 1}'` are the same call.
+- Hints: store the counts in `state.metadata`; the rejected call also counts toward the window; `'{"a":1,"b":2}'` and `'{"b": 2, "a": 1}'` are the same call. Both functions are plain functions (hook methods may be synchronous; pure computation doesn't need `async`).
 
 **(b) `retry_with_budget`: retries with a global budget and a deadline (Problem 1)**
 
-- Task: implement `RetryBudget.on_request` / `try_acquire` and `retry_with_budget` (three gates: per-request cap + global budget + deadline).
-- Hints: the docstring lists the order of checks. A retry that the deadline dooms anyway **should not consume a token**. When giving up, raise the **original exception** so the caller's existing error handling (a fallback, for example) keeps working.
+- Task: implement `RetryBudget.on_request` / `try_acquire` (plain functions) and `async def retry_with_budget` (three gates: per-request cap + global budget + deadline).
+- Hints: the docstring lists the order of checks. Each attempt is `await fn()` (`fn` returns a new coroutine every time), and backoff is `await sleep(delay)`. A retry that the deadline dooms anyway **should not consume a token**. When giving up, raise the **original exception** so the caller's existing error handling (a fallback, for example) keeps working. Catch only `Exception` so `asyncio.CancelledError` passes through (a test cancels an in-flight request and checks it isn't retried).
 
 **(c) Bonus: `SingleProbeCircuitBreaker` — let only one probe request through while half-open (Problem 2)**
 
-- Hints: don't hold the lock while calling `fn()`; reset `_probing` in `finally`, whether the probe succeeds or fails. Its tests are skipped automatically until you implement it.
+- Task: implement `async def call(fn)`. While half-open, the test fires 50 requests at once with `asyncio.gather`, with the probe request parked on an `await`; exactly 1 may reach the downstream and 49 must fail fast. It also cancels an in-flight probe and checks that the next request can probe again.
+- Hints: no lock needed — there must be no `await` between "check `_probing`" and "set it"; reset `_probing` in `finally`, whether the probe succeeds, fails, or is cancelled. Its tests are skipped automatically until you implement it.
 
 Verify:
 
@@ -513,7 +670,7 @@ make lesson N=08                                                           # run
 AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/08_reliability -v   # check against the reference solution
 ```
 
-The tests run fully offline with an injected fake clock, fake sleep, and a fixed random seed. Results are deterministic, and the suite finishes in under a second.
+The tests run fully offline with an injected fake clock, a fake async sleep, and a fixed random seed. Concurrency is real (`asyncio.gather`), and the assertions are on deterministic quantities (call counts, who got rejected), never on wall-clock time. Results are deterministic, and the suite finishes in under a second.
 
 ## 5. Going deeper (optional)
 
@@ -521,7 +678,7 @@ The tests run fully offline with an injected fake clock, fake sleep, and a fixed
 - **Client-side adaptive throttling**: the Handling Overload chapter of the Google SRE book describes an approach in which the client tracks, over the last two minutes, how many requests it sent and how many the backend accepted. Once requests reach K times the accepted count (typically K=2), it starts rejecting new requests locally with some probability. In an LLM setting, you can use this to steer part of the traffic to the backup model early when the provider starts rate limiting.
 - **LLM-specific "soft failures"**: an HTTP 200 doesn't mean success. `finish_reason == "length"` (truncated output), JSON that doesn't match the schema, empty replies, and tool arguments that fail validation all call for "resend with the error message", not a blind retry (see errors as observations in Lesson 03 and `complete_json` in Lesson 06).
 - **Streams that break mid-response**: once the user has seen half an answer, you can't simply retry the whole request. The common approach is to set separate timeouts for time to first token (retrying is safe at that point) and total duration, and after an interruption, flag it in the UI and offer a "Regenerate" button.
-- **Fault injection**: a recovery process you've never rehearsed is a recovery process you don't have. The demo's `FlakyLLM` and `CrashAfterTool` are minimal fault injection. In production, regularly inject 429s, timeouts, and process crashes in staging, and keep an eye on retry rate, breaker trips, fallback ratio, and `budget_exceeded` ratio (Lesson 10).
+- **Fault injection**: a recovery process you've never rehearsed is a recovery process you don't have. The demo's `FlakyLLM`, `CrashAfterTool`, and the 429/503-returning `services.py` are minimal fault injection; `agentkit.distributed.WorkerPool` can also send `kill -9` / `SIGSTOP` / `SIGTERM` to real worker processes (Lesson 13). In production, regularly inject 429s, timeouts, and process crashes in staging, and keep an eye on retry rate, breaker trips, fallback ratio, and `budget_exceeded` ratio (Lesson 10).
 - **Durable execution frameworks**: when a process gets complex enough to need scheduled wake-ups, multi-agent collaboration, or waits that span days, consider Temporal, LangGraph, or frameworks such as DBOS, Restate, and Inngest. Their core idea is the same as this lesson's: **record every step, replay instead of redoing, and make side effects idempotent**.
 
 ## 6. Common pitfalls and anti-patterns
@@ -533,14 +690,17 @@ The tests run fully offline with an injected fake clock, fake sleep, and a fixed
 | SDK retries + your retries + gateway retries | Retry counts multiply; traffic grows dozens of times during an outage | Retry in one layer only (`max_retries=0`) |
 | Only a per-request retry cap | Traffic triples the moment the downstream goes down | Add a global retry budget |
 | Inner timeout × retries > outer timeout | The last few retries are doomed to be cancelled | Propagate deadlines; decide whether to retry based on the time remaining |
-| A single request's 400 counts toward the breaker | One user's problem downgrades everyone | Count only errors that reflect downstream health |
+| A single request's 400 counts toward the breaker | One user's problem downgrades everyone | Count only errors that reflect downstream health (`record_if`) |
+| Each worker process has its own breaker | When the downstream dies, N processes each hit it threshold more times; newly scaled-out processes hit it all over again | Share breaker state (`SQLiteCircuitBreaker` on one machine, the gateway layer across machines) |
 | Silent fallback | Quality drops for a week before anyone notices | Instrument and alert on fallback events; run the eval set on the backup model |
 | Setting only `max_steps` | A single 100,000-token step still burns money | Multi-dimensional budgets |
 | Storing per-run state on the hook instance | Different users' data gets mixed; state is lost on recovery | Store it in `state.metadata` (JSON-serializable) |
 | Overwriting the checkpoint file in place | Crash mid-write and you lose even the old progress | Write a temp file, then atomically replace |
 | Generating the idempotency key with `uuid4()` inside the tool | The key changes on replay, so idempotency does nothing | Use a stable `run_id:call_id` |
-| Keeping the idempotency store in memory | It dies with the process | Use Redis / a database, and pass the key downstream |
-| Checkpoints whose recovery was never tested | You discover bugs in the recovery path during a real incident | Simulate a crash and recovery in tests (demo scenario 3) |
+| Keeping the idempotency store in memory | It dies with the process | Use storage every process shares (`SQLiteIdempotencyStore` / Redis / a database), and pass the key downstream |
+| A cross-process idempotency store built on "read a JSON file → modify → write back" | Two processes write at once and the later write overwrites the earlier (lost update) | Database transactions + a unique key (`INSERT OR IGNORE`) |
+| Shipping a breaker tested only with a fake clock | When real latency exceeds `reset_timeout`, "failing fast while open" never happens (measured in demo scenario 2) | At least one end-to-end drill with real time and real downstream latency |
+| Checkpoints whose recovery was never tested | You discover bugs in the recovery path during a real incident | Actually kill the process and resume from the checkpoint (demo scenario 3, `tests/test_distributed.py`) |
 | Counting approval wait time against the duration budget | The approved operation runs, but the user gets "timed out, aborted" | Count only active run time (`state.active_seconds`) |
 | Leaving `tool_call`s without results when aborting a run | The next model call with this history immediately returns 400 | Add a "not executed" result for every call that didn't run |
 
@@ -591,7 +751,7 @@ The tests run fully offline with an injected fake clock, fake sleep, and a fixed
 <details>
 <summary><b>Q6: Approvals can take hours. How does the architecture support that?</b></summary>
 
-- Don't block threads: pause, persist the state, notify asynchronously, and let any instance resume after approval.
+- Don't wait in memory (a thread or a coroutine — one deploy and it's all gone): pause, persist the state, notify asynchronously, and let any instance resume after approval.
 - Bind the approval to the specific call and its arguments; treat an approval timeout as a rejection.
 - Exclude waiting time from time budgets. For complex processes, use a workflow engine's signal mechanism.
 </details>

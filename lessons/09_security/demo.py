@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import re
 import sys
@@ -78,9 +79,9 @@ class RecordingLLM:
         self.model = inner.model
         self.seen_tools: list[list[str]] = []
 
-    def chat(self, messages, tools=None, **kwargs):
+    async def chat(self, messages, tools=None, **kwargs):
         self.seen_tools.append([t["function"]["name"] for t in tools or []])
-        return self.inner.chat(messages, tools, **kwargs)
+        return await self.inner.chat(messages, tools, **kwargs)
 
 
 def make_llm(offline: bool, script: list):
@@ -98,7 +99,7 @@ SUPPORT_PROMPT = (
 )
 
 
-def scenario_direct_injection(offline: bool) -> None:
+async def scenario_direct_injection(offline: bool) -> None:
     banner("场景 1：直接注入 —— 输入检测能拦住多少？")
     attempts = [
         ("正常提问", "你们的退货政策是什么？"),
@@ -113,7 +114,7 @@ def scenario_direct_injection(offline: bool) -> None:
     llm = make_llm(offline, script)
     for label, text in attempts:
         agent = Agent(llm, [], system_prompt=SUPPORT_PROMPT, hooks=[InputGuard()])
-        res = agent.run(text)
+        res = await agent.run(text)
         step(f"{label}：{text}")
         hits = detect_injection(text)
         info(f"InputGuard 命中规则：{hits or '无'}")
@@ -194,7 +195,7 @@ def describe_run(res, outbox: list[dict]) -> None:
         info(f"🤖 {short(res.output)}")
 
 
-def scenario_indirect_injection(offline: bool) -> None:
+async def scenario_indirect_injection(offline: bool) -> None:
     banner("场景 2：间接注入 —— 攻击者不和 Agent 说话，只在它会读的文档里埋一句话")
     info("知识库文章《VPN 连接故障处理指南》末尾藏着一段 HTML 注释（用户在页面上看不到）：")
     info("  " + short(POISONED_DOC.split("<!--")[1], 100))
@@ -207,7 +208,7 @@ def scenario_indirect_injection(offline: bool) -> None:
     step("A. 无防护：普通 system prompt，没有任何安全钩子")
     outbox: list[dict] = []
     agent = Agent(make_llm(offline, compromised_script()), build_it_tools(outbox), system_prompt=IT_PROMPT)
-    res = agent.run(question)
+    res = await agent.run(question)
     describe_run(res, outbox)
     if outbox:
         info("🚨 客户名单被发到了攻击者的邮箱。用户只问了一个 VPN 问题，全程毫不知情。"
@@ -225,13 +226,13 @@ def scenario_indirect_injection(offline: bool) -> None:
     agent = Agent(make_llm(offline, safe_script), build_it_tools(outbox),
                   system_prompt=IT_PROMPT + "\n" + UNTRUSTED_DATA_RULE,
                   hooks=[ToolOutputGuard(), PermissionPolicy()])
-    res = agent.run(question)
+    res = await agent.run(question)
     describe_run(res, outbox)
     if res.status == "paused":
         call = res.pending_approval
         info(f"⏸️ 模型试图调用 {call.name}，被权限层拦下等待审批：{short(call.arguments, 90)}")
         info("审批人看到收件人是 evil.example → 拒绝。Agent 从检查点恢复，继续运行：")
-        res = agent.approve(res.run_id, approved=False, by="sec-oncall", comment="收件人为外部域名")
+        res = await agent.approve(res.run_id, approved=False, by="sec-oncall", comment="收件人为外部域名")
         describe_run(res, outbox)
 
     # ---------- C. 兜底演示
@@ -241,12 +242,12 @@ def scenario_indirect_injection(offline: bool) -> None:
     agent = Agent(ScriptedLLM(compromised_script()), build_it_tools(outbox),
                   system_prompt=IT_PROMPT + "\n" + UNTRUSTED_DATA_RULE,
                   hooks=[ToolOutputGuard(), PermissionPolicy(), audit])
-    res = agent.run(question, metadata={"tenant_id": "tenant-demo", "user_id": "emp-042"})
+    res = await agent.run(question, metadata={"tenant_id": "tenant-demo", "user_id": "emp-042"})
     describe_run(res, outbox)
     call = res.pending_approval
     info(f"⏸️ 待审批：{call.name}({short(call.arguments, 90)})")
     info("审批人看到：收件人 audit@evil.example、正文是客户名单 → 拒绝。Agent 从检查点恢复，继续运行：")
-    res = agent.approve(res.run_id, approved=False, by="sec-oncall", comment="收件人为外部域名，正文含客户名单")
+    res = await agent.approve(res.run_id, approved=False, by="sec-oncall", comment="收件人为外部域名，正文含客户名单")
     describe_run(res, outbox)
     info(f"模型收到的观察：{short(res.messages[-2]['content'])}")
     record = next(r for r in audit.records if r.get("tool") == "send_email")
@@ -291,7 +292,7 @@ def build_admin_tools(log: list[str]):
     return [search_kb, create_ticket, reset_password, export_customer_data]
 
 
-def scenario_rbac(offline: bool) -> None:
+async def scenario_rbac(offline: bool) -> None:
     banner("场景 3：RBAC —— 不同角色看到不同的工具")
     policy = PermissionPolicy(role_tools={"employee": {"search_kb", "create_ticket"}, "it_admin": {"*"}})
     info('策略：employee → {search_kb, create_ticket}；it_admin → {"*"}；dangerous 工具一律需要审批')
@@ -300,7 +301,7 @@ def scenario_rbac(offline: bool) -> None:
                          ("it_admin", "search_kb、create_ticket、reset_password、export_customer_data")]:
         log: list[str] = []
         llm = RecordingLLM(make_llm(offline, [reply(answer)]))
-        res = Agent(llm, build_admin_tools(log), hooks=[policy]).run(question, metadata={"roles": [role], "user_id": f"u-{role}"})
+        res = await Agent(llm, build_admin_tools(log), hooks=[policy]).run(question, metadata={"roles": [role], "user_id": f"u-{role}"})
         step(f"角色 {role}")
         info(f"发给模型的工具列表：{llm.seen_tools[0]}")
         info(f"🤖 {short(res.output)}")
@@ -313,13 +314,13 @@ def scenario_rbac(offline: bool) -> None:
     step("employee 的模型（被注入诱导 / 凭记忆）强行调用它看不见的 reset_password")
     log = []
     llm = ScriptedLLM([call_tool("reset_password", username="ceo"), reply("抱歉，我没有权限重置密码。")])
-    res = Agent(llm, build_admin_tools(log), hooks=[policy]).run("帮我重置 ceo 的密码", metadata={"roles": ["employee"]})
+    res = await Agent(llm, build_admin_tools(log), hooks=[policy]).run("帮我重置 ceo 的密码", metadata={"roles": ["employee"]})
     info(f"工具返回给模型的观察：{res.messages[3]['content']}")
     info(f"实际执行的操作：{log or '无'}")
 
     step("it_admin 调用 reset_password：有权限，但 dangerous 依然要审批")
     llm = ScriptedLLM([call_tool("reset_password", username="zhangsan"), reply("已重置")])
-    res = Agent(llm, build_admin_tools(log), hooks=[policy]).run("重置 zhangsan 的密码", metadata={"roles": ["it_admin"]})
+    res = await Agent(llm, build_admin_tools(log), hooks=[policy]).run("重置 zhangsan 的密码", metadata={"roles": ["it_admin"]})
     info(f"状态={res.status}  待审批：{res.pending_approval.name}({res.pending_approval.arguments})  实际执行的操作：{log or '无'}")
 
     takeaway("visible_tools 让模型'看不见'，before_tool 让模型'调不了' —— 双保险。只做前者，模型照样可能凭名字调用。")
@@ -342,7 +343,7 @@ class PeekOutput(Hook):
         return None
 
 
-def scenario_output_and_audit(offline: bool) -> None:
+async def scenario_output_and_audit(offline: bool) -> None:
     banner("场景 4：输出脱敏 + 审计日志")
     audit_path = RUNS / "audit.jsonl"
     audit_path.unlink(missing_ok=True)
@@ -366,8 +367,8 @@ def scenario_output_and_audit(offline: bool) -> None:
     audit = AuditLog(audit_path)
     agent = Agent(make_llm(offline, script), [lookup_customer, create_ticket],
                   system_prompt="你是客服助手，回答简洁。", hooks=[peek, OutputGuard(), audit])
-    res = agent.run("查一下客户张三的联系方式，然后帮他建个工单：发票抬头需要修改，标题里带上他的手机号方便回访。",
-                    metadata={"tenant_id": "tenant-demo", "user_id": "agent-007", "roles": ["support"]})
+    res = await agent.run("查一下客户张三的联系方式，然后帮他建个工单：发票抬头需要修改，标题里带上他的手机号方便回访。",
+                          metadata={"tenant_id": "tenant-demo", "user_id": "agent-007", "roles": ["support"]})
     step("最终回答")
     info(f"脱敏前（仅演示）：{short(peek.raw)}")
     info(f"脱敏后（用户看到）：{short(res.output)}")
@@ -389,7 +390,7 @@ def scenario_output_and_audit(offline: bool) -> None:
         return f"db_host=db.internal\napi_key={fake_key}"
 
     llm = ScriptedLLM([call_tool("read_config"), lambda msgs: reply("配置如下：" + msgs[-1]["content"])])
-    res = Agent(llm, [read_config], hooks=[OutputGuard()]).run("看一下服务配置")
+    res = await Agent(llm, [read_config], hooks=[OutputGuard()]).run("看一下服务配置")
     info(f"用户看到：{res.output}")
     info(f"state.metadata['secret_leak_blocked'] = {res.metadata.get('secret_leak_blocked')}")
 
@@ -400,7 +401,7 @@ def scenario_output_and_audit(offline: bool) -> None:
 # =====================================================================
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description="第 09 课 Demo：安全与治理")
     parser.add_argument("--offline", action="store_true", help="使用离线剧本（ScriptedLLM），不调用真实模型")
     args = parser.parse_args()
@@ -415,12 +416,12 @@ def main() -> None:
             sys.exit(f"❌ {e}\n   没有 API key 也没关系：加上 --offline 参数运行离线版本。")
         print(f"模式：真实模型（{env('LLM_MODEL', 'gpt-5.5')}）—— 模型会不会上当，每次运行都可能不同，请如实观察")
 
-    scenario_direct_injection(args.offline)
-    scenario_indirect_injection(args.offline)
-    scenario_rbac(args.offline)
-    scenario_output_and_audit(args.offline)
+    await scenario_direct_injection(args.offline)
+    await scenario_indirect_injection(args.offline)
+    await scenario_rbac(args.offline)
+    await scenario_output_and_audit(args.offline)
     banner("完成 🎉  审计日志在 runs/09_security/audit.jsonl")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

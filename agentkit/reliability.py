@@ -194,6 +194,14 @@ class ResilientLLM:
         self.sleep = sleep
         self.events: list[str] = []  # 记录重试/降级事件，方便观测
 
+    async def aclose(self) -> None:
+        """关闭链上各模型的连接池，以及熔断器持有的资源（例如 SQLiteCircuitBreaker 的数据库连接）。"""
+        for llm, breaker, _ in self.chain:
+            for obj, method in ((llm, "aclose"), (breaker, "close")):
+                close = getattr(obj, method, None)
+                if close is not None:
+                    await maybe_await(close())
+
     def _on_retry(self, model: str):
         return lambda n, e, d: self.events.append(f"retry {model} #{n} after {d:.2f}s: {e}")
 

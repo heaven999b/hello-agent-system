@@ -164,7 +164,7 @@ agent = Agent(
         AuditLog("runs/audit.jsonl"),                            # 第 5 层：审计
     ],
 )
-agent.run("...", metadata={"tenant_id": "acme", "user_id": "u1", "roles": ["employee"]})  # 身份由服务端填写
+await agent.run("...", metadata={"tenant_id": "acme", "user_id": "u1", "roles": ["employee"]})  # 身份由服务端填写
 ```
 
 ### 1.6 本课的八张问题卡片
@@ -321,10 +321,10 @@ flowchart TB
 
 **怎么选**：B 是基线，高频小额操作叠加 C，大额和权限变更用 D。不管哪种方案都要做到：**审批内容具体到参数、翻译成人话、标出异常**（"将向**外部地址** audit@evil.example 发送邮件，正文包含 **3 位客户的手机号和年采购额**"）；**审批绑定具体参数**，批准后不能改；**审批超时按拒绝处理**；**监控每个审批人的通过率**，长期接近 100% 说明要么范围太宽，要么已经在盲批。
 
-**本课实现**：B。每个工具声明 `risk="read" | "write" | "dangerous"`，`PermissionPolicy(ask_risks={"dangerous"})` 只对危险操作要求审批；有 `approver` 函数时同步审批（命令行场景），没有时抛 `PauseRun` 异步审批，审批按 `tool_call_id` 绑定，参数随检查点保存（暂停与恢复的实现见[第 08 课问题 6](../08_reliability/README.md)）。另外两个减少无效审批、方便追责的细节：
+**本课实现**：B。每个工具声明 `risk="read" | "write" | "dangerous"`，`PermissionPolicy(ask_risks={"dangerous"})` 只对危险操作要求审批；有 `approver` 函数时当场审批（命令行里问一句，或者调审批服务的接口），没有时抛 `PauseRun`：状态落盘、运行结束，审批人几小时后再 `await agent.approve(...)`，审批按 `tool_call_id` 绑定，参数随检查点保存（暂停与恢复的实现见[第 08 课问题 6](../08_reliability/README.md)）。`approver` 可以是普通函数，也可以是 `async` 函数（比如 `await` 一个审批服务的 HTTP 接口，等待期间同一进程里的其他会话照常推进）。`PermissionPolicy` 发现它返回的是一个协程时，交给 Agent 去 `await`，而不是直接 `bool(...)` —— **`bool(协程)` 恒为 `True`**，那会把每一个高危操作都静默批准。这是 async 代码里最危险的一类 bug：不报错，只是悄悄做错。另外两个减少无效审批、方便追责的细节：
 
 - **参数不合法的调用不送审批**：`PermissionPolicy` 先按工具的 Schema 校验参数，校验不通过就直接交给工具层返回错误让模型自己改，不去打扰审批人（否则审批人批准的是一个注定失败的调用）；
-- **记录是谁批的**：`agent.approve(run_id, approved=False, by="sec-oncall", comment="收件人为外部域名")` 会写入审批记录，`AuditLog` 的每条工具调用记录都带 `approved` 和 `approved_by`。
+- **记录是谁批的**：`await agent.approve(run_id, approved=False, by="sec-oncall", comment="收件人为外部域名")` 会写入审批记录，`AuditLog` 的每条工具调用记录都带 `approved` 和 `approved_by`。
 
 练习 (a) 的套餐 × 风险矩阵是方案 B 的延伸：在风险等级之外再看租户属性，同样是写操作，免费版租户要确认，付费租户直接放行。
 
@@ -383,7 +383,7 @@ class OutputGuard(Hook):
 
 **怎么选**：需求能枚举就用 A；内部低风险用 B；面向外部用户或多租户，至少用 C。无论哪种都必须：**网络默认关闭**（否则沙箱本身就成了"对外通信"通道，凑齐致命三要素）；**沙箱里没有密钥**；**每次用全新的文件系统**；**超时后真正杀死进程**。
 
-**本课实现**：agentkit 没有内置沙箱，这里只给原则。一个相关的事实：`ToolRegistry.execute` 的超时基于线程，而 Python 线程无法被强行杀死，超时只是"不再等它"，代码可能还在后台跑（[agentkit/tools.py](../../agentkit/tools.py) 的注释专门提到了这点）。所以执行不可信代码，必须放在可以被整体杀掉的独立进程或沙箱里。
+**本课实现**：agentkit 没有内置沙箱，这里只给原则。一个相关的事实：工具的超时有三种语义（[agentkit/tools.py](../../agentkit/tools.py) 的模块说明）：`async def` 工具超时会被真正取消；普通同步函数放在线程池里执行，而 Python 线程无法被强行杀死，超时只是"不再等它"，代码可能还在后台跑；`@tool(isolation="process")` 在子进程里执行，超时直接 kill 掉子进程。所以执行不可信代码，至少要放在可以被整体杀掉的独立进程里 —— 但进程隔离只解决"杀得掉"，不解决"能访问什么"（网络、文件、环境变量里的密钥），那是沙箱的事。
 
 [第 19 课](../19_mcp_and_sandbox/README.md)从零搭了一个进程级沙箱，并实测它挡不住什么、什么时候必须换成容器或 microVM；[第 24 课](../24_coding_agents/README.md)则把代码执行放进编码 Agent，加上路径边界、测试保护和 diff 审查。
 
@@ -584,7 +584,7 @@ python lessons/09_security/demo.py             # 真实模型（约 40 秒）
 **(a) `PolicyEngine.decide`：权限决策矩阵（问题 2、3）**
 
 - 任务：按"全局禁用 → 角色显式禁止 → 未知风险 → 角色白名单 → 套餐 × 风险查表"的顺序返回 `allow / ask / deny`。
-- 提示：多个角色的白名单取**并集**，任何一个角色的显式禁止**一票否决**；所有"不认识"的情况都按最严格处理。写完后，已经写好的 `PolicyHook` 会把你的决策接入 Agent（测试里有集成用例）。
+- 提示：多个角色的白名单取**并集**，任何一个角色的显式禁止**一票否决**；所有"不认识"的情况都按最严格处理。写完后，已经写好的 `PolicyHook` 会把你的决策接入 Agent（测试里有集成用例，用 `await agent.run(...)` / `await agent.approve(...)` 跑一个真实的 Agent）。三道题都是普通函数：权限判断、脱敏、能力分析都是纯计算，不需要 `async`。
 
 **(b) `redact`：扩展 PII 脱敏（问题 4）**
 

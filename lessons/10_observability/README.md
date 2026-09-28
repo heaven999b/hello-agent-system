@@ -208,7 +208,7 @@ agentkit 为教学做了简化，和标准的对应关系：
 
 **场景**：主管 Agent 调用专家 Agent（部署在另一个服务里），专家 Agent 又调用了一个 MCP server。排查一次 40 秒的慢请求时，后端里出现了三个互不相关的 trace，只能按时间戳去猜哪几个是同一次请求。
 
-**为什么难**：trace 上下文在每一道边界都可能丢失：线程池（Python 的 `contextvars` **不会**自动传进 `ThreadPoolExecutor` 的工作线程）、异步任务、HTTP 调用、消息队列，以及等待审批的几个小时。
+**为什么难**：trace 上下文在每一道边界都可能丢失：线程池（`loop.run_in_executor` **不会**把 `contextvars` 带进工作线程；`asyncio.to_thread` 会）、异步任务（`asyncio.create_task` 创建时复制当前上下文，但在别处创建的任务看到的是别处的上下文）、HTTP 调用、消息队列、另一个 worker 进程，以及等待审批的几个小时。
 
 | 方案 | 怎么做 | 优点 | 缺点 | 适用场景 |
 |---|---|---|---|---|
@@ -219,7 +219,13 @@ agentkit 为教学做了简化，和标准的对应关系：
 
 **怎么选**：A + B 是基础，保证同一个请求只有一个 trace_id；C 永远要有，用户投诉时报的是 run_id，不是 trace_id；D 用在队列和长时间暂停的场景。上线前做一次端到端验证：发一个完整的请求，确认后端里只出现一个 trace_id。
 
-**本课实现**：agentkit 的 `Tracer` 用 `contextvars` 维护 span 栈（方案 A）；`ToolRegistry.execute` 在线程池里执行工具时，用 `pool.submit(contextvars.copy_context().run, t.fn, **kwargs)` 把上下文带进工具线程，所以通过 `agent_as_tool` 调用的子 Agent 会嵌套在父 span 下面（见 [agentkit/tools.py](../../agentkit/tools.py)）。从检查点恢复的运行会生成新的根 span `agent.resume`，用 run_id 关联（方案 C），查看器会把同一个 run_id 的多条 trace 串起来。可以用下面的代码自检：
+**本课实现**：agentkit 的 `Tracer` 用 `contextvars` 维护 span 栈（方案 A）。进程内的三种边界它都处理了：
+
+- **async 工具与子 Agent**：`agent_as_tool` 生成的是 async 工具，子 Agent 在同一个任务里 `await`，自然嵌套在父 span 下面；
+- **并发的只读工具**：同一轮里的多个只读工具由 `asyncio.gather` 并发执行，每个工具在自己的任务里运行；任务创建时复制当前上下文，所以 3 个 tool span 认出的是同一个父节点，而且在时间上互相重叠（Demo 的 t5）；
+- **同步工具**：普通函数放进线程池执行，执行器用 `loop.run_in_executor(pool, functools.partial(contextvars.copy_context().run, t.fn, **kwargs))` 把上下文带进工具线程（见 [agentkit/tools.py](../../agentkit/tools.py)）。
+
+从检查点恢复的运行会生成新的根 span `agent.resume`，用 run_id 关联（方案 C），查看器会把同一个 run_id 的多条 trace 串起来。可以用下面的代码自检：
 
 ```python
 from agentkit import Agent, ScriptedLLM, Tracer, call_tool, reply
@@ -229,9 +235,11 @@ t = Tracer()
 expert = Agent(ScriptedLLM([reply("专家答复")]), [], name="expert", tracer=t)
 boss = Agent(ScriptedLLM([call_tool("ask_expert", task="x"), reply("完成")]),
              [agent_as_tool(expert, "ask_expert", "专家")], name="boss", tracer=t)
-boss.run("hi")
-print(len(t.traces))  # agentkit 输出 1：子 Agent 嵌套在父 trace 里；输出 2 说明上下文在线程边界断了
+await boss.run("hi")
+print(len(t.traces))  # agentkit 输出 1：子 Agent 嵌套在父 trace 里；输出 2 说明上下文在任务或线程边界断了
 ```
+
+**跨进程时会怎样？** `Tracer` 是进程内的对象。服务部署成多个 worker 进程之后（第 13 课），每个进程有自己的 `Tracer`，各自导出自己的 span：API 进程里的"收到请求、入队"是一棵树，worker 进程里的 `agent.run` 是另一棵树，trace_id 互不相关；一个运行在进程 A 暂停等审批、审批后由进程 B `resume`，在 B 里又是一棵新树。本课的实现到这里为止，只能靠 run_id（方案 C）把它们关联起来。要真正拼成一棵树，需要方案 B：生产者把当前 trace 上下文写进任务 payload（W3C `traceparent`），消费者进程取出来"接着"这条 trace 继续。第 28 课的 `agentkit.contrib.otel` 提供了这两个函数：入队时 `payload["trace"] = inject_context({})`，worker 里 `async with continue_trace(job.payload["trace"]): await agent.run(...)`，见[第 28 课 2.4 节](../28_production_observability/README.md#24-跨队列传播inject_context--continue_trace)。
 
 ## 3. 从玩具到生产：逐层实现
 
@@ -272,7 +280,7 @@ def span(self, name: str, **attrs) -> Iterator[Span]:
                 self.exporter(s)
 ```
 
-1. **用 `contextvars` 维护"当前 span 栈"**，嵌套的 `with tracer.span(...)` 会自动认出父节点，不用一层层传 `parent`。它在多线程和 asyncio 下都能正确隔离，两个并发请求各有各的栈。OTel Python SDK 也是这么做的。
+1. **用 `contextvars` 维护"当前 span 栈"**，嵌套的 `with tracer.span(...)` 会自动认出父节点，不用一层层传 `parent`。它在多线程和 asyncio 下都能正确隔离：同一个进程里并发的几百个会话，每个会话是一个独立的 asyncio 任务，各有各的栈，不会把别人的 span 挂到自己名下。OTel Python SDK 也是这么做的。
 2. **暂停和中止不算错误**（见问题 4）。
 3. **记录异常后继续 `raise`。** 追踪只负责观察，不能改变程序行为。
 4. **根 span 结束时把整棵树交给 exporter。** 实现简单，但一个等了 3 小时审批的运行，结束前后端完全看不到它。OTel SDK 的 `BatchSpanProcessor` 是每个 span 一结束就放进队列、分批异步导出。
@@ -286,7 +294,7 @@ with self.tracer.span(
     "llm.chat",
     **{"gen_ai.request.model": getattr(self.llm, "model", "?"), "step": state.step, "messages": len(state.messages)},
 ) as span:
-    response = self.llm.chat(state.messages, tools=tools)
+    response = await self.llm.chat(state.messages, tools=tools)   # 等模型的这段时间，事件循环去推进别的会话
     span.set(
         **{
             "gen_ai.response.model": response.model,
@@ -307,9 +315,10 @@ with self.tracer.span(
 ```python
 with self.tracer.span(
     f"tool.{call.name}",
-    **{"tool.name": call.name, "tool.arguments": redact_pii(call.arguments)[:500], "tool.risk": t.risk if t else None},
+    **{"tool.name": call.name, "gen_ai.tool.call.id": call.id, "tool.arguments": redact_pii(call.arguments)[:500],
+       "tool.risk": t.risk if t else None},
 ) as span:
-    ...  # 权限钩子 → 执行工具 → after_tool 钩子
+    ...  # 权限钩子 → await 执行工具 → after_tool 钩子
     span.set(**{"tool.ok": result.ok, "tool.error_type": result.error_type, "tool.result_preview": redact_pii(result.content)[:200]})
 ```
 
@@ -357,31 +366,46 @@ flowchart LR
     E --> F["告警"]
 ```
 
-> 🏭 **生产版**：本课的 `Tracer` 把 span 写进 JSONL 文件，只适合单进程。把它桥接到 OpenTelemetry SDK、用 OTLP 导出到任意后端、让 trace 跨任务队列串起来、做尾部采样和脱敏、把运行指标暴露给 Prometheus 并配燃尽率告警，见[第 28 课](../28_production_observability/README.md)。
+> 🏭 **生产版**：本课的 `Tracer` 是进程内的：一个进程里并发的几百个会话它都能正确分开，但多个 worker 进程各自导出各自的 span，跨进程的 trace 串不起来（见问题 6 的"跨进程时会怎样"）；JSONL 文件也只适合本机查看。把它桥接到 OpenTelemetry SDK、用 OTLP 导出到任意后端、用 `inject_context` / `continue_trace` 让 trace 跨任务队列和进程串起来、做尾部采样和脱敏、把运行指标暴露给 Prometheus 并配燃尽率告警，见[第 28 课](../28_production_observability/README.md)。
 
 ## 4. 动手：运行 Demo
 
 ```bash
-python lessons/10_observability/demo.py --offline   # 离线剧本，无需 API key（约 6 秒）
-python lessons/10_observability/demo.py             # 真实模型（约 25 秒）
+python lessons/10_observability/demo.py --offline   # 离线剧本，无需 API key（约 7 秒）
+python lessons/10_observability/demo.py             # 真实模型（约 35 秒）
 ```
 
-Demo 里的电商客服 Agent 处理 4 个任务：正常查物流、问退货政策、**物流接口故障**、**带手机号的查询**。离线模式输出节选：
+Demo 里的电商客服 Agent 处理 5 个任务：正常查物流、问退货政策、**物流接口故障**、**带手机号的查询**、**一轮里并行查 3 样东西**。工具都是 `async def`（查库、调物流接口的等待用 `await asyncio.sleep` 表示），离线模式下模型的耗时交给 `ScriptedLLM(latency=...)`，同样是 `asyncio.sleep`，不是 `time.sleep`。离线模式输出节选（MacBook 8 核 / 8GB）：
 
 ```
 ▶ [t3-工具故障] 用户：帮我看看订单 A1002 的物流进度
   助手：抱歉，物流商接口暂时超时，无法查询 YT2002 的进度。订单已发货，建议稍后再查。
-  agent.run  2147ms  tokens=2008→122  status=completed steps=4 cost=$0.00250
-  ├─ llm.chat  308ms  tokens=408→22  → tool_calls: lookup_order
-  ├─ tool.lookup_order  56ms  ok
-  ├─ llm.chat  351ms  tokens=470→24  → tool_calls: track_shipment
-  ├─ tool.track_shipment  156ms  FAIL(tool_error)
-  ├─ llm.chat  404ms  tokens=530→24  → tool_calls: track_shipment
-  ├─ tool.track_shipment  159ms  FAIL(tool_error)
-  └─ llm.chat  701ms  tokens=600→52  → final_answer
+  agent.run  2119ms  tokens=2008→122  status=completed steps=4 cost=$0.00250
+  ├─ llm.chat  303ms  tokens=408→22  → tool_calls: lookup_order
+  ├─ tool.lookup_order  52ms  ok
+  ├─ llm.chat  352ms  tokens=470→24  → tool_calls: track_shipment
+  ├─ tool.track_shipment  153ms  FAIL(tool_error)
+  ├─ llm.chat  402ms  tokens=530→24  → tool_calls: track_shipment
+  ├─ tool.track_shipment  152ms  FAIL(tool_error)
+  └─ llm.chat  703ms  tokens=600→52  → final_answer
+
+▶ [t5-并行查询] 用户：订单 A1001 和 A1003 现在分别是什么状态？另外退货的运费谁出？
+  agent.run  1109ms  tokens=1020→112  status=completed steps=2 cost=$0.00147
+  ├─ llm.chat  453ms  tokens=430→64  → tool_calls: lookup_order, lookup_order, search_policy
+  ├─ tool.lookup_order  53ms  ok
+  ├─ tool.lookup_order  53ms  ok
+  ├─ tool.search_policy  32ms  ok
+  └─ llm.chat  602ms  tokens=590→48  → final_answer
+  时间线（每格 28ms，相对 agent.run 开始）：
+    llm.chat              ████████████████                                0 →   453ms
+    tool.lookup_order                     ██                            454 →   506ms
+    tool.lookup_order                     ██                            454 →   506ms
+    tool.search_policy                    █                             454 →   486ms
+    llm.chat                                ██████████████████████      507 →  1109ms
+  同一轮的 3 个只读工具（lookup_order, lookup_order, search_policy）：时间上互相重叠 → 并发执行；各自耗时加起来 138ms，实际只占了 53ms 墙钟。
 ...
   成功率（status=completed）    100%
-  运行耗时 p50 / p95            0.97s / 2.15s
+  运行耗时 p50 / p95            1.11s / 2.12s
   ...
   工具                    调用  失败  错误率
   track_shipment          3     2     67%   ← 需要关注
@@ -397,9 +421,10 @@ Demo 里的电商客服 Agent 处理 4 个任务：正常查物流、问退货�
 **重点观察：**
 
 1. **成功率 100%，工具错误率 67%**：问题 5 的场景。
-2. **离线剧本里模型对失败的工具重试了一次**，白花了一次模型调用。我们用真实模型跑的那次，模型遵守了 system prompt 里"不要反复重试"的要求；真实模型每次的行为可能不同。prompt 的约束有没有生效，看 trace 就知道。
-3. **模型调用占了总耗时的八成以上**（真实模式下是 97%）。
-4. **工具参数里的手机号在埋点处就被替换掉了，但姓名和地址逃过了正则**：这就是问题 2 里"默认不记录内容"的理由。
+2. **离线剧本里模型对失败的工具重试了一次**，白花了一次模型调用。我们用真实模型跑的那次，模型遵守了 system prompt 里"不要反复重试"的要求（t3 只调了一次 `track_shipment`）；真实模型每次的行为可能不同。prompt 的约束有没有生效，看 trace 就知道。
+3. **并行的工具调用在 trace 里是重叠的 span。** t5 里模型在一轮里要了 3 个只读工具，Agent 用 `asyncio.gather` 并发执行：三个 span 的起点相同，各自耗时加起来 138ms，只占了 53ms 墙钟。这时"子 span 耗时之和"会大于父 span 里对应的那段时间，所以耗时分析要看时间线（瀑布图），而不是把子 span 的耗时相加。用真实模型跑的那次，gpt-5.5 同样在一轮里发出了这 3 个调用，trace 里同样是重叠的三个 span。有写操作时 Agent 会退回逐个执行（第 08 课：每个写操作执行完都要落盘）。
+4. **模型调用占了总耗时的八成以上**（t3：离线 83%，真实模式 96%）。
+5. **工具参数里的手机号在埋点处就被替换掉了，但姓名和地址逃过了正则**：这就是问题 2 里"默认不记录内容"的理由。
 
 **在浏览器里看 trace**：用 agentkit 自带的查看器 [agentkit/viewer.py](../../agentkit/viewer.py) 把 JSONL 渲染成一个 HTML 页面：
 
@@ -430,7 +455,7 @@ make lesson N=10
 # 等价于 .venv/bin/python -m pytest lessons/10_observability
 ```
 
-提示：先跑一次 Demo，打开 `traces/demo.jsonl` 看看真实数据长什么样；docstring 里的"规则细节"每一条都有测试对应，也都来自真实的坑。写完再跑 Demo，第 3 节会显示"计算函数来自 exercise.py（你的实现）"。
+提示：先跑一次 Demo，打开 `traces/demo.jsonl` 看看真实数据长什么样；docstring 里的"规则细节"每一条都有测试对应，也都来自真实的坑。写完再跑 Demo，第 3 节会显示"计算函数来自 exercise.py（你的实现）"。三个函数都是普通函数（纯计算，输入是 span 字典列表）。集成测试里有一个用例让真实的 Agent 在一轮里并发执行 3 个只读工具，导出的 3 个 tool span 在时间上重叠 —— 你的统计要按次数和状态算，不能假设子 span 是一个接一个首尾相接的。
 
 ## 6. 深入（给有余力的你）
 
@@ -537,8 +562,8 @@ flowchart TD
 <details>
 <summary>Q6：多 Agent、跨服务的调用链怎么串成一条 trace？怎么验证？</summary>
 
-- 进程内靠 contextvars，线程池和异步任务的边界要手动复制上下文；
-- 跨服务靠 W3C Trace Context 的 `traceparent`，HTTP、MCP、消息队列都要透传；
+- 进程内靠 contextvars：asyncio 任务创建时自动复制上下文，线程池（`run_in_executor`）要手动 `copy_context().run`；
+- 跨服务、跨 worker 进程靠 W3C Trace Context 的 `traceparent`，HTTP、MCP、消息队列（任务 payload）都要透传；
 - 长时间暂停和队列消费用 span link 或 run_id 关联；
 - 验证：发一个端到端请求，检查后端里是否只有一个 trace_id。
 </details>

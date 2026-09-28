@@ -2,7 +2,7 @@
 
 # 第 08 课：可靠性工程 —— 让 Agent 在失败中存活
 
-> 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：面对限流、宕机、死循环、崩溃、重复副作用、长时间审批这六类企业常见故障，说出 2-4 种方案的取舍并选对方案 ｜ 📦 对应源码：`agentkit/reliability.py`、`agentkit/budget.py`、`agentkit/state.py`、`agentkit/tools.py`（幂等）、`agentkit/agent.py`（恢复）
+> 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：面对限流、宕机、死循环、崩溃、重复副作用、长时间审批这六类企业常见故障，说出 2-4 种方案的取舍并选对方案 ｜ 📦 对应源码：`agentkit/reliability.py`、`agentkit/budget.py`、`agentkit/state.py`、`agentkit/tools.py`（幂等）、`agentkit/agent.py`（恢复）、`agentkit/distributed/sqlite.py`（跨进程的熔断器与幂等存储）
 >
 > 📖 必读：[Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/)（Mike Ulrich, 2016）—— Google SRE Book 第 22 章，讲清故障如何沿调用链层层放大，本课问题 1 里"多层重试相乘"的例子就出自这里；重点读 "Retries" 和 "Latency and Deadlines" 两节，理解为什么重试要有预算、截止时间要沿调用链传递。
 
@@ -75,10 +75,10 @@ flowchart LR
 | # | 企业问题 | 关键技术 | agentkit | 练习 |
 |---|---|---|---|---|
 | 1 | 高峰期模型 API 频繁 429 | 退避 + 抖动、重试预算、截止时间 | `retry_call`、`backoff_delay` | (b) `retry_with_budget` |
-| 2 | 主模型供应商宕机 | 熔断器、降级链 | `CircuitBreaker`、`ResilientLLM` | (c) 半开单试探 |
+| 2 | 主模型供应商宕机 | 熔断器、降级链、跨进程共享熔断状态 | `CircuitBreaker`、`ResilientLLM`、`SQLiteCircuitBreaker` | (c) 半开单试探 |
 | 3 | Agent 死循环烧钱 | 多维预算、循环检测 | `BudgetHook` | (a) `LoopGuard` |
 | 4 | 进程崩溃、发布重启 | 检查点、持久化执行 | `FileCheckpointer`、`Agent.resume` | — |
-| 5 | 恢复后重复退款 / 重复建单 | 幂等键 | `IdempotencyStore`、`ToolContext.idempotency_key` | — |
+| 5 | 恢复后重复退款 / 重复建单 | 幂等键 | `SQLiteIdempotencyStore`、`ToolContext.idempotency_key` | — |
 | 6 | 审批要等好几个小时 | 暂停落盘、异步恢复 | `PauseRun`、`Agent.approve` | — |
 
 ## 2. 企业问题卡片
@@ -90,12 +90,16 @@ flowchart LR
 **为什么难**：
 
 - **什么都重试是错的。** 400（参数错、上下文超长）、401（key 失效）重试一万次也是同样结果，还可能触发风控；只有 429、5xx、超时、断连这类**瞬时错误**才值得重试；
-- **固定间隔重试会制造"整齐的冲锋"。** 1000 个客户端同时收到 429、都等 1 秒后重试，服务端在同一瞬间又收到 1000 个请求（**惊群效应**，thundering herd）。Demo 场景 1 的模拟：
+- **固定间隔重试会制造"整齐的冲锋"。** 一大批客户端同时收到 429、都等同样长的时间再重试，服务端在同一瞬间又收到一整批请求（**惊群效应**，thundering herd），于是又是大部分被拒、再整齐地等、再一起冲。Demo 场景 1 做了一个真实的实验（不是用随机数画直方图）：500 个并发客户端同时打一个**独立进程**里的网关，网关同时最多处理 50 个请求、每个 100ms，满了立刻返回 429；表里的数字全部来自网关自己的日志（MacBook 8 核 / 8GB，负载约 4，一次运行的结果）：
 
   ```text
-  无抖动（每个客户端都等 1.0s 后重试）：   → 最拥挤的 100ms 里有 1000 个重试请求同时到达
-  全抖动（每个客户端在 [0, 1.0s] 内随机等待）：→ 最拥挤的 100ms 里有 120 个重试请求同时到达
+  策略                总请求  被 429  重试最密的 10ms  全部成功  一半成功  网关利用率
+  固定间隔 0.5s       2750    2250    324              4.67s     2.64s     21%
+  指数退避，无抖动    2750    2250    340              6.66s     2.64s     15%
+  指数退避 + 全抖动   2001    1501    76               1.64s     0.61s     61%
   ```
+
+  固定间隔时，每 0.5 秒有一堵"墙"：几百个重试挤在同一个 10ms 里到达，网关只接得住 50 个，其余全部 429，两堵墙之间网关却闲着（利用率 21%）。无抖动的指数退避只是把墙与墙的间隔拉长了。全抖动把同样的重试摊开在时间轴上：429 少了三分之一，所有人都成功的时间缩短到约 1/3。
 
 - **重试会放大流量。** Google SRE 书举过例子：数据库过载时，后端、前端、JavaScript 三层各自重试 3 次（每层 4 次尝试），一次用户操作最多在数据库上产生 $4^3=64$ 次请求。Agent 系统同样有前端 → 网关 → Agent 服务 → 模型网关多层；
 - **持续超额时，重试只是把失败推迟。** 需求是限额的 1.8 倍，重试再多也塞不进去，只会增加延迟；
@@ -118,13 +122,17 @@ flowchart LR
 
 **本课实现**：方案 A。
 
-1. **错误分类在 LLM 适配层完成**（[agentkit/llm.py](../../agentkit/llm.py)），上层只看 `retryable` 一个布尔值，换厂商时重试逻辑不用改：
+1. **错误分类在 LLM 适配层完成**（[agentkit/llm.py](../../agentkit/llm.py) 的 `map_openai_error`），上层只看 `retryable` 一个布尔值，换厂商时重试逻辑不用改：
 
    ```python
-   except self._openai.APIStatusError as e:
-       code = e.status_code
-       # 429 限流、408 超时、5xx 服务端错误：重试可能成功；400/401/403/404：重试没用
-       raise LLMError(str(e), status_code=code, retryable=code in (408, 409, 429) or code >= 500) from e
+   code = e.status_code
+   # 429 限流、408 超时、5xx 服务端错误：重试可能成功；400/401/403/404：重试没用。
+   # 但 429 有两种：限流（等一等就好）和额度用完（insufficient_quota，重试一万次也没用）。
+   retryable = code in (408, 409, 429) or code >= 500
+   if code == 429 and "insufficient_quota" in str(e):
+       retryable = False
+   retry_after = float(e.response.headers.get("retry-after"))   # 服务端建议的等待秒数（没有这个头时为 None）
+   return LLMError(str(e), status_code=code, retryable=retryable, retry_after=retry_after)
    ```
 
    这个判定与 OpenAI 官方 Python SDK 的默认重试判定一致。注意 `OpenAICompatLLM` 创建客户端时写了 `max_retries=0`：**故意关掉 SDK 自带的重试**，否则 SDK 重试 2 次、你的代码再重试 3 次，一次调用最多变成 9 次请求，而且 SDK 内部的重试你看不见。**重试只在一层做，并且做在看得见的地方。**
@@ -137,11 +145,32 @@ flowchart LR
        return (rng or random).uniform(0, upper)         # 全抖动：在 [0, 上限] 内均匀随机
    ```
 
-   AWS 的 Marc Brooker 用模拟比较过"不抖动 / 全抖动 / 等值抖动 / 去相关抖动"：不抖动的方案做的工作最多、耗时也最长；全抖动的总调用量最少，而且实现最简单。`rng`、`sleep`、`clock` 都可注入，所以本课的测试都是确定性的，不会真的睡眠。
+   AWS 的 Marc Brooker 用模拟比较过"不抖动 / 全抖动 / 等值抖动 / 去相关抖动"：不抖动的方案做的工作最多、耗时也最长；全抖动的总调用量最少，而且实现最简单。上面 Demo 的真实实验得出了同样的结论（全抖动那一行用的就是 `backoff_delay(n, base=0.1, cap=1.0)`）。
 
-3. **练习 (b)** 补上 agentkit 没有的两道闸门：**全局重试预算**（令牌桶：每个新请求存 0.1 个令牌、每次重试花 1 个，思路同 Google SRE 的"重试不超过请求的 10%"和 gRPC 的 `retryThrottling`）和**截止时间**（剩余时间不够再等一次退避，就不再重试）。测试会证明：下游彻底宕机时，100 个请求在"每个请求最多 3 次尝试"下本来要打 300 次，有了预算只打 113 次。
+   重试循环本身是 async 的（`retry_call`，`ResilientLLM` 内部用的就是它）：
 
-> 生产级升级：优先读取响应里的 `Retry-After` 头（OpenAI 官方 SDK 会读，agentkit 为简洁没有实现）；全局限流和重试预算放到模型网关或 Redis 里共享；给不同层约定"已重试过，别再重试"的错误码。
+   ```python
+   async def retry_call(fn, *, max_attempts=3, base_delay=0.5, max_delay=8.0, retry_if=is_retryable, sleep=asyncio.sleep, on_retry=None):
+       for attempt in range(1, max_attempts + 1):
+           try:
+               return await fn()            # fn 每次返回一个新协程：协程只能 await 一次，重试要重新创建
+           except Exception as e:           # CancelledError 是 BaseException：调用方取消时直接穿透，不会被重试
+               if attempt == max_attempts or not retry_if(e):
+                   raise
+               delay = backoff_delay(attempt, base_delay, max_delay)
+               server_hint = getattr(e, "retry_after", None)   # 服务端说了"N 秒后再试"就听它的
+               if server_hint is not None:
+                   delay = max(delay, min(server_hint, max_delay * 4))
+               await sleep(delay)           # 等待期间让出事件循环：同一个进程里的其他会话照常推进
+   ```
+
+   用法：`await retry_call(lambda: llm.chat(messages))`。`rng`、`sleep`、`clock` 都可注入，所以本课的练习测试都是确定性的，不会真的睡眠。
+
+3. **练习 (b)** 补上 agentkit 没有的两道闸门：**全局重试预算**（令牌桶：每个新请求存 0.1 个令牌、每次重试花 1 个，思路同 Google SRE 的"重试不超过请求的 10%"和 gRPC 的 `retryThrottling`）和**截止时间**（剩余时间不够再等一次退避，就不再重试）。测试用 `asyncio.gather` 真的并发发起 100 个请求、共享一个预算：下游彻底宕机时，"每个请求最多 3 次尝试"本来要打 300 次，有了预算只打 110 次。为什么是 110 而不是逐个发送时的 113？并发时 100 个首次请求几乎同时存入令牌，桶在失败回来之前就被存到了上限 `max_tokens=10` —— 上限的作用正是限制"一出故障能有多少重试同时冲出去"。
+
+   预算不用加锁：100 个请求是同一个事件循环里的协程，而协程只在 `await` 处切换，`try_acquire` 里没有 `await`，"读令牌 → 判断 → 扣减"不会被打断。多个**进程**共享预算时，内存里的桶就不够了，要放进所有进程都看得到的地方（单机：`agentkit.distributed.SQLiteTokenBucket`；多机：Redis 或模型网关）。
+
+> 生产级升级：`Retry-After` 已经接上了（`OpenAICompatLLM` 把响应头解析进 `LLMError.retry_after`，`retry_call` 取它和自己算的退避中较大的那个）；全局限流和重试预算放到模型网关或 Redis 里共享；给不同层约定"已重试过，别再重试"的错误码。
 
 ### 问题 2：主模型供应商宕机了 25 分钟
 
@@ -212,12 +241,53 @@ agent = Agent(llm, tools)
 
 设计要点：每个模型有**自己的**熔断器；熔断器包在重试**外面**（一次"用尽了所有重试的调用"才算一次失败）；所有模型都失败时抛 `LLMError`，Agent 把它变成 `status="failed"` 和一句"服务暂时不可用"，而不是 500 —— 方案 D 应该在调用 Agent 的业务层根据这个状态来做。
 
-agentkit 的两处简化，也是生产级实现要补上的：
+熔断器还有两个细节，生产级实现（如 Java 的 Resilience4j）都有，agentkit 也都实现了：
 
-- `CircuitBreaker` 把**所有**异常都计入失败（Demo 场景 2 正是用"模型不存在"的 400 来触发熔断）。生产级实现（如 Java 的 Resilience4j）都允许配置"哪些异常计入、哪些忽略"；
-- half_open 时放行**所有**请求，500 个并发请求会同时涌向刚恢复的下游。练习 (c)（加分题）让你实现"半开时只放行 1 个试探请求"。
+- **哪些异常计入熔断**：`CircuitBreaker(record_if=...)`（`ResilientLLM` 同名参数）。默认全部计入 —— Demo 场景 2 正是用"模型不存在"的 400 来触发熔断；生产中可以只统计反映"下游不健康"的错误，别让一个用户自己的超长上下文把所有人切到备用模型；
+- **半开时只放行 1 个试探请求**，其余并发请求继续快速失败。否则下游刚恢复一点，500 个并发请求一拥而上，又把它压垮：
 
-> 规模化之后：熔断器是进程内的（每个实例各自判断，简单、无依赖，业界主流），还是放在 Redis 里共享（整体跳闸更快，但引入新依赖）？这类问题见[第 13 课](../13_distributed_concurrency/README.md)。
+  ```python
+  async def call(self, fn):
+      state = self.state
+      if state == "open":
+          raise CircuitOpenError(self.name)
+      probe = state == "half_open"
+      if probe:
+          if self._probing:              # 已经有一个试探请求在路上
+              raise CircuitOpenError(self.name)
+          self._probing = True           # 检查和置位之间没有 await：同一个事件循环里的其他协程插不进来
+      try:
+          result = await fn()            # 唯一的切换点：试探请求在这里等，别的协程被上面的检查挡住
+      except Exception as e:
+          ...                            # 计入失败；试探失败则重新打开、重新计时
+      finally:
+          if probe:
+              self._probing = False      # 成功、失败、被取消都要复位
+      ...
+  ```
+
+  为什么一个布尔标志就够、不需要锁？协程只会在 `await` 处切换。练习 (c)（加分题）让你自己实现一遍，测试用 `asyncio.gather` 在半开时同时发 50 个请求，证明只有 1 个打到下游。
+
+**多个 worker 进程共享一个熔断器。** 上面的熔断器在进程内存里。服务通常跑着很多个 worker 进程：进程 A 已经连续失败、熔断了，进程 B、C 还各自要再失败 `failure_threshold` 次才会熔断 —— 下游已经挂了，你还要再往它身上打一批请求；每个新扩容出来的进程也都从 closed 开始重新试错。`agentkit.distributed.SQLiteCircuitBreaker` 是同一个状态机，只是失败计数、打开时间、"谁在试探"都存在一个所有进程共用的 SQLite 文件里：
+
+```python
+from agentkit.distributed import SQLiteCircuitBreaker
+
+llm = ResilientLLM(primary, [backup], max_attempts=2,
+                   breaker_factory=lambda model: SQLiteCircuitBreaker("runs/breakers.db", model,
+                                                                      failure_threshold=3, reset_timeout=30))
+```
+
+Demo 场景 2 的 B 部分用真实进程验证了它：坏掉的主模型是另一个进程（`services.py`，每次返回 503，自己给调用计数），每个 worker 是 `demo.py` 再起的一个进程（`OpenAICompatLLM` → 主模型，每个请求最多尝试 2 次）。主模型服务统计到的调用次数：
+
+| 进程 | 熔断器 | 打了坏掉的主模型几次 |
+|---|---|---|
+| A（第一个发现故障的） | 共享 | 6（3 个请求 × 2 次尝试后熔断，第 4 个请求快速失败） |
+| B（A 退出后才启动） | 共享 | **0**：第一次调用就快速失败，直接走备用模型 |
+| B′（对照） | 各自内存里的 `CircuitBreaker` | 6：自己再撞 3 个请求才熔断 |
+| C（主模型修好、过了 `reset_timeout` 之后） | 共享 | 4：第 1 个请求就是半开试探，成功后熔断器关闭 |
+
+半开时的"只放一个试探"跨进程也要成立：内存里的布尔标志别的进程看不见，所以 `SQLiteCircuitBreaker` 用一个带过期时间的**试探租约**（`probe_until`）—— 在一个写事务里检查并占住它的进程去试探，其余进程继续快速失败；试探者如果中途崩溃，租约过期后别的进程可以接着试，不会永远卡在半开。`tests/test_distributed.py` 里有两个对应的测试：另一个真实子进程把熔断器打开后，本进程第一次调用就快速失败、主模型调用次数为 0；两个各自持有连接的实例（和两个进程一样只通过文件共享状态）半开时只放行一个试探。局限：SQLite 只能在一台机器上共享；多台机器时把熔断放到模型网关层（第 29 课）或 Redis。
 
 ### 问题 3：Agent 死循环，一晚上烧掉一大笔钱
 
@@ -279,10 +349,13 @@ C 是**练习 (a) `LoopGuard`**。本题最重要的知识点是：**计数必�
 ```python
 def save(self, state: RunState) -> None:
     path = self._path(state.run_id)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    # 临时文件名必须唯一：两个进程同时保存同一个 run 时，固定的 .tmp 会互相踩
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    tmp.write_text(state.to_json(indent=2), encoding="utf-8")
     os.replace(tmp, path)   # 原子替换：崩溃时文件要么是旧的完整版本，要么是新的完整版本
 ```
+
+原子替换只保证"文件不会写坏"，不保证"不会被覆盖"：两个进程都以为自己在处理同一个 run 时，后写的那个悄悄覆盖先写的。所以 `FileCheckpointer` 适合"同一时刻只有一个进程处理一个 run"（本课 Demo 场景 3：进程 1 死了，进程 2 才接手）；多个 worker 可能抢同一个 run 时，要用带版本号和 fencing token 的检查点（见下面的"生产级升级"）。
 
 这就是**持久化执行（durable execution）** 的核心思想。和业界方案的对照：
 
@@ -294,11 +367,35 @@ def save(self, state: RunState) -> None:
 
 注意最后一行：**所有方案都要求有副作用的操作是幂等的。** 为什么？见下一张卡片。
 
-> 生产级升级：文件换成 Postgres / Redis；用一个后台任务扫描"状态为 running 但心跳过期"的运行来触发恢复，并用租约保证同一时刻只有一个实例在恢复它（[第 13 课](../13_distributed_concurrency/README.md)）；发布时先"排空"再停机（[第 16 课：发布与运维](../16_release_ops/README.md)）。
+**谁来触发恢复？** Demo 里是我们手动启动进程 2。生产中要自动化："有个进程死了，它手上的运行由别人接着跑"，而且同一时刻只能有一个进程在恢复它。这套机制在 `agentkit.distributed` 里是真实实现的（[第 13 课](../13_distributed_concurrency/README.md)详讲），核心是**租约**：
+
+- 运行以任务的形式放进持久化队列，worker 领取任务不是"拿走"而是"借走一段时间"（租约），`run_worker` 给每个任务起一个心跳协程定期续租；
+- 持有者崩溃、卡死或被暂停，心跳就停了。任何 worker 下一次领取任务时，`SQLiteJobQueue.claim` 在**同一个写事务**里先回收过期的租约：
+
+  ```python
+  rows = conn.execute("SELECT id, attempts, max_attempts, worker_id FROM agent_jobs "
+                      "WHERE status = 'leased' AND lease_until < ?", (now,)).fetchall()
+  # 还有尝试次数 → 退避后放回队列；次数用尽 → 死信（一个每次都让 worker 崩溃的"毒消息"最多害死 max_attempts 个 worker）
+  ```
+
+- 接手的 worker 用 `AgentJobHandler` 执行任务：发现这个 run 已经有检查点，就调用 `agent.resume(run_id)` 从断点继续，而不是从头再来；
+- 被暂停后又醒过来的旧持有者（"僵尸"）还以为自己持有任务。每次领取都会发一个全局递增的 fencing token，检查点和任务状态的写入都带着它，对不上就拒绝 —— 所以检查点要换成带版本号 CAS 和 fence 的 `SQLiteCheckpointer`。
+
+  ```python
+  # 每个 worker 进程里（python -m agentkit.distributed.worker ...，或用 WorkerPool 一次拉起 N 个）：
+  db = SQLiteDB("runs/jobs.db")                   # 同一个进程里的几个对象共用一个连接
+  queue, ckpt, idem = SQLiteJobQueue(db), SQLiteCheckpointer(db), SQLiteIdempotencyStore(db)
+  for x in (queue, ckpt, idem):
+      await x.setup()                             # 建表
+  agent = Agent(llm, tools, checkpointer=ckpt, idempotency_store=idem)
+  await run_worker(queue, AgentJobHandler(agent, ckpt), worker_id="w1", stop_event=stop, lease_seconds=30)
+  ```
+
+`tests/test_distributed.py` 用真实的进程和信号验证了这几件事：`kill -9` 持有任务的 worker 后，别的进程在租约过期后接手、从检查点继续、工具不会再执行一次；`SIGSTOP` 冻结的僵尸醒来后，它的续租、检查点写入和提交全部被拒绝。发布时先"排空"再停机见[第 16 课：发布与运维](../16_release_ops/README.md)。
 
 > 检查点解决的是"同一个任务在几分钟到几小时内被打断"。如果任务长到一个上下文窗口都装不下（几小时到几天），就需要另一种持久化：用功能清单、进度文件和 git 让一个全新的会话读交接文档后接班，见[第 24 课的长时运行 harness](../24_coding_agents/README.md#13-长时运行agent-每次醒来都失忆)。
 
-> 🏭 **生产版**：本课的文件检查点和内存幂等存储都是单进程的教学版。多实例部署时，检查点换成带版本号 CAS 和 fencing 的 Postgres、幂等存储换成 Redis，见[第 26 课](../26_state_and_queues/README.md)；跨天等待审批、需要定时唤醒的流程交给 Temporal 这类持久化执行引擎，见[第 27 课](../27_durable_workflows/README.md)；本课的超时只能让调用方不再等待，线程本身杀不掉，能真正取消的异步运行时见[第 30 课](../30_async_runtime/README.md)。
+> 🏭 **生产版**：单机多进程时，本课 Demo 用的 `SQLiteIdempotencyStore`、`SQLiteCircuitBreaker`，以及第 13 课的 `SQLiteCheckpointer` / `SQLiteJobQueue` 已经是真实的跨进程实现；多台机器时，检查点换成带版本号 CAS 和 fencing 的 Postgres、幂等存储换成 Redis，接口相同，见[第 26 课](../26_state_and_queues/README.md)；跨天等待审批、需要定时唤醒的流程交给 Temporal 这类持久化执行引擎，见[第 27 课](../27_durable_workflows/README.md)。关于超时：`async def` 工具超时会被真正取消；普通同步函数在线程池里执行，超时后调用方不再等它，但线程杀不掉；`@tool(isolation="process")` 在子进程里执行，超时直接 kill（[第 30 课](../30_async_runtime/README.md)详讲取消语义）。
 
 ### 问题 5：恢复之后，客户收到了两笔退款
 
@@ -344,30 +441,46 @@ def idempotency_key(self) -> str:
 
 `tool_call_id` 由模型生成、存在检查点里，恢复后不会变，所以重放时能命中；模型在另一步里再决定建一张工单，是一个新的 `call_id`，不会被误去重。Temporal 官方文档给出的建议如出一辙：用 Workflow Run ID + Activity ID 组合成幂等键。**千万不要在工具内部用 `uuid4()` 现生成幂等键**：每次执行都生成新的，重放时 key 变了，等于没有。
 
-`ToolRegistry.execute` 只对 `write` / `dangerous` 工具启用幂等（读操作天然幂等，缓存它反而会让恢复后读到过期数据）：
+工具执行器只对 `write` / `dangerous` 工具启用幂等（读操作天然幂等，缓存它反而会让恢复后读到过期数据）：执行前 `get(key)`，命中就直接返回上次的结果；成功后 `put(key, result)`。
 
 ```python
-agent = Agent(llm, tools, checkpointer=FileCheckpointer("runs"), idempotency_store=IdempotencyStore())
+from agentkit.distributed import SQLiteIdempotencyStore
+
+store = SQLiteIdempotencyStore("runs/idempotency.db")
+await store.setup()   # 建表
+agent = Agent(llm, tools, checkpointer=FileCheckpointer("runs/checkpoints"), idempotency_store=store)
 ```
 
-Demo 场景 3 会**真的杀掉一个子进程**（`os._exit`，不做任何清理）来复现这个窗口：没有幂等保护时，工单系统里出现两张一模一样的工单；换成持久化的幂等存储后只有一张。注意 agentkit 自带的 `IdempotencyStore` 在内存里，进程一崩就没了，恰恰在最需要它的时候失效，所以 Demo 里用了一个写文件的 `FileIdempotencyStore`。
+**幂等存储必须在"接手的那个进程"也看得到的地方。** agentkit 自带的 `IdempotencyStore` 是内存里的一个 dict，进程一崩它就跟着没了，恰恰在最需要它的时候失效。自己写一个"读 JSON 文件 → 改 → 写回"的版本也不行：两个进程同时读到旧内容、各自加一条再写回，后写的覆盖先写的（丢更新）；固定的 `.tmp` 临时文件名还会让两个进程互相踩。`SQLiteIdempotencyStore` 把记录放在 SQLite 表里，`put` 是一条事务里的 `INSERT OR IGNORE`（两个进程几乎同时成功时，先写入的结果为准）。
 
-方案 B 的写法（示意代码，`payments` 代表你的支付服务客户端）：
+Demo 场景 3 用真实的进程复现这个窗口：外部的工单系统是另一个进程（`services.py`）；进程 1 里的 Agent 调用 `create_ticket`（真的发 HTTP 请求建单），然后**真的死掉**（`os._exit(137)`，不执行任何清理）；进程 2 是一个全新的进程，用同一个 `run_id` 从检查点恢复。工单数来自工单系统自己的记录：
+
+| 用例 | 进程 1 死在哪里 | 保护 | 工单数 |
+|---|---|---|---|
+| 1 | 工具执行完、检查点写入前 | 无 | 2 ❌ |
+| 2 | 同上（幂等记录已写） | `SQLiteIdempotencyStore` | 1 ✅ 进程 2 命中幂等记录，工具没有再执行 |
+| 3 | 工具内部：下游已建单、幂等记录还没写 | `SQLiteIdempotencyStore` | 2 ❌ 调用方的幂等存储无能为力 |
+| 4 | 同上 | 再把 `ctx.idempotency_key` 作为 `Idempotency-Key` 头传给下游 | 1 ✅ 工单系统认出同一个 key，返回原来的工单 |
+
+用例 3 就是方案 A 表格里说的缺点："副作用完成后、记录写入前崩溃，仍会重复"。用例 4 是方案 B 的写法 —— 下游在自己的存储里"执行操作 + 记录 key"，同一个 key 第二次到来直接返回上次的结果：
 
 ```python
 @tool(risk="write")
-def create_refund(order_id: str, amount: float, ctx: ToolContext) -> str:
-    """发起退款"""
-    return payments.refund(order_id, amount, idempotency_key=ctx.idempotency_key)
+async def create_ticket(title: str, ctx: ToolContext) -> str:
+    """创建工单"""
+    async with httpx.AsyncClient() as http:
+        r = await http.post(f"{TICKETS_URL}/tickets", json={"title": title},
+                            headers={"Idempotency-Key": ctx.idempotency_key})   # 同一次调用重放时 key 不变
+    return f"工单已创建：{r.json()['id']}"
 ```
 
 这正是 Stripe 等支付 API 支持 `Idempotency-Key` 请求头的原因。
 
-> 生产级升级：幂等存储用 Redis（`SET key value NX` 加过期时间）或数据库唯一索引；并发场景下的去重、分布式锁、乐观锁见[第 13 课](../13_distributed_concurrency/README.md)。
+> 生产级升级：单机多进程用 `SQLiteIdempotencyStore`（本课 Demo）；多台机器用 Redis（`SET key value NX` 加过期时间）或数据库唯一索引（第 26 课）。注意它只记"成功之后"的结果：两个进程**同时**执行同一个调用（僵尸 worker 和接手者撞在一起）时两边都查不到记录、都会执行，所以真正有副作用的下游还是要自己认幂等键；并发场景下的去重、租约、fencing 见[第 13 课](../13_distributed_concurrency/README.md)。
 
 ### 问题 6：审批要等好几个小时
 
-**场景**：报销 Agent 处理金额超过 5000 元的单据需要主管审批。主管平均 3 小时后才处理，高峰每小时新增 300 单待审批。如果每一单都让一个线程阻塞等待，稳态下同时挂着约 900 个线程；而且这 3 小时里服务只要发布一次，所有等待中的审批就全部丢失。
+**场景**：报销 Agent 处理金额超过 5000 元的单据需要主管审批。主管平均 3 小时后才处理，高峰每小时新增 300 单待审批。如果每一单都在内存里挂着等（一个线程或一个协程），稳态下同时挂着约 900 个；协程很便宜，挂 900 个本身不是问题，真正的问题是：这 3 小时里服务只要发布一次，所有等待中的审批就全部丢失。
 
 **为什么难**：等待时间不可预测（5 分钟到第二天）；等待期间服务会重启、会扩缩容；审批通过后，执行的必须**恰好是**当初提交审批的那个操作，参数不能被改。
 
@@ -403,14 +516,14 @@ sequenceDiagram
 
 ```python
 agent = Agent(llm, [refund], hooks=[PermissionPolicy()], checkpointer=FileCheckpointer("runs/approvals"))
-res = agent.run("订单 A1 退款 99 元")
+res = await agent.run("订单 A1 退款 99 元")
 res.status            # 'paused'
 res.pending_approval  # ToolCall(id='call_1', name='refund', arguments='{"order_id": "A1", "amount": 99.0}')
 
 # ……审批系统通知主管。几小时后，可能是另一个进程、另一台机器：
 agent2 = Agent(llm, [refund], hooks=[PermissionPolicy()], checkpointer=FileCheckpointer("runs/approvals"))
-res2 = agent2.approve(res.run_id, approved=True,   # 执行退款并继续；approved=False 则把"未获批准"告诉模型
-                      by="zhang.manager", comment="核对订单无误")   # 谁批的、为什么批，写入审批记录
+res2 = await agent2.approve(res.run_id, approved=True,   # 执行退款并继续；approved=False 则把"未获批准"告诉模型
+                            by="zhang.manager", comment="核对订单无误")   # 谁批的、为什么批，写入审批记录
 ```
 
 审批按 `tool_call_id` 记录，调用参数随检查点保存，所以批准的就是当初那次调用，模型没有机会在批准后改参数。"审批什么、谁来批、如何避免审批疲劳"是第 09 课的内容。
@@ -422,66 +535,108 @@ res2 = agent2.approve(res.run_id, approved=True,   # 执行退款并继续；app
 ## 3. 动手：运行 Demo
 
 ```bash
-python lessons/08_reliability/demo.py --offline   # 离线剧本，无需 API key，结果确定
-python lessons/08_reliability/demo.py             # 真实模型（约 30 秒，十几次模型调用）
+python lessons/08_reliability/demo.py --offline            # 离线剧本，无需 API key（约 20 秒）
+python lessons/08_reliability/demo.py                      # 真实模型（约 1 分钟，二十次左右模型调用）
+python lessons/08_reliability/demo.py --offline --only 1   # 只跑场景 1；--keep 把检查点、SQLite 文件留在 runs/08_reliability/
 ```
 
-真实模式下，场景 1 在真实模型外面套了一层故障注入（`FlakyLLM`：前两次调用抛 429）；场景 2 用一个故意不存在的模型名模拟主模型不可用，备用模型读取 `.env` 里的 `LLM_FALLBACK_MODEL`。以下是真实模型的输出节选：
+Demo 一开始把 [services.py](services.py) 拉起为**一个独立的进程**，扮演三个下游：容量有限的模型网关（场景 1）、一个坏掉的主模型（场景 2B）、一个工单系统（场景 3）；演示结束时关掉它。场景 2B、3 还会再启动若干个 `demo.py` 子进程扮演 worker —— 进程之间不共享内存，只通过 HTTP 和 SQLite 文件打交道。惊群实验、跨进程熔断、崩溃恢复这三部分的数字都来自"另一个进程"自己的记录，两种模式下都一样。
 
-**场景 1：重试（对应问题 1）**
+真实模式下，场景 1 在真实模型外面套了一层故障注入（`FlakyLLM`：前两次调用抛 429）；场景 2A 用一个故意不存在的模型名模拟主模型不可用，备用模型读取 `.env` 里的 `LLM_FALLBACK_MODEL`。以下是一次真实模型运行的输出节选（MacBook 8 核 / 8GB，负载约 4）：
+
+**场景 1：重试 + 惊群实验（对应问题 1）**
 
 ```text
 ▶ Agent → ResilientLLM → FlakyLLM（前两次抛 429）→ 模型
-   📝 retry gpt-5.5 #1 after 0.37s: Error code: 429 - Rate limit reached, please retry later
-   📝 retry gpt-5.5 #2 after 0.47s: Error code: 429 - Rate limit reached, please retry later
-   ✅ 状态=completed，底层共调用 3 次，总耗时 3.6s
+   📝 retry gpt-5.5 #1 after 0.29s: Error code: 429 - Rate limit reached, please retry later
+   📝 retry gpt-5.5 #2 after 0.49s: Error code: 429 - Rate limit reached, please retry later
+   ✅ 状态=completed，底层共调用 3 次，总耗时 4.4s
 ▶ 对照：如果错误是 400（参数错误），重试有用吗？
    底层调用次数：1（没有重试），状态=failed，给用户的回复：抱歉，服务暂时不可用，请稍后再试。
+▶ 为什么一定要加抖动？真实实验：500 个客户端在同一时刻打同一个网关进程
+   每 100ms 到达网关的请求数（一个字符 = 100ms，█ = 500 个，· = 0 个；数据来自网关日志）：
+     固定间隔 0.5s      █····█····▇····▆····▅····▄····▄····▃····▂····▁
+                        前 1 秒：500 0 0 0 0 450 0 0 0 0
+     指数退避，无抖动   ██·▇···▆·······▅·········▄·········▄·········▃·········▂·········▁
+                        前 1 秒：500 450 0 400 0 0 0 350 0 0
+     指数退避 + 全抖动  █▆▄▂▂▂▁▁▁▁▁▁▁▁▁▁
+                        前 1 秒：948 343 197 112 115 75 58 23 36 34
+
+   策略                总请求  被 429  重试最密的 10ms  全部成功  一半成功  网关利用率
+   固定间隔 0.5s       2750    2250    324              4.67s     2.64s     21%
+   指数退避，无抖动    2750    2250    340              6.66s     2.64s     15%
+   指数退避 + 全抖动   2001    1501    76               1.64s     0.61s     61%
 ```
 
-👀 观察：Agent 对两次 429 毫无感知；400 一次都没有重试。后面还有 1000 个客户端的抖动模拟直方图。
+👀 观察：Agent 对两次 429 毫无感知；400 一次都没有重试。惊群实验里，固定间隔那一行是一排整齐的"墙"：每一堵都是几百个重试挤在同一个 10ms 里，网关只接得住 50 个；全抖动那一行是一条连续下降的曲线。全抖动第一个 100ms 的请求反而最多（948 个）：`base=0.1s` 时第一次重试的等待在 [0, 0.1s] 里随机，大部分也落在这 100ms 内 —— 但它们是摊开到达的，最密的 10ms 只有 76 个。
+
+实验的两个设计细节：① 客户端没有用 httpx，而是每个客户端一条 keep-alive 连接、手工拼请求字节。实测 httpx 在一个进程里每秒只能发出一两百个请求，500 个"同时"发出的请求被它自己的 CPU 开销摊开到好几秒，惊群还没到网关就被客户端抹平了；② 网关用标准库 asyncio 手写，而不是 FastAPI，理由相同：服务端每个请求多花 1ms，500 个同时到达的请求就会被它自己摊开到半秒。**测量工具本身不能成为被测现象的一部分。**
 
 **场景 2：熔断 + 降级（对应问题 2）**
 
 ```text
+▶ A. 进程内的熔断器（CircuitBreaker）：真实时钟 —— 真的等 reset_timeout 秒，而不是拨快一个假时钟
 ▶ 请求 1：用一句话解释：什么是熔断器？
-   熔断器：closed → closed    实际回答的模型：gpt-5.6-luna    耗时 3.9s
+   熔断器：closed → closed    主模型被调用 1 次    实际回答的模型：gpt-5.6-luna    耗时 3.8s
 ▶ 请求 2：用一句话解释：什么是降级？
-   熔断器：closed → open    实际回答的模型：gpt-5.6-luna    耗时 1.6s
+   熔断器：closed → open    主模型被调用 1 次    实际回答的模型：gpt-5.6-luna    耗时 3.5s
 ▶ 请求 3：用一句话解释：什么是重试预算？
-   熔断器：open → open    实际回答的模型：gpt-5.6-luna    耗时 2.4s
+   熔断器：open → open    主模型被调用 0 次    实际回答的模型：gpt-5.6-luna    耗时 3.1s
    📝 fallback from gpt-5.5-does-not-exist: 熔断器 [gpt-5.5-does-not-exist] 处于打开状态，快速失败
-▶ ⏩ 31 秒过去了，主模型已经修好。熔断器进入 half_open，放一个试探请求过去……
+▶ ⏳ 真的等熔断器进入半开（reset_timeout=8.0s，从它打开的那一刻算起）……
+   又等了 1.4s，主模型已经修好。熔断器现在是 half_open，放一个试探请求过去……
 ▶ 请求 4：用一句话解释：什么是幂等？
-   熔断器：half_open → closed    实际回答的模型：gpt-5.5    耗时 2.1s
+   熔断器：half_open → closed    主模型被调用 1 次    实际回答的模型：gpt-5.5    耗时 1.6s
+
+▶ B. 跨进程共享的熔断器（SQLiteCircuitBreaker）：每个 worker 都是一个独立的操作系统进程
+▶ 进程 A：第一个发现故障的 worker
+      [进程 A pid=43836] 请求 3：熔断器 closed → open    回答来自 backup-model
+      [进程 A pid=43836] 请求 4：熔断器 open → open    回答来自 backup-model
+▶ 进程 B：另一个 worker（A 已经退出，B 只看得到那个 SQLite 文件）
+      [进程 B pid=43839] 请求 1：熔断器 open → open    回答来自 backup-model
+      ...
+▶ 主模型服务自己统计的调用次数（每个请求最多尝试 2 次）
+   进程 A（共享熔断器）         打了主模型 6 次：连续 3 个请求失败（每个 2 次尝试）后熔断器打开，之后的请求不再打它
+   进程 B（共享熔断器）         打了主模型 0 次 ✅ 第一次调用就快速失败，直接走备用模型
+   进程 B′（各自的内存熔断器）   打了主模型 6 次：它得自己再失败 3 个请求才会熔断
+   进程 C（恢复后）             打了主模型 4 次：每个请求 1 次，第 1 个是试探，成功后熔断器关闭（最终状态：closed）
 ```
 
-👀 观察：请求 3 根本没有调用主模型；请求 4 的试探成功后流量回到主模型。熔断器用的是注入的假时钟，所以不用真等 30 秒。
+👀 观察：请求 3 根本没有调用主模型；请求 4 的试探成功后流量回到主模型。A 部分用的是真实时钟：离线模式 `reset_timeout=1.5` 秒，真实模型 8 秒 —— 必须比备用模型回答一次的耗时长。我们第一次用 1.5 秒跑真实模型时，备用模型一次回答要 2-3 秒，熔断器在请求 2 还没结束时就已经进入半开，请求 3 变成了又一次（失败的）试探，"打开期间快速失败"根本看不到。**只用假时钟的测试发现不了这个问题。**
 
 **场景 3：崩溃恢复（对应问题 4、5）**
 
 ```text
-▶ 【没有幂等保护】启动子进程运行 Agent
-      [子进程] 工具已执行：工单已创建：T-1001（3 楼打印机卡纸，优先级 high）
-      [子进程] 💥 就在此刻进程被 kill -9 —— 工具结果还没来得及写进检查点
-   子进程退出码：137（被杀死）
-▶ 新进程接手：用同一个 run_id 从检查点恢复（agent.resume）
-   ❌ 外部工单系统里现在一共有 2 张工单：T-1001, T-1002
-▶ 【有幂等保护（持久化的 IdempotencyStore）】启动子进程运行 Agent
-   ...
-   ✅ 外部工单系统里现在一共有 1 张工单：T-1001
+▶ 用例 1：没有幂等保护
+      [进程 1 pid=43846] 工具已执行：工单已创建：T-1001（3 楼打印机卡纸，优先级 high）
+      [进程 1] 💥 就在此刻进程死亡（os._exit(137)）—— 工具结果还没来得及写进检查点
+   进程 1 退出码：137（被杀死）
+   工单系统（另一个进程）里已有 1 张工单；检查点里最后一条消息是 role=assistant，带 1 个工具调用、没有工具结果 → 看起来'还没执行'
+      [进程 2 pid=43860] 恢复后状态：completed    🤖 已为你提交 IT 工单：T-1002。
+   进程 2 退出码：0    ❌ 工单系统里现在一共有 2 张工单：T-1001, T-1002
+▶ 用例 2：SQLiteIdempotencyStore（所有进程共享的幂等记录）
+      ...
+      [进程 2] ♻️  幂等存储命中 ticket-demo:call_1eC2O6CQMKzwWpZBgOAlgCZv → 直接返回上次的结果，工具没有再执行
+   进程 2 退出码：0    ✅ 工单系统里现在一共有 1 张工单：T-1001
+▶ 用例 3：同上，但崩在更窄的窗口：下游已经建单、幂等记录还没写
+      ...
+   进程 2 退出码：0    ❌ 工单系统里现在一共有 2 张工单：T-1001, T-1002
+▶ 用例 4：再把幂等键传给下游（Idempotency-Key 请求头）
+      ...
+      [进程 2] 工单系统认出了同一个 Idempotency-Key（ticket-demo:call_PZrV9sxB7ErMCVyiQwnredPU）→ 返回原来的 T-1001，没有新建
+   进程 2 退出码：0    ✅ 工单系统里现在一共有 1 张工单：T-1001
 ```
 
-👀 观察：打开 `runs/08_reliability/crash_plain/checkpoints/ticket-demo.json`，看崩溃时检查点里最后一条消息；再看 `crash_idempotent/idempotency.json` 里的 key 长什么样。
+👀 观察：加上 `--keep` 运行，打开 `runs/08_reliability/crash_1/checkpoint_at_crash.json`（进程 1 死亡那一刻的检查点副本；`checkpoints/` 里的那份已经被进程 2 恢复完成后的状态覆盖了），看最后一条消息；再用 `sqlite3 runs/08_reliability/crash_2/idempotency.db "select key from idempotency"` 看幂等键长什么样（`run_id:call_id`）。
 
 **场景 4：预算（对应问题 3）**
 
 ```text
    状态=stopped  stop_reason=budget_exceeded  模型调用 4 次  工具执行 3 次
 ▶ 链路追踪（第 10 课详讲）—— 一眼看出它在原地打转：
-   agent.run  8411ms  tokens=1978→88  status=stopped steps=4 cost=$0.00335
-   ├─ llm.chat  1622ms  tokens=409→22  → tool_calls: check_report_status
-   ├─ tool.check_report_status  3ms  ok
+   agent.run  6762ms  tokens=1978→88  status=stopped steps=4 cost=$0.00335
+   ├─ llm.chat  1724ms  tokens=409→22  → tool_calls: check_report_status
+   ├─ tool.check_report_status  0ms  ok
    ...
    每一步的输入 token：409 → 466 → 523 → 580
 ```
@@ -495,16 +650,17 @@ python lessons/08_reliability/demo.py             # 真实模型（约 30 秒，
 **(a) `LoopGuard`：检测 Agent 死循环（问题 3）**
 
 - 任务：实现 `normalize_arguments`（参数 JSON 归一化）和 `LoopGuard.before_tool`：同一工具 + 相同参数在最近 `window` 次调用中出现 `>= max_repeats` 次时，第一次返回拒绝理由提醒模型换思路，之后再超限抛 `StopRun("loop_detected")`。
-- 提示：计数存在 `state.metadata` 上；被拒绝的那次调用也要计入窗口；`'{"a":1,"b":2}'` 和 `'{"b": 2, "a": 1}'` 是同一个调用。
+- 提示：计数存在 `state.metadata` 上；被拒绝的那次调用也要计入窗口；`'{"a":1,"b":2}'` 和 `'{"b": 2, "a": 1}'` 是同一个调用。两个函数都是普通函数（钩子方法可以是同步的，纯计算不需要 `async`）。
 
 **(b) `retry_with_budget`：带全局预算和截止时间的重试（问题 1）**
 
-- 任务：实现 `RetryBudget.on_request` / `try_acquire` 和 `retry_with_budget`（单请求上限 + 全局预算 + 截止时间三道闸门）。
-- 提示：docstring 里列出了判断顺序。注定因截止时间而放弃的重试**不应消耗令牌**；放弃时抛出**原始异常**，调用方原有的错误处理（比如降级）不受影响。
+- 任务：实现 `RetryBudget.on_request` / `try_acquire`（普通函数）和 `async def retry_with_budget`（单请求上限 + 全局预算 + 截止时间三道闸门）。
+- 提示：docstring 里列出了判断顺序。每次尝试都 `await fn()`（`fn` 每次返回一个新协程），退避用 `await sleep(delay)`；注定因截止时间而放弃的重试**不应消耗令牌**；放弃时抛出**原始异常**，调用方原有的错误处理（比如降级）不受影响；只捕获 `Exception`，让 `asyncio.CancelledError` 穿透（测试会取消一个进行中的请求，检查它没有被重试）。
 
 **(c) 加分题 `SingleProbeCircuitBreaker`：半开时只放行 1 个试探请求（问题 2）**
 
-- 提示：调用 `fn()` 时不要持有锁；无论试探成功失败，都在 `finally` 里复位 `_probing`。没做时它的测试会自动跳过。
+- 任务：实现 `async def call(fn)`。测试在半开时用 `asyncio.gather` 同时发 50 个请求，试探请求挂在 `await` 上，要求只有 1 个打到下游、49 个快速失败；还会取消进行中的试探，检查下一个请求能接着试探。
+- 提示：不需要锁 —— "检查 `_probing`"和"置位"之间不能有 `await`；无论试探成功、失败还是被取消，都在 `finally` 里复位 `_probing`。没做时它的测试会自动跳过。
 
 验证：
 
@@ -513,7 +669,7 @@ make lesson N=08                                                           # 跑
 AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/08_reliability -v   # 对照参考答案
 ```
 
-测试全部离线，注入了假时钟、假 sleep 和固定随机种子，结果确定，不到 1 秒跑完。
+测试全部离线，注入了假时钟、假的 async sleep 和固定随机种子；并发用 `asyncio.gather` 真实发起，断言的是确定性的量（调用次数、谁被拒绝），不靠墙钟。结果确定，不到 1 秒跑完。
 
 ## 5. 深入（给有余力的你）
 
@@ -521,7 +677,7 @@ AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/08_reliability -v   # 对
 - **客户端自适应限流**：Google SRE 书 Handling Overload 一章描述了一种做法：客户端统计最近两分钟的请求数和被后端接受的请求数，请求数达到接受数的 K 倍（通常 K=2）后，开始在本地按概率拒绝新请求。在 LLM 场景下，可以用它在供应商限流时把一部分流量提前导向备用模型。
 - **LLM 特有的"软失败"**：HTTP 200 不代表成功。`finish_reason == "length"`（输出被截断）、JSON 不符合 schema、空回复、工具参数校验失败，都要"带着错误信息重发"，而不是原样重试（第 03 课的错误即观察、第 06 课的 `complete_json`）。
 - **流式输出中途断开**：用户已经看到半段回答时，不能简单地重试整个请求。常见做法是分开设置"首 token 超时"（这时重试是安全的）和"总时长超时"，中断后在 UI 上标记并提供"重新生成"。
-- **故障注入**：没有演练过的恢复流程等于没有恢复流程。Demo 里的 `FlakyLLM` 和 `CrashAfterTool` 就是最小的故障注入；生产中要在预发环境定期注入 429、超时、进程崩溃，并盯住重试率、熔断次数、降级比例、`budget_exceeded` 比例这些指标（第 10 课）。
+- **故障注入**：没有演练过的恢复流程等于没有恢复流程。Demo 里的 `FlakyLLM`、`CrashAfterTool`、会返回 429 / 503 的 `services.py` 就是最小的故障注入；`agentkit.distributed.WorkerPool` 还能对真实的 worker 进程发 `kill -9` / `SIGSTOP` / `SIGTERM`（第 13 课）。生产中要在预发环境定期注入 429、超时、进程崩溃，并盯住重试率、熔断次数、降级比例、`budget_exceeded` 比例这些指标（第 10 课）。
 - **持久化执行框架**：当流程复杂到需要定时唤醒、多 Agent 协作、跨天等待时，可以考虑 Temporal、LangGraph，或 DBOS、Restate、Inngest 等框架。它们的核心思想和本课一样：**记录每一步、重放而不是重做、副作用必须幂等**。
 
 ## 6. 常见坑与反模式
@@ -533,14 +689,17 @@ AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/08_reliability -v   # 对
 | SDK 重试 + 自己重试 + 网关重试 | 重试次数相乘，故障时流量翻几十倍 | 只在一层重试（`max_retries=0`） |
 | 只有单请求重试上限 | 下游宕机时流量直接翻 3 倍 | 加全局重试预算 |
 | 内层超时 × 重试次数 > 外层超时 | 最后几次重试注定被取消 | 截止时间传播，按剩余时间决定是否重试 |
-| 单个请求的 400 也计入熔断 | 个别用户的问题让所有人被降级 | 只统计反映下游健康的错误 |
+| 单个请求的 400 也计入熔断 | 个别用户的问题让所有人被降级 | 只统计反映下游健康的错误（`record_if`） |
+| 每个 worker 进程各自一个熔断器 | 下游挂了，N 个进程各自再撞 N × 阈值次；新扩容的进程从头再撞 | 共享熔断状态（单机 `SQLiteCircuitBreaker`，多机放到网关层） |
 | 悄悄降级 | 质量下降一周没人发现 | 降级事件打点、告警；备用模型跑评估集 |
 | 只设 `max_steps` | 一步 10 万 token 照样烧钱 | 多维预算 |
 | 在 hook 实例上存"本次运行"的状态 | 不同用户的数据串在一起；恢复后状态丢失 | 存在 `state.metadata` 上（JSON 可序列化） |
 | 直接覆盖写检查点文件 | 写到一半崩溃，连旧进度都丢了 | 先写临时文件，再原子替换 |
 | 幂等键在工具内部用 `uuid4()` 生成 | 重放时 key 变了，幂等形同虚设 | 用稳定的 `run_id:call_id` |
-| 幂等存储放在内存里 | 进程崩溃时它也一起丢了 | Redis / 数据库，并把 key 传给下游 |
-| 有检查点，但从没测过恢复 | 真出事才发现恢复路径有 bug | 在测试里模拟崩溃并恢复（Demo 场景 3） |
+| 幂等存储放在内存里 | 进程崩溃时它也一起丢了 | 所有进程共享的存储（`SQLiteIdempotencyStore` / Redis / 数据库），并把 key 传给下游 |
+| 用"读 JSON 文件 → 改 → 写回"做跨进程的幂等存储 | 两个进程同时写，后写的覆盖先写的（丢更新） | 数据库事务 + 唯一键（`INSERT OR IGNORE`） |
+| 用假时钟测完熔断器就上线 | 真实延迟比 `reset_timeout` 还长时，"打开期间快速失败"根本不会发生（Demo 场景 2 实测） | 至少有一个用真实时间、真实下游延迟的端到端演练 |
+| 有检查点，但从没测过恢复 | 真出事才发现恢复路径有 bug | 真的杀掉进程再从检查点恢复（Demo 场景 3、`tests/test_distributed.py`） |
 | 时长预算把"等审批"的时间也算进去 | 批准的操作执行了，用户却收到"超时中止" | 只统计活跃运行时间（`state.active_seconds`） |
 | 中止运行时留下没有结果的 `tool_call` | 下一轮带着这段历史调用模型直接 400 | 给每个未执行的调用补一条"未执行"结果 |
 
@@ -591,7 +750,7 @@ AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/08_reliability -v   # 对
 <details>
 <summary><b>Q6：审批可能要等几个小时，架构上怎么支持？</b></summary>
 
-- 不能阻塞线程：暂停、状态落盘、异步通知、审批后任意实例恢复；
+- 不能在内存里干等（无论线程还是协程，发布一次就全丢了）：暂停、状态落盘、异步通知、审批后任意实例恢复；
 - 审批与具体调用和参数绑定；审批超时按拒绝处理；
 - 预算计时要扣除等待时间；复杂流程可以用工作流引擎的信号机制。
 </details>
