@@ -14,14 +14,17 @@ Anthropic《Building Effective Agents》里最重要的一句话：
     4. orchestrator_workers  编排者-执行者：LLM 动态拆解子任务，并行执行后汇总
     5. evaluator_optimizer   评估-优化：生成 → 评审 → 按意见修改，循环直到合格
     6. agent_as_tool         多 Agent：把一个 Agent 包装成另一个 Agent 的工具（主管-专家模式）
+
+所有步骤都是 async 的：并行模式用 asyncio.gather 真正同时发出请求（有并发上限），
+任何一步被取消（用户断开、超时），整条工作流都会停下来，而不是在后台继续花钱。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
-from typing import Annotated, Callable, Literal, Sequence, TypeVar
+from typing import Annotated, Awaitable, Callable, Literal, Sequence, TypeVar
 
 from pydantic import BaseModel, Field, ValidationError, create_model
 
@@ -30,15 +33,16 @@ from .tools import Tool, ToolContext
 from .types import Message
 
 M = TypeVar("M", bound=BaseModel)
+T = TypeVar("T")
 
 
 # ---------------------------------------------------------------- 基础积木
 
-def complete(llm: LLM, prompt: str, system: str | None = None) -> str:
+async def complete(llm: LLM, prompt: str, system: str | None = None) -> str:
     """单次调用：最简单的 LLM 积木。"""
     messages: list[Message] = [{"role": "system", "content": system}] if system else []
     messages.append({"role": "user", "content": prompt})
-    return llm.chat(messages).content or ""
+    return (await llm.chat(messages)).content or ""
 
 
 def extract_json(text: str) -> str:
@@ -55,7 +59,7 @@ def extract_json(text: str) -> str:
     return text[start : end + 1]
 
 
-def complete_json(llm: LLM, prompt: str, model_cls: type[M], system: str | None = None, max_repairs: int = 2) -> M:
+async def complete_json(llm: LLM, prompt: str, model_cls: type[M], system: str | None = None, max_repairs: int = 2) -> M:
     """结构化输出 + 自动修复：校验失败就把错误信息发回给模型，让它改，最多 max_repairs 次。
 
     这是企业里最常用的模式之一：下游代码需要的是**可靠的数据结构**，不是一段自由文本。
@@ -66,7 +70,7 @@ def complete_json(llm: LLM, prompt: str, model_cls: type[M], system: str | None 
     messages.append({"role": "user", "content": f"{prompt}\n\n只输出一个符合以下 JSON Schema 的 JSON，不要输出任何其他文字：\n{schema}"})
     last_error = ""
     for _ in range(max_repairs + 1):
-        text = llm.chat(messages).content or ""
+        text = (await llm.chat(messages)).content or ""
         try:
             return model_cls.model_validate_json(extract_json(text))
         except (ValidationError, ValueError) as e:
@@ -78,10 +82,10 @@ def complete_json(llm: LLM, prompt: str, model_cls: type[M], system: str | None 
 
 # ---------------------------------------------------------------- 1. 提示链
 
-def chain(steps: Sequence[Callable[[str], str]], text: str, gate: Callable[[int, str], bool] | None = None) -> str:
-    """依次执行每一步，上一步输出是下一步输入。gate(i, output) 返回 False 时提前终止并抛错。"""
+async def chain(steps: Sequence[Callable[[str], Awaitable[str]]], text: str, gate: Callable[[int, str], bool] | None = None) -> str:
+    """依次执行每一步（每一步是 async 函数），上一步输出是下一步输入。gate(i, output) 返回 False 时提前终止并抛错。"""
     for i, step in enumerate(steps):
-        text = step(text)
+        text = await step(text)
         if gate is not None and not gate(i, text):
             raise ValueError(f"第 {i + 1} 步的输出没有通过检查：{text[:200]}")
     return text
@@ -89,21 +93,39 @@ def chain(steps: Sequence[Callable[[str], str]], text: str, gate: Callable[[int,
 
 # ---------------------------------------------------------------- 2. 路由
 
-def route(llm: LLM, text: str, routes: dict[str, str]) -> str:
+async def route(llm: LLM, text: str, routes: dict[str, str]) -> str:
     """让模型从 routes（名称 → 说明）里选一个类别。返回值保证是 routes 的某个 key。"""
     names = tuple(routes)
     Choice = create_model("RouteChoice", route=(Literal[names], ...), reason=(str, ""))  # type: ignore[valid-type]
     options = "\n".join(f"- {k}: {v}" for k, v in routes.items())
-    result = complete_json(llm, f"请把下面的请求分到最合适的类别。\n\n可选类别：\n{options}\n\n请求：{text}", Choice)
+    result = await complete_json(llm, f"请把下面的请求分到最合适的类别。\n\n可选类别：\n{options}\n\n请求：{text}", Choice)
     return result.route  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------- 3. 并行
 
-def parallel(fns: Sequence[Callable[[], str]], max_workers: int = 4) -> list[str]:
-    """并行执行多个独立任务，按输入顺序返回结果。LLM 调用是 I/O 密集型，线程池就够用。"""
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(lambda f: f(), fns))
+async def parallel(fns: Sequence[Callable[[], Awaitable[T]]], max_concurrency: int = 8) -> list[T]:
+    """并行执行多个独立任务（每个是返回协程的函数），按输入顺序返回结果。
+
+    - 真并发：所有任务在同一个事件循环里同时等待模型，不需要线程；
+    - 有上限：max_concurrency 个同时在途，防止一次把网关打出 429（背压）；
+    - 一个失败，全部取消：gather 默认只把第一个异常抛出来、其他任务照跑。这里用 TaskGroup 语义：
+      一个任务出错，其余还没完成的任务立刻取消，不在后台继续花钱。
+    """
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def one(fn):
+        async with sem:
+            return await fn()
+
+    tasks = [asyncio.ensure_future(one(f)) for f in fns]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)  # 等它们真正停下来
+        raise
 
 
 def majority_vote(answers: Sequence[str]) -> str:
@@ -123,14 +145,14 @@ class Plan(BaseModel):
     subtasks: list[str] = Field(description="拆解出的相互独立的子任务，每个子任务是一句完整的指令")
 
 
-def orchestrator_workers(llm: LLM, task: str, worker: Callable[[str], str], max_subtasks: int = 5) -> str:
+async def orchestrator_workers(llm: LLM, task: str, worker: Callable[[str], Awaitable[str]], max_subtasks: int = 5) -> str:
     """编排者动态拆解任务 → 执行者并行处理 → 编排者汇总。
     和 parallel 的区别：子任务不是写死的，而是模型根据具体输入决定的。"""
-    plan = complete_json(llm, f"把下面的任务拆解成最多 {max_subtasks} 个可以并行完成的独立子任务。\n\n任务：{task}", Plan)
+    plan = await complete_json(llm, f"把下面的任务拆解成最多 {max_subtasks} 个可以并行完成的独立子任务。\n\n任务：{task}", Plan)
     subtasks = plan.subtasks[:max_subtasks]
-    results = parallel([lambda s=s: worker(s) for s in subtasks])
+    results = await parallel([lambda s=s: worker(s) for s in subtasks])
     parts = "\n\n".join(f"### 子任务 {i + 1}：{s}\n{r}" for i, (s, r) in enumerate(zip(subtasks, results)))
-    return complete(llm, f"原始任务：{task}\n\n以下是各子任务的结果，请整合成一份完整、连贯、不重复的最终答复：\n\n{parts}")
+    return await complete(llm, f"原始任务：{task}\n\n以下是各子任务的结果，请整合成一份完整、连贯、不重复的最终答复：\n\n{parts}")
 
 
 # ---------------------------------------------------------------- 5. 评估-优化
@@ -140,9 +162,9 @@ class Review(BaseModel):
     feedback: str = Field(description="如果没通过，具体说明要怎么改")
 
 
-def evaluator_optimizer(
-    generate: Callable[[str, str | None], str],
-    evaluate: Callable[[str], Review],
+async def evaluator_optimizer(
+    generate: Callable[[str, str | None], Awaitable[str]],
+    evaluate: Callable[[str], Awaitable[Review]],
     task: str,
     max_rounds: int = 3,
 ) -> tuple[str, list[Review]]:
@@ -152,8 +174,8 @@ def evaluator_optimizer(
     reviews: list[Review] = []
     candidate = ""
     for _ in range(max_rounds):
-        candidate = generate(task, feedback)
-        review = evaluate(candidate)
+        candidate = await generate(task, feedback)
+        review = await evaluate(candidate)
         reviews.append(review)
         if review.passed:
             break
@@ -163,21 +185,22 @@ def evaluator_optimizer(
 
 # ---------------------------------------------------------------- 6. 多 Agent：Agent 即工具
 
-def agent_as_tool(agent, name: str, description: str) -> Tool:
+def agent_as_tool(agent, name: str, description: str, timeout_s: float = 300.0) -> Tool:
     """把一个专家 Agent 包装成工具，交给主管 Agent 调用（supervisor 模式）。
 
     好处：专家有自己独立的 system prompt、工具集和上下文窗口，主管的上下文不会被专家的中间步骤污染。
     注意：身份信息（ctx）要透传给子 Agent，否则子 Agent 会"失去身份"，或被迫让模型传身份（危险）。
     """
 
-    def delegate(
+    async def delegate(
         task: Annotated[str, Field(description="交给该专家的完整任务描述，要包含所有必要的上下文")],
         ctx: ToolContext,
     ) -> str:
         meta = {"tenant_id": ctx.tenant_id, "user_id": ctx.user_id, "roles": list(ctx.roles), "parent_run": ctx.run_id}
-        result = agent.run(task, metadata=meta)
+        result = await agent.run(task, metadata=meta)
         if not result.ok:
             return f"专家 {name} 未能完成任务（{result.status}）：{result.output}"
         return result.output or ""
 
-    return Tool(delegate, name=name, description=description)
+    # 专家要跑好几轮模型，给足时间；主管被取消时，专家的运行也会一起被取消（async 工具可以真取消）
+    return Tool(delegate, name=name, description=description, timeout_s=timeout_s)

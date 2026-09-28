@@ -1,6 +1,6 @@
 [project]
 name = "agentkit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Hello Agent System：企业级 Agent 系统设计训练营——从零手写一个看得懂的教学框架，再用异步运行时与成熟组件（Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar）落地生产"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "pytest-asyncio>=0.24"]
 server = ["fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
 # 第 20 课：同一任务的 DSPy / LangGraph / OpenAI Agents SDK 实现（版本已实测；0.x 的包锁小版本）
 frameworks = [
@@ -38,9 +38,12 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["agentkit", "agentkit.aio", "agentkit.contrib"]
+packages = ["agentkit", "agentkit.distributed", "agentkit.contrib"]
 
 [tool.pytest.ini_options]
 # importlib 模式：允许多个课程目录里都有同名的 test_exercise.py
 addopts = "--import-mode=importlib -q"
+# async def test_... 直接写，不用加装饰器；每个测试一个新的事件循环，互不影响
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests", "lessons", "capstone", "production"]

@@ -13,7 +13,10 @@
 - 改写数据：on_run_start / after_tool / on_final 返回新值
 - 拒绝一次工具调用：before_tool 返回字符串（拒绝原因会作为观察反馈给模型）
 - 中止整个运行：抛 StopRun
-- 暂停等人工：抛 PauseRun（状态会被保存，之后 agent.resume() 继续）
+- 暂停等人工：抛 PauseRun（状态会被保存，之后 await agent.resume() 继续）
+
+每个方法都可以写成普通方法，也可以写成 `async def`（比如要查 Redis / 数据库的限流钩子）：
+Agent 会自动 await。纯计算的钩子（权限表、预算、脱敏）写成普通方法就好。
 """
 
 from __future__ import annotations

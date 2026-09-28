@@ -27,7 +27,7 @@ from .types import Message, Usage
 class RunState:
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     messages: list[Message] = field(default_factory=list)
-    status: str = "running"  # running / completed / paused / max_steps / stopped / failed
+    status: str = "running"  # running / completed / paused / max_steps / stopped / failed / cancelled
     step: int = 0
     usage: Usage = field(default_factory=Usage)
     cost_usd: float = 0.0

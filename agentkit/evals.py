@@ -16,13 +16,14 @@ import json
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Awaitable, Callable, Iterable, Union
 
 from pydantic import BaseModel, Field
 
 from .agent import Agent, RunResult
 from .llm import LLM
-from .workflows import complete_json
+from .tools import maybe_await
+from .workflows import complete_json, parallel
 
 
 @dataclass
@@ -41,7 +42,8 @@ class Check:
     detail: str = ""
 
 
-Grader = Callable[[EvalCase, RunResult], list[Check]]
+# 评分器：普通函数（规则评分，纯计算）或 async 函数（LLM 评委，要调用模型）都可以
+Grader = Callable[[EvalCase, RunResult], Union[list[Check], Awaitable[list[Check]]]]
 
 
 def is_subsequence(expected: list[str], actual: list[str]) -> bool:
@@ -100,12 +102,12 @@ def llm_judge(llm: LLM, rubric: str, pass_score: int = 4) -> Grader:
     - 定期抽样人工复核评委的判断，校准它。
     """
 
-    def grade(case: EvalCase, result: RunResult) -> list[Check]:
+    async def grade(case: EvalCase, result: RunResult) -> list[Check]:
         prompt = (
             f"你是严格的质量评审员。请根据评分细则给 AI 助手的回答打分。\n\n"
             f"## 评分细则\n{rubric}\n\n## 用户问题\n{case.input}\n\n## 助手回答\n{result.output}"
         )
-        v = complete_json(llm, prompt, JudgeVerdict)
+        v = await complete_json(llm, prompt, JudgeVerdict)
         return [Check("llm_judge", v.score >= pass_score, f"{v.score}/5：{v.reason}")]
 
     return grade
@@ -181,34 +183,40 @@ def load_cases(path: str | Path) -> list[EvalCase]:
     return cases
 
 
-def run_eval(
+async def run_eval(
     make_agent: Callable[[], Agent],
     cases: Iterable[EvalCase],
     graders: Iterable[Grader] = (rule_grader,),
+    *,
+    concurrency: int = 4,
 ) -> EvalReport:
-    """对每个用例新建一个 Agent（保证用例之间互不影响），运行并评分。"""
+    """对每个用例新建一个 Agent（保证用例之间互不影响），运行并评分。
+
+    concurrency：同时在跑的用例数。100 个用例 × 每个 5 秒，串行要 8 分钟，并发 8 个只要 1 分钟；
+    上限别设太高——评估和线上服务共用模型配额时，会把网关打出 429，反而拖慢、还会产生"基础设施失败"。
+    结果按用例顺序返回，和并发度无关。
+    """
     graders = list(graders)
-    results = []
-    for case in cases:
+
+    async def one(case: EvalCase) -> CaseResult:
         agent = make_agent()
-        t0 = time.time()
-        res = agent.run(case.input, metadata=case.metadata)
-        latency = (time.time() - t0) * 1000
-        checks = [c for g in graders for c in g(case, res)]
-        results.append(
-            CaseResult(
-                id=case.id,
-                passed=all(c.passed for c in checks),
-                checks=checks,
-                status=res.status,
-                output=res.output or "",
-                tools=res.tools_called(),
-                steps=res.steps,
-                tokens=res.usage.total,
-                cost_usd=res.cost_usd,
-                latency_ms=latency,
-                tags=case.tags,
-                infra_error=res.status == "failed" and (res.stop_reason or "").startswith("llm_error"),
-            )
+        t0 = time.perf_counter()
+        res = await agent.run(case.input, metadata=case.metadata)
+        latency = (time.perf_counter() - t0) * 1000
+        checks = [c for g in graders for c in await maybe_await(g(case, res))]
+        return CaseResult(
+            id=case.id,
+            passed=all(c.passed for c in checks),
+            checks=checks,
+            status=res.status,
+            output=res.output or "",
+            tools=res.tools_called(),
+            steps=res.steps,
+            tokens=res.usage.total,
+            cost_usd=res.cost_usd,
+            latency_ms=latency,
+            tags=case.tags,
+            infra_error=res.status == "failed" and (res.stop_reason or "").startswith("llm_error"),
         )
-    return EvalReport(results)
+
+    return EvalReport(await parallel([lambda c=c: one(c) for c in cases], max_concurrency=concurrency))

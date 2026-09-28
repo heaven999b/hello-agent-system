@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import datetime
 import operator
 from typing import Annotated
@@ -47,14 +48,15 @@ def current_time() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
 
 
-def main() -> None:
+async def amain() -> None:
     agent = Agent(default_llm(), [calculator, current_time], name="chat")
     history: list = []
     show_trace = True
     print("🤖 agentkit chat（/trace 切换追踪显示，/exit 退出）")
     while True:
         try:
-            text = input("\n你> ").strip()
+            # input() 会阻塞：放进线程，等用户打字时事件循环不被卡住（这个小程序里没有别的会话，但这是好习惯）
+            text = (await asyncio.to_thread(input, "\n你> ")).strip()
         except (EOFError, KeyboardInterrupt):
             break
         if text in ("/exit", "/quit"):
@@ -65,11 +67,15 @@ def main() -> None:
             continue
         if not text:
             continue
-        result = agent.run(text, history=history)
+        result = await agent.run(text, history=history)
         history = result.history
         print(f"\n助手> {result.output}")
         if show_trace and result.trace:
             print("\n" + render_tree(result.trace))
+
+
+def main() -> None:
+    asyncio.run(amain())
 
 
 if __name__ == "__main__":

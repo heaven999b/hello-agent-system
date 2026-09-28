@@ -6,7 +6,7 @@
 
 两种基础策略：
 1. SlidingWindow   滑动窗口：只保留最近的消息（简单、便宜、会丢信息）
-2. SummarizingCompactor 摘要压缩：把早期对话压成摘要（保留要点、多一次模型调用）
+2. SummarizingCompactor 摘要压缩：把早期对话压成摘要（保留要点、多一次模型调用，所以它的 apply 是 async）
 
 ⚠️ 最常见的坑：截断时把 assistant 的 tool_calls 和对应的 tool 结果拆开了。
 孤立的 tool 消息会让 API 直接报 400 错误。所以我们按"块"截断：
@@ -104,7 +104,7 @@ class SummarizingCompactor:
         self.max_summary_chars = max_summary_chars
         self.compactions = 0
 
-    def apply(self, messages: list[Message]) -> list[Message]:
+    async def apply(self, messages: list[Message]) -> list[Message]:
         if estimate_tokens(messages) <= self.max_tokens:
             return messages
         head, blocks = split_blocks(messages)
@@ -123,7 +123,7 @@ class SummarizingCompactor:
         # 之前的摘要消息（如果有）就在 old 里，会和更早的对话一起被重新压缩，不会越积越多
         history = "\n".join(_render(m) for b in old for m in b)
         prompt = SUMMARY_PROMPT.format(history=history, max_chars=self.max_summary_chars)
-        summary = (self.llm.chat([{"role": "user", "content": prompt}]).content or "").strip()
+        summary = ((await self.llm.chat([{"role": "user", "content": prompt}])).content or "").strip()
         if len(summary) > self.max_summary_chars:
             summary = summary[: self.max_summary_chars] + "…（摘要已截断）"
         self.compactions += 1

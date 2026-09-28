@@ -5,9 +5,10 @@
 
 - KeyedLimiter：按 key（通常是租户）限制**同时在跑**的运行数，再加一个全局上限保护下游（网关、连接池）。
   舱壁的意思是：船舱之间有隔板，一个舱进水，整艘船不会沉。
-- AsyncTokenBucket：按 key 限制**速率**（每秒多少次），等待令牌时让出事件循环，不阻塞其他会话。
+- TokenBucket：按 key 限制**速率**（每秒多少次），等待令牌时让出事件循环，不阻塞其他会话。
 
-这些都是单进程内的控制；多实例部署时，全局配额要放到 Redis 或网关层（第 26、29 课）。
+这些是单进程内的控制；多个 worker 进程之间共享的配额见 agentkit.distributed（SQLite，单机多进程），
+多机部署放到 Redis 或网关层（第 26、29 课）。
 """
 
 from __future__ import annotations
@@ -93,7 +94,7 @@ async def _acquire(sem: asyncio.Semaphore, timeout: float | None, what: str) -> 
         raise LimitExceeded(f"{what} 的并发槽位已满，等待 {timeout:.2f}s 后仍未获得") from None
 
 
-class AsyncTokenBucket:
+class TokenBucket:
     """按 key 的令牌桶：rate 为每秒补充的令牌数，capacity 为桶容量（允许的突发量）。"""
 
     def __init__(self, rate: float, capacity: float, clock: Callable[[], float] = time.monotonic):

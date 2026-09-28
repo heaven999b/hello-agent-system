@@ -9,12 +9,11 @@
   Redis 共享限流计数、缓存、审计。业务服务只需要把 base_url 指向网关（agentkit 的 OpenAICompatLLM 即可），
   部署配置见 lessons/29_gateway_and_guardrails/configs/litellm-config.yaml。
 
-两个类，接口分别对齐 agentkit 的 LLM 与 agentkit.aio 的 AsyncLLM：
+LiteLLMRouterLLM 实现 agentkit 的 LLM 协议，底层是 Router.acompletion：
 
-    llm = LiteLLMRouterLLM.from_env()          # 同步：Router.completion，给 Agent 用
-    allm = AsyncLiteLLMRouterLLM.from_env()    # 异步：Router.acompletion，chat() + stream()，给 AsyncAgent 用
+    llm = LiteLLMRouterLLM.from_env()    # await llm.chat(...)；async for ev in llm.stream(...)
 
-重试只放一层：Router 已经在做重试和降级，外面再套 ResilientLLM / AsyncResilientLLM(max_attempts=3)
+重试只放一层：Router 已经在做重试和降级，外面再套 ResilientLLM(max_attempts=3)
 会把一次失败放大成 (num_retries+1) × 3 次请求（重试放大，第 08 课）。要叠加时把其中一层的重试次数设为 0 / 1。
 """
 
@@ -23,15 +22,13 @@ from __future__ import annotations
 import time
 from typing import Any, AsyncIterator
 
-from agentkit.aio import StreamDone, StreamEvent, TextDelta, ToolCallAccumulator
 from agentkit.config import env
-from agentkit.llm import LLMError
+from agentkit.llm import LLMError, StreamDone, StreamEvent, TextDelta, ToolCallAccumulator
 from agentkit.types import LLMResponse, Message, ToolCall, Usage, new_call_id
 
 from . import require
 
 __all__ = [
-    "AsyncLiteLLMRouterLLM",
     "LiteLLMRouterLLM",
     "to_llm_error",
     "to_llm_response",
@@ -123,8 +120,22 @@ def to_llm_error(e: Exception) -> LLMError:
     return LLMError(msg, retryable=False)
 
 
-class _RouterLLMBase:
-    """同步版与异步版共用：构造 Router、从环境变量构造、整理路由信息。"""
+class LiteLLMRouterLLM:
+    """实现 agentkit 的 LLM 协议，底层是 litellm.Router.acompletion。
+
+    await chat(messages, tools) -> LLMResponse：一次完整调用。一个事件循环里可以同时挂几十个请求，不需要几十个线程。
+    stream(messages, tools)：逐个 yield TextDelta（文本增量），最后 yield 一个 StreamDone（完整 LLMResponse，
+    含拼好的工具调用和 usage）。降级只发生在拿到第一个分片之前（建立连接 / 上游直接报错）；
+    流到一半断了，Router 没法把已经发给用户的半句话"收回来"。
+
+    model_list: LiteLLM 格式的部署列表，每项 {"model_name": 模型组名, "litellm_params": {...}}；
+                同名的多项组成一个模型组，Router 在组内负载均衡。
+    fallbacks:  [{"主模型组": ["备用组1", "备用组2"]}]：主模型组重试耗尽后按顺序降级。
+    num_retries: 每个模型组的重试次数（Router 负责退避，等待时让出事件循环）。
+    timeout:    单次请求超时（秒）。
+    model:      本 LLM 调用哪个模型组；默认 model_list 第一项的 model_name。
+    router_kwargs: 原样传给 litellm.Router，如 routing_strategy、allowed_fails、cooldown_time、redis_host……
+    """
 
     def __init__(
         self,
@@ -208,36 +219,6 @@ class _RouterLLMBase:
         if self.last_route["model_group"] != self.model:
             self.events.append(f"fallback {self.model} -> {self.last_route['model_group']}")
 
-
-class LiteLLMRouterLLM(_RouterLLMBase):
-    """实现 agentkit 的 LLM 协议：chat(messages, tools) -> LLMResponse，底层是 litellm.Router.completion。
-
-    model_list: LiteLLM 格式的部署列表，每项 {"model_name": 模型组名, "litellm_params": {...}}；
-                同名的多项组成一个模型组，Router 在组内负载均衡。
-    fallbacks:  [{"主模型组": ["备用组1", "备用组2"]}]：主模型组重试耗尽后按顺序降级。
-    num_retries: 每个模型组的重试次数（Router 负责退避）。
-    timeout:    单次请求超时（秒）。
-    model:      本 LLM 调用哪个模型组；默认 model_list 第一项的 model_name。
-    router_kwargs: 原样传给 litellm.Router，如 routing_strategy、allowed_fails、cooldown_time、redis_host……
-    """
-
-    def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs: Any) -> LLMResponse:
-        start = time.perf_counter()
-        try:
-            resp = self.router.completion(**self._params(messages, tools, kwargs))
-        except Exception as e:  # noqa: BLE001 —— 统一收敛成 LLMError，Agent 只认这一种
-            raise self._on_error(e, start) from e
-        self._on_success(getattr(resp, "_hidden_params", None), start)
-        return to_llm_response(resp, default_model=self.model)
-
-
-class AsyncLiteLLMRouterLLM(_RouterLLMBase):
-    """异步版：实现 agentkit.aio 的 AsyncLLM 协议，底层是 litellm.Router.acompletion。
-
-    chat()：await 一次完整调用。一个事件循环里可以同时挂几十个请求，不需要几十个线程。
-    stream()：逐个 yield TextDelta（文本增量），最后 yield 一个 StreamDone（完整 LLMResponse，含拼好的工具调用和 usage）。
-    降级只发生在拿到第一个分片之前（建立连接 / 上游直接报错）；流到一半断了，Router 没法把已经发给用户的半句话"收回来"。
-    """
 
     async def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs: Any) -> LLMResponse:
         start = time.perf_counter()

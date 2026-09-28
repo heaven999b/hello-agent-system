@@ -8,25 +8,37 @@
 5. 风险分级：read / write / dangerous，供权限系统做审批（第 09 课）；
 6. 超时 + 输出截断：一个慢工具或一个巨大的返回值都不能拖垮整个 Agent；
 7. 写操作幂等：同一次调用重放时不能重复扣款 / 重复建工单（第 08 课）。
+
+工具函数可以是 `async def`，也可以是普通函数。三种执行方式，对应三种真实的超时语义：
+
+| 工具类型 | 怎么执行 | 超时时发生什么 |
+|---|---|---|
+| `async def` 工具（调用 HTTP API、数据库等） | 直接在事件循环里 await | **真正取消**：CancelledError 传进工具，连接被释放 |
+| 普通同步函数 | 放进线程池，不阻塞事件循环 | 调用方按时拿到超时结果，**但线程无法被强杀**，会在后台跑完（Python 的硬限制） |
+| `@tool(isolation="process")` | 在子进程里执行 | **硬超时**：直接 kill 子进程，适合 CPU 密集或不可信代码 |
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
+import functools
 import inspect
 import json
+import multiprocessing
 import typing
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
+from .timeouts import wait_for
 from .types import ToolCall
 
 Risk = Literal["read", "write", "dangerous"]
+Isolation = Literal["thread", "process"]
 
 
 class ToolError(Exception):
@@ -74,6 +86,7 @@ class Tool:
         risk: Risk = "read",
         timeout_s: float = 30.0,
         max_output_chars: int = 4000,
+        isolation: Isolation | None = None,
     ):
         self.fn = fn
         self.name = name or fn.__name__
@@ -83,6 +96,11 @@ class Tool:
         self.risk = risk
         self.timeout_s = timeout_s
         self.max_output_chars = max_output_chars
+        self.is_async = inspect.iscoroutinefunction(fn)
+        if isolation == "process" and self.is_async:
+            raise TypeError("async 工具不需要进程隔离：它本身就可以被取消")
+        # None / "thread"：async 工具在事件循环里 await，同步工具进线程池；"process"：子进程执行，超时即 kill
+        self.isolation = isolation
         self.wants_ctx = "ctx" in inspect.signature(fn).parameters
         self.args_model = _build_args_model(fn, self.name)
 
@@ -121,7 +139,7 @@ class Tool:
             return None, f"错误：参数校验失败：\n{problems}\n请修正后重试。"
         return dict(args), None
 
-    def __call__(self, *args, **kwargs):  # 允许像普通函数一样直接调用，方便单元测试
+    def __call__(self, *args, **kwargs):  # 允许像普通函数一样直接调用，方便单元测试（async 工具返回协程，要 await）
         return self.fn(*args, **kwargs)
 
     def __repr__(self) -> str:
@@ -146,16 +164,31 @@ def _build_args_model(fn: Callable, name: str) -> type[BaseModel]:
 
 
 def tool(fn: Callable | None = None, **options) -> Any:
-    """装饰器：@tool 或 @tool(risk="write", timeout_s=5)。"""
+    """装饰器：@tool 或 @tool(risk="write", timeout_s=5)，也可以装饰 async def 函数。"""
     if fn is None:
         return lambda f: Tool(f, **options)
     return Tool(fn, **options)
 
 
+def isolated(t: Tool) -> Tool:
+    """把一个同步工具标记为"在子进程里执行"（等价于 @tool(isolation="process")）。
+    被包装的函数必须是模块级函数：子进程要能按模块名 import 到它。"""
+    if t.is_async:
+        raise TypeError("async 工具不需要进程隔离：它本身就可以被取消")
+    t.isolation = "process"
+    return t
+
+
+async def maybe_await(value):
+    """同步实现直接返回值，async 实现返回协程：两种都支持（钩子、检查点、幂等存储都可以是任意一种）。"""
+    return await value if inspect.isawaitable(value) else value
+
+
 class IdempotencyStore:
     """幂等存储：记住"某个 idempotency_key 已经成功执行过，结果是什么"。
 
-    生产环境用 Redis / 数据库唯一索引实现，并设置过期时间；这里用内存 dict 演示原理。
+    这里用内存 dict 演示原理，只在一个进程里有效；多个 worker 进程之间要用 agentkit.distributed.SQLiteIdempotencyStore
+    （单机多进程），多机用 Redis / 数据库唯一索引（第 26 课）。get / put 也可以是 async 方法。
     """
 
     def __init__(self):
@@ -169,7 +202,7 @@ class IdempotencyStore:
 
 
 class ToolRegistry:
-    """工具注册表 + 统一执行入口。所有工具调用都经过 execute()，这是做校验/超时/幂等的唯一关口。"""
+    """工具注册表。所有工具调用都经过 ToolExecutor.execute()，这是做校验/超时/幂等的唯一关口。"""
 
     def __init__(self, tools: Iterable[Tool] = (), idempotency_store: IdempotencyStore | None = None):
         self._tools: dict[str, Tool] = {}
@@ -194,11 +227,30 @@ class ToolRegistry:
         allowed = set(only) if only is not None else None
         return [t.schema() for t in self._tools.values() if allowed is None or t.name in allowed]
 
-    def execute(self, call: ToolCall, ctx: ToolContext | None = None) -> ToolResult:
-        ctx = ctx or ToolContext(call_id=call.id)
-        t = self._tools.get(call.name)
+    async def execute(self, call: ToolCall, ctx: ToolContext | None = None) -> ToolResult:
+        """执行一次工具调用（校验 → 幂等 → 带超时执行 → 格式化）。Agent 内部用的是可共享的 ToolExecutor。"""
+        return await ToolExecutor(self).execute(call, ctx or ToolContext(call_id=call.id))
+
+    def not_found(self, name: str) -> ToolResult:
+        return ToolResult(False, f"错误：不存在名为 {name!r} 的工具。可用工具：{', '.join(self._tools)}", "not_found")
+
+
+class ToolExecutor:
+    """统一的工具执行入口。
+
+    max_threads：同步工具用的线程池大小。None 表示用事件循环的默认线程池（全进程共享、有上限，
+    asyncio.run 结束时自动关闭）；服务里通常给一个独立的、有上限的池——同步工具再多，也不会无限开线程
+    把进程拖垮（这也是一种背压），而且不和 asyncio.to_thread 等其他用途抢线程。
+    """
+
+    def __init__(self, registry: ToolRegistry, *, max_threads: int | None = None):
+        self.registry = registry
+        self._threads = ThreadPoolExecutor(max_workers=max_threads, thread_name_prefix="agentkit-tool") if max_threads else None
+
+    async def execute(self, call: ToolCall, ctx: ToolContext) -> ToolResult:
+        t = self.registry.get(call.name)
         if t is None:
-            return self.not_found(call.name)
+            return self.registry.not_found(call.name)
 
         # 1) 解析 JSON（模型可能输出不合法的 JSON）+ 2) 按 Schema 校验（缺字段、类型错、越界、多余字段）
         kwargs, error = t.parse_arguments(call.arguments)
@@ -208,34 +260,88 @@ class ToolRegistry:
             kwargs["ctx"] = ctx
 
         # 3) 幂等：写操作如果这个 key 已成功执行过，直接返回上次结果，不再产生副作用
-        use_idem = self.idempotency_store is not None and t.risk in ("write", "dangerous")
+        store = self.registry.idempotency_store
+        use_idem = store is not None and t.risk in ("write", "dangerous")
         if use_idem:
-            cached = self.idempotency_store.get(ctx.idempotency_key)
+            cached = await maybe_await(store.get(ctx.idempotency_key))
             if cached is not None:
                 return cached
 
-        # 4) 带超时执行。注意：Python 线程无法被强杀，超时后线程可能仍在后台跑，
-        #    生产中高风险/不可信的工具应放到独立进程或沙箱（容器、gVisor、Firecracker）里执行。
-        #    copy_context：把当前的 contextvars（如追踪的 Span 栈）带进工具线程，
-        #    否则工具内部再调用子 Agent 时，子 Agent 的 trace 会"断链"，无法嵌套在父 Span 下。
-        pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(contextvars.copy_context().run, t.fn, **kwargs)
+        # 4) 带超时执行（三种方式见模块说明）
         try:
-            output = future.result(timeout=t.timeout_s)
-        except FutureTimeout:
+            if t.isolation == "process":
+                output = await run_in_subprocess(t.fn, kwargs, t.timeout_s)
+            elif t.is_async:
+                output = await wait_for(t.fn(**kwargs), t.timeout_s)
+            else:
+                loop = asyncio.get_running_loop()
+                # copy_context：把当前的 contextvars（如追踪的 Span 栈）带进工具线程，
+                # 否则工具内部的 Span 会"断链"，无法嵌套在父 Span 下
+                runner = functools.partial(contextvars.copy_context().run, t.fn, **kwargs)
+                # 不用 asyncio.wait_for：3.12 之前它会在"工具刚完成 + 外部取消"同时发生时吞掉取消（timeouts.py）
+                output = await wait_for(loop.run_in_executor(self._threads, runner), t.timeout_s)
+        except asyncio.TimeoutError:
             return timeout_result(t)
-        except Exception as e:  # noqa: BLE001 —— 任何异常都要变成观察，不能让 Agent 崩溃
+        except Exception as e:  # noqa: BLE001 —— 工具异常变成观察；CancelledError 是 BaseException，会正常穿透
             return exception_result(t, e)
-        finally:
-            pool.shutdown(wait=False)
 
         result = ToolResult(True, format_output(t, output))
         if use_idem:
-            self.idempotency_store.put(ctx.idempotency_key, result)
+            await maybe_await(store.put(ctx.idempotency_key, result))
         return result
 
-    def not_found(self, name: str) -> ToolResult:
-        return ToolResult(False, f"错误：不存在名为 {name!r} 的工具。可用工具：{', '.join(self._tools)}", "not_found")
+    def close(self) -> None:
+        if self._threads is not None:
+            self._threads.shutdown(wait=False, cancel_futures=True)
+
+
+# ------------------------------------------------------------------------------------ 进程隔离
+
+
+def _subprocess_entry(conn, fn, kwargs) -> None:
+    try:
+        conn.send(("ok", fn(**kwargs)))
+    except ToolError as e:
+        conn.send(("tool_error", str(e)))
+    except BaseException as e:  # noqa: BLE001 —— 任何异常都要带回父进程，不能让子进程静默消失
+        conn.send(("exception", f"{type(e).__name__}: {e}"))
+    finally:
+        conn.close()
+
+
+async def run_in_subprocess(fn, kwargs: dict, timeout: float):
+    """在独立子进程里执行 fn(**kwargs)，超时（或调用方被取消）就 kill 子进程。
+
+    这是 Python 里唯一可靠的"硬超时"：线程杀不掉，协程只能在 await 点被取消，
+    而一个死循环的纯计算函数没有 await 点。代价是进程启动开销（spawn 通常几百毫秒）和参数必须可 pickle。
+    生产中更强的隔离是容器 / gVisor / microVM（第 19 课）。
+    """
+    mp = multiprocessing.get_context("spawn")  # spawn 比 fork 安全：fork 一个带着事件循环和线程的进程容易死锁
+    parent, child = mp.Pipe(duplex=False)
+    proc = mp.Process(target=_subprocess_entry, args=(child, fn, kwargs), daemon=True)
+    loop = asyncio.get_running_loop()
+    # spawn 一个进程要 fork/exec + 传参，同步调用会卡住事件循环（实测每次 ~10ms，所有会话一起等）
+    await loop.run_in_executor(None, proc.start)
+    child.close()
+    try:
+        ready = await loop.run_in_executor(None, parent.poll, timeout)
+        if not ready:
+            raise asyncio.TimeoutError
+        kind, payload = parent.recv()
+    except EOFError:
+        raise RuntimeError(f"工具子进程异常退出（exitcode={proc.exitcode}）") from None
+    finally:
+        if proc.is_alive():
+            proc.kill()  # 超时或被取消：直接杀掉，不给它继续消耗 CPU 的机会
+        try:
+            await asyncio.shield(loop.run_in_executor(None, proc.join, 2))  # join 也可能阻塞：放进线程；被取消也要把僵尸进程收掉
+        finally:
+            parent.close()  # 即使在等待 join 时被取消，管道也要立即关闭，不能等垃圾回收
+    if kind == "ok":
+        return payload
+    if kind == "tool_error":
+        raise ToolError(payload)
+    raise RuntimeError(payload)
 
 
 def timeout_result(t: Tool) -> ToolResult:
@@ -243,7 +349,7 @@ def timeout_result(t: Tool) -> ToolResult:
 
 
 def exception_result(t: Tool, e: Exception) -> ToolResult:
-    """把工具抛出的异常变成给模型看的观察（同步 / 异步执行器共用）。"""
+    """把工具抛出的异常变成给模型看的观察。"""
     if isinstance(e, ToolError):
         return ToolResult(False, f"错误：{e}", "tool_error")
     # 意外异常的原文（SQL、内网地址、堆栈……）不能给模型：模型可能把它转述给用户。
