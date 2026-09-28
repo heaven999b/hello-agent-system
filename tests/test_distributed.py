@@ -461,3 +461,56 @@ async def test_shared_breaker_lets_only_one_probe_through(tmp_path):
 
 def _probing(db) -> bool:
     return bool(rows(db, "SELECT 1 FROM circuit_breakers WHERE probe_until IS NOT NULL"))
+
+
+# ------------------------------------------------------------------ 回归（第 12/13 课在真实部署中发现）
+
+
+async def test_stop_signal_is_seen_even_when_every_slot_is_busy(tmp_path):
+    """满载时主循环停在"等名额"上；停机信号必须能叫醒它，grace_period 才生效。"""
+    q = SQLiteJobQueue(tmp_path / "jobs.db")
+    await q.setup()
+    await q.enqueue("slow", {}, tenant_id="t")
+    started = asyncio.Event()
+
+    async def slow(job):
+        started.set()
+        await asyncio.sleep(30)
+
+    stop = asyncio.Event()
+    worker = asyncio.create_task(run_worker(q, slow, worker_id="w", stop_event=stop, concurrency=1,
+                                            poll_interval=0.01, grace_period=0.3))
+    await asyncio.wait_for(started.wait(), 10)
+    t0 = time.monotonic()
+    stop.set()
+    stats = await asyncio.wait_for(worker, 10)
+    assert stats["cancelled"] == 1 and time.monotonic() - t0 < 5  # 以前要等 30 秒的任务自己跑完
+    assert (await q.get(1)).status == "leased"  # 被取消的任务不提交、不归还，租约过期后别人接手
+    await q.close()
+
+
+async def test_many_processes_can_create_the_same_new_database_at_once(tmp_path):
+    """几个进程同时新建同一个库（同时切换 WAL）时不能报 database is locked。"""
+    import sys
+
+    script = (
+        "import asyncio, os, sys, time\n"
+        "from agentkit.distributed import SQLiteCheckpointer, SQLiteJobQueue\n"
+        "gate, db = sys.argv[1], sys.argv[2]\n"
+        "while not os.path.exists(gate):\n"
+        "    time.sleep(0.001)\n"
+        "async def main():\n"
+        "    for obj in (SQLiteCheckpointer(db), SQLiteJobQueue(db)):\n"
+        "        await obj.setup()\n"
+        "        await obj.close()\n"
+        "asyncio.run(main())\n"
+    )
+    for round_ in range(4):
+        gate, db = tmp_path / f"gate{round_}", tmp_path / f"fresh{round_}.db"
+        procs = [await asyncio.create_subprocess_exec(sys.executable, "-c", script, str(gate), str(db),
+                                                      stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                 for _ in range(6)]
+        await asyncio.sleep(0.5)  # 让 6 个进程都停在起跑线上
+        gate.touch()
+        outs = [await p.communicate() for p in procs]
+        assert all(p.returncode == 0 for p in procs), [o[0].decode()[-300:] for o in outs]

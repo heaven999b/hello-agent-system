@@ -7,7 +7,7 @@
 
 三个函数都是**普通的同步函数**（不是 async def）：它们直接调用阻塞的 sqlite3，
 测试和 demo 在**没有事件循环的独立进程**里调用它们，阻塞只会挡住调用者自己。
-要在事件循环里用这类阻塞代码，得先把它挪到线程里（jobqueue.AsyncJobQueue 就是这么做的，README 3.10 节）。
+要在事件循环里用这类阻塞代码，得先把它挪到线程里（jobqueue.AsyncJobQueue 就是这么做的，README 3.11 节）。
 
 开始之前，先读两个文件（都不长）：
   - jobqueue.py      表结构 SCHEMA、CLAIMABLE_WHERE、connect()、Job、LeaseLostError，以及完整版的 JobQueue

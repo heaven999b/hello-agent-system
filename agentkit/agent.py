@@ -378,9 +378,14 @@ class Agent:
         # 否则下一个运行会在上一个运行真正结束前拿到槽位，同一租户的并发就会短暂超过上限
         slot = self.limiter.slot(self.limiter_key(state), timeout=self.limiter_timeout) if self.limiter is not None else None
         entered = False
+        never_started = False  # 新运行在拿舱壁槽位时就被拒：什么都没发生，不落盘、不跑收尾钩子
         try:
             if slot is not None:
-                await slot.__aenter__()
+                try:
+                    await slot.__aenter__()
+                except LimitExceeded:
+                    never_started = prepare is not None
+                    raise
                 entered = True
             body = self._prepare_and_loop(state, prepare)
             if self.run_timeout is not None:
@@ -414,6 +419,12 @@ class Agent:
             # 收尾（on_run_end 钩子 + 最后一次保存）放进一个独立任务并用 shield 保护：
             # Web 框架（例如 Starlette/AnyIO）断开连接时可能**反复**取消，第二次取消如果打断了这次保存，
             # 检查点就会永远停在 running。shield 保证收尾任务跑完；外层照样收到取消并继续向外传播。
+            if never_started:
+                # 以前这里照样存检查点：存下的是一段"没有用户问题"的对话，AgentJobHandler 推迟后 resume，
+                # 模型只看到 system 消息（第 12 课在真实部署中发现）。现在不存，重试时从头开始这次运行；
+                # on_run_start 没跑过，on_run_end 也不跑，成对的钩子（在途计数、审计）不会错位
+                self._annotate(span, state, cost_before)
+                return pending
             finish = asyncio.ensure_future(self._finish(state, slot if entered else None))
             try:
                 await asyncio.shield(finish)

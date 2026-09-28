@@ -32,6 +32,7 @@ from typing import Any, Awaitable, Callable, Iterable, Protocol
 from ..hooks import Hook, StopRun
 from ..state import RunState
 from ..timeouts import wait_for
+from ..tools import maybe_await
 
 logger = logging.getLogger("agentkit.distributed")
 
@@ -164,6 +165,30 @@ def _emitter(worker_id: str, on_event):
     return emit
 
 
+async def _acquire_or_stop(sem: asyncio.Semaphore, stop_event: asyncio.Event) -> bool:
+    """等一个并发名额，或者等到停机信号，谁先到算谁。拿到名额返回 True；停机返回 False（名额已归还）。
+
+    只 await sem.acquire() 的话，满载时主循环停在这里，看不到停机信号：在途任务要跑 8 秒，
+    grace_period=1 也要等 8 秒才退出（第 12/13 课在真实进程上测出来的）。
+    """
+    if stop_event.is_set():
+        return False
+    acquire = asyncio.ensure_future(sem.acquire())
+    stop = asyncio.ensure_future(stop_event.wait())
+    try:
+        await asyncio.wait({acquire, stop}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stop.cancel()
+        if not acquire.done():
+            acquire.cancel()
+        await asyncio.gather(acquire, stop, return_exceptions=True)
+    got = acquire.done() and not acquire.cancelled() and acquire.exception() is None
+    if got and stop_event.is_set():  # 两个同时到达：停机优先，名额还回去
+        sem.release()
+        return False
+    return got
+
+
 async def _wait_or_timeout(stop_event: asyncio.Event, timeout: float) -> None:
     try:
         await wait_for(stop_event.wait(), timeout)  # 取消安全版：3.12 之前的 asyncio.wait_for 可能吞掉停机时的取消
@@ -268,9 +293,7 @@ async def run_worker(
     while not stop_event.is_set():
         if max_jobs is not None and stats["claimed"] >= max_jobs:
             break
-        await sem.acquire()  # 背压：满载时停在这里
-        if stop_event.is_set():
-            sem.release()
+        if not await _acquire_or_stop(sem, stop_event):  # 背压：满载时停在这里（但停机信号能叫醒它）
             break
         try:
             job = await queue.claim(worker_id, lease_seconds, kinds)
@@ -400,6 +423,14 @@ class AgentJobHandler:
             self._adopt(agent_or_factory)
         else:
             self._shared, self.make_agent = None, agent_or_factory
+
+    async def aclose(self) -> None:
+        """worker 进程退出前调用（worker 命令行会自动调用）：释放共享 Agent 的线程池和模型连接、关闭检查点的连接。"""
+        if self._shared is not None:
+            await self._shared.aclose()
+        close = getattr(self.checkpointer, "close", None)
+        if close is not None:
+            await maybe_await(close())
 
     @staticmethod
     def _adopt(agent) -> None:

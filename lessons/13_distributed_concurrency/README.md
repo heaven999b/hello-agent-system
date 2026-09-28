@@ -288,18 +288,23 @@ EXEC
 
 ## 3. 从玩具到生产：逐层实现
 
-### 3.1 为什么用 SQLite 模拟"分布式"
+### 3.1 真进程、真竞争：SQLite 能证明什么，不能证明什么
 
-Demo 里的每个 worker 都是用 `multiprocessing`（spawn 方式）启动的**独立操作系统进程**，彼此不共享任何内存，只通过同一个 SQLite 文件协作。谁先抢到、谁覆盖了谁、谁崩溃后留下了什么，全都是真实发生的竞争，而不是用 `sleep` 演出来的。
+本课所有的并发都发生在**独立的操作系统进程**之间：`demo.py` 用 `multiprocessing`（spawn 方式）拉起 worker，`demo_agents.py` / `demo_scale.py` 用 `WorkerPool` 拉起 `python -m agentkit.distributed.worker`，练习的并发测试用 [`race.py`](race.py) 同时拉起 6~10 个 `python` 进程。进程之间不共享任何内存，只通过同一个 SQLite 文件协作：谁先抢到、谁覆盖了谁、谁崩溃后留下了什么，全都是真实发生的竞争。故障也是真的：`kill -9` 是 SIGKILL，"僵尸"是被 SIGSTOP 冻结、再被 SIGCONT 唤醒的真实进程，优雅停机收到的是 SIGTERM —— 没有用 `sleep` 冒充的停顿，也没有用线程冒充的进程。
 
-SQLite 和生产数据库的差别也要心里有数：
+所以下面这些结论是**真的被验证过的**：多个进程同时领取，同一个任务不会被领两次（练习测试 + 场景 1）；租约过期后，崩溃进程手上的任务会被接手（场景 2、`demo_agents.py`）；被冻结的旧持有者醒来后，它的提交、续租、检查点写入都会被 fence 拒绝（场景 3、`demo_agents.py`）；跨进程的名额在持有者被 kill -9 后能回来（场景 5）。
 
-| | 本课的 SQLite | 生产（Postgres / Redis / SQS） |
-|---|---|---|
-| 写并发 | 同一时刻只有**一个**写者（其他写者排队） | 行级锁，多个写者并行 |
-| 部署 | 只能在同一台机器上（官方文档：WAL 模式不支持网络文件系统） | 真正的多机 |
-| 时间 | 所有进程共用一台机器的时钟 | 不同机器的时钟会漂移，租约应以数据库服务器的时间为准 |
-| 语义 | 原子领取、租约、fence、CAS 的写法和生产**完全一样** | 同左 |
+SQLite 证明不了的，也要心里有数：
+
+| | 本课（SQLite，单机多进程） | 生产（Postgres / Redis / SQS，多台机器） | 哪里讲 |
+|---|---|---|---|
+| 写并发 | 同一时刻只有**一个**写者（其他写者排队）；3.12 节实测了它在哪里封顶 | 行级锁，多个写者并行 | 3.12 节、第 26 课 |
+| 部署 | 只能在同一台机器上（官方文档：WAL 模式不支持网络文件系统） | 真正的多机 | 第 26 课 |
+| 网络 | 没有网络：不会丢包，不会出现"请求发出去了，但不知道对方收没收到"，不会有网络分区 | 这些都是常态：超时 ≠ 失败，重试必须幂等 | 问题 3、问题 6；网络分区见下文的 `TcpProxy` |
+| 时间 | 所有进程共用一台机器的时钟 | 不同机器的时钟会漂移，租约应以数据库服务器的时间为准 | 6.1、6.2 节 |
+| 语义 | 原子领取、租约、fence、CAS 的写法和生产**完全一样** | 同左 | |
+
+[第 26 课](../26_state_and_queues/README.md)把存储换成真正的 Postgres 服务进程（行级锁、`SKIP LOCKED`、用数据库服务器的 `now()` 判断租约）和 Redis，接口与 `agentkit.distributed` 相同，再用多进程 kill -9 验证一遍。**网络分区**也有可运行的验证：`agentkit.distributed.chaos.TcpProxy` 是一个可以随时"拔网线"的 TCP 代理，放在 worker 和数据库之间。[`tests/contrib/test_postgres.py`](../../tests/contrib/test_postgres.py) 里，两个 worker 进程通过 TCP 连同一个 Postgres，一个经过代理、一个直连：持有任务的那个断网后进程活得好好的，但心跳发不出去，任务被另一个接手；网络恢复后，它的迟到写入被检查点的 CAS 拒绝。不过这些进程仍然在同一台机器上，而且 `TcpProxy` 的"断网"是立刻重置连接，真实的分区更常见的是包被静默丢弃、要等 TCP 超时才发现（它的文档如实写了这个局限）。**真正的多台机器和时钟漂移，本仓库没有可运行的演示**，只能靠 6.2 节和延伸阅读来理解。
 
 ### 3.2 连接设置：三个参数，少一个就出问题
 
@@ -371,6 +376,16 @@ with write_txn(self.conn) as c:          # BEGIN IMMEDIATE：别的写者进不�
 
 两种写法怎么选？写法 A 在 SQLite 里最直观；写法 B 不需要显式事务，在任何数据库里都能用，也是"CAS"思想的第二次出场（第一次是会话的版本号）。到了 Postgres，标准做法是第三种：`FOR UPDATE SKIP LOCKED`（第 6.1 节）。
 
+**怎么证明它真的对？** 单进程测试证明不了：一个进程里只有一个连接在写，竞态根本不会发生。练习的并发测试用 [`race.py`](race.py) 同时拉起 8 个 `python` 进程，各用各的连接，等所有进程都连好数据库后一起开抢（"开跑"信号是一个文件，所有进程在 1 毫秒内看到它），并在每条 SQL 执行前停 1 毫秒，把本来就存在的竞态窗口放大。`demo.py` 场景 1 的实测（6 个进程抢 30 个任务）：
+
+```text
+   写法                            领取次数  重复领取  每个进程领到        耗时（含起进程）
+   ❌ 先 SELECT 再无条件 UPDATE    88        58 ❌     17/13/16/14/16/12   0.21s
+   ✅ claim_job（solution.py）     30        0 ✅      4/5/2/6/7/6         0.23s
+```
+
+还有一个测试专门盯着 fence：6 个进程反复抢 3 个任务，租约只有 20 毫秒、领了就不管（相当于 worker 一个接一个地卡死），跑满 1 秒。对每个任务，断言 fence 从 1 开始连续递增、每个值只发出去一次，而且每次接手都发生在上一个租约过期之后。有竞态的领取会把同一个 fence 发给两个进程，那样 fencing 就失效了：存储无法分辨谁才是"最新的持有者"。
+
 "可领取"的完整定义在 [`CLAIMABLE_WHERE`](jobqueue.py) 里，三个条件缺一不可：
 
 ```sql
@@ -416,7 +431,9 @@ def heartbeat(self, job_id, fence, lease_seconds, *, now=None):
         raise LeaseLostError(...)   # 已经被别人接手：worker 应该停止处理
 ```
 
-Demo 里每个任务配一个后台 `Heartbeat` 线程，每隔 `租约 / 4` 续一次。worker 进程被 `kill -9` 时，心跳线程随之消失，租约自然过期。注意心跳线程必须**用自己的数据库连接**：`sqlite3` 连接不能跨线程使用（这也是为什么 demo 的 `TicketSystem` 每次调用都新开一个连接 —— agentkit 在单独的线程里执行工具）。
+`demo.py` 里每个任务配一个 `heartbeat` 协程，和 Agent 跑在同一个事件循环里，每隔 `租约 / 4` 续一次。worker 进程被 `kill -9` 时，它随进程一起消失；进程被 SIGSTOP 冻结时，它也和整个进程一起停下，租约自然过期。场景 3 就是这么验证的：冻结期间一次续租都没发出去，解冻后的第一次续租就被拒绝了（`💔 心跳被拒绝：……你手里的 fence=1 已经过期`）。
+
+心跳和 Agent 在同一个事件循环里，带来一个硬约束：**这个进程里不能有阻塞调用**。一次阻塞 10 秒的数据库调用，会让这个进程里所有任务的心跳一起停 10 秒（3.11 节实测）。所以 worker 通过 `AsyncJobQueue` 调用同步的 `JobQueue`；`TicketSystem.create` 是同步工具里的阻塞调用，agentkit 自动把同步工具放进线程池执行，事件循环不受影响（工具每次可能跑在不同的线程上，而 `sqlite3` 连接不能跨线程使用，所以它每次调用新开一个连接）。
 
 ### 3.6 失败、重试、死信
 
@@ -461,98 +478,236 @@ no, created = tickets.create(title, priority, job_id=job.id, created_by=worker_i
 
 `TicketSystem.create` 用唯一索引去重：`INSERT` 成功就是新建；唯一约束冲突就查出已有的那张返回。"执行"和"记录 key"在同一条语句里完成，中间没有缝。
 
-还有一个容易漏掉的点：agentkit 自带的 `IdempotencyStore` 存在进程内存里，**进程一死就没了**，而且别的 worker 也看不到。分布式场景下，幂等记录必须放在所有 worker 共享、最好和副作用在同一个事务里的地方，也就是下游系统本身。
+还有一个容易漏掉的点：agentkit 自带的 `IdempotencyStore` 存在进程内存里，**进程一死就没了**，而且别的 worker 也看不到。多个 worker 进程要用共享的 `SQLiteIdempotencyStore`（多机用 Redis，第 26 课）：`demo_agents.py` 里，任务 #1 的持有者在"工具已执行、幂等记录已写、检查点还没落盘"时被 kill -9，接手的进程重放同一个调用，直接拿到上次的结果，工具没有再执行。但它只记"成功之后"的结果：如果崩溃恰好落在"下游已经执行、还没来得及记录"之间（`demo.py` 场景 2 就卡在这个时刻），它同样拦不住。所以最后一道防线，是下游自己认幂等键，并且"执行 + 记录 key"在同一个事务里。
 
 ### 3.9 从本课代码到生产
 
-| 本课 | Postgres 版 | 托管队列版（以 SQS 为例） |
-|---|---|---|
-| `claim`（BEGIN IMMEDIATE / 条件 UPDATE） | `UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED)` | `ReceiveMessage`（消息在可见性超时内对别人不可见） |
-| `lease_until` / `heartbeat` | 同左，用数据库的 `now()` 计时 | visibility timeout / `ChangeMessageVisibility` |
-| `complete` | 带 fence 的条件 UPDATE | `DeleteMessage`（必须用最近一次接收拿到的 receipt handle） |
-| `attempts` / 死信 | 同左 | `maxReceiveCount` + DLQ |
-| `group_key` | 同左，或按 key 分区 | FIFO 队列的 message group |
-| `fence` | 同左 | 没有严格的等价物：官方文档说明，用旧的 receipt handle 删除，请求照样成功，但消息不一定被删掉。所以"提交结果"的 fencing 要在你自己的存储层实现 |
-| `SessionStore` CAS | `UPDATE ... WHERE version = $n` | 例如 DynamoDB 的条件写入 |
+| 本课手写 | `agentkit.distributed`（SQLite，单机多进程，3.10 节） | Postgres 版（第 26 课） | 托管队列版（以 SQS 为例） |
+|---|---|---|---|
+| `claim`（BEGIN IMMEDIATE / 条件 UPDATE） | `SQLiteJobQueue.claim`：`BEGIN IMMEDIATE` 里先回收过期租约，再领取 | `UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED)` | `ReceiveMessage`（消息在可见性超时内对别人不可见） |
+| `lease_until` / `heartbeat` | 同左；`run_worker` 每 1/3 租约自动续约一次 | 同左，用数据库的 `now()` 计时 | visibility timeout / `ChangeMessageVisibility` |
+| `complete` | 带 fence 的条件 UPDATE，被拒绝时抛 `LeaseLost` | 带 fence 的条件 UPDATE | `DeleteMessage`（必须用最近一次接收拿到的 receipt handle） |
+| `attempts` / 死信 | 同左（`dead`、`redrive`） | 同左 | `maxReceiveCount` + DLQ |
+| `group_key` | 没有实现（要按会话串行，就用本课 `jobqueue.py` 的写法） | 同左，或按 key 分区 | FIFO 队列的 message group |
+| `fence` | 同左，但整张表共用一个计数器，全局递增 | 同左 | 没有严格的等价物：官方文档说明，用旧的 receipt handle 删除，请求照样成功，但消息不一定被删掉。所以"提交结果"的 fencing 要在你自己的存储层实现 |
+| `SessionStore` CAS | `SQLiteCheckpointer`：检查点带版本号 CAS，`fenced(fence)` 视图接管时让旧持有者的写入失效 | `UPDATE ... WHERE version = $n` | 例如 DynamoDB 的条件写入 |
 
-> 🏭 **生产版**：本课用 SQLite 模拟分布式协调。[第 26 课](../26_state_and_queues/README.md)用真实的 Postgres（`SKIP LOCKED` 队列、版本号 CAS 检查点、fencing 接管）和 Redis（幂等、Lua 令牌桶、带 fencing token 的锁）把这张表的中间一列实现了一遍，并用多进程 kill -9 实测没有重复的副作用；[第 30 课](../30_async_runtime/README.md)把 worker 换成异步运行时，一个进程可以同时跑几十上百个任务。
+> 🏭 **生产版**：[第 26 课](../26_state_and_queues/README.md)用真实的 Postgres（`SKIP LOCKED` 队列、版本号 CAS 检查点、fencing 接管）和 Redis（幂等、Lua 令牌桶、带 fencing token 的锁）把这张表的第三列实现了一遍，接口和 `agentkit.distributed` 相同（`PostgresJobQueue` / `PostgresCheckpointer`），`run_worker`、`AgentJobHandler`、worker 命令行都不用改，同样用多进程 kill -9 实测没有重复的副作用；[第 31 课](../31_deployment_and_scaling/README.md)把 API + 多个 worker 进程部署起来，做压测、故障注入和扩缩容。
+
+### 3.10 从本课代码到框架：agentkit.distributed
+
+你在本课手写的每一块，框架里都有对应的实现（[`agentkit/distributed/`](../../agentkit/distributed/__init__.py)，零依赖，SQLite 单机多进程）：
+
+| 你在本课写的 | 框架里的对应 | 区别 / 多做了什么 |
+|---|---|---|
+| `JobQueue.claim`、练习 (a) `claim_job` | `SQLiteJobQueue.claim` | fence 来自整张表共用的计数器，全局递增：同一个 run 会先后对应多个任务（run → 审批后的 resume），检查点的 fence 保护的是整个 run，只有全局递增才能保证"后来者的 fence 一定更大" |
+| `heartbeat` 协程 | `run_worker` 给每个任务起一个续租协程 | 续租被拒绝 → `job.lost` 置位 → `LeaseGuard` 钩子在下一次模型 / 工具调用前让 Agent 停手，少做无用功（最终的安全仍然靠 fence） |
+| 练习 (b) `complete_job` | `complete / fail / heartbeat / release` 全部带 fence，对不上抛 `LeaseLost` | `release` 把任务放回队列、不消耗尝试次数（被限流推迟时用） |
+| `fail` 的退避 / 死信、`redrive` | 同名方法 | 租约过期且次数用尽 → `dead`，在 `claim` 里顺手回收 |
+| `session_store` 的版本号 CAS | `SQLiteCheckpointer`（版本号 CAS）+ `fenced(fence)` 视图 | `load` 时"接管"：把表里的 fence 改成自己的、版本 +1，fence 更旧的写入一律 `CheckpointConflict`（6.7 节） |
+| 下游 `TicketSystem` 的唯一索引 | `SQLiteIdempotencyStore` | 所有进程共享的"这个幂等键已经成功执行过、结果是……"；只记成功之后，所以下游仍要认 key |
+| `demo.py` 里手写的 worker 循环 | `run_worker` | 背压（并发槽位满了就不再领取，任务留在队列里给别的进程）、`RetryLater`（不消耗次数）、`PermanentJobError`、SIGTERM 优雅停机 |
+| `handle_agent_job`（有检查点就 resume） | `AgentJobHandler` | 一个共享的 Agent；每次领取用这次的 fence 创建检查点视图；租户以 `job.tenant_id` 为准；暂停等审批时正常完成任务 |
+| `mp.Process` + `os.kill` | `WorkerPool` | 拉起 N 个 `python -m agentkit.distributed.worker` 进程（和生产里每个 Pod 跑的是同一条命令）；`kill / pause / resume / terminate / restart`；`events()` 汇总每个进程打出的 JSON 事件 |
+| 场景 5 的名额 | `SQLiteSemaphore`；另有 `SQLiteTokenBucket`、`SQLiteCircuitBreaker` | 跨进程的并发名额、令牌桶、熔断器，都带租约或只存在数据库里，持有者崩溃不会泄漏 |
+
+[`demo_agents.py`](demo_agents.py) 用框架跑 8 个 Agent 任务（报修 → `create_ticket` 写工具 → 回复），3 个 worker 进程，每个进程同时处理 1 个任务，业务代码只有 [`worker_app.py`](worker_app.py) 里的一个 Agent 和一个工具。三次真实的故障注入：
+
+```bash
+.venv/bin/python lessons/13_distributed_concurrency/demo_agents.py --offline   # 约 6 秒
+```
+
+```text
+  [+ 0.34s] w0     │ 🧾 create_ticket 真正执行 → T-1001（任务 #1，幂等键 job-1:call_527d6bbffd81）
+  [+ 0.34s] w0     │ （任务 #1：工具已执行、幂等记录已写，检查点还没落盘 —— 故障窗口 5 秒）
+  [+ 0.34s] w1     │ 任务 #2：拿到工具结果，第二次调用模型……
+  [+ 0.37s] 调度器 │ 💥 kill -9 w0（pid 37204，退出码 -9）：租约没还、检查点没写、不留遗言
+  [+ 0.38s] 调度器 │ 重新拉起 w0′（新 pid 37207），相当于 K8s 重建 Pod
+  [+ 0.38s] 调度器 │ 🧊 SIGSTOP w1（pid 37205）：进程被冻结，心跳停了，它自己毫不知情
+  ...
+  [+ 1.69s] w0′    │ 领取任务 #2（第 2 次，fence=6）
+  [+ 1.69s] w0′    │ 任务 #2：拿到工具结果，第二次调用模型……
+  [+ 2.56s] w2     │ 领取任务 #1（第 2 次，fence=7）
+  [+ 2.56s] w2     │ ♻️  幂等存储命中 job-1:call_527d6bbffd81 → 直接用上次的结果，工具没有再执行
+  [+ 2.69s] w0′    │ ✅ 完成任务 #2（fence=6）
+  [+ 2.72s] 调度器 │ ▶️  SIGCONT w1：解冻，它接着执行被冻结前的那一行
+  [+ 2.72s] w1     │ 💔 任务 #2 续租被拒绝（fence=2 已过期）
+  [+ 2.72s] w1     │ ❌ 任务 #2：检查点写入被拒绝（CheckpointConflict） → 停手，什么都不提交
+  [+ 2.72s] w1     │ 领取任务 #7（第 1 次，fence=9）
+  [+ 2.77s] 调度器 │ 🛑 SIGTERM w2（pid 37206，手上正在处理任务 #1）：K8s 删除 Pod 时发的就是它
+  [+ 3.56s] w2     │ ✅ 完成任务 #1（fence=7）
+  [+ 3.56s] w2     │ 进入停机收尾（draining）：不再领取新任务
+  [+ 3.56s] w2     │ 下线
+  [+ 3.61s] 调度器 │ w2 退出，退出码 0
+
+检查（5.2 秒完成）：
+  ✅ 8 个任务全部成功
+  ✅ 每个任务恰好提交了一次（completed 事件按任务计数全是 1）
+  ✅ 每个任务只建了一张工单（下游 tickets 表）
+  ✅ 工具函数一共只真正执行了 8 次：kill -9 之后的重放由 SQLiteIdempotencyStore 挡住
+  ✅ 任务 #1 被领取两次，接手者的 fence 更大
+  ✅ 僵尸 w1 醒来后的写入被拒绝，没有提交任务 #2
+  ✅ 任务 #2 的检查点最后由接手者写入（writer=w0）
+  ✅ kill -9 的进程退出码 -9，SIGTERM 的进程退出码 0
+  ✅ w2 收到 SIGTERM 后没有再领取新任务，自己做完了在途的任务 #1 才下线
+```
+
+读这条时间线：
+
+1. **kill -9**：故障窗口是真实存在的（工具执行完、幂等记录写入之后，到检查点落盘之前），`worker_app.py` 只是在任务 #1 的第一次执行时把它拉长到 5 秒，好让信号落在里面。w0 死后，任务 #1 的租约（1 秒）还挂在它名下；2.56 秒时 w2 做完手头的活才空出来接手 —— 所有活着的 worker 都忙时，接手要等到有人空闲。接手者从检查点看到"模型已发起 `create_ticket`、还没有结果"，重放**同一个** `call_id`，幂等键不变，`SQLiteIdempotencyStore` 命中。
+2. **SIGSTOP**：w1 冻结在第二次模型调用里。租约过期后 w0′（重启后的新进程）领走任务 #2，`fenced(6).load` 接管检查点；w1 被 SIGCONT 唤醒后，它的模型调用返回、Agent 保存检查点 → `CheckpointConflict`，同时续租也被拒绝。它没有崩溃，只是被拒绝了，接着领别的任务。
+3. **SIGTERM**：w2 停止领取，把在途的任务 #1 做完才退出（退出码 0），不需要别人接手。时间线里 `draining` 出现在 `completed` 之后，是因为这个进程的并发上限是 1、唯一的槽位被在途任务占着，`run_worker` 要等槽位空出来才看到停机信号（这是实测发现的问题，见 6.4 节）。
+
+### 3.11 在事件循环里调用阻塞的 sqlite3：JobQueue 为什么保持同步
+
+本课的 `JobQueue` / `SessionStore` 和三道练习都是**同步**代码，直接调用阻塞的 `sqlite3`。这是刻意的决定：
+
+- 练习的并发测试和 `demo.py` 的会话 worker 都在**没有事件循环的独立进程**里调用它们。阻塞只挡住调用者自己，进程之间的竞争照样真实；同步代码也最容易看清每条 SQL 的先后。
+- 但跑 Agent 的 worker 进程里有事件循环：Agent 是 async 的，心跳是同一个循环里的另一个协程。在这里直接调用阻塞的 `claim` / `complete`，就是第 02 课讲过的坑：别的进程正在写库时，SQLite 按 `busy_timeout` 排队等写锁（本课设的是 10 秒），这段时间整个事件循环都停着 —— 这个进程里所有任务的心跳一起停、租约一起过期、被别的 worker 接手，"数据库慢了一点"就变成了"一批任务重复执行"。
+
+`test_exercise.py` 里的 `test_async_jobqueue_keeps_the_event_loop_running` 把这件事量了出来：另一个真实进程握住写锁 0.8 秒，同时有一个每 10 毫秒醒一次的协程在计数。在事件循环里直接调用 `JobQueue.claim`，这 0.8 秒里它**一次都没醒**（断言恰好是 0 次）；经过 `AsyncJobQueue`，它照常醒了约 70 次（断言至少 20 次）。
+
+[`jobqueue.py`](jobqueue.py) 末尾的 `AsyncJobQueue` 把每个调用放进**一个专用线程**，事件循环只 `await` 结果：
+
+```python
+class AsyncJobQueue:
+    def __init__(self, path, **kwargs):
+        self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jobqueue")
+        ...
+
+    async def _call(self, method, *args, **kwargs):
+        def run():
+            if self._q is None:  # 连接在专用线程里创建，之后也只在这个线程里使用
+                self._q = JobQueue(self._path, **self._kwargs)
+            return getattr(self._q, method)(*args, **kwargs)
+
+        return await asyncio.get_running_loop().run_in_executor(self._exec, run)
+```
+
+为什么不直接用 `asyncio.to_thread`？`sqlite3` 连接默认不能跨线程使用，而 `to_thread` 用的线程池每次可能换一个线程；一个线程 + 一个连接，所有调用排队执行，简单且安全。`agentkit.distributed.SQLiteDB` 用的是同一个办法。同样的规矩也适用于工具：`demo.py` 的 `create_ticket` 是同步函数，agentkit 自动把它放进线程池；`worker_app.py` 的 `create_ticket` 是 async 函数，它的数据库写入走 `await db.write(...)`（专用线程）。**async 函数里绝不能直接做阻塞调用。**
+
+### 3.12 实测：加进程能快多少，瓶颈在哪
+
+[`demo_scale.py`](demo_scale.py) 用真实的 worker 进程测了两组吞吐。计时从"开闸"算起：任务先带着很长的延迟入队，等所有 worker 进程都启动完毕，再用一条 `UPDATE` 让它们同时变成可领取，进程启动时间不算在内。测量条件：Apple M1（8 核，8GB 内存），macOS 14.4，Python 3.11.7，SQLite 3.41.2；测量时机器上还跑着别的任务，load average 约 3。数字会随机器和负载变化（负载 40 多时，A 组只有每秒一千多个任务），但趋势是稳定的。
+
+```bash
+.venv/bin/python lessons/13_distributed_concurrency/demo_scale.py --offline   # 约 20 秒
+```
+
+```text
+A. 空任务 × 2000：只测队列（每个任务 = 领取 + 提交，两次写事务），每个进程 run_worker 并发 8
+  进程数    耗时      任务/秒   写事务/秒（×2）   相对 1 个进程   worker CPU 利用率
+  1         0.37s     5401      10801             1.00x           114%
+  2         0.39s     5140      10281             0.95x           59%
+  4         0.40s     5061      10123             0.94x           28%
+
+B. Agent 任务：每个任务 2 次模型调用（各 asyncio.sleep 0.1 秒）+ 1 次写工具。
+   领取 1 + 接管检查点 1 + 检查点保存 5 + 工具写入 1 + 幂等记录 1 + 提交 1 = 每个任务 10 次写事务（实测计数）
+  进程 × 并发   模型名额  任务数  耗时      任务/秒   理论上限  达到    写事务/秒  CPU 利用率
+  1 × 1         不限      16      3.35s     4.8       5         96%     48         2%
+  1 × 8         不限      96      2.70s     35.5      40        89%     355        14%
+  4 × 8         不限      96      0.71s     135.2     160       85%     1352       9%
+  4 × 8         ≤3        96      6.75s     14.2      15        95%     142        4%
+  1 × 64        不限      512     1.78s     287.5     320       90%     2875       40%
+  4 × 64        不限      512     0.72s     710.4     1280      55%     7104       25%
+  8 × 64        不限      512     0.77s     661.7     2560      26%     6617       12%
+```
+
+怎么读：
+
+- **A 组是队列本身的天花板。** 空任务只剩"领取 + 提交"两次写事务：1 个进程每秒约 5400 个任务，这时它的 CPU 已经用满（114%：事件循环一个核，数据库线程又占了一点）；加到 2 个、4 个进程，吞吐不升反降，每个进程的 CPU 利用率掉到 59%、28% —— 多出来的进程都在排队等同一把写锁。SQLite 同一时刻只允许一个写者，这就是"单写者"的上限在本机的位置：每秒约一万次这种小事务。
+- **B 组前几行：时间几乎全花在等模型上。** 理论上限 = 同时在跑的任务数 ÷ 每个任务等模型的 0.2 秒。第一把杠杆是**同一个进程里的 async 并发**（1×1 → 1×8，4.8 → 35.5 任务/秒，第 02 课）；再加进程乘上去（4×8，135 任务/秒）。所有进程共用 3 个模型名额（`SQLiteSemaphore`）时，4 个进程也只有 3 个并发的吞吐（14.2，理论 15）—— 瓶颈是模型配额，加进程没用。
+- **B 组最后三行：瓶颈换成了共享数据库。** 并发拉到 ×64，1 → 4 个进程还能翻一倍多，4 → 8 个进程不再增长（710 → 662），只达到理论上限的 26%，而 worker 的 CPU 大部分时间闲着（12%）。这时每秒约 7000 次写事务全部排队经过同一把写锁。要再往上，换成多写者的数据库（Postgres 行级锁，第 26 课），或者减少每个任务的写入次数（比如不是每一步都写检查点）。
+- **什么时候真的需要多个进程？** 从这张表看，一个 async 进程就能撑起几百个同时在等模型的任务。加进程的理由主要是另外几个：一个进程只能用一个 CPU 核（高并发时序列化、校验的 CPU 开销会先到顶）；一个进程崩溃不该带走所有任务；滚动发布时要有别的进程接手；以及最终要跨机器。
 
 ## 4. 动手：运行 Demo
 
+三个 demo，全部是真实的多进程：
+
 ```bash
-.venv/bin/python lessons/13_distributed_concurrency/demo.py --offline   # 离线：ScriptedLLM，约 30 秒
-.venv/bin/python lessons/13_distributed_concurrency/demo.py             # 真实模型：约 26 次调用、模型并发 ≤ 3，约 1 分钟
-.venv/bin/python lessons/13_distributed_concurrency/demo.py --offline --only 2,3   # 只跑场景 2 和 3
+.venv/bin/python lessons/13_distributed_concurrency/demo.py --offline          # 自己动手：5 个场景，约 15 秒
+.venv/bin/python lessons/13_distributed_concurrency/demo.py --offline --only 2,3
+.venv/bin/python lessons/13_distributed_concurrency/demo.py                    # 场景 2、3 调用真实模型，其余场景不调用模型
+.venv/bin/python lessons/13_distributed_concurrency/demo_agents.py --offline   # 框架版 + 故障注入时间线（3.10 节），约 6 秒
+.venv/bin/python lessons/13_distributed_concurrency/demo_scale.py --offline    # 吞吐实测（3.12 节），约 20 秒
 ```
 
-**场景 1：横向扩展**（离线模式实际输出）
+`demo.py` 的 worker 是用 `multiprocessing`（spawn）拉起的独立进程，每个进程里一个事件循环、一个共享的 async Agent；离线模式的"模型"是 `ScriptedLLM(latency=0.3)`，等待用的是 `asyncio.sleep`，等模型时心跳照常续约。下面是离线模式的实际输出。
+
+**场景 1：原子领取**：见 3.3 节。错误写法 88 次领取、58 次重复；你的 `claim_job`（没写完时用参考答案）30 次、0 次重复。
+
+**场景 2：kill -9 一个刚建完工单的 worker**（带幂等键的一轮）
 
 ```text
-   worker 数  模型并发  完成    耗时     吞吐(个/秒)  加速比   各 worker 处理数
-   ──────────────────────────────────────────────────────────────────────────────
-   1          不限      16/16   5.12s    3.1          1.0x     16
-   2          不限      16/16   2.55s    6.3          2.0x     8/8
-   4          不限      16/16   1.29s    12.4         4.0x     4/4/4/4
-   8          不限      16/16   0.68s    23.6         7.6x     2/2/2/2/2/2/2/2
-   8          ≤3        16/16   1.72s    9.3          3.0x     2/2/2/2/2/2/2/2
-```
-
-观察：Agent 的时间几乎都花在"等模型"上，所以加进程能近似线性地提速；但加上"模型并发 ≤ 3"之后，8 个 worker 也只剩 3 倍 —— **瓶颈从"worker 不够"转移到了"模型配额不够"**。真实模型模式下（3 个任务，1 个 vs 3 个 worker）一次运行的结果是 9.9 秒 vs 4.4 秒。
-
-**场景 2：kill -9 一个刚建完工单的 worker**（真实模型模式实际输出，带幂等键的一轮）
-
-```text
-   [+  3.2s] worker-1 │ 🧾 建工单 T-1001（幂等键 job-1:call_QSNolaMUdUjzr1mLnbmyOOH2）
-   [+  3.2s] worker-1 │ 工单建好了，但结果还没写进检查点、任务也还没提交……
-   [+  3.2s] 调度器   │ 💥 kill -9 worker-1：进程瞬间消失 —— 不释放租约、不写检查点、不留遗言
+   [+  0.4s] worker-1 │ 🧾 建工单 T-1002（幂等键 job-1:call_431ea088eb25）
+   [+  0.4s] worker-1 │ 工单建好了，但结果还没写进检查点、任务也还没提交……
+   [+  0.4s] 调度器   │ 💥 kill -9 worker-1（退出码 -9）：进程瞬间消失 —— 不释放租约、不写检查点、不留遗言
+   [+  0.4s] 调度器   │    任务 #1 的租约最多还剩 1.5 秒，到期前没人能接手；拉起替补 worker-3（相当于 K8s 重建 Pod）
    ...
-   [+  6.8s] worker-2 │ 领取任务 #1（第 2 次尝试，fence=2）：3 楼东区的打印机一直卡纸，红灯闪个不停
-   [+  6.8s] worker-2 │ 发现前任留下的检查点 → 从断点继续，而不是从头再来
-   [+  6.8s] worker-2 │ ♻️  幂等键命中 → 返回已有工单 T-1001，没有重复创建
-   [+  8.6s] worker-2 │ ✅ 完成 #1：已为您创建工单：T-1001
+   [+  1.6s] worker-2 │ 领取任务 #1（第 2 次尝试，fence=2）：3 楼东区的打印机一直卡纸，红灯闪个不停
+   [+  1.6s] worker-2 │ 发现前任留下的检查点 → 从断点继续，而不是从头再来
+   [+  1.7s] worker-2 │ ♻️  幂等键命中 → 返回已有工单 T-1002，没有重复创建
+   [+  2.0s] worker-2 │ ✅ 完成 #1：已为你创建工单 T-1002，IT 同事会尽快联系你。（worker-2 回复）
 
                任务完成  工单总数（应为 3）    任务 #1 的工单      任务 #1 领取次数
    不带幂等键  3/3       4（重复 1 张 ❌）     T-1001、T-1004      2 次 / fence=2
-   带幂等键    3/3       3（✅ 无重复）        T-1001              2 次 / fence=2
+   带幂等键    3/3       3（✅ 无重复）        T-1002              2 次 / fence=2
 ```
 
-观察：① kill 发生在 3.2 秒。租约最多 3 秒后过期，而此时两个活着的 worker 都在忙，worker-2 在 6.8 秒做完手头的任务后立刻接手了任务 #1。租约的代价就在这里：**发现一个 worker 死了，最多要等一个租约的时长**；② 两轮的"领取次数"都是 2、fence 都是 2，说明租约保证了"不丢"；③ 只有带幂等键的那一轮没有重复工单。
+观察：① 工单是在 0.4 秒建的，kill 紧跟其后；工具是同步函数，在 agentkit 的线程池里执行，所以它阻塞的那段时间事件循环照常运转、心跳照常续约，直到进程被杀；② 任务 #1 的租约 1.5 秒后过期，1.6 秒时 worker-2 接手。租约的代价就在这里：**发现一个 worker 死了，最多要等一个租约的时长**；③ 两轮的"领取次数"都是 2、fence 都是 2，说明租约保证了"不丢"；只有带幂等键的那一轮没有重复工单。
 
-**场景 3：僵尸 worker**
+**场景 3：僵尸 worker（真实的 SIGSTOP / SIGCONT）**（带 fence 的检查点那一轮）
 
 ```text
-   [+  4.2s] worker-1 │ 😵 Agent 跑完了，正要提交时卡住 8 秒（模拟 GC 停顿 / 虚拟机被暂停：心跳也停了）
-   [+  7.0s] worker-2 │ 领取任务 #1（第 2 次尝试，fence=2）：...
-   [+  7.0s] worker-2 │ 发现前任留下的检查点 → 从断点继续，而不是从头再来
-   [+  7.0s] worker-2 │ ✅ 完成 #1：已为您创建工单：T-1001
-   [+ 11.7s] worker-1 │ 醒了！以为自己还持有租约，继续提交结果……
-   [+ 11.7s] worker-1 │ ❌ 提交被拒绝（LeaseLostError）：任务 #1 已被重新领取：当前 fence=2（持有者 worker-2），你手里的 fence=1 已经过期
+   [+  0.5s] worker-1 │ 🧾 建工单 T-1001（幂等键 job-1:call_23cc2a44ceeb）
+   [+  0.5s] worker-1 │ 工具已执行、检查点已写，正在第二次调用模型……
+   [+  0.5s] 调度器   │ 🧊 SIGSTOP worker-1（pid 37104）：进程被操作系统冻结 —— 它的心跳协程也停了，但它自己毫不知情
+   [+  1.7s] worker-2 │ 领取任务 #1（第 2 次尝试，fence=2）：3 楼东区的打印机一直卡纸，红灯闪个不停
+   [+  1.7s] worker-2 │ 发现前任留下的检查点 → 从断点继续，而不是从头再来
+   [+  2.0s] worker-2 │ ✅ 完成 #1：已为你创建工单 T-1001，IT 同事会尽快联系你。（worker-2 回复）
+   [+  2.0s] 调度器   │ ▶️  SIGCONT worker-1：解冻。它从被冻结的那一行继续执行，手里还攥着 fence=1 的旧租约
+   [+  2.0s] worker-1 │ 💔 心跳被拒绝：任务 #1 已被重新领取：当前 fence=2（持有者 worker-2），你手里的 fence=1 已经过期
+   [+  2.0s] worker-1 │ ❌ 检查点写入被拒绝（CheckpointConflict）：run job-1 已被 worker-2 接管 → 立刻停手
+
+   检查点                      队列：状态 / 提交者 / fence     检查点里最终回答的作者        检查点 = 提交的结果？
+   FileCheckpointer            succeeded / worker-2 / fence=2  worker-1                      ❌ 不一致（被僵尸覆盖）
+   SQLiteCheckpointer.fenced   succeeded / worker-2 / fence=2  worker-2（writer=worker-2）   ✅ 一致
 ```
 
-观察：worker-2 从检查点发现 Agent 已经跑完，直接提交，一次模型都没调；worker-1 醒来时完全不知道自己已经"失业"，是存储端的 fence 挡住了它。
+观察：worker-2 从检查点接着跑（工具结果已经在检查点里，没有再建工单）；worker-1 醒来时完全不知道自己已经"失业"。换成不认 fence 的 `FileCheckpointer` 跑同一个场景：它的队列提交同样被 fence 挡住（`❌ 提交被拒绝（LeaseLostError）`），可它的最后一次检查点保存**成功了**，悄悄覆盖了 worker-2 写的结果，没有任何报错 —— 队列里记录的是 worker-2 的回答，检查点里却是 worker-1 的。挡住僵尸的必须是存储端在写入那一刻的检查（6.7 节）。
 
-**场景 4：同一会话并发写**（不调用模型，两种模式一致）
+**场景 4：同一会话并发写**（会话 worker 是没有事件循环的同步进程，用 sleep 代表模型耗时；两种模式一致）
 
 ```text
    方案                              保存的消息  丢失    模型调用次数      CAS 冲突  顺序正确  耗时
-   A. 不做并发控制（最后写入者胜）   4/16        12 ❌   16（浪费 12）     -         -         0.22s
-   B. 乐观并发：版本号 CAS + 重试    16/16       0 ✅    37（浪费 21）     21        ❌ 否     1.01s
-   C. 按会话串行：队列 group_key     16/16       0 ✅    16                0         ✅ 是     0.92s
+   A. 不做并发控制（最后写入者胜）   4/16        12 ❌   16（浪费 12）     -         -         0.24s
+   B. 乐观并发：版本号 CAS + 重试    16/16       0 ✅    37（浪费 21）     21        ❌ 否     1.13s
+   C. 按会话串行：队列 group_key     16/16       0 ✅    16                0         ✅ 是     0.89s
 ```
 
 观察：A 丢了 3/4 的消息，却**没有任何报错**；B 一条不丢，但为冲突多付了二十几次"模型调用"；C 零冲突、顺序正确。你完成练习 (c) 之后，B 和 C 会自动改用你写的 `update_session_with_retry`。
 
-运行产物在 `lessons/13_distributed_concurrency/runs/` 下，可以用任何 SQLite 工具打开 `queue.db` 看每个任务的 `attempts`、`fence`、`worker_id`。
+**场景 5：共享配额 + kill -9**
+
+```text
+   实现                                  之后能拿到  结果
+   multiprocessing.BoundedSemaphore(2)   1 个        ❌ 永久少了 1 个（没人会替死者 release）
+   SQLiteSemaphore(limit=2, 租约 1 秒)   2 个        ✅ kill 后还占着 1 个，1.03 秒后租约到期自动归还
+```
+
+观察：`multiprocessing.Semaphore` 只是操作系统里的一个计数器，谁拿了、谁死了它一概不知；`SQLiteSemaphore` 的每个名额是带租约的一行记录，持有期间自动续约，持有者一死，租约到期后名额自动回来（问题 5 的方案 C 说的"许可必须带租约"）。
+
+运行产物在 `lessons/13_distributed_concurrency/runs/` 下，可以用任何 SQLite 工具打开 `queue.db` 看每个任务的 `attempts`、`fence`、`worker_id`，打开 `checkpoints.db` 的 `agent_runs` 表看每个 run 的 `fence`、`version`、`writer`。
 
 ## 5. 练习
 
-打开 [`exercise.py`](exercise.py)，实现三个函数：
+打开 [`exercise.py`](exercise.py)，实现三个函数。它们都是**普通的同步函数**（不是 `async def`，不需要 `await`）：直接调用阻塞的 `sqlite3`，由测试在没有事件循环的独立进程里调用（为什么这样设计见 3.11 节）。
 
 | 题目 | 要做什么 | 测试怎么验证 |
 |---|---|---|
-| (a) `claim_job` | 原子领取最老的可领取任务：写租约，`attempts + 1`，`fence + 1` | 8 个线程同时抢 40 个任务，每个任务恰好被领取一次；租约过期后可被重新领取且 fence 变大；次数用尽后不再发出 |
+| (a) `claim_job` | 原子领取最老的可领取任务：写租约，`attempts + 1`，`fence + 1` | 8 个**进程**同时抢 40 个任务，每个任务恰好被领取一次；6 个进程在 20 毫秒的租约上反复抢 1 秒，每个 fence 只发出去一次、接手一定在租约过期之后；租约过期后可被重新领取且 fence 变大；次数用尽后不再发出 |
 | (b) `complete_job` | 只有 `status='leased'` 且 fence 匹配时才允许提交 | 僵尸 worker 的提交被拒绝且数据不变；重复提交被拒绝；租约过期但没人接手时迟到的提交仍然有效 |
-| (c) `update_session_with_retry` | CAS + 有限次重试，每次冲突后重新读取、重新应用修改，带抖动的退避 | 确定性地制造冲突，检查第二次拿到的是新数据；达到上限后放弃；10 个线程并发自增 100 次，一次不丢 |
+| (c) `update_session_with_retry` | CAS + 有限次重试，每次冲突后重新读取、重新应用修改，带抖动的退避 | 确定性地制造冲突，检查第二次拿到的是新数据；达到上限后放弃；10 个**进程**并发自增 100 次，一次不丢（同时断言真的发生过 CAS 冲突） |
 
 ```bash
 make lesson N=13
@@ -561,10 +716,12 @@ make lesson N=13
 
 提示：
 
-- 并发测试会给每个连接装一个 trace 回调，在每条 SQL 执行前停 1 毫秒，把竞态窗口放大。"先 SELECT、再无条件 UPDATE"的写法，以及用默认 `BEGIN` 的写法，都会稳定地失败（后者会报 `database is locked`，原因见 3.2 节）。
+- 并发测试用 [`race.py`](race.py) 拉起真实的子进程，你的函数跑在子进程里；子进程里抛出的异常（包括 `NotImplementedError`）会在测试里原样重新抛出，报错信息里带着是哪个进程、完整的 traceback。
+- claim 的并发测试会给每个连接装一个 trace 回调，在每条 SQL 执行前停 1 毫秒，把竞态窗口放大。"先 SELECT、再无条件 UPDATE"的写法，以及用默认 `BEGIN` 的写法，都会稳定地失败（后者会报 `database is locked`，原因见 3.2 节）。
 - (a) 可以直接复用 `jobqueue.CLAIMABLE_WHERE`；建议用写法 B 实现，和 `JobQueue.claim` 的写法 A 对照着理解。
 - (c) 里 `update_fn` 必须作用在**每次新读到的** `data` 上。
-- 做完之后重跑 demo，场景 4 会显示"来自 exercise.py（你的实现 👍）"。
+- 做完之后重跑 demo，场景 1、4 会显示"exercise.py，你的实现 👍"。
+- `test_async_jobqueue_keeps_the_event_loop_running` 不是练习（`AsyncJobQueue` 已经写好），不做练习它也会通过；它量的是 3.11 节那个"在事件循环里阻塞"的坑。
 
 ## 6. 深入（给有余力的你）
 
@@ -615,27 +772,31 @@ row = conn.execute(f"""
 
 ### 6.4 优雅停机：发版时别制造"僵尸"
 
-滚动发布时，K8s 先给 Pod 发 SIGTERM，等待一段宽限期后再 SIGKILL。worker 收到 SIGTERM 时应该：① 立刻停止领取新任务；② 在宽限期内尽量完成手头的任务；③ 做不完的，主动把任务放回队列（或者干脆等租约过期）。放回时不应计入 `attempts`，否则每次发版都会消耗一次重试机会。本课的 `JobQueue` 没有实现"主动归还"，你可以试着加一个 `release(job_id, fence)`：校验 fence，把状态改回 `queued`，并把 `attempts` 减一。 生产版 worker 的完整停机时间线（停止领取 → 排空 → 交还 → 退出）和实测见[第 31 课](../31_deployment_and_scaling/README.md)。
+滚动发布时，K8s 先给 Pod 发 SIGTERM，等待一段宽限期（`terminationGracePeriodSeconds`，默认 30 秒）后再 SIGKILL。worker 收到 SIGTERM 时应该：① 立刻停止领取新任务；② 在宽限期内尽量完成手头的任务；③ 做不完的，主动把任务放回队列，或者干脆不提交、等租约过期由别人从检查点接手。放回时不应计入 `attempts`，否则每次发版都会消耗一次重试机会。
+
+本课手写的 `JobQueue` 没有实现"主动归还"，你可以试着加一个 `release(job_id, fence)`：校验 fence，把状态改回 `queued`，并把 `attempts` 减一。框架里这些都有了：`stop_on_signals` 用 `loop.add_signal_handler` 把 SIGTERM 接到一个 `asyncio.Event` 上；`run_worker` 看到它就不再领取，等在途任务最多 `grace_period` 秒，超时的任务被**取消、不提交、不归还**，它们的租约自然过期后由别的 worker 从检查点接手（fence 保证取消前的写入不会覆盖接手者）；`SQLiteJobQueue.release()` 归还任务时不消耗次数（被限流推迟的任务就走这条路）。`demo_agents.py` 里，被 SIGTERM 的 worker 没有再领取新任务，把在途的任务做完后以退出码 0 退出。
+
+实测还发现了一个框架问题（已报告给维护者）：`run_worker` 在领取前要先拿到一个并发槽位，**所有槽位都被在途任务占着时，它停在"等槽位"那一步，看不到停机信号**，直到有任务结束。结果是 `grace_period` 在这种情况下不起作用：并发上限 1、`grace=1` 秒、在途任务要跑 8 秒，SIGTERM 之后进程 8.08 秒才退出（期望是约 1 秒后取消任务）。如果在途任务比 K8s 的宽限期还长，Pod 会被 SIGKILL，而不是由 worker 自己干净地取消。修复方法是让"等槽位"和"等停机信号"同时等待，谁先到算谁。生产版 worker 的完整停机时间线（停止领取 → 排空 → 交还 → 退出）和实测见[第 31 课](../31_deployment_and_scaling/README.md)。
 
 ### 6.5 Saga 的最小骨架（示意代码）
 
 ```python
-def book_trip(trip, ctx):
+async def book_trip(trip, ctx):
     done = []                                           # 已完成步骤的补偿动作，按顺序记录
-    steps = [
+    steps = [                                           # (动作, 补偿)：都是"返回协程的函数"
         (lambda: airline.book(trip, idem=f"{ctx.run_id}:flight"), lambda: airline.cancel(idem=f"{ctx.run_id}:flight")),
         (lambda: hotel.book(trip, idem=f"{ctx.run_id}:hotel"),    lambda: hotel.cancel(idem=f"{ctx.run_id}:hotel")),
         (lambda: expense.submit(trip, idem=f"{ctx.run_id}:expense"), None),
     ]
     for action, compensate in steps:
         try:
-            action()
+            await action()
         except Exception as e:
             for undo in reversed(done):                 # 反向补偿
                 try:
-                    undo()                              # 补偿也要幂等、可重试
+                    await undo()                        # 补偿也要幂等、可重试
                 except Exception:
-                    escalate_to_human(trip, e)          # 补偿失败 → 人工兜底
+                    await escalate_to_human(trip, e)    # 补偿失败 → 人工兜底
                     raise
             raise
         if compensate:
@@ -647,40 +808,56 @@ def book_trip(trip, ctx):
 ### 6.6 singleflight 的进程内实现
 
 ```python
-import threading
-from concurrent.futures import Future
+import asyncio
 
 
 class SingleFlight:
-    """同一个 key 同一时刻只放行一个真正的调用，其余调用者等它的结果。"""
+    """同一个进程里：同一个 key 同一时刻只放行一个真正的调用，其余协程等它的结果。"""
 
     def __init__(self):
-        self._lock = threading.Lock()
-        self._inflight: dict[str, Future] = {}
+        self._inflight: dict[str, asyncio.Task] = {}
 
-    def do(self, key: str, fn):
-        with self._lock:
-            fut = self._inflight.get(key)
-            leader = fut is None
-            if leader:
-                fut = self._inflight[key] = Future()
-        if not leader:
-            return fut.result()           # 跟随者：等领头的结果（异常也会原样抛出）
-        try:
-            fut.set_result(fn())
-        except BaseException as e:
-            fut.set_exception(e)
-        finally:
-            with self._lock:
-                del self._inflight[key]  # 结束就移除：下一批请求重新回源，不会永远复用旧结果
-        return fut.result()
+    async def do(self, key: str, fn):
+        task = self._inflight.get(key)
+        if task is None:  # 领头的：真正去回源
+            task = asyncio.ensure_future(fn())
+            self._inflight[key] = task
+            task.add_done_callback(lambda _: self._inflight.pop(key, None))  # 结束就移除：下一批请求重新回源
+        # shield：某个调用方被取消（比如它的 HTTP 客户端断开了），不会把大家共同等待的那个任务也取消掉
+        return await asyncio.shield(task)
 ```
 
-我们实测：500 个线程同时对同一个 key 调用一个耗时 0.2 秒的函数，真正执行的只有 1 次，500 个调用者拿到同一个结果。它只在一个进程内有效；跨进程 / 跨机器时，要用分布式锁（带租约）或前面提到的"回源令牌"来实现同样的效果。Go 的 `golang.org/x/sync/singleflight` 提供的是同样的语义：同一个 key 同一时刻只有一个执行在途，重复的调用者等待并拿到同一个结果。
+事件循环是单线程的，"查字典 → 放进字典"之间没有 `await`，所以不需要锁。我们实测：500 个协程同时对同一个 key 调用一个耗时 0.2 秒的函数，真正执行的只有 1 次，500 个调用者拿到同一个结果，总耗时 0.20 秒；函数抛异常时，100 个调用者拿到的是同一个异常（错误也会被共享）；一个调用方中途被取消，其他调用方照样拿到结果。
+
+**它只在一个进程内有效。** 4 个 worker 进程各有一份字典，同一个热点 key 最多回源 4 次；几十个进程就是几十次，缓存击穿依然会发生，只是被除以了进程数。跨进程要把"谁在回源"放到共享存储里：用带租约的"回源令牌"（和 `SQLiteSemaphore` 同一个套路：拿到令牌的去回源，其他进程稍等再读缓存；持有者崩溃，租约到期后别人接手），或者直接用缓存层的 lease（问题 7 里 memcache 论文的做法）。Go 的 `golang.org/x/sync/singleflight` 提供的是同样的进程内语义：同一个 key 同一时刻只有一个执行在途，重复的调用者等待并拿到同一个结果。
 
 ### 6.7 检查点的写入也需要 fencing
 
-本课场景 3 里，僵尸 worker 卡在"提交"之前，所以它醒来后没有再写检查点。但如果它卡在 Agent 循环的**中间**，醒来后会继续跑、继续存检查点，把新 worker 写的检查点覆盖掉。`FileCheckpointer` 不知道 fence 的存在。更严谨的做法是：检查点记录里带上写入者的 fence，保存时用条件写入（`WHERE fence <= 我的 fence`）；或者每一步开始前检查一次心跳线程的 `lost` 标志（能缩小窗口，但不能消除）。**凡是受租约保护的写入，都应该带 fence。**
+僵尸 worker 醒来后，如果它卡在 Agent 循环的**中间**，会继续跑、继续存检查点，把新 worker 写的检查点覆盖掉。`FileCheckpointer` 不知道 fence 的存在，`demo.py` 场景 3 实测了后果：队列提交被 fence 挡住了，检查点却被僵尸悄悄覆盖，队列和检查点对不上，而且没有任何报错。
+
+这件事现在由核心的 `agentkit.distributed.SQLiteCheckpointer` 负责，两层保护：
+
+- **版本号 CAS**：实例记住每个 run 最后读到 / 写入的版本号 v，保存时 `UPDATE ... SET version = version + 1 WHERE run_id = ? AND version = v`，更新到 0 行就抛 `CheckpointConflict`。
+- **fence 接管**：纯 CAS 是"先写者赢"：僵尸和新 worker 读到同一个版本时，谁先写谁赢，输的可能恰恰是新 worker。所以每次领取任务都用这次的 fence 创建一个视图 `ckpt.fenced(job.fence, writer=worker_id)`，它在 `load` 时"接管"这个 run：
+
+```sql
+UPDATE agent_runs SET fence = :my_fence, version = version + 1, writer = :me, updated_at = :now
+WHERE run_id = :run_id AND fence <= :my_fence
+```
+
+  版本号加一，旧持有者手里的版本号从这一刻起全部作废，它之后的任何保存都会冲突；fence 比表里小的 `load` 直接被拒绝。**最新的租约持有者总是赢家**，不管谁先写。
+
+```python
+base = SQLiteCheckpointer("runs/checkpoints.db")
+await base.setup()                                      # 建表（进程启动时一次）
+ckpt = base.fenced(job.fence, writer=worker_id)          # 每领取一次任务创建一个视图
+if await ckpt.load(run_id) is not None:                 # load = 接管
+    result = await agent.resume(run_id, checkpointer=ckpt)
+else:
+    result = await agent.run(text, run_id=run_id, checkpointer=ckpt)
+```
+
+`AgentJobHandler` 替你做的就是这几行（`demo.py` 的 `handle_agent_job` 是手写版）。另一个办法是每一步开始前检查一次心跳发现的"租约已丢失"（框架里的 `LeaseGuard` 钩子）：它能减少无用功，但检查和写入之间还可能再停顿一次，所以只能缩小窗口，不能代替 fence。**凡是受租约保护的写入，都应该带 fence。**
 
 ### 6.8 规模再大一些会怎样
 
@@ -705,6 +882,10 @@ class SingleFlight:
 | 每个 worker 各自按"总配额"限流 | 实际打出 N 倍配额，全是 429 | 全局限流 / 按 worker 数分配 |
 | 在 Agent 里用 2PC 协调外部 API | 外部 API 不支持；长时间持锁 | Saga + 补偿 + 人工兜底 |
 | 用"调大超时"解决长任务 | 任何一跳漏改就断；断线后重复执行 | 异步任务 + 进度推送 |
+| 在事件循环里直接调用阻塞的 sqlite3 / requests | 等锁、等网络的那几秒里整个进程停摆，所有任务的心跳一起停，租约一起过期、被重复执行 | 专用线程（`AsyncJobQueue`、`SQLiteDB`）或 async 驱动；同步工具交给 agentkit 放进线程池 |
+| 用 `multiprocessing.Semaphore` 做跨进程配额 | 持有者被 kill -9 后名额永久泄漏；跨机器根本用不了 | 带租约的信号量（`SQLiteSemaphore`、Redis） |
+| 检查点不认 fence（`FileCheckpointer`、裸 `UPDATE`） | 僵尸覆盖接手者写的检查点，没有任何报错 | 版本号 CAS + fence 接管（`SQLiteCheckpointer.fenced`） |
+| 多个进程同时新建同一个 SQLite 文件 | 有进程在切换 WAL 模式时直接收到 `database is locked`（实测） | 先由一个进程建好库和表，再拉起 worker |
 
 ## 8. 面试 & 设计评审问题
 
@@ -795,6 +976,9 @@ class SingleFlight:
 - [ ] 我能为多 worker 共享的模型配额设计一套限流方案，并解释吵闹的邻居怎么防
 - [ ] 我能解释为什么 Agent 场景不用 2PC，并写出一个 Saga 的骨架
 - [ ] 我能说出重试风暴、惊群、缓存击穿的成因和对策
+- [ ] 我能解释为什么在事件循环里不能直接调用阻塞的 sqlite3，以及"一个专用线程 + 一个连接"为什么是正确的做法
+- [ ] 我能说出本课的 SQLite 多进程演示证明了什么、证明不了什么（多机、网络分区、时钟漂移）
+- [ ] 我能把手写的 claim / fence / 心跳 / 死信 / CAS 对应到 `agentkit.distributed` 的实现上
 - [ ] 我完成了练习：`make lesson N=13` 全部通过
 
 ## 延伸阅读

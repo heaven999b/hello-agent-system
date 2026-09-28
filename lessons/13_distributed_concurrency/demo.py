@@ -612,7 +612,7 @@ def run_zombie_case(ctx, args, kind: str) -> dict:
     finally:
         if froze:
             os.kill(first.pid, signal.SIGCONT)
-            log(f"▶️  SIGCONT worker-1：解冻。它从被冻结的那一行继续执行，手里还攥着 fence=1 的旧租约")
+            log("▶️  SIGCONT worker-1：解冻。它从被冻结的那一行继续执行，手里还攥着 fence=1 的旧租约")
     join_all([first, second], timeout=600)
     job = q.get(1)
     output, writer = final_checkpoint(workdir, kind)

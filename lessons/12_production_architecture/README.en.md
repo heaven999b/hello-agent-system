@@ -2,7 +2,7 @@
 
 # Lesson 12: Production architecture — from script to service
 
-> 🕐 Time: 15 min | 🎯 You'll be able to: draw a reference architecture for an enterprise agent platform and explain what problem each component solves, and make sound calls on the key architectural decisions: sync vs async, stateful vs stateless, tenant isolation, framework choice, and model gateways | 📦 Source: this lesson's exercise (multi-tenant rate limiting, model routing), `agentkit/state.py`, `agentkit/llm.py`; for a complete service example, see `capstone/server.py`
+> 🕐 Time: 15 min | 🎯 You'll be able to: draw a reference architecture for an enterprise agent platform and explain what problem each component solves, and make sound calls on the key architectural decisions: sync vs async, stateful vs stateless, tenant isolation, framework choice, and model gateways | 📦 Source: this lesson's exercise (multi-tenant rate limiting, model routing); the mini deployment [`mini_api.py`](mini_api.py) (API process), [`worker_app.py`](worker_app.py) (worker process), [`deployment.py`](deployment.py) (starts them as real processes); [`agentkit/distributed/`](../../agentkit/distributed/__init__.py), [`agentkit/limits.py`](../../agentkit/limits.py), [`agentkit/state.py`](../../agentkit/state.py)
 >
 > 📖 Primary reading: [12-Factor Agents - Principles for building reliable LLM applications](https://github.com/humanlayer/12-factor-agents) (Dex Horthy, 2025) — HumanLayer's twelve principles for turning an agent into software you can put in front of customers, mapping directly onto this lesson's problem cards on async tasks, stateless workers, and framework choice; focus on Factor 5 (unify execution state and business state), Factor 6 (launch/pause/resume with simple APIs), and Factor 8 (own your control flow).
 
@@ -15,9 +15,9 @@ Agents are the same. `python agent.py` runs just fine on your laptop. Then, at 9
 | Symptom | What's missing | Where it's covered |
 |---|---|---|
 | The model provider returns 429 and half the requests fail | Rate limiting; retries and fallback in the model gateway | This lesson's exercise, Lesson 08, Problem 5 |
-| One department's script calls the agent in an infinite loop and burns through the whole company's quota | Multi-tenant rate limiting | This lesson's exercise |
-| "Summarize my department's leave last quarter" takes 2 minutes, but the gateway times out at 60 seconds | Async tasks | Problem 1 |
-| A rolling deploy loses all 200 in-flight tasks | Stateless workers + checkpoints | Problem 2, Lesson 13 |
+| One department's script calls the agent in an infinite loop and burns through the whole company's quota | Multi-tenant rate limiting | This lesson's exercise, demo Sections 4 and 5 |
+| "Summarize my department's leave last quarter" takes 2 minutes, but the gateway times out at 60 seconds | Async tasks | Problem 1, demo Section 2 |
+| A rolling deploy loses all 200 in-flight tasks | Stateless workers + checkpoints | Problem 2, demo Section 3, Lesson 13 |
 | Company A's employees see Company B's policies | Multi-tenant isolation | Problem 3, Lesson 15 |
 | Someone edits the prompt, everyone gets wrong answers all afternoon, and rolling back requires a new deploy | Config center, progressive rollout, rollback | Lesson 16 |
 | At month-end, finance asks: how much did AI cost, and which department should pay for what? | Cost attribution | This lesson's demo, Lesson 14 |
@@ -60,11 +60,11 @@ flowchart TB
 
 | Component | Problem it solves | In agentkit | Deep dive |
 |---|---|---|---|
-| API gateway | Authenticates callers, identifies the tenant, rate-limits, rejects oversized requests | This lesson's exercise: `TenantRateLimiter` | [Lesson 13](../13_distributed_concurrency/README.en.md) (global rate limiting and backpressure) |
+| API gateway | Authenticates callers, identifies the tenant, rate-limits, rejects oversized requests | This lesson's exercise: `TenantRateLimiter`; the mini deployment's [`mini_api.py`](mini_api.py) | [Lesson 13](../13_distributed_concurrency/README.en.md) (global rate limiting and backpressure) |
 | Session service | Multi-turn conversation history, streaming, reconnecting after a dropped connection | `RunResult.history` | Problem 1 |
-| Task queue | Makes long tasks async, smooths out traffic peaks, retries failures | — | [Lesson 13](../13_distributed_concurrency/README.en.md) (lease-based queues, delivery semantics) |
-| Agent runtime workers | Run the agent loop; stateless, so they can scale up or down at any time | [agent.py](../../agentkit/agent.py) | Problem 2, [Lesson 02](../02_agent_loop/README.en.md) |
-| State store | Checkpoints, sessions, approval state | [state.py](../../agentkit/state.py) | [Lesson 08](../08_reliability/README.en.md), [Lesson 13](../13_distributed_concurrency/README.en.md) (concurrent writes) |
+| Task queue | Makes long tasks async, smooths out traffic peaks, retries failures | `agentkit.distributed.SQLiteJobQueue` | [Lesson 13](../13_distributed_concurrency/README.en.md) (lease-based queues, delivery semantics) |
+| Agent runtime workers | Run the agent loop; stateless, so they can scale up or down at any time | [agent.py](../../agentkit/agent.py); `run_worker` + `AgentJobHandler` (worker processes) | Problem 2, [Lesson 02](../02_agent_loop/README.en.md), [Lesson 13](../13_distributed_concurrency/README.en.md) |
+| State store | Checkpoints, sessions, approval state | [state.py](../../agentkit/state.py); `SQLiteCheckpointer` (shared across processes, fence takeover) | [Lesson 08](../08_reliability/README.en.md), [Lesson 13](../13_distributed_concurrency/README.en.md) (concurrent writes) |
 | Vector store / memory | Knowledge retrieval and long-term memory, isolated by tenant and permission | [memory.py](../../agentkit/memory.py) | [Lesson 04](../04_context_memory/README.en.md), [Lesson 15](../15_enterprise_rag/README.en.md) |
 | Model gateway | Unified interface, key custody, routing, quotas, billing, fallback, caching | [llm.py](../../agentkit/llm.py), [reliability.py](../../agentkit/reliability.py), this lesson's exercise: `choose_model` | Problem 5, [Lesson 14](../14_cost_latency/README.en.md) |
 | Tool services | Wrap enterprise systems as standardized tools (MCP) | [tools.py](../../agentkit/tools.py) | [Lesson 03](../03_tools/README.en.md), Section 1.5 |
@@ -122,7 +122,7 @@ flowchart LR
 - **b sets the burst size**: after an idle stretch, how many requests can go through back to back. **r sets the long-term average rate.**
 - Compared with a **fixed window** of "at most N per minute," a token bucket has no window-boundary problem. With a fixed window, up to 2N requests can get through in a short span straddling the boundary between two windows.
 - For LLMs you need to limit two things at once: requests (RPM) and tokens (TPM). A request can deduct tokens based on its expected token usage; that's what `try_acquire(tokens=...)` is for.
-- **One bucket per tenant** prevents the "noisy neighbor" problem; a global bucket around them protects the total upstream model quota. With multiple replicas, bucket state has to live in shared storage such as Redis and be updated atomically. Stripe's engineering blog post *Scaling your API with rate limiters* describes their approach based on token buckets and Redis. Distributed rate limiting and backpressure are covered in [Lesson 13](../13_distributed_concurrency/README.en.md).
+- **One bucket per tenant** prevents the "noisy neighbor" problem; a global bucket around them protects the total upstream model quota. With multiple replicas, bucket state has to live in shared storage and be updated atomically: in demo Section 4, two API processes with their own in-memory buckets let through 16 requests (the configured limit is about 9), while a shared `SQLiteTokenBucket` let through 8. Across machines it goes into Redis; Stripe's engineering blog post *Scaling your API with rate limiters* describes their approach based on token buckets and Redis. Distributed rate limiting and backpressure are covered in [Lesson 13](../13_distributed_concurrency/README.en.md).
 
 **Model routing: good enough is good enough.** Most requests are simple and can go to a cheap model; only the hard ones need a strong model. The rule order in this lesson's exercise is: **hard constraints first (does it need tool calling, does the context fit), then quality requirements (high complexity means strong models only), and only then pick the cheapest of the remaining candidates**. In the demo, routing this way cuts the daily bill by 69% compared with "use the strong model for everything." A step further is a **cascade**: let the cheap model answer first, and escalate to the strong model if the answer fails validation; see [Lesson 14](../14_cost_latency/README.en.md). Keep in mind that routing changes who answers, so every model that requests can be routed to needs its own run of the eval set (Lesson 11).
 
@@ -153,7 +153,7 @@ The A2A website sums up the relationship like this: use MCP to give a single age
 
 **How to choose**: Decide by task duration and whether a human needs to step in. Use A for anything that finishes within 10 seconds, default to B for interactive chat, and use C for anything longer than a minute or two, or anything that may pause for approval. The most common real-world pattern is **C + B combined**: the task runs asynchronously with its state persisted, the client subscribes to progress over SSE, and after a disconnect it resubscribes using the task_id. Remember: **streaming is just a transport, and a task's lifecycle must never be tied to a connection.** If the connection drops, the task keeps running.
 
-**In this lesson**: The "pause → save state in a checkpoint → another worker resumes" flow in Section 4 of the demo is the core mechanism behind option C. [capstone/server.py](../../capstone/server.py) turns it into an HTTP API (`POST /runs` to start, `GET /runs/{run_id}` to poll, `POST /runs/{run_id}/approval` to resume after approval). Task queues, leases, and delivery semantics are covered in [Lesson 13](../13_distributed_concurrency/README.en.md).
+**In this lesson**: The mini deployment implements option C (demo Section 2). On `POST /runs`, an API process only authenticates, rate-limits, routes, and enqueues, returning `202` and a run_id in a measured 8 ms; a worker process runs the task in the background while the client polls `GET /runs/{run_id}`. The control, `POST /runs/sync`, runs the agent inside the request: the client's 2-second timeout cuts it off, yet the server finishes the run 2.5 seconds later — the money is spent and nobody gets the result. "Pause for approval, then resume on any worker" uses the same machinery: `AgentJobHandler`'s `resume` jobs ([Lesson 13](../13_distributed_concurrency/README.en.md)); [capstone/server.py](../../capstone/server.py) shows how to write `POST /runs/{run_id}/approval`. Task queues, leases, and delivery semantics are covered in [Lesson 13](../13_distributed_concurrency/README.en.md).
 
 ### Problem 2: Should agent workers keep sessions in memory?
 
@@ -169,7 +169,7 @@ The A2A website sums up the relationship like this: use MCP to give a single age
 
 **How to choose**: Default to B. Consider C when flows are long, span multiple systems, and failure is costly. Use A only for prototypes. Whether you choose B or C, **write tools must be idempotent** (Lesson 08): replaying a tool call during recovery must never charge a customer twice or submit a request twice.
 
-**In this lesson**: agentkit implements option B with checkpoints. The main loop calls `checkpointer.save` at every step, and `FileCheckpointer` writes to a temp file first and then atomically replaces the original (see [agentkit/state.py](../../agentkit/state.py)). In Section 4 of the demo, worker A pauses and is destroyed, and worker B picks up from the checkpoint and finishes the job; the identity, the pending call awaiting approval, and the approval record are all in the checkpoint. In production, swap the files for Postgres / Redis. For multiple workers writing to the same session concurrently (distributed locks, optimistic concurrency, per-partition serialization, fencing tokens), see [Lesson 13](../13_distributed_concurrency/README.en.md).
+**In this lesson**: agentkit implements option B with checkpoints: the main loop calls `checkpointer.save` at every step. In the mini deployment, checkpoints live in a `SQLiteCheckpointer` shared by every process (demo Section 3): a long task is at step 1 when the worker process holding it gets `kill -9`; once the lease expires, another worker process claims it (second claim, fence 1 → 2), picks up from the checkpoint to finish steps 2 and 3, and the checkpoint's last writer changes to the new worker — step 1, already done, isn't redone. The client just keeps polling, and it doesn't matter which of the two API processes answers, because the state isn't in any process's memory. In production, swap SQLite for Postgres / Redis (Lesson 26). For multiple workers writing to the same session concurrently (distributed locks, optimistic concurrency, per-partition serialization, fencing tokens), see [Lesson 13](../13_distributed_concurrency/README.en.md).
 
 ### Problem 3: How far should multi-tenant isolation go?
 
@@ -187,7 +187,7 @@ The three models in the table below borrow their terms from the AWS whitepaper *
 
 **How to choose**: Tier customers by compliance requirements first. Customers with an explicit "physical isolation" requirement get A, or at least C with a dedicated data layer; everyone else gets B. With B, isolation must be the **framework's default behavior**, not something every developer has to remember to add: identity is injected by the gateway, the storage layer enforces tenant_id, cache keys include tenant_id, each tenant has its own rate-limit bucket and quota, and cost is attributed per tenant. Isolation points that agent systems are especially prone to miss: long-term memory, semantic caches, retrieval indexes, tool credentials (each tenant should use its own credentials to access its own enterprise systems), and trace data.
 
-**In this lesson**: The exercise's `TenantRateLimiter` gives each tenant its own bucket; in agentkit, identity in `ToolContext` is injected by the system, and `MemoryStore` isolates data by tenant and user (Lesson 04). In Section 3 of the demo, employees of different tenants ask the same question and each get their own tenant's data, with cost booked per tenant. Permission-aware retrieval and index isolation are covered in [Lesson 15](../15_enterprise_rag/README.en.md).
+**In this lesson**: The exercise's `TenantRateLimiter` gives each tenant its own bucket; in agentkit, identity in `ToolContext` is injected by the system, and `MemoryStore` isolates data by tenant and user (Lesson 04). In the mini deployment, identity comes from an API key (standing in for a JWT verified by the gateway) and is written into the job's `tenant_id` at enqueue time; `AgentJobHandler` trusts only that, never a tenant claimed in the payload. Tools take the tenant and user from `ctx`; asking for another tenant's run returns 404 (checked by a test); the workers also have a per-tenant bulkhead (demo Section 5), and cost is booked per tenant. Permission-aware retrieval and index isolation are covered in [Lesson 15](../15_enterprise_rag/README.en.md).
 
 ### Problem 4: Build it yourself, use a framework, or use a managed platform?
 
@@ -229,68 +229,125 @@ Common frameworks compared (only well-established facts are listed; see each pro
 
 **How to choose**: The discipline that "every model call goes through the gateway" matters more than which product you choose. Most teams start with B or C; at very large scale or with special needs, they build on top of B or switch to A. Whichever you choose: business code knows only **logical model names** (`mini`, `pro`), with the real model decided by gateway config; the gateway itself runs with multiple replicas; and there's an emergency path that bypasses the gateway and connects directly to a provider.
 
-**In this lesson**: agentkit's LLM abstraction (Lesson 02) means business code depends only on `chat(messages, tools)`. The exercise's `choose_model` plays the role of the gateway's routing rules, and Lesson 08's `ResilientLLM` plays the role of the gateway's retries, circuit breaking, and fallback. The cliproxyapi instance your local `.env` points to (`http://localhost:8317/v1`) is exactly this kind of OpenAI-compatible local proxy: your code only knows one address and one key, and the proxy decides which model sits behind them.
+**In this lesson**: agentkit's LLM abstraction (Lesson 02) means business code depends only on `chat(messages, tools)`. The exercise's `choose_model` plays the role of the gateway's routing rules — the mini deployment's API processes call it for every request and write the chosen logical model into the job — and Lesson 08's `ResilientLLM` plays the role of the gateway's retries, circuit breaking, and fallback. The cliproxyapi instance your local `.env` points to (`http://localhost:8317/v1`) is exactly this kind of OpenAI-compatible local proxy: your code only knows one address and one key, and the proxy decides which model sits behind them.
 
 ## 3. From toy to production: where agentkit fits in the reference architecture
 
-agentkit's **design patterns** are production-grade, but agentkit itself is a teaching implementation: synchronous, single-process, with in-memory or local-file storage. Here's what each piece becomes in production:
+agentkit's core is async: one process drives hundreds of sessions at once (Lesson 02). `agentkit.distributed` handles the division of labor across processes: a shared job queue, fenced checkpoints, cross-process token buckets and concurrency slots, worker processes, and fault injection (Lesson 13). It's still a teaching implementation, though: the storage is SQLite (one machine only, one writer at a time), and there's no real gateway, config center, or multi-machine deployment. Here's what each piece becomes in production:
 
 | Capability | agentkit teaching implementation | In production |
 |---|---|---|
-| Agent loop | [agent.py](../../agentkit/agent.py), synchronous and single-process | A cluster of stateless workers driven by a queue (Problems 1 and 2) |
-| Checkpoints | `InMemoryCheckpointer` / `FileCheckpointer` | Postgres / Redis, with version numbers or leases (Lesson 13) |
-| Tool execution | In-process threads + timeouts | Separate tool services (MCP servers) + sandboxes (containers, gVisor, Firecracker). The comments in [tools.py](../../agentkit/tools.py) say so too: Python threads can't be forcibly killed, so high-risk tools must run in a separate process or sandbox |
+| Agent loop | [agent.py](../../agentkit/agent.py), async, hundreds of sessions per process; `agentkit.distributed` worker processes claim jobs from a queue (this lesson's mini deployment) | A cluster of stateless workers (a Kubernetes Deployment) driven by a queue and scaled on backlog (Problems 1 and 2, Lesson 31) |
+| Job queue | `SQLiteJobQueue`: leases, fences, retries, dead letters (many processes, one machine) | Postgres `SKIP LOCKED` / SQS / Redis Streams (Lessons 13 and 26) |
+| Checkpoints | `InMemoryCheckpointer` / `FileCheckpointer` (single process), `SQLiteCheckpointer` (shared across processes, version CAS + fence takeover) | Postgres / Redis (Lesson 26) |
+| Tool execution | Async tools are awaited directly, sync tools run in a thread pool, `@tool(isolation="process")` runs in a subprocess (which a timeout can actually kill) | Separate tool services (MCP servers) + sandboxes (containers, gVisor, Firecracker) |
 | Model calls | `OpenAICompatLLM` + `ResilientLLM` | A model gateway (Problem 5) |
-| Rate limiting | The in-memory token bucket from the exercise | Enforced centrally at the gateway; a distributed token bucket built on Redis + atomic scripts (Lesson 13) |
+| Rate limiting | The exercise's `TokenBucket` / `TenantRateLimiter` (pure algorithm), `agentkit.limits.TokenBucket` (in-process), `SQLiteTokenBucket` (shared across processes on one machine) | Enforced centrally at the gateway; a distributed token bucket built on Redis + atomic Lua scripts (Lesson 26) |
+| Concurrency bulkheads | `agentkit.limits.KeyedLimiter` (in-process), `SQLiteSemaphore` (cross-process, leased) | Concurrency quotas at the gateway / in Redis |
 | Tracing | `Tracer` + JSONL + viewer | OTel SDK + Collector + backend (Lesson 10) |
 | Prompts and config | Strings in code | Config center + versioning + progressive rollout (Lesson 16) |
 | Auditing | `AuditLog` writing JSONL | Append-only, tamper-proof storage (Lesson 09) |
 | Evals | `run_eval` | CI pipeline + online sampled evaluation (Lesson 11) |
+
+### 3.1 The mini deployment: the reference architecture running on one machine
+
+The demo builds the skeleton of the reference architecture out of real processes ([`deployment.py`](deployment.py)):
+
+```mermaid
+flowchart LR
+    C["Client (httpx)<br/>round-robins across API processes"] -->|"HTTP"| A1["api-1 / api-2<br/>shared token bucket"]
+    C -->|"HTTP"| A2["mem-1 / mem-2<br/>in-process token buckets (control group)"]
+    A1 -->|"enqueue · 202"| DB[("jobs.db (SQLite)<br/>queue · checkpoints · token buckets · slots")]
+    A2 -->|"enqueue · 202"| DB
+    DB <-->|"claim · heartbeat · checkpoint · commit"| W["worker-0 / worker-1<br/>python -m agentkit.distributed.worker"]
+```
+
+- **API processes**: [`mini_api.py`](mini_api.py) is a FastAPI app, and each process is one `python -m uvicorn mini_api:app --app-dir lessons/12_production_architecture --port ...` command (a real subprocess, not a thread). `POST /runs`: API key → tenant identity → per-tenant rate limit (`429` + `Retry-After` if there aren't enough tokens) → `choose_model` routing → enqueue → `202`. `GET /runs/{id}` reads the job and the checkpoint. The same code runs as 4 processes that differ only in their rate-limit backend (the `MINI_RATE_BACKEND` environment variable).
+- **Worker processes**: `WorkerPool` starts 2 `python -m agentkit.distributed.worker` processes that load [`worker_app.py`](worker_app.py): each job first passes two per-tenant bulkheads, then goes to `AgentJobHandler`, which runs the HR agent and writes a checkpoint to the same SQLite file at every step.
+- **Shutdown**: SIGTERM to the API processes first (uvicorn stops accepting new requests, finishes the ones in hand, and runs FastAPI's shutdown logic), then SIGTERM to the workers (`run_worker` stops claiming and drains in-flight jobs); anything still running after the timeout gets SIGKILL.
+- **How it differs from a real deployment**: every process is on one machine; SQLite has one writer at a time ([Lesson 13, section 3.12](../13_distributed_concurrency/README.en.md) measures the ceiling); there's no load balancer, so the client round-robins across the API processes itself; and identity comes from an API-key table instead of a JWT verified by the gateway. For the multi-machine version, see Lessons 26 and 31.
+- Optional dependencies required: `pip install -e ".[server]"` (FastAPI, uvicorn, httpx). Without them, the demo prints the install command and exits with code 1, and the deployment tests are skipped.
+
+### 3.2 The exercise's rate limiter, and what it looks like across processes
 
 **Two design decisions in the exercise:**
 
 - **The token bucket uses "lazy refill."** Instead of running a background thread that adds tokens on a timer, each access works out how many tokens to add in one go, based on how much time has passed since the last update. It's O(1), needs no timer, and ports easily to an atomic Redis script. **The clock is injectable**, so tests can use a fake clock and get fully deterministic results. There's also an easy-to-miss edge case: when the clock goes backward, don't move "last updated" backward with it. Otherwise, when the clock catches up again, that interval gets counted twice and tokens appear out of thin air.
 - **When routing can't find a suitable strong model, it raises an error instead of silently falling back to a weak one.** Silent fallback lets quality problems creep in without anyone noticing. Falling back should be an explicit decision by the caller, and it should be recorded in the trace.
 
-The exercise's `TenantRateLimiter` keeps each tenant's bucket in an in-memory dict that only ever grows. In production, watch out for two things: evict tenants that have been inactive for a long time (LRU / TTL), or memory will grow without bound; and with multiple replicas, move the state into shared storage.
+The exercise is a pure algorithm (plain synchronous functions with an injected clock), and that's a legitimate way to unit-test it: whether the algorithm is right has nothing to do with how many processes it runs in. But **where the state lives** decides whether it holds up in a deployment. The same "refill + take" algorithm comes in several versions:
+
+| Version | Where the bucket state lives | Processes sharing one bucket | Used in this lesson |
+|---|---|---|---|
+| The exercise's `TokenBucket` / `TenantRateLimiter` | Attributes of a Python object / a dict | One process | `mem-1`, `mem-2` in demo Section 4 (the reference answer until you finish yours) |
+| `agentkit.limits.TokenBucket` | An in-process dict (by key); `acquire` yields to the event loop while it waits | One process | Rate-limiting within one process (e.g. `await bucket.acquire(key)` before calling the model); not used in this lesson's demo |
+| `agentkit.distributed.SQLiteTokenBucket` | One row in a SQLite table; "refill + take" happens inside a single `BEGIN IMMEDIATE` write transaction | Every process on one machine | `api-1`, `api-2` in demo Section 4 |
+| Redis + a Lua script | One key in Redis; the script runs atomically on the server | Every machine | [Lesson 26](../26_state_and_queues/README.en.md) |
+
+Measured in demo Section 4: on the free plan (capacity 5, 2 tokens per second), the configuration allows about 9 requests in 2 seconds. Two processes with their own in-memory buckets let through 16 (8 each — each process thinks it's the only one), while a shared `SQLiteTokenBucket` let through 8. Double the processes and the in-memory buckets' real quota doubles; when Kubernetes autoscales, the quota quietly grows with the replica count. The test `test_in_memory_buckets_multiply_the_limit_but_a_shared_bucket_holds_it` pins this down: the in-memory buckets let through at least 2 × 5, and the shared bucket never exceeds "capacity + rate × elapsed time."
+
+The exercise's `TenantRateLimiter` has one more problem: its buckets live in a dict that only ever grows. Tenants that have been inactive for a long time need to be evicted (LRU / TTL), or memory grows without bound; `agentkit.limits.KeyedLimiter` uses reference counting to reclaim entries nobody is using.
+
+**A per-tenant bulkhead** (demo Section 5) is a different kind of limit: not "how many per second," but "how many running at once." Before handing a job to the agent, a worker takes two slots: an in-process `KeyedLimiter` (at most 2 per tenant within one worker) and a cross-process `SQLiteSemaphore` (at most 3 per tenant across all workers). If it can't get them, it raises `RetryLater`: the job goes back to the queue without using up an attempt, and the worker moves on to other jobs. Measured on hooli's 24 jobs: at most 3 running at once across all workers and at most 2 within any one worker, 47 deferrals, and not a single failure. With only the in-process bulkhead, the limit is 2 × the number of workers and grows as you scale out; the cross-process slots don't change with the replica count.
+
+> Note: the bulkhead lives in the worker's handler rather than using `Agent(limiter=..., limiter_timeout=...)`. Measuring the latter turned up a framework issue (reported to the maintainers): the agent tries to take the slot **before** it writes the user's input into its state; when it can't, the run ends as `rate_limited` and saves a checkpoint that doesn't contain the user's question, so when `AgentJobHandler` defers the job and later calls `resume`, the model sees a conversation with no user question in it.
 
 > 🏭 **In production**: for a cross-instance token bucket kept in Redis and made atomic with a Lua script, plus checkpoints and a job queue on Postgres, see [Lesson 26](../26_state_and_queues/README.en.md). For a model gateway built on LiteLLM Router, permissions written as Cedar policy files, and tiered classifier guardrails, see [Lesson 29](../29_gateway_and_guardrails/README.en.md). For the reference architecture actually assembled into an API + multi-worker service, with load tests, failure injection, and scaling, see [Lesson 31](../31_deployment_and_scaling/README.en.md).
 
 ## 4. Hands-on: run the demo
 
 ```bash
-python lessons/12_production_architecture/demo.py --offline   # fully offline (a few seconds)
-python lessons/12_production_architecture/demo.py             # Sections 3 and 4 call a real model (about 30 seconds)
+pip install -e ".[server]"                                     # the mini deployment needs FastAPI, uvicorn, httpx
+python lessons/12_production_architecture/demo.py --offline   # scripted model, about 15 seconds
+python lessons/12_production_architecture/demo.py             # workers and the sync endpoint call a real model (about 60 model calls)
 ```
 
-Sections 1 and 2 are pure simulations (with a fake clock), so both modes produce the same output. Here is an excerpt. (Demo output translated from Chinese.)
+Section 0 is pure arithmetic (the routing bill), identical in both modes; Sections 1–5 start a real mini deployment: 4 API processes + 2 worker processes. Here's an excerpt of actual offline output. (Demo output translated from Chinese.)
 
 ```
-  Tenant    Sent    A. One global bucket (cap 60, 30/s)   B. One bucket per tenant (by plan)
-  acme      100     allowed  54 ( 54%)                    allowed 100 (100%)
-  globex    40      allowed  20 ( 50%)                    allowed  40 (100%)
-  initech   5       allowed   1 ( 20%)                    allowed   5 (100%)
-  hooli     500     allowed 281 ( 56%)                    allowed  14 (  3%)
-...
   Total: $36.73/day with routing vs. $117.62/day using the strong model for everything, a 69% saving
 ...
-  [hooli/u-carl] How many vacation days do I have left??   → 429 Too Many Requests (Retry-After: 60)
+  ❌ POST /runs/sync → client timed out after 2.0 s (httpx.ReadTimeout); the user only sees a failure
+  ✅ POST /runs → 202, returned in 8 ms (api-1): run_id=job-1, routed to logical model pro
 ...
-worker B: resuming from checkpoint run_id = 5af8f12fa345
-  Tool result: submitted annual leave for acme/u-alice: 3 days starting 2026-10-08, approval ID LV-5af8f1
-  Approval record (stored in the checkpoint for auditing): by=mgr-zhao  approved=True  comment=Approved, please arrange a proper handover  tool=submit_leave
+  [+ 0.3s] api-2  job leased    run running   step 0  checkpoint last written by worker-0  fence=1  claim #1
+  [+ 1.2s] api-1  job leased    run running   step 1  checkpoint last written by worker-0  fence=1  claim #1
+  [+ 1.2s] 💥 kill -9 worker-0 (pid 42729, exit code -9): it was halfway through, and everything in its memory is gone
+  [+ 1.2s]    Kubernetes would start a new pod to replace it: worker-2 (pid 42734)
+  [+ 2.8s] api-2  job queued    run running   step 1  checkpoint last written by worker-0  fence=1  claim #1
+  [+ 3.4s] api-2  job leased    run running   step 1  checkpoint last written by worker-2  fence=2  claim #2
+  [+ 4.6s] api-2  job leased    run running   step 2  checkpoint last written by worker-2  fence=2  claim #2
+  [+ 5.9s] api-2  job succeeded run completed step 3  checkpoint last written by worker-2  fence=2  claim #2
+  Looking back at the sync request: the server's run sync-demo-1 finished 2.5 s after the client gave up (status completed, 3 steps)
+...
+  in-process buckets (mem-1 + mem-2)   sent  39, allowed 16 (mem-1 allowed 8, mem-2 allowed 8), the rest got 429 (Retry-After: 1)
+  shared bucket (api-1 + api-2)        sent  39, allowed  8 (api-1 allowed 4, api-2 allowed 4), the rest got 429 (Retry-After: 1)
+  Configured limit: one bucket 5 + 2/s × 2.0 s ≈ 9.
+...
+  acme's 3 questions all finished in 1.2 s (each question is 2 model calls, about 0.5 s), status succeeded, succeeded, succeeded
+  hooli's 24 jobs took another 1.5 s to finish; deferred by the full bulkhead (RetryLater) 47 times along the way
+  hooli's peak concurrency: 3 across all workers (cross-process limit 3), 2 within each worker process (in-process limit 2)
+...
+  Tenant    Allowed  Rate-limited  Done  Tokens   Cost (sample prices, by logical model)
+  hooli     24       54            24    19848    $0.003269
+  acme      4        0             4     7644     $0.020719
+...
+  Exit codes: api-1=-15, api-2=-15, mem-1=-15, mem-2=-15, worker-0=-9, worker-1=0, worker-2=0
 ```
 
 **What to look for:**
 
-1. **Section 1: with one global bucket, hooli alone drains the quota**, and acme, the top-paying tenant, has nearly half its requests rejected. With one bucket per tenant, hooli only exhausts its own allowance.
-2. **Section 2: the vast majority of traffic is simple requests**, and a cheap model handles them fine. Requests that exceed every model's context window are rejected outright instead of being crammed in anyway.
-3. **Section 3: employees of different tenants who ask the same question each get their own data**, because tools take identity from `ctx` instead of letting the model fill it in. Every cent can be attributed to a specific tenant. In real mode, all logical models map to the single real model available on this machine, and the demo prints a note saying so.
-4. **Section 4: worker B has never seen this run before, yet it finishes it**, because the identity, the pending call awaiting approval, and the approval record are all in the checkpoint. This is what makes it possible for stateless workers to scale freely and survive rolling deploys.
+1. **Section 0: the vast majority of traffic is simple requests**, and a cheap model handles them fine. Requests that exceed every model's context window are rejected outright instead of being crammed in anyway.
+2. **Section 2: don't tie a long task to one HTTP connection.** The sync endpoint is cut off by the client's 2-second timeout, yet the server runs it to completion anyway (money spent, and the user will probably click again); the async endpoint returns `202` in 8 ms and the task runs on a worker.
+3. **Section 3: workers are stateless because all the state lives in shared storage.** After the worker at step 1 is kill -9'd, the job is reclaimed once its lease (1.5 s) expires, backs off briefly, and is claimed by the new worker (fence 1 → 2), which continues after step 1 — step 1 isn't redone. Polls alternate between api-1 and api-2, and the answers agree.
+4. **Section 4: in-process rate limiters multiply the quota across replicas** (16 vs. a limit of 9); the shared bucket holds it (8).
+5. **Section 5: a bulkhead limits "how many at once."** The noisy hooli gets at most 3 running at once across processes and at most 2 per worker; blocked jobs are deferred, not failed; acme's questions still finish within 1.2 s.
+6. **Billing**: each run's token usage is in its checkpoint and is priced by the logical model the API chose at routing time, so every cent can be attributed to a tenant.
+7. **Exit codes**: uvicorn shuts down gracefully on SIGTERM (its log shows `Application shutdown complete`) and then, by convention, ends itself with the signal it received, hence -15; workers exit with 0 after draining, and the kill -9'd one with -9.
 
 ## 5. Exercise
 
-Open [exercise.py](exercise.py) and implement:
+Open [exercise.py](exercise.py) and implement the following. They're all **plain synchronous code** (pure algorithms, no `async` / `await` needed) with an injectable clock, so the tests use a fake clock and get fully deterministic results:
 
 | What to write | Key points |
 |---|---|
@@ -303,48 +360,50 @@ make lesson N=12
 # equivalent to .venv/bin/python -m pytest lessons/12_production_architecture
 ```
 
-When you're done, run the demo again: the first line will report that the implementation comes from exercise.py (your implementation).
+When you're done, run the demo again: the first line will report that the implementation comes from exercise.py (your implementation). The routing bill in Section 0, `choose_model` in the API processes, and the `TenantRateLimiter` in `mem-1` / `mem-2` all switch to your code — your rate limiter really does get put inside two API processes, and you can watch it let through 2×.
+
+The 3 cases at the end of the test file aren't exercises: they start real API processes and worker processes to verify that "in-memory buckets across two processes let through at least 2×, while a shared bucket holds the limit," "after kill -9, another worker picks up from the checkpoint," and "the per-tenant bulkhead holds across worker processes." They use the reference answer for routing and rate limiting, so they pass whether or not you've done the exercises; without `.[server]` installed they're skipped.
 
 ## 6. Going deeper: launch checklist
 
 Each item is tagged with the relevant lesson(s).
 
 **Reliability**
-- [ ] Model calls have timeouts, retries, and fallback (05)
-- [ ] Steps, tokens, and spend are all capped (05)
-- [ ] Every step writes a checkpoint, and write tools are idempotent (05, 10)
-- [ ] Per-tenant rate limits and quotas (09, 10)
+- [ ] Model calls have timeouts, retries, and fallback (08)
+- [ ] Steps, tokens, and spend are all capped (08)
+- [ ] Every step writes a checkpoint, and write tools are idempotent (08, 13)
+- [ ] Per-tenant rate limits and quotas (12, 13)
 
 **Security**
-- [ ] Identity is injected by the gateway; the model never gets identity parameters (02, 09)
-- [ ] Least privilege, with human approval for high-risk operations (06)
-- [ ] Untrusted code runs in a sandbox (06)
-- [ ] Three layers of guardrails: input, output, and tool output (06)
-- [ ] Secrets are held in the gateway or a key management service (09)
+- [ ] Identity is injected by the gateway; the model never gets identity parameters (03, 12)
+- [ ] Least privilege, with human approval for high-risk operations (09)
+- [ ] Untrusted code runs in a sandbox (09)
+- [ ] Three layers of guardrails: input, output, and tool output (09)
+- [ ] Secrets are held in the gateway or a key management service (12)
 
 **Observability**
-- [ ] Traces cover model and tool calls (07)
-- [ ] Metrics dashboards and alerts (07)
-- [ ] Users can report a run_id, and you can go from a complaint to the trace (07)
-- [ ] A PII handling policy is in place (07)
+- [ ] Traces cover model and tool calls (10)
+- [ ] Metrics dashboards and alerts (10)
+- [ ] Users can report a run_id, and you can go from a complaint to the trace (10)
+- [ ] A PII handling policy is in place (10)
 
 **Evals**
-- [ ] Eval set + CI gate, with a safety-case veto (08)
-- [ ] Online sampled evaluation (08)
+- [ ] Eval set + CI gate, with a safety-case veto (11)
+- [ ] Online sampled evaluation (11)
 
 **Release and operations**
-- [ ] Prompts and models are versioned (13)
-- [ ] Progressive rollout and one-click rollback (13)
-- [ ] Kill switch: shut off a single tool or the whole agent immediately when something goes wrong (13)
+- [ ] Prompts and models are versioned (16)
+- [ ] Progressive rollout and one-click rollback (16)
+- [ ] Kill switch: shut off a single tool or the whole agent immediately when something goes wrong (16)
 
 **Cost**
-- [ ] Attribution by tenant and feature (09, 11)
-- [ ] Budget alerts (07, 11)
-- [ ] Model routing and caching (09, 11)
+- [ ] Attribution by tenant and feature (12, 14)
+- [ ] Budget alerts (10, 14)
+- [ ] Model routing and caching (12, 14)
 
 **Compliance**
-- [ ] Complete, tamper-proof audit logs (06)
-- [ ] Clearly defined data retention periods (07)
+- [ ] Complete, tamper-proof audit logs (09)
+- [ ] Clearly defined data retention periods (10)
 - [ ] The model providers' data processing terms, and any cross-border data transfer issues, have been reviewed
 
 ## 7. Common pitfalls and anti-patterns
@@ -358,6 +417,7 @@ Each item is tagged with the relevant lesson(s).
 7. **Routing rules that silently downgrade**: complex tasks get routed to a weak model, and nobody notices the quality problems.
 8. **Picking a framework before working out the requirements**: the framework's abstractions don't match your permission and audit model, and you end up coding around the framework.
 9. **Hard-coding prompts in code**: changing a single word requires a deploy, and there's no quick way to roll back when something goes wrong.
+10. **Every replica with its own in-memory rate limiter**: what actually gets through is "the configured limit × the number of replicas" (in this lesson, 2 processes let through about 2×), and the quota quietly grows whenever you autoscale.
 
 ## 8. Interview & design review questions
 
@@ -423,6 +483,7 @@ Each item is tagged with the relevant lesson(s).
 - [ ] I can explain how to decide between building it yourself, using a framework, and using a managed platform
 - [ ] I can explain what a model gateway is responsible for, and why business code should only know logical model names
 - [ ] I can explain what each of the token bucket's two parameters controls, and why each tenant needs its own bucket
+- [ ] I can explain why in-process rate limiters let through N× across replicas, and how a shared token bucket and a cross-process bulkhead hold the limit
 - [ ] I've finished the exercise: `make lesson N=12` passes
 
 ## 10. Design exercise on paper

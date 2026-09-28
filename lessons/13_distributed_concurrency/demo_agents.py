@@ -188,15 +188,23 @@ async def run(args) -> int:
         await eventually(lambda: [e for e in pool.events() if e.get("pid") == zombie_pid and e["event"] in
                                   ("ownership_lost", "heartbeat_rejected", "fence_rejected")], 30, "僵尸的写入被拒绝")
 
-        # ③ SIGTERM：挑一个正在处理任务的 worker（不是僵尸），请它优雅停机
+        # ③ SIGTERM：挑一个刚领到任务的 worker（不是僵尸），请它优雅停机 ——
+        #    "刚领到"保证信号到达时它手上确实有活（一个任务至少要 1.2 秒）
         async def busy_worker():
+            now = time.time()
             for job in await queue.list_jobs("leased"):
                 w = next((i for i, x in enumerate(pool.workers) if x.worker_id == job.worker_id and x.alive), None)
-                if w is not None and w != zombie and w != victim:
+                claimed = [e["t"] for e in pool.events("claimed") if e["job"] == job.id and e["worker_id"] == job.worker_id]
+                if w is not None and w != zombie and claimed and now - claimed[-1] < 0.4:
                     return (w, job.id)
             return None
 
-        target, in_flight = await eventually(busy_worker, wait, "一个正在处理任务的 worker")
+        try:
+            target, in_flight = await eventually(busy_worker, 5, "一个刚领到任务的 worker")
+        except TimeoutError:  # 剩下的任务恰好都做完了：再来一条报修，等有人领走它
+            ids.append(await queue.enqueue("run", {"op": "run", "input": "显示器闪屏", "metadata": {"user_id": "u200"}},
+                                           tenant_id="acme", idempotency_key="msg-extra"))
+            target, in_flight = await eventually(busy_worker, wait, "一个刚领到任务的 worker")
         term_wid, term_pid = pool.workers[target].worker_id, pool.workers[target].pid
         term_at = time.time()
         pool.terminate(target)
@@ -239,7 +247,7 @@ async def run(args) -> int:
         (f"{len(ids)} 个任务全部成功", all(j.status == "succeeded" for j in jobs.values())),
         ("每个任务恰好提交了一次（completed 事件按任务计数全是 1）", sorted(completed.values()) == [1] * len(ids)),
         ("每个任务只建了一张工单（下游 tickets 表）", len(tickets) == len(ids) and all(r["n"] == 1 for r in tickets)),
-        ("工具函数一共只真正执行了 8 次：kill -9 之后的重放由 SQLiteIdempotencyStore 挡住",
+        (f"工具函数一共只真正执行了 {len(ids)} 次：kill -9 之后的重放由 SQLiteIdempotencyStore 挡住",
          sum(r["n"] for r in tool_calls) == len(ids) and any(e["job"] == j1 for e in idem_hits)),
         (f"任务 #{j1} 被领取两次，接手者的 fence 更大",
          len(claims[j1]) == 2 and claims[j1][1]["fence"] > claims[j1][0]["fence"]),
@@ -248,7 +256,7 @@ async def run(args) -> int:
          and not any(e["event"] == "completed" and e["job"] == j2 for e in zombie_events)),
         (f"任务 #{j2} 的检查点最后由接手者写入（writer={ckpt2[0]['writer'] if ckpt2 else '?'}）",
          bool(ckpt2) and ckpt2[0]["writer"] == jobs[j2].worker_id != zombie_wid),
-        (f"kill -9 的进程退出码 -9，SIGTERM 的进程退出码 0",
+        ("kill -9 的进程退出码 -9，SIGTERM 的进程退出码 0",
          exit_codes.get("killed") == -9 and exit_codes.get("terminated") == 0),
         (f"{term_wid} 收到 SIGTERM 后没有再领取新任务，自己做完了在途的任务 #{in_flight} 才下线",
          not any(e["event"] == "claimed" and e["t"] > term_at for e in term_events)

@@ -5,7 +5,7 @@
     谁先抢到、谁覆盖了谁、谁崩溃了留下什么，全都是真实发生的竞争，不是用 sleep 演出来的。
     这和"多台机器上的 worker + 一个共享的 Postgres"在并发语义上是一回事。
 
-它做不到的（如实说明，第 13 课 7 节）：
+它做不到的（如实说明，第 13 课 3.1、3.12 节）：
 - 只能在**一台机器**上：WAL 模式要求所有进程共享同一块内存映射，不支持网络文件系统；
 - 同一时刻只有**一个写者**：写入吞吐有上限（本机实测见第 13 课），适合几个到几十个 worker 进程；
 - 用的是各进程的本机时钟（同一台机器上是同一个时钟）；多机时要用数据库服务器的时钟（Postgres 的 now()）；
@@ -67,7 +67,18 @@ class SQLiteDB:
             # isolation_level=None：自己决定事务从哪里开始（见 write）；timeout 就是 busy_timeout
             conn = sqlite3.connect(self.path, timeout=self.busy_timeout, isolation_level=None, check_same_thread=False)
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")  # 读写互不阻塞，只有写和写互斥
+            # 读写互不阻塞，只有写和写互斥。切换 WAL 要短暂独占整个文件：几个进程同时新建同一个库时，
+            # 这一句会直接报 "database is locked"，busy_timeout 管不到它（第 13 课实测 40 次启动错 4 次），所以自己退避重试
+            deadline = time.monotonic() + self.busy_timeout
+            while True:
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as e:
+                    if "locked" not in str(e) or time.monotonic() > deadline:
+                        conn.close()
+                        raise
+                    time.sleep(random.uniform(0.01, 0.05))  # 在数据库专用线程里，不会卡住事件循环
             conn.execute("PRAGMA synchronous=NORMAL")
             self._conn = conn
         return self._conn

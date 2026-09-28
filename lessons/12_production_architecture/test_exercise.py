@@ -1,17 +1,28 @@
-"""第 12 课练习测试：离线、确定性（用假时钟，不 sleep）。
+"""第 12 课测试。
+
+前半部分是练习测试：纯算法、离线、确定性（注入假时钟，不 sleep）。
+后半部分验证迷你部署里"跨进程"的说法：起真实的 API 进程（uvicorn）和 worker 进程（WorkerPool），
+走真实的 HTTP；断言的是确定性的量（放行数的上下界、fence、领取次数、同时在跑的峰值），时间只作宽松的上限。
+这部分不依赖你的练习（路由和限流器用 solution.py），需要 pip install -e ".[server]"，没装就跳过。
 
 运行：make lesson N=12
 """
 
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import math
+import sqlite3
+import time
+from pathlib import Path
 
 import pytest
 
-from agentkit.testing import load_exercise
+from agentkit.testing import load_exercise, load_sibling
 
 ex = load_exercise(__file__)
+HERE = Path(__file__).resolve().parent
 
 
 class FakeClock:
@@ -220,3 +231,122 @@ def test_invalid_task_raises_value_error():
                 {"input_tokens": 10, "complexity": "extreme"}):
         with pytest.raises(ValueError):
             ex.choose_model(bad, CATALOG)
+
+
+# ------------------------------------------------------------------ 迷你部署：真实的进程（不是练习）
+
+needs_server = pytest.mark.skipif(
+    any(importlib.util.find_spec(m) is None for m in ("fastapi", "uvicorn", "httpx")),
+    reason='需要 pip install -e ".[server]"',
+)
+HOOLI = {"Authorization": "Bearer key-hooli-carl"}
+ACME = {"Authorization": "Bearer key-acme-alice"}
+GLOBEX = {"Authorization": "Bearer key-globex-bob"}
+
+
+def _deployment(tmp_path, **kw):
+    deployment = load_sibling(__file__, "deployment")
+    return deployment.MiniDeployment(tmp_path / "mini", router=HERE / "solution.py", **kw)
+
+
+def _peak(intervals) -> int:
+    points = sorted([(s, 1) for s, _ in intervals] + [(e, -1) for _, e in intervals])
+    level = best = 0
+    for _, d in points:
+        level += d
+        best = max(best, level)
+    return best
+
+
+@needs_server
+async def test_in_memory_buckets_multiply_the_limit_but_a_shared_bucket_holds_it(tmp_path):
+    """hooli 的 free 套餐：桶容量 5、每秒补 2 个。两组各两个 API 进程，各发 20 个请求（组内轮流）：
+    进程内的桶 → 每个进程各有一个满桶，至少放行 2 × 5 = 10；共享的 SQLiteTokenBucket → 不超过 5 + 2 × 耗时 + 1。"""
+    import httpx
+
+    async with _deployment(tmp_path, apis=[("m1", "memory"), ("m2", "memory"), ("s1", "sqlite"), ("s2", "sqlite")],
+                           workers=0) as dep:
+        async with httpx.AsyncClient(timeout=10) as http:
+            async def fire(names):
+                accepted, retry_after, served = 0, set(), set()
+                start = time.monotonic()
+                for i in range(20):
+                    r = await http.post(f"{dep.apis[names[i % 2]].url}/runs", json={"message": f"q{i}", "complexity": "low"},
+                                        headers=HOOLI)
+                    assert r.status_code in (202, 429), r.text
+                    served.add(r.headers["x-served-by"])
+                    if r.status_code == 202:
+                        accepted += 1
+                    else:
+                        retry_after.add(int(r.headers["retry-after"]))
+                return accepted, time.monotonic() - start, retry_after, served
+
+            memory, shared = await asyncio.gather(fire(["m1", "m2"]), fire(["s1", "s2"]))
+    assert memory[3] == {"m1", "m2"} and shared[3] == {"s1", "s2"}  # 请求真的落在了两个不同的进程上
+    assert memory[0] >= 10, memory  # 每个进程各自的满桶：配额被放大
+    assert 5 <= shared[0] <= 5 + 2 * shared[1] + 1, shared  # 共享的桶守住了"容量 + 速率 × 时间"
+    assert shared[2] and min(shared[2]) >= 1  # 429 带着 Retry-After
+
+
+@needs_server
+async def test_202_then_poll_and_another_worker_resumes_after_kill_9(tmp_path):
+    """长任务：POST 立刻 202；跑到一半 kill -9 持有它的 worker；另一个 worker 进程从检查点接着跑完同一个 run。"""
+    import httpx
+
+    async with _deployment(tmp_path, apis=[("api", "sqlite")], workers=2, lease=1.0,
+                           worker_options={"long_latency": 0.8}) as dep:
+        async with httpx.AsyncClient(timeout=10) as http:
+            base = dep.apis["api"].url
+            started = time.monotonic()
+            r = await http.post(f"{base}/runs", json={"message": "帮我汇总部门请假情况并生成报告", "complexity": "high"},
+                                headers=ACME)
+            assert r.status_code == 202 and time.monotonic() - started < 5
+            run_id = r.json()["run_id"]
+            deadline = time.monotonic() + 60
+            killed = first_fence = None
+            while time.monotonic() < deadline:
+                info = (await http.get(f"{base}/runs/{run_id}", headers=ACME)).json()
+                if killed is None and info["job_status"] == "leased" and (info["step"] or 0) >= 1:
+                    killed, first_fence = info["worker_id"], info["fence"]
+                    dep.pool.kill(next(i for i, w in enumerate(dep.pool.workers) if w.worker_id == killed))
+                if info["job_status"] == "succeeded":
+                    break
+                await asyncio.sleep(0.05)
+            other = (await http.get(f"{base}/runs/{run_id}", headers=GLOBEX)).status_code
+    assert killed is not None, "没有等到任务跑到一半"
+    assert info["job_status"] == "succeeded" and info["run_status"] == "completed", info
+    assert info["attempts"] == 2 and info["fence"] > first_fence
+    assert info["worker_id"] != killed and info["writer"] == info["worker_id"]  # 检查点最后由接手者写入
+    assert info["step"] == 3 and "汇总报告" in info["output"]  # 从检查点接着跑，没有从头再来（一共 3 步）
+    assert other == 404  # 别的租户看不到这个 run
+
+
+@needs_server
+async def test_tenant_bulkhead_holds_across_worker_processes(tmp_path):
+    """globex 一口气提交 12 个任务，2 个 worker 进程 × 每个 8 并发：
+    进程内 KeyedLimiter 每个进程最多 2 个，跨进程 SQLiteSemaphore 加起来最多 3 个；拿不到槽位的任务被推迟而不是失败。"""
+    import httpx
+
+    async with _deployment(tmp_path, apis=[("api", "sqlite")], workers=2,
+                           worker_options={"latency": 0.2, "tenant_local": 2, "tenant_shared": 3}) as dep:
+        async with httpx.AsyncClient(timeout=10) as http:
+            base = dep.apis["api"].url
+            runs = [(await http.post(f"{base}/runs", json={"message": f"我还剩几天年假？{i}", "complexity": "low"},
+                                     headers=GLOBEX)).json()["run_id"] for i in range(12)]
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                infos = [(await http.get(f"{base}/runs/{rid}", headers=GLOBEX)).json() for rid in runs]
+                if all(i["job_status"] == "succeeded" for i in infos):
+                    break
+                await asyncio.sleep(0.2)
+        deferred = dep.pool.events("deferred")
+    assert all(i["job_status"] == "succeeded" for i in infos)
+    conn = sqlite3.connect(dep.db)
+    rows = conn.execute("SELECT pid, start, end FROM slot_log WHERE tenant = 'globex'").fetchall()
+    conn.close()
+    assert len(rows) == 12
+    assert _peak([(s, e) for _, s, e in rows]) <= 3  # 所有 worker 进程加起来
+    for pid in {p for p, _, _ in rows}:
+        assert _peak([(s, e) for p, s, e in rows if p == pid]) <= 2  # 每个 worker 进程里
+    assert len({p for p, _, _ in rows}) == 2  # 两个进程都干了活
+    assert deferred and all(e["job"] for e in deferred)  # 舱壁真的挡过：任务被放回队列而不是失败

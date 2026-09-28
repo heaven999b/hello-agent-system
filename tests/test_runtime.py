@@ -353,6 +353,33 @@ def test_limiter_timeout_becomes_rate_limited_status():
     assert sorted([a.stop_reason, b.stop_reason]) == ["final_answer", "rate_limited"]
 
 
+async def test_run_rejected_by_bulkhead_leaves_no_half_checkpoint():
+    """新运行拿不到舱壁槽位 = 什么都没发生：不存"没有用户问题"的检查点（否则推迟后 resume，模型只看到 system），
+    也不跑 on_run_end（on_run_start 没跑过，成对的钩子不能错位）。重试时用同一个 run_id 从头开始。"""
+    ends = []
+
+    class Track:
+        def on_run_end(self, state):
+            ends.append(state.run_id)
+
+        def __getattr__(self, name):
+            return lambda *a: None
+
+    limiter = KeyedLimiter(per_key=1)
+    llm = ScriptedLLM(responder=lambda m: reply(f"答：{m[-1]['content']}"), latency=0.3)
+    agent = Agent(llm, [], hooks=[Track()], limiter=limiter, limiter_timeout=0.05)
+    first, second = await asyncio.gather(agent.run("问题一", metadata={"tenant_id": "t"}, run_id="r1"),
+                                         agent.run("问题二", metadata={"tenant_id": "t"}, run_id="r2"))
+    limited = first if first.stop_reason == "rate_limited" else second
+    assert limited.status == "stopped" and limited.stop_reason == "rate_limited"
+    assert agent.checkpointer.load(limited.run_id) is None
+    assert ends == [({"r1", "r2"} - {limited.run_id}).pop()]
+    text = "问题一" if limited is first else "问题二"
+    retried = await agent.run(text, metadata={"tenant_id": "t"}, run_id=limited.run_id)
+    assert retried.ok and retried.output == f"答：{text}"
+    assert [m["role"] for m in llm.calls[-1]["messages"]] == ["system", "user"]
+
+
 def test_token_bucket_waits_without_blocking():
     async def main():
         bucket = TokenBucket(rate=10, capacity=2)

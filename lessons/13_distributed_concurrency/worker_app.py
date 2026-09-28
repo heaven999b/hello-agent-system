@@ -127,6 +127,9 @@ class CpuReport:
     async def aclose(self) -> None:  # worker 进程退出前会调用 handler.aclose()
         if self.first is not None:
             self.emit("cpu", seconds=round(time.process_time() - self.first, 4))
+        inner_close = getattr(self.inner, "aclose", None)
+        if inner_close is not None:
+            await inner_close()
 
 
 async def make_handler(wctx: WorkerContext):
@@ -179,6 +182,7 @@ async def make_handler(wctx: WorkerContext):
                   checkpointer=ckpt, idempotency_store=idem,
                   hooks=[Timeline(emit, float(opts.get("chaos_window", 5.0)))])
     handler = AgentJobHandler(agent, ckpt)  # 一个共享的 Agent；每个任务用这次领取的 fence 创建检查点视图
+    handler.aclose = agent.aclose  # 进程退出前关掉模型客户端的连接池（真实模型时）
     if opts.get("cpu_report") == "1":
         return CpuReport(handler, make_emit(wid))
     return handler

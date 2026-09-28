@@ -1,51 +1,45 @@
-"""第 12 课 Demo：给 Agent 套上"生产外壳"。
+"""第 12 课 Demo：给 Agent 套上"生产外壳" —— 在一台机器上用真实的进程搭一个迷你部署。
 
 场景：一家 HR SaaS 公司，同一套 HR 助手服务多家企业客户（租户），套餐不同。
-  1. 多租户限流：一个租户的脚本失控狂刷接口 —— 全局一个桶 vs 每租户一个桶
-  2. 模型路由：不同请求选不同模型，和"全部用最强模型"比一比每天的账单
-  3. 迷你网关端到端：鉴权身份 → 限流 → 路由 → 调模型 → 按租户记账
-  4. 无状态 worker：worker A 跑到一半暂停等审批 → 状态进检查点 → worker B 接手完成
 
-运行：
-    python lessons/12_production_architecture/demo.py            # 第 3、4 节调用真实模型
-    python lessons/12_production_architecture/demo.py --offline  # 全部离线，无需 API key
+    0. 模型路由算账（纯计算，不涉及并发）：够用就好，和"全部用最强模型"比一比每天的账单
+    1. 起一个迷你部署：4 个 API 进程（uvicorn）+ 2 个 worker 进程（WorkerPool），共享一个 SQLite 文件
+    2. 长任务 vs HTTP 超时：同步接口被客户端 2 秒超时掐断（服务端照样跑完、白跑）；异步接口 202 + 轮询
+    3. 无状态 worker：kill -9 正在跑长任务的 worker，另一个 worker 从检查点接着跑完同一个 run
+    4. 跨进程限流：两个 API 进程各用各的内存桶 vs 共用一个 SQLiteTokenBucket，实测放行数
+    5. 按租户的舱壁：进程内 KeyedLimiter + 跨进程 SQLiteSemaphore，吵闹的租户挤不垮别人；最后按租户记账
 
-第 1、2 节是纯模拟（用假时钟），两种模式输出相同。
+运行（需要 pip install -e ".[server]"：FastAPI、uvicorn、httpx）：
+    python lessons/12_production_architecture/demo.py --offline   # 剧本模型，约 15 秒
+    python lessons/12_production_architecture/demo.py             # worker 和同步接口调用真实模型（.env），约 60 次模型调用
+
+运行产物（SQLite 文件、各进程日志）在 lessons/12_production_architecture/runs/mini/ 下。
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import math
-import random
+import asyncio
 import shutil
+import sqlite3
 import sys
 import time
 import unicodedata
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Annotated
-
-from pydantic import Field
-
-from agentkit import (
-    Agent,
-    FileCheckpointer,
-    PermissionPolicy,
-    ScriptedLLM,
-    ToolContext,
-    call_tool,
-    default_llm,
-    reply,
-    tool,
-)
 
 HERE = Path(__file__).resolve().parent
 RUNS_DIR = HERE / "runs"
+sys.path.insert(0, str(HERE))
+
+import deployment  # noqa: E402  同目录模块
+
+KEYS = {"acme": "key-acme-alice", "globex": "key-globex-bob", "hooli": "key-hooli-carl"}
+LONG_TASK = "帮我汇总部门上季度的请假情况并生成报告"
 
 
 def section(title: str, component: str) -> None:
-    print(f"\n{'=' * 72}\n{title}\n{'=' * 72}")
+    print(f"\n{'=' * 76}\n{title}\n{'=' * 76}")
     print(f"对应参考架构中的：{component}\n")
 
 
@@ -55,94 +49,21 @@ def pad(text: str, width: int) -> str:
 
 
 def load_impl():
-    """优先用你在 exercise.py 里的实现；还没写完就用参考答案。"""
-    sys.path.insert(0, str(HERE))
+    """优先用你在 exercise.py 里的实现；还没写完就用参考答案。返回 (模块, 文件路径, 说明)。"""
     import exercise  # noqa: E402
 
     try:
         exercise.TokenBucket(1, 1).try_acquire()
+        exercise.TenantRateLimiter({"f": exercise.Plan("f", 1, 1)}, {}, "f").try_acquire("t")
         exercise.choose_model({"input_tokens": 1}, [exercise.ModelSpec("m", 10, True, True, 1, 1)])
-        return exercise, "exercise.py（你的实现）"
+        return exercise, HERE / "exercise.py", "exercise.py（你的实现）"
     except NotImplementedError:
         import solution  # noqa: E402
 
-        return solution, "solution.py（参考答案 —— 完成练习后会自动换成你的实现）"
+        return solution, HERE / "solution.py", "solution.py（参考答案 —— 完成练习后会自动换成你的实现）"
 
 
-class FakeClock:
-    def __init__(self):
-        self.t = 0.0
-
-    def __call__(self) -> float:
-        return self.t
-
-
-# ---------------------------------------------------------------- 1. 多租户限流
-
-
-def demo_rate_limit(impl) -> None:
-    section("1. 多租户限流：吵闹的邻居（noisy neighbor）", "API 网关 → 限流")
-    plans = {
-        "free": impl.Plan("free", capacity=5, refill_rate=1),
-        "pro": impl.Plan("pro", capacity=20, refill_rate=5),
-        "enterprise": impl.Plan("enterprise", capacity=50, refill_rate=20),
-    }
-    tenants = {  # 租户: (套餐, 每秒请求数)
-        "acme": ("enterprise", 10),
-        "globex": ("pro", 4),
-        "initech": ("free", 0.5),
-        "hooli": ("free", 50),  # 客户的脚本有 bug，死循环调用接口
-    }
-    print("模拟 10 秒流量（每 0.1 秒一个时间片，同一时间片内请求随机到达）：")
-    for t, (plan, rate) in tenants.items():
-        note = "   ← 脚本失控" if t == "hooli" else ""
-        print(f"  {t:<9} 套餐 {plan:<11} 每秒 {rate:>4} 个请求{note}")
-
-    def simulate(acquire) -> dict[str, list[int]]:
-        clock_state["t"] = 0.0
-        rng = random.Random(42)
-        credit = {t: 0.0 for t in tenants}
-        stats = {t: [0, 0] for t in tenants}  # [发出, 放行]
-        for _ in range(100):
-            arrivals = []
-            for t, (_, rate) in tenants.items():
-                credit[t] += rate * 0.1
-                n = int(credit[t])
-                credit[t] -= n
-                arrivals += [t] * n
-            rng.shuffle(arrivals)
-            for t in arrivals:
-                stats[t][0] += 1
-                stats[t][1] += acquire(t)
-            clock_state["t"] += 0.1
-        return stats
-
-    clock_state = {"t": 0.0}
-
-    def clock():
-        return clock_state["t"]
-
-    global_bucket = impl.TokenBucket(capacity=60, refill_rate=30, clock=clock)
-    shared = simulate(lambda t: global_bucket.try_acquire())
-    limiter = impl.TenantRateLimiter(plans, {t: p for t, (p, _) in tenants.items()}, "free", clock=clock)
-    isolated = simulate(lambda t: limiter.try_acquire(t))
-
-    print(f"\n  {pad('租户', 10)}{pad('发出', 8)}{pad('A. 全局一个桶（容量 60，30/秒）', 34)}B. 每租户一个桶（按套餐）")
-    for t in tenants:
-        (sent, ok_a), (_, ok_b) = shared[t], isolated[t]
-        print(f"  {pad(t, 10)}{pad(str(sent), 8)}{pad(f'放行 {ok_a:>3}（{ok_a / sent:>4.0%}）', 34)}放行 {ok_b:>3}（{ok_b / sent:>4.0%}）")
-    while limiter.try_acquire("hooli"):
-        pass
-    print(f"\n  方案 B 下 hooli 的桶空了之后，429 响应头 Retry-After: {math.ceil(limiter.retry_after('hooli'))}"
-          "（free 套餐每秒补 1 个令牌；HTTP 的 Retry-After 只接受整数秒，所以向上取整）")
-    print(
-        "\n观察：方案 A 里，hooli 一个租户就把全局桶抽干了，付费最多的 acme 也有一半请求被拒；"
-        "\n      方案 B 里，hooli 只会把自己的桶抽干，其他租户完全不受影响。"
-        "\n      生产中两层都要：每租户的桶保证公平，外层的全局桶保护上游模型的总配额。"
-    )
-
-
-# ---------------------------------------------------------------- 2. 模型路由
+# ---------------------------------------------------------------- 0. 模型路由算账（纯计算）
 
 
 def catalog(impl) -> list:
@@ -169,15 +90,10 @@ REQUESTS = [  # (说明, task, 每天次数)
 
 
 def demo_routing(impl) -> None:
-    section("2. 模型路由：够用就好，别什么都上最强的模型", "模型网关 → 路由")
+    section("0. 模型路由算账：够用就好，别什么都上最强的模型（纯计算，不涉及并发）", "模型网关 → 路由")
     models = catalog(impl)
     by_name = {m.name: m for m in models}
-    print("模型目录（示例价格，美元 / 百万 token）：")
-    for m in models:
-        print(f"  {m.name:<5} 上下文 {m.context_window:>9,}  工具 {'✓' if m.supports_tools else '✗'}  "
-              f"强模型 {'✓' if m.strong else '✗'}  输入 ${m.input_price:<5} 输出 ${m.output_price}")
-
-    print(f"\n  {pad('请求', 28)}{pad('选中', 7)}{pad('每天次数', 10)}{pad('路由后/天', 12)}全用强模型/天")
+    print(f"  {pad('请求', 28)}{pad('选中', 7)}{pad('每天次数', 10)}{pad('路由后/天', 12)}全用强模型/天")
     total_routed = total_strong = 0.0
     for label, task, per_day in REQUESTS:
         try:
@@ -193,183 +109,266 @@ def demo_routing(impl) -> None:
         print(f"  {pad(label, 28)}{pad(name, 7)}{pad(str(per_day), 10)}{pad(f'${cost:,.2f}', 12)}${cost_strong:,.2f}")
     print(f"\n  合计：路由后每天 ${total_routed:,.2f}，全用强模型每天 ${total_strong:,.2f}，"
           f"节省 {1 - total_routed / total_strong:.0%}")
-    print(
-        "\n观察：绝大多数流量是简单请求，交给便宜模型；少数难题才用强模型。"
-        "\n      最后一个请求超出了所有模型的上下文，路由器直接拒绝，而不是硬塞进去（那样会报错或被截断）。"
-        "\n      注意：路由改变了'谁来回答'，每个被路由到的模型都要单独跑评估集（第 11 课）。"
-    )
+    print("\n观察：绝大多数流量是简单请求，交给便宜模型；最后一个请求超出了所有模型的上下文，路由器直接拒绝。"
+          "\n      下面的迷你部署里，API 进程对每个请求调用同一个 choose_model，把选中的逻辑模型写进任务。")
 
 
-# ---------------------------------------------------------------- 3. 迷你网关
+# ---------------------------------------------------------------- 迷你部署里的客户端
 
 
-LEAVE_BALANCE = {("acme", "u-alice"): 7, ("globex", "u-bob"): 12, ("hooli", "u-carl"): 3}
+class Client:
+    """模拟调用方：用真实的 HTTP 请求打到各个 API 进程（没有负载均衡器，由客户端轮流发）。"""
+
+    def __init__(self, http, dep):
+        self.http, self.dep = http, dep
+
+    def url(self, api: str, path: str) -> str:
+        return f"{self.dep.apis[api].url}{path}"
+
+    async def submit(self, api: str, tenant: str, message: str, complexity: str = "medium", **kw):
+        return await self.http.post(self.url(api, "/runs"), json={"message": message, "complexity": complexity},
+                                    headers={"Authorization": f"Bearer {KEYS[tenant]}"}, **kw)
+
+    async def get(self, api: str, tenant: str, run_id: str) -> dict:
+        r = await self.http.get(self.url(api, f"/runs/{run_id}"), headers={"Authorization": f"Bearer {KEYS[tenant]}"})
+        r.raise_for_status()
+        return r.json()
+
+    async def wait_done(self, tenant: str, run_id: str, apis: list[str], timeout: float = 120) -> dict:
+        deadline = time.monotonic() + timeout
+        i = 0
+        while time.monotonic() < deadline:
+            info = await self.get(apis[i % len(apis)], tenant, run_id)
+            i += 1
+            if info["job_status"] in ("succeeded", "failed", "dead"):
+                return info
+            await asyncio.sleep(0.1)
+        raise TimeoutError(f"{run_id} 在 {timeout}s 内没有完成")
 
 
-@tool
-def get_leave_balance(ctx: ToolContext) -> str:
-    """查询当前员工的剩余年假天数。"""
-    days = LEAVE_BALANCE.get((ctx.tenant_id, ctx.user_id))
-    return f"剩余年假 {days} 天" if days is not None else "没有找到该员工的假期记录"
+def peak(intervals: list[tuple[float, float]]) -> int:
+    points = sorted([(s, 1) for s, _ in intervals] + [(e, -1) for _, e in intervals])
+    level = best = 0
+    for _, d in points:
+        level += d
+        best = max(best, level)
+    return best
 
 
-@tool
-def search_policy(query: Annotated[str, Field(description="检索关键词")]) -> str:
-    """检索本公司的 HR 制度。"""
-    return "【年假】入职满 1 年 5 天，满 10 年 10 天，满 20 年 15 天；可分次使用，当年未休可顺延至次年 3 月底。"
+# ---------------------------------------------------------------- 2 + 3. 长任务、HTTP 超时、无状态 worker
 
 
-HR_TOOLS = [get_leave_balance, search_policy]
-HR_PROMPT = "你是企业 HR 助手。制度问题先用 search_policy 检索；个人数据用工具查询，不要编造。回答不超过 3 句话。"
+async def demo_long_task_and_stateless(client: Client, dep) -> str:
+    import httpx
 
-GATEWAY_REQUESTS = [  # (租户, 用户, 问题, 路由用的任务画像)
-    ("acme", "u-alice", "公司的年假制度是怎样的？", {"input_tokens": 600, "output_tokens": 100, "needs_tools": True, "complexity": "low"}),
-    ("globex", "u-bob", "我还剩几天年假？", {"input_tokens": 600, "output_tokens": 80, "needs_tools": True, "complexity": "low"}),
-    ("hooli", "u-carl", "我还剩几天年假？", {"input_tokens": 600, "output_tokens": 80, "needs_tools": True, "complexity": "low"}),
-    ("hooli", "u-carl", "我还剩几天年假？？", {"input_tokens": 600, "output_tokens": 80, "needs_tools": True, "complexity": "low"}),
-    ("hooli", "u-carl", "我还剩几天年假？？？", {"input_tokens": 600, "output_tokens": 80, "needs_tools": True, "complexity": "low"}),
-    ("acme", "u-alice", "新员工入职满 1 年、中途调岗，年假怎么算？请分情况说明。",
-     {"input_tokens": 800, "output_tokens": 400, "needs_tools": True, "complexity": "high"}),
-]
+    section("2. 长任务 vs HTTP 超时：同步接口 vs 202 + 轮询", "API 网关 → 任务队列 → Agent 运行时 worker")
+    print(f"请求：{LONG_TASK}（HR 助手要调 3 次模型，离线剧本里每次 1.2~1.5 秒）")
+    print("客户端（相当于浏览器前面的网关）的超时设为 2 秒。\n")
+    started = time.monotonic()
+    gave_up_at = None
+    try:
+        await client.http.post(client.url("api-1", "/runs/sync"), json={"message": LONG_TASK, "complexity": "high"},
+                               headers={"Authorization": f"Bearer {KEYS['acme']}", "X-Request-Id": "demo-1"}, timeout=2.0)
+        print("  同步接口：居然在 2 秒内返回了（真实模型这次很快）")
+    except httpx.ReadTimeout:
+        gave_up_at = time.time()
+        print(f"  ❌ POST /runs/sync → {time.monotonic() - started:.1f} 秒后客户端超时（httpx.ReadTimeout），用户只看到失败")
+
+    started = time.monotonic()
+    r = await client.submit("api-1", "acme", LONG_TASK, "high", timeout=5.0)
+    body = r.json()
+    run_id = body["run_id"]
+    print(f"  ✅ POST /runs → {r.status_code}，{(time.monotonic() - started) * 1000:.0f} 毫秒返回（{r.headers['x-served-by']}）："
+          f"run_id={run_id}，路由到逻辑模型 {body['model']}")
+
+    section("3. 无状态 worker：kill -9 正在跑这个 run 的 worker，另一个 worker 从检查点接着跑", "Agent 运行时 worker + 状态存储（检查点）")
+    print("客户端每 0.3 秒轮询一次 GET /runs/{id}，轮流发给 api-1 / api-2：状态都在共享的 SQLite 里，哪个 API 进程都答得上来。\n")
+    last, killed, apis = None, None, ["api-1", "api-2"]
+    deadline = time.monotonic() + 120
+    i = 0
+    while time.monotonic() < deadline:
+        api = apis[i % 2]
+        i += 1
+        info = await client.get(api, "acme", run_id)
+        view = (info["job_status"], info["run_status"], info["step"], info["writer"], info["fence"], info["attempts"])
+        if view != last:
+            print(f"  [+{time.monotonic() - started:4.1f}s] {pad(api, 6)} 任务 {info['job_status']:<9} run {str(info['run_status']):<9} "
+                  f"第 {info['step'] or 0} 步  检查点最后写入者 {str(info['writer']):<9} fence={info['fence']}  第 {info['attempts']} 次领取")
+            last = view
+        if killed is None and info["job_status"] == "leased" and (info["step"] or 0) >= 1:
+            idx = next(k for k, w in enumerate(dep.pool.workers) if w.worker_id == info["worker_id"])
+            killed = info["worker_id"]
+            pid = dep.pool.workers[idx].pid
+            dep.pool.kill(idx)
+            print(f"  [+{time.monotonic() - started:4.1f}s] 💥 kill -9 {killed}（pid {pid}，退出码 {dep.pool.workers[idx].returncode}）："
+                  f"它正跑到一半，内存里的一切都没了")
+            new = dep.pool.add()
+            print(f"  [+{time.monotonic() - started:4.1f}s]    K8s 会拉起一个新 Pod 补上：{new.worker_id}（pid {new.pid}）")
+        if info["job_status"] in ("succeeded", "failed", "dead"):
+            break
+        await asyncio.sleep(0.3)
+    print(f"\n  最终回答：{' '.join((info['output'] or '').split())[:60]}")
+    sync = await client.get("api-1", "acme", "sync-demo-1")
+    if gave_up_at is not None and sync["run_status"] == "completed":
+        print(f"  回头看那个同步请求：服务端的 run {sync['run_id']} 在客户端放弃 {sync['updated_at'] - gave_up_at:.1f} 秒之后跑完了"
+              f"（状态 {sync['run_status']}，{sync['step']} 步）—— 算力和模型费用都花了，却没有人拿到结果；用户多半还会再点一次")
+    else:
+        print(f"  回头看那个同步请求：服务端的 run {sync['run_id']} 状态 = {sync['run_status']}")
+    print("\n观察：202 让请求和执行解耦，任务多长都不怕连接超时；worker 被 kill -9 后，接手的 worker 从检查点继续"
+          "\n      （fence 变大、第 2 次领取、检查点写入者换人），前面已经做完的步骤不会重做。worker 无状态，才能随意替换。")
+    return run_id
 
 
-def offline_gateway_script(tenant: str, question: str) -> list:
-    if "剩几天" in question:
-        days = {"globex": 12, "hooli": 3}.get(tenant, 7)
-        return [call_tool("get_leave_balance", input_tokens=380, output_tokens=15),
-                reply(f"你还剩 {days} 天年假。", 420, 12)]
-    if "分情况" in question:
-        return [call_tool("search_policy", query="年假 调岗", input_tokens=400, output_tokens=20),
-                reply("入职满 1 年享 5 天年假；调岗不影响工龄累计，年假按总工龄计算；当年未休可顺延至次年 3 月底。", 520, 60)]
-    return [call_tool("search_policy", query="年假", input_tokens=380, output_tokens=18),
-            reply("入职满 1 年 5 天，满 10 年 10 天，满 20 年 15 天。", 470, 30)]
+# ---------------------------------------------------------------- 4 + 5. 限流与舱壁
 
 
-def demo_gateway(impl, offline: bool) -> None:
-    section("3. 迷你网关端到端：身份 → 限流 → 路由 → 调模型 → 记账",
-            "API 网关 → Agent 运行时 → 模型网关 → 可观测性 / 计费")
-    models = catalog(impl)
-    by_name = {m.name: m for m in models}
-    # 为了在几个请求里就看到限流效果，这里 free 套餐设得很紧：突发 1 次，之后每分钟补 1 次
-    plans = {"free": impl.Plan("free", 1, 1 / 60), "pro": impl.Plan("pro", 10, 1), "enterprise": impl.Plan("enterprise", 50, 5)}
-    limiter = impl.TenantRateLimiter(plans, {"acme": "enterprise", "globex": "pro"}, default_plan="free")
-    ledger: dict[str, dict] = {}
-    if not offline:
-        print("本机只配置了一个真实模型，所以 lite / mini / pro 这些逻辑模型都映射到它（.env 里的 LLM_MODEL）。"
-              "\n生产中模型网关会把逻辑名映射到不同的真实模型；记账按逻辑模型的示例价目表计算。\n")
+async def burst(client: Client, apis: list[str], tenant: str, seconds: float, interval: float) -> dict:
+    """在 seconds 秒里每 interval 秒发一个请求，轮流发给 apis（像负载均衡那样）。返回每个 API 的 202 / 429 计数和 run_id。"""
+    results: dict = {"accepted": Counter(), "rejected": Counter(), "run_ids": [], "retry_after": set()}
 
-    for tenant, user, question, task in GATEWAY_REQUESTS:
-        head = f"[{tenant}/{user}] {question[:14]}"
-        # ① 身份：生产中来自网关验证过的 JWT，这里直接给定。绝不能让模型或客户端随便声明自己是谁。
-        # ② 限流
-        if not limiter.try_acquire(tenant):
-            print(f"  {pad(head, 46)}→ 429 Too Many Requests（Retry-After: {math.ceil(limiter.retry_after(tenant))}）")
-            ledger.setdefault(tenant, {"ok": 0, "rejected": 0, "tokens": 0, "cost": 0.0})["rejected"] += 1
+    async def one(api: str, n: int):
+        r = await client.submit(api, tenant, f"我还剩几天年假？（第 {n} 次）", "low", timeout=10.0)
+        if r.status_code == 202:
+            results["accepted"][api] += 1
+            results["run_ids"].append(r.json()["run_id"])
+        elif r.status_code == 429:
+            results["rejected"][api] += 1
+            results["retry_after"].add(r.headers.get("retry-after"))
+        else:
+            raise RuntimeError(f"{api} 返回 {r.status_code}: {r.text}")
+
+    tasks, start, n = [], time.monotonic(), 0
+    while time.monotonic() - start < seconds:
+        tasks.append(asyncio.create_task(one(apis[n % len(apis)], n)))
+        n += 1
+        await asyncio.sleep(interval)
+    await asyncio.gather(*tasks)
+    results["elapsed"] = time.monotonic() - start
+    results["sent"] = n
+    return results
+
+
+async def demo_limits(client: Client, dep, impl, long_run: str) -> dict:
+    section("4. 跨进程限流：每个进程一个内存桶 vs 所有进程共用一个桶", "API 网关 → 按租户限流")
+    plan = {"capacity": 5, "rate": 2}
+    print(f"hooli（free 套餐：桶容量 {plan['capacity']}、每秒补 {plan['rate']} 个）的脚本失控：每 50 毫秒发一个请求，持续 2 秒。")
+    print("同时打两组 API（每组约 40 个请求），每组两个进程，客户端在组内轮流发（相当于负载均衡）：")
+    print("  mem-1 / mem-2：每个进程里一个 TenantRateLimiter（你在练习里写的，状态在进程内存里）")
+    print("  api-1 / api-2：共用 agentkit.distributed.SQLiteTokenBucket（状态在共享的 SQLite 里）\n")
+    mem, shared = await asyncio.gather(burst(client, ["mem-1", "mem-2"], "hooli", 2.0, 0.05),
+                                       burst(client, ["api-1", "api-2"], "hooli", 2.0, 0.05))
+    bound = plan["capacity"] + plan["rate"] * max(mem["elapsed"], shared["elapsed"])
+    for label, r, apis in (("进程内的桶（mem-1 + mem-2）", mem, ["mem-1", "mem-2"]), ("共享的桶（api-1 + api-2）", shared, ["api-1", "api-2"])):
+        total = sum(r["accepted"].values())
+        per = "，".join(f"{a} 放行 {r['accepted'][a]}" for a in apis)
+        print(f"  {pad(label, 30)} 发出 {r['sent']:>3}，放行 {total:>2}（{per}），其余 429（Retry-After: {'/'.join(sorted(r['retry_after']))}）")
+    print(f"\n  配置的上限：一个桶 {plan['capacity']} + {plan['rate']}/秒 × {max(mem['elapsed'], shared['elapsed']):.1f} 秒 ≈ {bound:.0f} 个。"
+          f"\n  进程内的桶：每个进程各有一个满桶、各按自己的速率补充，两个进程放行约 2 倍；进程越多，实际速率越高。"
+          f"\n  共享的桶：两个进程每次取令牌都在同一个 SQLite 写事务里'补充 + 扣减'，守住了配置的上限。")
+
+    section("5. 按租户的舱壁：吵闹的租户挤不垮别人", "Agent 运行时 worker → 并发配额")
+    print("上面被放行的 hooli 请求都进了队列。worker 在交给 Agent 之前先拿两层槽位：")
+    print("  进程内 KeyedLimiter：每个租户在一个 worker 里最多 2 个同时在跑；")
+    print("  跨进程 SQLiteSemaphore：每个租户在所有 worker 加起来最多 3 个。拿不到 → RetryLater，任务放回队列、不消耗重试次数。")
+    print("这时 acme 的员工来问 3 个问题，看它们要等多久：\n")
+    acme_started = time.monotonic()
+    acme_runs = [(await client.submit(f"api-{k % 2 + 1}", "acme", "公司的年假制度是怎样的？", "low", timeout=10.0)).json()["run_id"]
+                 for k in range(3)]
+    acme_done = await asyncio.gather(*(client.wait_done("acme", rid, ["api-1", "api-2"]) for rid in acme_runs))
+    acme_latency = time.monotonic() - acme_started
+    hooli_runs = mem["run_ids"] + shared["run_ids"]
+    hooli_waited = time.monotonic()
+    await asyncio.gather(*(client.wait_done("hooli", rid, ["api-1", "api-2"], timeout=180) for rid in hooli_runs))
+    conn = sqlite3.connect(dep.db, timeout=30)
+    rows = conn.execute("SELECT tenant, worker, pid, start, end FROM slot_log").fetchall()
+    conn.close()
+    by_tenant: dict[str, list] = defaultdict(list)
+    by_worker: dict[tuple, list] = defaultdict(list)
+    for tenant, worker, pid, start, end in rows:
+        by_tenant[tenant].append((start, end))
+        by_worker[(tenant, worker, pid)].append((start, end))
+    deferred = [e for e in dep.pool.events("deferred")]
+    hooli_workers = {f"{w}(pid {pid})": peak(iv) for (t, w, pid), iv in by_worker.items() if t == "hooli"}
+    print(f"  acme 的 3 个问题全部完成用了 {acme_latency:.1f} 秒（每个问题本身 2 次模型调用，约 0.5 秒），"
+          f"状态 {', '.join(d['job_status'] for d in acme_done)}")
+    print(f"  hooli 的 {len(hooli_runs)} 个任务又过了 {time.monotonic() - hooli_waited:.1f} 秒才全部做完；"
+          f"期间因为舱壁满了被推迟（RetryLater）{len(deferred)} 次")
+    print(f"  hooli 同时在跑的任务数峰值：所有 worker 加起来 {peak(by_tenant['hooli'])}（跨进程上限 3），"
+          f"每个 worker 进程里 {max(hooli_workers.values())}（进程内上限 2）："
+          + "，".join(f"{k} {v}" for k, v in sorted(hooli_workers.items())))
+    print("\n观察：只有进程内的舱壁时，两个 worker 加起来 hooli 最多能同时跑 2 × 2 = 4 个；跨进程的槽位把它压到 3。"
+          "\n      被挡住的任务放回队列（不消耗重试次数），一个租户占不满 worker 的并发名额，别的租户的任务照常被领走；"
+          "\n      hooli 同时最多只占 3 个模型调用，也就吃不光整个平台共用的模型配额。")
+    return {"hooli": hooli_runs, "acme": [long_run, *acme_runs],
+            "rejected": {"hooli": sum(mem["rejected"].values()) + sum(shared["rejected"].values())}}
+
+
+async def ledger(client: Client, impl, runs: dict) -> None:
+    section("记账：每一分钱都归到租户", "可观测性 / 计费")
+    prices = {m.name: m for m in catalog(impl)}
+    print(f"  {pad('租户', 10)}{pad('放行', 6)}{pad('被限流', 8)}{pad('完成', 6)}{pad('tokens', 9)}成本（示例价格，按逻辑模型）")
+    for tenant, run_ids in runs.items():
+        if tenant == "rejected":
             continue
-        # ③ 路由
-        model = impl.choose_model(task, models)
-        # ④ 调用：逻辑模型 → 真实模型
-        llm = ScriptedLLM(offline_gateway_script(tenant, question), model=model) if offline else default_llm()
-        agent = Agent(llm, HR_TOOLS, system_prompt=HR_PROMPT, name="hr-assistant", max_steps=4)
-        t0 = time.time()
-        res = agent.run(question, metadata={"tenant_id": tenant, "user_id": user, "roles": ["employee"]})
-        # ⑤ 记账：按租户归因（按逻辑模型的价目表）
-        cost = by_name[model].estimated_cost(res.usage.input_tokens, res.usage.output_tokens)
-        row = ledger.setdefault(tenant, {"ok": 0, "rejected": 0, "tokens": 0, "cost": 0.0})
-        row["ok"] += 1
-        row["tokens"] += res.usage.total
-        row["cost"] += cost
-        answer = " ".join((res.output or "").split())[:60]
-        print(f"  {pad(head, 46)}→ {model:<5} {res.status} {time.time() - t0:>5.1f}s  {answer}")
+        infos = [await client.get("api-1", tenant, rid) for rid in run_ids]
+        tokens = sum(i["usage"]["input_tokens"] + i["usage"]["output_tokens"] for i in infos if i["usage"])
+        cost = sum(prices[i["model"]].estimated_cost(i["usage"]["input_tokens"], i["usage"]["output_tokens"])
+                   for i in infos if i["usage"])
+        done = sum(1 for i in infos if i["job_status"] == "succeeded")
+        print(f"  {pad(tenant, 10)}{pad(str(len(run_ids)), 6)}{pad(str(runs['rejected'].get(tenant, 0)), 8)}"
+              f"{pad(str(done), 6)}{pad(str(tokens), 9)}${cost:.6f}")
 
-    print(f"\n  {pad('租户', 10)}{pad('成功', 6)}{pad('被限流', 8)}{pad('tokens', 9)}成本（示例价格）")
-    for tenant, row in ledger.items():
-        print(f"  {pad(tenant, 10)}{pad(str(row['ok']), 6)}{pad(str(row['rejected']), 8)}{pad(str(row['tokens']), 9)}${row['cost']:.6f}")
-    print(
-        "\n观察：hooli（免费套餐）连发 3 次，只有第 1 次放行；同一个问题，不同租户查到的是各自员工的数据"
-        "\n      （工具通过 ctx 拿到网关注入的 tenant_id / user_id，而不是让模型填）；每一分钱都能归到具体租户。"
+
+async def run(args) -> int:
+    impl, impl_path, impl_name = load_impl()
+    print(f"（限流器和路由器的实现来自 {impl_name}）")
+    demo_routing(impl)
+    missing = deployment.missing_server_deps()
+    if missing:
+        print(f"\n❌ 迷你部署需要可选依赖 {', '.join(missing)}：请在仓库根目录执行  {deployment.INSTALL_HINT}")
+        return 1
+    import httpx
+
+    section("1. 起一个迷你部署：4 个 API 进程 + 2 个 worker 进程，共享一个 SQLite 文件", "整张参考架构的骨架")
+    workdir = RUNS_DIR / "mini"
+    shutil.rmtree(workdir, ignore_errors=True)
+    dep = deployment.MiniDeployment(
+        workdir, apis=[("api-1", "sqlite"), ("api-2", "sqlite"), ("mem-1", "memory"), ("mem-2", "memory")],
+        workers=2, lease=1.5, offline=args.offline, router=impl_path,
+        worker_options={"latency": 0.25, "long_latency": 1.2, "tenant_local": 2, "tenant_shared": 3},
     )
-
-
-# ---------------------------------------------------------------- 4. 无状态 worker
-
-
-@tool(risk="write")
-def submit_leave(
-    start_date: Annotated[str, Field(description="开始日期，YYYY-MM-DD")],
-    days: Annotated[int, Field(ge=1, le=30, description="请假天数")],
-    ctx: ToolContext,
-) -> str:
-    """提交年假申请（需要主管审批）。"""
-    return f"已为 {ctx.tenant_id}/{ctx.user_id} 提交年假：{start_date} 起 {days} 天，审批单号 LV-{ctx.run_id[:6]}"
-
-
-def make_worker(llm, checkpoint_dir: Path) -> Agent:
-    """每个 worker 都是一个"全新"的 Agent 实例：不在内存里保留任何运行状态，状态全在检查点里。"""
-    return Agent(
-        llm,
-        [get_leave_balance, submit_leave],
-        system_prompt="你是企业 HR 助手。用户要请假时，直接用 submit_leave 提交申请。",
-        name="hr-assistant",
-        hooks=[PermissionPolicy(ask_risks={"write"})],  # 写操作需要主管审批
-        checkpointer=FileCheckpointer(checkpoint_dir),
-        max_steps=4,
-    )
-
-
-def demo_stateless_workers(offline: bool) -> None:
-    section("4. 无状态 worker：A 暂停等审批，B 从检查点接手", "Agent 运行时 worker + 状态存储（检查点）")
-    ckpt_dir = RUNS_DIR / "checkpoints"
-    shutil.rmtree(ckpt_dir, ignore_errors=True)
-    question = "帮我申请从 2026-10-08 开始的 3 天年假"
-    meta = {"tenant_id": "acme", "user_id": "u-alice", "roles": ["employee"]}
-
-    llm_a = ScriptedLLM([call_tool("submit_leave", start_date="2026-10-08", days=3)]) if offline else default_llm()
-    worker_a = make_worker(llm_a, ckpt_dir)
-    res = worker_a.run(question, metadata=meta)
-    print(f"worker A：{question}")
-    print(f"  状态 = {res.status}，run_id = {res.run_id}")
-    if res.status != "paused":
-        print(f"  （模型这次没有发起提交，而是回复了：{(res.output or '')[:80]}）"
-              "\n  真实模型有时会先追问细节；想稳定看到暂停 / 恢复流程，请用 --offline 运行。")
-        return
-    ckpt = ckpt_dir / f"{res.run_id}.json"
-    saved = json.loads(ckpt.read_text(encoding="utf-8"))
-    print(f"  等待审批：{res.pending_approval.name}({res.pending_approval.arguments})")
-    print(f"  检查点：{ckpt.relative_to(HERE.parent.parent)}（{ckpt.stat().st_size} 字节）")
-    print(f"    status={saved['status']}  step={saved['step']}  pending={saved['pending']['name']}  "
-          f"metadata={saved['metadata']}")
-    del worker_a  # 模拟：worker A 所在的 Pod 被滚动发布替换掉了，内存里什么都没留下
-
-    print("\n…… 3 小时后，主管在审批系统里点了「批准」，请求被负载均衡到了另一台机器上的 worker B ……\n")
-    llm_b = ScriptedLLM([reply("已提交：2026-10-08 起 3 天年假，主管已批准，审批单号见系统通知。")]) if offline else default_llm()
-    worker_b = make_worker(llm_b, ckpt_dir)
-    done = worker_b.approve(res.run_id, approved=True, by="mgr-zhao", comment="同意，请做好工作交接")
-    tool_msgs = [m["content"] for m in done.messages if m["role"] == "tool"]
-    print(f"worker B：从检查点恢复 run_id = {done.run_id}")
-    print(f"  工具执行结果：{tool_msgs[-1] if tool_msgs else '（无）'}")
-    print(f"  最终状态 = {done.status}，回答：{' '.join((done.output or '').split())[:80]}")
-    log = json.loads(ckpt.read_text(encoding="utf-8"))["approval_log"][-1]
-    print(f"  审批记录（写在检查点里，供审计）：by={log['by']}  approved={log['approved']}  "
-          f"comment={log['comment']}  tool={log['tool']}")
-    print(
-        "\n观察：worker B 从没见过这次运行，却能接着做完 —— 因为全部状态（消息历史、待审批的调用、"
-        "\n      租户和用户身份）都在检查点里。worker 无状态，才能随意扩缩容、滚动发布、崩溃重启。"
-        "\n      生产中检查点放 Postgres / Redis，而不是本地文件；两个 worker 同时抢同一个 run 时还要加锁。"
-    )
+    started = time.monotonic()
+    await dep.start()  # start() 失败时会先停掉已经拉起的进程
+    try:
+        for api in dep.apis.values():
+            print(f"  {pad(api.name, 6)} pid {api.popen.pid:<6} {api.url}  限流后端：{'共享 SQLiteTokenBucket' if api.backend == 'sqlite' else '进程内存（TenantRateLimiter）'}")
+        for w in dep.pool.workers:
+            print(f"  {pad(w.worker_id, 9)} pid {w.pid:<6} python -m agentkit.distributed.worker（并发 8，租约 {dep.lease} 秒）")
+        print(f"  共享状态：{dep.db.relative_to(HERE.parents[1])}（{time.monotonic() - started:.1f} 秒全部就绪）")
+        async with httpx.AsyncClient() as http:
+            client = Client(http, dep)
+            long_run = await demo_long_task_and_stateless(client, dep)
+            runs = await demo_limits(client, dep, impl, long_run)
+            await ledger(client, impl, runs)
+    finally:
+        print("\n停机：先对 API 进程发 SIGTERM（不再接新请求），再对 worker 发 SIGTERM（排空在途任务），超时未退出的 SIGKILL")
+        codes = await dep.stop()
+    print("  退出码：" + "，".join(f"{name}={code}" for name, code in codes.items()))
+    graceful = [a.name for a in dep.apis.values() if "Application shutdown complete" in a.log_path.read_text(errors="replace")]
+    print(f"  API 进程：uvicorn 收到 SIGTERM 后先优雅停机（日志里有 'Application shutdown complete' 的：{', '.join(graceful) or '无'}），"
+          "\n            再按惯例用收到的信号结束自己，所以退出码是 -15；worker：排空后正常退出是 0，被 kill -9 的是 -9。")
+    return 0
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--offline", action="store_true", help="第 3、4 节用 ScriptedLLM 剧本代替真实模型")
+    parser.add_argument("--offline", action="store_true", help="worker 和同步接口用剧本模型代替真实模型")
     args = parser.parse_args()
-    impl, impl_name = load_impl()
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"（限流器和路由器的实现来自 {impl_name}）")
-    demo_rate_limit(impl)
-    demo_routing(impl)
-    demo_gateway(impl, args.offline)
-    demo_stateless_workers(args.offline)
+    t = time.time()
+    code = asyncio.run(run(args))
+    print(f"\n总耗时 {time.time() - t:.0f} 秒。运行产物在 {(RUNS_DIR / 'mini').relative_to(HERE.parents[1])}/")
+    sys.exit(code)
 
 
 if __name__ == "__main__":
