@@ -87,7 +87,7 @@ def test_lease_shorter_than_drain_when_renewal_stops_on_sigterm():
     # 收到 SIGTERM 就不续租：租约 15s < min(最长任务 40s, 排空窗口 5+20=25s) → 排空期间被别人接手
     issues = ex.validate_shutdown_timeline(40, 5, 20, 15, 40, lease_renewal="stops_on_sigterm")
     assert "lease_expires_during_drain" in codes(issues)
-    # 同样的数字，但排空期间持续续租（run_async_worker 的做法）：租约比宽限期短也没关系
+    # 同样的数字，但排空期间持续续租（run_worker 的做法）：租约比宽限期短也没关系
     assert "lease_expires_during_drain" not in codes(ex.validate_shutdown_timeline(40, 5, 20, 15, 40))
     # 任务本身都很短（10s < 租约 15s）：就算不续租也来不及重复
     assert ex.validate_shutdown_timeline(40, 5, 20, 15, 10, lease_renewal="stops_on_sigterm") == []

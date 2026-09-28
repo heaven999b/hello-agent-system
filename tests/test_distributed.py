@@ -514,3 +514,29 @@ async def test_many_processes_can_create_the_same_new_database_at_once(tmp_path)
         gate.touch()
         outs = [await p.communicate() for p in procs]
         assert all(p.returncode == 0 for p in procs), [o[0].decode()[-300:] for o in outs]
+
+
+async def test_release_on_cancel_hands_the_job_back_immediately(tmp_path):
+    """停机时被取消的任务：默认等租约过期；release_on_cancel=True 时立刻归还，别人马上能领（不消耗尝试次数）。"""
+    q = SQLiteJobQueue(tmp_path / "jobs.db")
+    await q.setup()
+    jid = await q.enqueue("slow", {}, tenant_id="t")
+    started = asyncio.Event()
+
+    async def slow(job):
+        started.set()
+        await asyncio.sleep(30)
+
+    stop = asyncio.Event()
+    events = []
+    worker = asyncio.create_task(run_worker(q, slow, worker_id="w", stop_event=stop, concurrency=1, lease_seconds=60,
+                                            poll_interval=0.01, grace_period=0.2, release_on_cancel=True,
+                                            on_event=lambda n, i: events.append(n)))
+    await asyncio.wait_for(started.wait(), 10)
+    stop.set()
+    await asyncio.wait_for(worker, 10)
+    job = await q.get(jid)
+    assert job.status == "queued" and "released_on_cancel" in events  # 租约 60 秒，但不用等
+    again = await q.claim("w2", lease_seconds=5)
+    assert again.id == jid and again.attempts == 1 and again.fence > job.fence
+    await q.close()

@@ -5,27 +5,28 @@
 
 Hook 顺序（Agent 按列表顺序调用）：
     OTelTracer          放第一个：给根 span 补 conversation id、工具 call id（第 28 课）
-    AsyncClassifierGuard  输入护栏：命中直接 StopRun，一次模型调用都不花（第 29 课）
+    ClassifierGuard     输入护栏：命中直接 StopRun，一次模型调用都不花（第 29 课）
     PrometheusHook      运行数、耗时、token、工具调用（第 28 课）
-    AsyncRateLimitHook  调模型前按租户从 Redis 令牌桶拿令牌；等不到 → rate_limited → 后台任务 RetryLater（第 26 课）
+    RateLimitHook       调模型前按租户从 Redis 令牌桶拿令牌；等不到 → rate_limited → 后台任务 RetryLater（第 26 课）
     CedarPolicy         工具级 + 参数级授权；dangerous 工具 → PauseRun 等人工审批（第 29 课）
     RunEventsHook       放最后：只有通过了授权的工具调用才推送 tool_started
+
+框架（agentkit）只有一套 async 实现：这里的 Agent、ResilientLLM、ToolExecutor 就是各课用的那一个，
+contrib 里的 Postgres / Redis / LiteLLM / Cedar 适配器也都是 async 的（Hook 方法可以直接 await）。
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from collections import deque
 
-from agentkit.aio import AsyncAgent, AsyncResilientLLM, AsyncToolExecutor, wait_for  # wait_for：取消安全版（gh-86296）
-from agentkit.contrib.guards import AsyncClassifierGuard, RegexClassifier
+from agentkit import Agent, ResilientLLM, ToolExecutor, ToolRegistry, wait_for  # wait_for：取消安全版（gh-86296）
+from agentkit.contrib.guards import ClassifierGuard, RegexClassifier
 from agentkit.contrib.otel import OTelTracer, PrometheusHook, normalize_stop_reason
 from agentkit.contrib.policy import CedarPolicy, entity_args_context
-from agentkit.contrib.postgres import AsyncPostgresCheckpointer, AsyncPostgresJobQueue
-from agentkit.contrib.redis_store import AsyncRateLimitHook, AsyncRedisIdempotencyStore, AsyncRedisTokenBucket
+from agentkit.contrib.postgres import PostgresCheckpointer, PostgresJobQueue
+from agentkit.contrib.redis_store import RateLimitHook, RedisIdempotencyStore, RedisTokenBucket
 from agentkit.hooks import Hook
-from agentkit.tools import ToolRegistry
 
 from . import telemetry
 from .backend import Backend
@@ -38,25 +39,40 @@ QUEUE_TABLE = "agent_jobs"
 RUNS_TABLE = "agent_runs"
 
 
-SWALLOWED_CANCEL_EVENT = "swallowed_cancellation"  # agentkit.aio 补抛被吞掉的取消时，warning 日志 extra 里的 agentkit_event
+SWALLOWED_CANCEL_EVENT = "swallowed_cancellation"  # agentkit 补抛被吞掉的取消时，warning 日志 extra 里的 agentkit_event
+FRAMEWORK_LOGGER = "agentkit"  # 框架的 logger（agentkit/agent.py 里的 logging.getLogger("agentkit")）
 
 
 class SwallowedCancelCounter(logging.Handler):
     """把框架"补抛被吞掉的取消"这件事变成指标 itdesk_swallowed_cancellations_total。
 
-    分工：检测和补抛由 agentkit.aio 负责（Task.cancelling() 比进入运行时的基线大 → 调模型、执行工具之前补抛，
-    Python 3.11+；3.10 上没有 cancelling()，检查关闭）。服务这边只负责让它**可见**：不为 0 就说明有依赖在吞取消
+    分工：检测和补抛由框架负责（agentkit/agent.py 的 _raise_if_cancel_swallowed：Task.cancelling() 比进入运行时的
+    基线大 → 调模型、执行工具之前补抛，Python 3.11+；3.10 上没有 cancelling()，检查关闭）。
+    服务这边只负责让它**可见**：不为 0 就说明有依赖在吞取消
     （Python < 3.12 的 asyncio.wait_for 竞态，本课实测 redis-py、psycopg_pool 都会），该升级 Python 或换库了。
     按日志记录上的结构化字段 agentkit_event 匹配，而不是按措辞：框架改了文案，计数也不会悄悄停在 0。
+
+    它挂在框架的总 logger "agentkit" 上（agentkit.distributed、agentkit.contrib.* 的记录也会传上来）。
+    一旦挂了 Handler，logging 就不再用 lastResort 把这些 WARNING 打到 stderr，所以这里顺带把它们转成
+    一行结构化日志（framework_log），别让框架的告警（例如 run_worker 里 on_event 回调出错）悄悄消失。
     """
 
     def emit(self, record: logging.LogRecord) -> None:
-        if getattr(record, "agentkit_event", None) == SWALLOWED_CANCEL_EVENT:
-            telemetry.SWALLOWED_CANCELS.inc()
+        try:
+            if getattr(record, "agentkit_event", None) == SWALLOWED_CANCEL_EVENT:
+                telemetry.SWALLOWED_CANCELS.inc()
+            fields = {"level": record.levelname, "logger": record.name, "message": record.getMessage()}
+            if getattr(record, "agentkit_event", None):
+                fields["agentkit_event"] = record.agentkit_event
+            if record.exc_info:
+                fields["exception"] = logging.Formatter().formatException(record.exc_info)[-2000:]
+            telemetry.log("framework_log", **fields)
+        except Exception:  # noqa: BLE001 —— 日志 Handler 自己不能抛
+            self.handleError(record)
 
 
 def install_swallowed_cancel_counter() -> None:
-    logger = logging.getLogger("agentkit.aio")
+    logger = logging.getLogger(FRAMEWORK_LOGGER)
     if not any(isinstance(h, SwallowedCancelCounter) for h in logger.handlers):
         logger.addHandler(SwallowedCancelCounter(level=logging.WARNING))
 
@@ -84,26 +100,25 @@ class RunEventsHook(Hook):
 
 
 def build_llm(settings: Settings):
-    """三种模型后端，外面统一套一层 AsyncResilientLLM 做**进程内舱壁**（max_concurrency）。
+    """三种模型后端，外面统一套一层 ResilientLLM 做**进程内舱壁**（max_concurrency）。
 
     重试只放一层（第 29 课）：LiteLLM Router 自己会重试和降级，所以 litellm 后端这层 max_attempts=1；
     直连网关的 openai 后端由这层重试 3 次。
     """
     if settings.llm_backend == "scripted":
         inner = scripted_llm(settings.scripted_latency_s, settings.scripted_jitter, seed=os.getpid())
-        inner.calls = deque(maxlen=200)  # AsyncScriptedLLM 默认保存每次调用的深拷贝：长时间运行的服务里只留最近 200 次
         attempts = 1
     elif settings.llm_backend == "litellm":
-        from agentkit.contrib.gateway import AsyncLiteLLMRouterLLM
+        from agentkit.contrib.gateway import LiteLLMRouterLLM
 
-        inner = AsyncLiteLLMRouterLLM.from_env(num_retries=2, timeout=60)
+        inner = LiteLLMRouterLLM.from_env(num_retries=2, timeout=60)
         attempts = 1
     else:
-        from agentkit.aio import AsyncOpenAICompatLLM
+        from agentkit import OpenAICompatLLM
 
-        inner = AsyncOpenAICompatLLM(max_connections=settings.llm_max_concurrency)
+        inner = OpenAICompatLLM(max_connections=settings.llm_max_concurrency)
         attempts = 3
-    return AsyncResilientLLM(inner, max_attempts=attempts, max_concurrency=settings.llm_max_concurrency)
+    return ResilientLLM(inner, max_attempts=attempts, max_concurrency=settings.llm_max_concurrency)
 
 
 class Runtime:
@@ -137,25 +152,26 @@ class Runtime:
         self.redis_blocking = aredis.Redis.from_url(s.redis_url, socket_timeout=30, socket_connect_timeout=5)
         self.bus = EventBus(self.redis, self.redis_blocking, maxlen=s.events_maxlen, ttl_s=s.events_ttl_s)
 
-        self.ckpt = AsyncPostgresCheckpointer(self.pool, RUNS_TABLE)
-        self.queue = AsyncPostgresJobQueue(self.pool, QUEUE_TABLE, max_attempts=5, base_backoff=0.5, max_backoff=30)
+        # 检查点、队列、业务表共用上面这一个池（传池而不是连接串：适配器不再各建一个池）
+        self.ckpt = PostgresCheckpointer(self.pool, RUNS_TABLE)
+        self.queue = PostgresJobQueue(self.pool, QUEUE_TABLE, max_attempts=5, base_backoff=0.5, max_backoff=30)
 
         self.backend = Backend(self.pool, tool_latency_s=s.tool_latency_s, diagnostics_latency_s=s.diagnostics_latency_s)
         self.registry = ToolRegistry(make_tools(self.backend))
-        self.idempotency = AsyncRedisIdempotencyStore(self.redis, namespace="itdesk:idem", ttl_seconds=86400)
+        self.idempotency = RedisIdempotencyStore(self.redis, namespace="itdesk:idem", ttl_seconds=86400)
         self.registry.idempotency_store = self.idempotency
         # 进程级的工具执行器（有上限的线程池）：即使将来按任务定制 Agent，线程池也只有一个
-        self.executor = AsyncToolExecutor(self.registry, max_threads=16)
+        self.executor = ToolExecutor(self.registry, max_threads=16)
         self.llm = build_llm(s)
 
         self.provider = telemetry.setup(s)
         self.tracer = OTelTracer(self.provider, provider_name="openai")
         # 待审批数由 API 的采样任务从数据库读出后 set（暂停和恢复常发生在不同进程，进程内增减会漂移）
         self.prom = PrometheusHook(track_approvals=False)
-        self.guard = AsyncClassifierGuard(RegexClassifier(), on="input", threshold=0.5)
-        llm_bucket = AsyncRedisTokenBucket(self.redis, s.llm_rate_per_sec, s.llm_burst, prefix="itdesk:rl:llm")
-        self.ratelimit = AsyncRateLimitHook(llm_bucket, wait_timeout=s.llm_rate_wait_s)
-        self.api_bucket = AsyncRedisTokenBucket(
+        self.guard = ClassifierGuard(RegexClassifier(), on="input", threshold=0.5)
+        llm_bucket = RedisTokenBucket(self.redis, s.llm_rate_per_sec, s.llm_burst, prefix="itdesk:rl:llm")
+        self.ratelimit = RateLimitHook(llm_bucket, wait_timeout=s.llm_rate_wait_s)
+        self.api_bucket = RedisTokenBucket(
             self.redis, s.api_rate_per_sec, s.api_burst, prefix="itdesk:rl:api",
             overrides={t: (float(v[0]), float(v[1])) for t, v in s.api_rate_overrides.items()},
         )
@@ -171,9 +187,9 @@ class Runtime:
     def hooks(self) -> list:
         return [self.tracer, self.guard, self.prom, self.ratelimit, self.policy, self.events_hook]
 
-    def new_agent(self, checkpointer=None) -> AsyncAgent:
+    def new_agent(self, checkpointer=None) -> Agent:
         """每个进程建一个，被所有会话 / 任务并发复用；每次运行通过 checkpointer= 传入自己的检查点视图。"""
-        return AsyncAgent(
+        return Agent(
             self.llm,
             self.registry,
             system_prompt=SYSTEM_PROMPT,
@@ -213,7 +229,9 @@ class Runtime:
         except Exception:  # noqa: BLE001
             pass
         self.executor.close()
-        close = getattr(self.llm.chain[0][0], "aclose", None) if hasattr(self.llm, "chain") else None
+        # ResilientLLM.aclose() 关掉链上每个模型的连接池（OpenAICompatLLM）和熔断器持有的资源。
+        # Agent 只是借用 self.llm（API 和 worker 各自的 Agent 都指向它），所以由 Runtime 关、只关一次
+        close = getattr(self.llm, "aclose", None)
         if close is not None:
             try:
                 await close()

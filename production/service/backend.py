@@ -9,7 +9,7 @@ capstone 的 Backend 是进程内的字典：它在单进程里讲清了租户�
    worker 被 kill -9、租约过期、任务被接手重放时，真正挡住重复工单的是这条唯一约束。
 3. 每次副作用尝试都记一行 side_effect_attempts（inserted / deduplicated）：压测后据此证明"重放发生过、而且被挡住了"。
 
-幂等键 = ToolContext.idempotency_key = f"{run_id}:{call_id}"。AsyncAgent 在执行工具之前已经把带 call_id 的
+幂等键 = ToolContext.idempotency_key = f"{run_id}:{call_id}"。Agent 在执行工具之前已经把带 call_id 的
 模型回复落盘；取消 / 超时时写工具保持未回答，resume 时用**同一个 call_id** 重放（第 30 课），所以幂等键在重放时不变。
 """
 

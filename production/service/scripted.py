@@ -1,4 +1,4 @@
-"""离线模式的"模型"：带延迟的 AsyncScriptedLLM + 一个按对话内容决定下一步的 responder。
+"""离线模式的"模型"：带延迟的 ScriptedLLM + 一个按对话内容决定下一步的 responder。
 
 压测和端到端测试不能调真实模型（贵、慢、不确定），但又要让 Agent 走完真实的路径：
 多轮工具调用、并行只读工具、写工具、需要审批的高危工具、流式文本。responder 只看"最后一条用户消息"
@@ -18,8 +18,7 @@ from __future__ import annotations
 import json
 import random
 
-from agentkit import call_tool, call_tools, reply
-from agentkit.aio import AsyncScriptedLLM
+from agentkit import ScriptedLLM, call_tool, call_tools, reply
 from agentkit.types import LLMResponse, Message, Usage
 
 
@@ -82,7 +81,7 @@ def respond(messages: list[Message]) -> LLMResponse:
         return _answer(f"已为您创建工单 {_ticket_no(results) or '（未知）'}，IT 工程师会在 4 个工作小时内响应。")
 
     if "VPN" in text.upper():
-        if rounds == 0:  # 同一轮两个只读工具：AsyncAgent 会并行执行
+        if rounds == 0:  # 同一轮两个只读工具：Agent 会并行执行
             return call_tools(("search_kb", {"query": "VPN"}), ("check_system_status", {"system": "vpn"}))
         return _answer("根据 [KB-001]：先确认 AcmeConnect 已安装并完成多因素认证；遇到错误 809 请切换为 TCP 443 模式。"
                        "另外当前有已知故障 INC-2041（上海办公室 VPN 间歇性断连），预计 18:00 前恢复。")
@@ -90,11 +89,14 @@ def respond(messages: list[Message]) -> LLMResponse:
     return _answer("您好，我是 IT 服务台助手，可以帮您查知识库、查系统状态、提工单和发起密码重置。")
 
 
-def scripted_llm(latency_s: float, jitter: float = 0.3, seed: int | None = None) -> AsyncScriptedLLM:
-    """每次调用耗时 latency_s × (1 ± jitter)。真实模型的延迟不是常数（第 30 课 3.6：两次运行差一倍），压测要带上抖动。"""
+def scripted_llm(latency_s: float, jitter: float = 0.3, seed: int | None = None) -> ScriptedLLM:
+    """每次调用耗时 latency_s × (1 ± jitter)。真实模型的延迟不是常数（第 30 课 3.6：两次运行差一倍），压测要带上抖动。
+
+    keep_calls=200：ScriptedLLM 默认保存每次调用的消息深拷贝（方便测试断言），长时间运行的服务里只留最近 200 次，
+    否则内存只增不减（第 31 课发现 6；以前服务里自己把 calls 换成 deque，现在框架有这个参数）。"""
     rng = random.Random(seed)
 
     def latency(_n: int) -> float:
         return max(0.0, latency_s * (1 + jitter * (2 * rng.random() - 1)))
 
-    return AsyncScriptedLLM(responder=respond, latency=latency, model="scripted", stream_chunk=8)
+    return ScriptedLLM(responder=respond, latency=latency, model="scripted", stream_chunk=8, keep_calls=200)

@@ -211,6 +211,7 @@ async def run_worker(
     on_event: Callable[[str, dict], None] | None = None,
     max_jobs: int | None = None,
     transient_errors: tuple[type[BaseException], ...] | None = None,
+    release_on_cancel: bool = False,
 ) -> dict:
     """worker 主循环：**一个进程**用 asyncio 同时处理最多 concurrency 个任务。返回计数统计。
 
@@ -222,6 +223,8 @@ async def run_worker(
     - **停机**：stop_event 置位后不再领取；等在途任务最多 grace_period 秒，超时的任务被取消，
       **不提交、不归还**，它们的租约自然过期后由别的 worker 从检查点接手（fence 保证取消前的写入不会覆盖接手者）。
       grace_period 要小于 K8s 的 terminationGracePeriodSeconds（默认 30 秒），给取消和清理留出时间。
+      release_on_cancel=True 时，被取消的任务立刻（带 fence）归还队列，别的 worker 马上就能领，不必等租约过期；
+      代价是多一次数据库写，而且归还时如果数据库不可用，照样只能等租约过期。
     - transient_errors：队列后端"暂时不可用"的异常类型（数据库重启、连接池借不到连接），领取时遇到就退避重试。
       不传则用队列自己声明的 queue.transient_errors（PostgresJobQueue 声明了 psycopg 的连接错误）。
 
@@ -277,10 +280,19 @@ async def run_worker(
             else:
                 await queue.complete(job, result)
                 stats["succeeded"] += 1
-                emit("completed", job=job.id, fence=job.fence, result=result)
+                emit("completed", job=job.id, fence=job.fence, kind=job.kind, tenant_id=job.tenant_id, result=result)
         except LeaseLost as e:
             stats["fence_rejected"] += 1
             emit("fence_rejected", job=job.id, fence=job.fence, error=str(e))
+        except asyncio.CancelledError:
+            if release_on_cancel:
+                # shield：这次归还本身不能再被取消打断；归还失败（租约已丢、数据库不可用）就算了，等租约过期
+                try:
+                    await asyncio.shield(queue.release(job, reason="cancelled on shutdown"))
+                    emit("released_on_cancel", job=job.id, fence=job.fence)
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
         except Exception as e:  # noqa: BLE001 —— 提交时数据库出错：不确定是否已提交，交给租约过期后重新领取
             stats["commit_errors"] += 1
             emit("commit_error", job=job.id, error=f"{type(e).__name__}: {e}")
@@ -313,7 +325,7 @@ async def run_worker(
             await _wait_or_timeout(stop_event, poll_interval * random.uniform(0.5, 1.5))
             continue
         stats["claimed"] += 1
-        emit("claimed", job=job.id, fence=job.fence, attempts=job.attempts, kind=job.kind)
+        emit("claimed", job=job.id, fence=job.fence, attempts=job.attempts, kind=job.kind, tenant_id=job.tenant_id)
         task = asyncio.create_task(process(job), name=f"job-{job.id}")
         tasks.add(task)
         task.add_done_callback(tasks.discard)

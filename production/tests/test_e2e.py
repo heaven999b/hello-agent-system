@@ -5,7 +5,10 @@
 - 接手用任务表里的 fence（全局递增）/ attempts、检查点的 writer、以及"副作用尝试"表里的 deduplicated 记录来证明；
 - 跨队列 trace 用各进程导出的 span（JSONL）里的 trace_id 和父子关系来证明。
 
-运行：.venv/bin/python -m pytest production/tests -v   （约 40–60 秒；依赖缺失时整个文件跳过）
+测试函数是 async def（pytest-asyncio 的 auto 模式，每个测试一个事件循环）；stack 是模块级的同步 fixture，
+整个文件共用一套进程。
+
+运行：.venv/bin/python -m pytest production/tests -v   （约 20–60 秒；依赖缺失时整个文件跳过）
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ if str(REPO_ROOT) not in sys.path:
 
 import psycopg  # noqa: E402
 
+from agentkit import wait_for  # noqa: E402  取消安全的 wait_for（第 30 课）
+from agentkit.contrib.postgres import PostgresJobQueue  # noqa: E402
 from production.loadtest import ApiClient, parse_metrics, metric_sum  # noqa: E402
 from production.run_local import LocalStack, http_get  # noqa: E402
 
@@ -52,10 +57,6 @@ def stack():
     s.cleanup()
 
 
-def run(coro):
-    return asyncio.run(coro)
-
-
 def db(stack, sql: str, params: tuple = ()):
     with psycopg.connect(stack.database_url, autocommit=True) as c:
         cur = c.execute(sql, params)
@@ -68,8 +69,8 @@ async def watch(c: ApiClient, who: str, run_id: str, stop, after: str | None = N
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         headers = {"Last-Event-ID": after} if after else {}
-        res = await asyncio.wait_for(c.sse("GET", f"/v1/runs/{run_id}/events", who, headers=headers, stop=stop),
-                                     deadline - time.monotonic())
+        res = await wait_for(c.sse("GET", f"/v1/runs/{run_id}/events", who, headers=headers, stop=stop),
+                             deadline - time.monotonic())
         seen += res.events
         if res.events:
             after = res.events[-1]["id"]
@@ -99,7 +100,7 @@ def test_health_readiness_and_metrics(stack):
 # ------------------------------------------------------------------------------------------ 后台任务 + 审批
 
 
-def test_background_run_with_approval_end_to_end(stack):
+async def test_background_run_with_approval_end_to_end(stack):
     async def body():
         c = ApiClient(stack.api_url, stack.keys)
         try:
@@ -131,17 +132,16 @@ def test_background_run_with_approval_end_to_end(stack):
         finally:
             await c.aclose()
 
-    run(body())
+    await body()
 
 
-def test_approval_resume_is_not_refused_after_the_run_job_was_taken_over(stack):
+async def test_approval_resume_is_not_refused_after_the_run_job_was_taken_over(stack):
     """本课压测发现、已在框架修复的问题的回归测试（讲义 3.6 发现 2）。
 
     修复前：fence 按任务各自从 1 数起，而检查点的 fence 保护整个 run。run 任务被别的 worker 接手过（fence=2）之后，
     审批产生的 resume 任务从 fence=1 开始，被检查点当成"旧持有者"拒绝，要空等一个租约才能继续。
     修复后：claim 从整张队列表共用的序列取 fence（nextval），全局单调 —— resume 任务的 fence 一定更大，第一次领取就接手。
     """
-    from agentkit.contrib.postgres import AsyncPostgresJobQueue
     from production.service.identity import DEMO_IDENTITIES
 
     alice = DEMO_IDENTITIES["acme-alice"]
@@ -150,7 +150,7 @@ def test_approval_resume_is_not_refused_after_the_run_job_was_taken_over(stack):
     async def crash_while_holding_the_run_job():
         # 先由"测试扮演的 worker"领取 run 任务，然后不提交、不续租（相当于 kill -9）
         db(stack, "INSERT INTO service_runs (run_id, tenant_id, user_id, mode) VALUES (%s, 'acme', 'alice', 'background')", (run_id,))
-        q = AsyncPostgresJobQueue(stack.database_url)
+        q = PostgresJobQueue(stack.database_url)
         meta = {"user_id": "alice", "roles": alice["roles"], "tenant_plan": alice["plan"], "department": alice["department"]}
         job_id = await q.enqueue("held-by-test", {"op": "run", "run_id": run_id, "input": "我忘记密码了，帮我重置密码",
                                                   "metadata": meta}, tenant_id="acme")
@@ -176,7 +176,7 @@ def test_approval_resume_is_not_refused_after_the_run_job_was_taken_over(stack):
         finally:
             await c.aclose()
 
-    job_id, takeover_fence, rest, approve_to_done = run(body())
+    job_id, takeover_fence, rest, approve_to_done = await body()
     assert not any(e["event"] in ("ownership_lost", "fence_rejected", "retrying") for e in rest)
     (op, attempts, fence), = db(stack, "SELECT payload->>'op', attempts, fence FROM agent_jobs "
                                        "WHERE payload->>'run_id' = %s AND id <> %s", (run_id, job_id))
@@ -190,7 +190,7 @@ def test_approval_resume_is_not_refused_after_the_run_job_was_taken_over(stack):
 # ------------------------------------------------------------------------------------------ 交互式：断开即取消
 
 
-def test_sse_disconnect_cancels_interactive_run_and_resume_finishes_it(stack):
+async def test_sse_disconnect_cancels_interactive_run_and_resume_finishes_it(stack):
     async def body():
         c = ApiClient(stack.api_url, stack.keys)
         try:
@@ -216,13 +216,13 @@ def test_sse_disconnect_cancels_interactive_run_and_resume_finishes_it(stack):
         finally:
             await c.aclose()
 
-    run(body())
+    await body()
 
 
 # ------------------------------------------------------------------------------------------ 租户隔离
 
 
-def test_tenant_isolation(stack):
+async def test_tenant_isolation(stack):
     async def body():
         c = ApiClient(stack.api_url, stack.keys)
         try:
@@ -238,13 +238,11 @@ def test_tenant_isolation(stack):
             await c.aclose()
         return run_id
 
-    run_id = run(body())
+    run_id = await body()
 
     # 纵深防御：就算有人绕过 API 直接往队列里塞一个"globex 恢复 acme 的 run"的任务，worker 也会拒绝（PermanentJobError）
-    from agentkit.contrib.postgres import AsyncPostgresJobQueue
-
     async def forge():
-        q = AsyncPostgresJobQueue(stack.database_url)
+        q = PostgresJobQueue(stack.database_url)
         job_id = await q.enqueue("agent", {"op": "resume", "run_id": run_id, "approvals": {}}, tenant_id="globex")
         for _ in range(100):
             job = await q.get(job_id)
@@ -254,14 +252,14 @@ def test_tenant_isolation(stack):
         await q.close()
         return job
 
-    job = run(forge())
+    job = await forge()
     assert job.status == "failed" and "属于租户 acme" in job.last_error
 
 
 # ------------------------------------------------------------------------------------------ 限流
 
 
-def test_rate_limit_429_and_stream_bulkhead(stack):
+async def test_rate_limit_429_and_stream_bulkhead(stack):
     async def body():
         c = ApiClient(stack.api_url, stack.keys)
         try:
@@ -296,13 +294,13 @@ def test_rate_limit_429_and_stream_bulkhead(stack):
         finally:
             await c.aclose()
 
-    run(body())
+    await body()
 
 
 # ------------------------------------------------------------------------------------------ 跨队列 trace
 
 
-def test_trace_continues_across_the_queue(stack):
+async def test_trace_continues_across_the_queue(stack):
     trace_id, parent = secrets.token_hex(16), secrets.token_hex(8)
 
     async def body():
@@ -316,7 +314,7 @@ def test_trace_continues_across_the_queue(stack):
         finally:
             await c.aclose()
 
-    run(body())
+    await body()
     spans = []
     for f in (stack.run_dir / "spans").glob("*.jsonl"):
         spans += [json.loads(line) for line in f.read_text().splitlines() if trace_id in line]
@@ -334,7 +332,7 @@ def test_trace_continues_across_the_queue(stack):
 # ------------------------------------------------------------------------------------------ 故障注入
 
 
-def test_kill_minus_9_worker_job_is_taken_over_without_duplicate_ticket(stack):
+async def test_kill_minus_9_worker_job_is_taken_over_without_duplicate_ticket(stack):
     async def body():
         c = ApiClient(stack.api_url, stack.keys)
         try:
@@ -353,7 +351,7 @@ def test_kill_minus_9_worker_job_is_taken_over_without_duplicate_ticket(stack):
         finally:
             await c.aclose()
 
-    run_id, victim, takeover, recovered_s = run(body())
+    run_id, victim, takeover, recovered_s = await body()
     # fence 来自全局序列：接手者的 fence 一定比被杀的持有者大（具体数值取决于之前领取过多少次）
     assert takeover["data"]["worker"] != victim["worker"] and takeover["data"]["fence"] > victim["fence"]
     (status, fence, attempts, last_error), = db(stack, "SELECT status, fence, attempts, last_error FROM agent_jobs "
@@ -368,11 +366,11 @@ def test_kill_minus_9_worker_job_is_taken_over_without_duplicate_ticket(stack):
     print(f"\nkill -9 → 另一个 worker 完成：{recovered_s:.1f}s（租约 3s）")
 
 
-def test_rolling_restart_cancels_releases_and_replays_without_duplicates(stack):
+async def test_rolling_restart_cancels_releases_and_replays_without_duplicates(stack):
     """滚动发布：新 worker 起来的同时，旧 worker 逐个收到 SIGTERM。
 
     宽限期（0.3s）比建单工具的下游耗时（0.8s）短，所以"正在建单"的任务一定会被取消：
-    AsyncAgent 把检查点记为 cancelled（写工具保持未回答）→ worker 立刻归还任务 → 别的 worker 接手，
+    Agent 把检查点记为 cancelled（写工具保持未回答）→ worker 立刻归还任务 → 别的 worker 接手，
     用同一个 call_id 重放 create_ticket → 数据库唯一约束去重。"""
     old = list(stack.workers)
 
@@ -401,7 +399,7 @@ def test_rolling_restart_cancels_releases_and_replays_without_duplicates(stack):
         finally:
             await c.aclose()
 
-    run_ids, results, codes = run(body())
+    run_ids, results, codes = await body()
     assert codes == [0] * len(old)  # 全部优雅退出
     released = {e["data"].get("worker") for evs in results for e in evs if e["event"] == "released"}
     n_released = sum(e["event"] == "released" for evs in results for e in evs)
@@ -417,6 +415,8 @@ def test_rolling_restart_cancels_releases_and_replays_without_duplicates(stack):
         assert claims == sorted(claims) and len(set(claims)) == len(claims)  # 同一个 run 的每次领取 fence 严格递增
     rows = db(stack, "SELECT attempts FROM agent_jobs WHERE payload->>'run_id' = ANY(%s)", (handed,))
     assert 1 <= len(handed) <= n_released and all(a == 1 for (a,) in rows)  # 同一个 run 可能被归还不止一次
-    stats = [json.loads(line)["stats"] for p in old for line in p.log_path.read_text().splitlines() if '"worker_stopped"' in line]
+    stopped = [json.loads(line) for p in old for line in p.log_path.read_text().splitlines() if '"worker_stopped"' in line]
+    stats = [x["stats"] for x in stopped]
     assert len(stats) == len(old) and sum(s["cancelled"] for s in stats) == n_released
+    assert all(x["inflight_left"] == 0 for x in stopped)  # worker 按 id 记的在途任务全部清掉了（没有泄漏）
     assert released <= {p.name for p in old}

@@ -34,7 +34,7 @@ RATE_LIMIT_ERRORS = Counter("itdesk_rate_limiter_errors", "限流器本身出错
 SSE_STREAMS = Gauge("itdesk_sse_streams", "当前打开的 SSE 连接", ["kind"], multiprocess_mode="livesum")
 JOB_EVENTS = Counter("itdesk_worker_job_events", "worker 的任务事件", ["event"])
 JOB_RELEASED = Counter("itdesk_worker_jobs_released", "停机时被取消并立即归还的任务")
-SWALLOWED_CANCELS = Counter("itdesk_swallowed_cancellations", "被依赖库吞掉、由 agentkit.aio 在步骤边界补抛的取消次数")
+SWALLOWED_CANCELS = Counter("itdesk_swallowed_cancellations", "被依赖库吞掉、由框架在步骤边界补抛的取消次数")
 TTFT = Histogram("itdesk_stream_ttft_seconds", "交互式流的首个文本片段延迟", buckets=(0.1, 0.25, 0.5, 1, 2, 4, 8, 16))
 
 

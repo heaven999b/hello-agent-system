@@ -2,7 +2,7 @@
 
 两种交互模式（讲义问题卡片 1、5 讲何时用哪个）：
 
-    交互式  POST /v1/chat/stream        本进程直接跑 AsyncAgent，SSE 边生成边推；客户端断开 → 运行取消、检查点记 cancelled
+    交互式  POST /v1/chat/stream        本进程直接跑 Agent，SSE 边生成边推；客户端断开 → 运行取消、检查点记 cancelled
     后台    POST /v1/runs               入队（Postgres SKIP LOCKED 队列），立刻返回 run_id；worker 执行
             GET  /v1/runs/{id}          状态：检查点（Postgres）+ 任务表
             GET  /v1/runs/{id}/events   SSE 进度：Redis Streams，支持 Last-Event-ID 断线续传
@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel, Field
 
-from agentkit.aio import ApprovalRequired, KeyedLimiter, LimitExceeded, RunFinished, RunStarted, TextDelta, ToolFinished, ToolStarted
+from agentkit import ApprovalRequired, KeyedLimiter, LimitExceeded, RunFinished, RunStarted, TextDelta, ToolFinished, ToolStarted
 from agentkit.contrib.otel import continue_trace, inject_context
 
 from . import telemetry
@@ -160,8 +160,8 @@ async def stream_slot(request: Request, p: Principal = Depends(rate_limited)) ->
     finally:
         for _run_id, task in guard.tasks:
             if not task.done():
-                # 取消万一被依赖库吞掉（Python < 3.12），agentkit.aio 会在下一个步骤边界补抛（Task.cancelling() 检查）
-                task.cancel()  # 客户端断开 / 响应结束：运行还没完就取消它（AsyncAgent 会把检查点记为 cancelled）
+                # 取消万一被依赖库吞掉（Python < 3.12），框架会在下一个步骤边界补抛（Task.cancelling() 检查）
+                task.cancel()  # 客户端断开 / 响应结束：运行还没完就取消它（Agent 会把检查点记为 cancelled）
         SSE_STREAMS.labels("chat").dec()
         await slot.__aexit__(None, None, None)  # 释放只做同步操作，取消过程中也能完成
 
@@ -218,7 +218,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.rt = rt
         app.state.keys = KeyRing(settings.api_keys)
         app.state.limiter = KeyedLimiter(settings.streams_per_tenant, global_limit=settings.streams_global)
-        # 交互式运行共用一个 AsyncAgent（它可以被并发复用，第 30 课 2.1）；每个运行传自己的检查点视图
+        # 交互式运行共用一个 Agent（它可以被并发复用，第 30 课 2.1）；每个运行传自己的检查点视图
         app.state.agent = rt.new_agent()
         sampler = asyncio.create_task(_sample_backlog(rt))
         log("api_started", instance=settings.instance_id, keys=len(app.state.keys), llm=settings.llm_backend)

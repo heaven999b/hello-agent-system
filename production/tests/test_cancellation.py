@@ -1,12 +1,12 @@
 """取消被依赖库"吞掉"：先证明它真的会发生，再证明框架在步骤边界把它补回来（讲义 3.6 发现 3，已在框架修复）。
 
 背景：Python 3.12 之前的 asyncio.wait_for 有竞态（CPython gh-86296）：被等待的东西刚好就绪、外部取消又在同一轮事件循环
-到达时，它返回结果、吞掉取消。agentkit.aio 自己用取消安全的 wait_for，但本服务依赖的两个库内部仍在用它：
+到达时，它返回结果、吞掉取消。agentkit 自己用取消安全的 wait_for（agentkit/timeouts.py），但本服务依赖的两个库内部仍在用它：
   - redis-py 8.1.0：每条命令都经过 AbstractConnection.send_packed_command → asyncio.wait_for
   - psycopg_pool 3.3.3：等连接时 ACondition.wait_timeout → asyncio.wait_for
 本课压测里的表现：交互式运行在"限流 Hook 调 Redis"时被取消，取消被吞掉，客户端早已断开，运行照常跑完、照样建了工单。
 
-修复（框架层，agentkit/aio/agent.py 的 _raise_if_cancel_swallowed）：进入运行时记下 Task.cancelling() 作为基线，
+修复（框架层，agentkit/agent.py 的 _raise_if_cancel_swallowed）：进入运行时记下 Task.cancelling() 作为基线，
 在"调用模型前（before_llm 之后）"和"执行工具前（before_tool 之后）"检查，计数变大就补抛 CancelledError（3.11+）。
 
 这里的测试：
@@ -33,8 +33,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from agentkit import call_tool, reply, tool  # noqa: E402
-from agentkit.aio import AsyncAgent, AsyncScriptedLLM, ToolFinished  # noqa: E402
+import agentkit.agent  # noqa: E402
+from agentkit import Agent, ScriptedLLM, ToolFinished, call_tool, reply, tool  # noqa: E402
 from agentkit.hooks import Hook  # noqa: E402
 from agentkit.state import InMemoryCheckpointer  # noqa: E402
 
@@ -63,23 +63,21 @@ async def cancel_mid_flight(op, trials: int) -> dict:
 
 
 @needs_old_wait_for
-def test_redis_py_can_swallow_cancellation(redis_url):
+async def test_redis_py_can_swallow_cancellation(redis_url):
     import redis.asyncio as aredis
 
-    async def main():
-        r = aredis.Redis.from_url(redis_url)
+    random.seed(3)
+    r = aredis.Redis.from_url(redis_url)
+    try:
         await r.set("x", 1)
         res = await cancel_mid_flight(lambda: r.get("x"), 200)
+    finally:
         await r.aclose()
-        return res
-
-    random.seed(3)
-    res = asyncio.run(main())
     assert res["swallowed"] >= 1, res  # 本机 3.11.7 实测约 20%–25%
 
 
 @needs_old_wait_for
-def test_psycopg_pool_swallows_cancellation_when_a_connection_arrives_at_the_same_time(pg_uri):
+async def test_psycopg_pool_swallows_cancellation_when_a_connection_arrives_at_the_same_time(pg_uri):
     from psycopg_pool import AsyncConnectionPool
 
     async def trial() -> str:
@@ -103,10 +101,7 @@ def test_psycopg_pool_swallows_cancellation_when_a_connection_arrives_at_the_sam
                 return "cancelled"
             return "swallowed" if used else "?"
 
-    async def main():
-        return [await trial() for _ in range(3)]
-
-    assert "swallowed" in asyncio.run(main())  # 本机 3.11.7 实测 20/20
+    assert "swallowed" in [await trial() for _ in range(3)]  # 本机 3.11.7 实测 20/20
 
 
 class SwallowsCancellation(Hook):
@@ -142,8 +137,8 @@ def make_agent():
         return call_tool("search_kb", q="vpn") if done == 0 else call_tool("create_ticket", title="VPN") if done == 1 else reply("好了")
 
     swallow = SwallowsCancellation()
-    agent = AsyncAgent(AsyncScriptedLLM(responder=respond, latency=0.01), [search_kb, create_ticket],
-                       checkpointer=InMemoryCheckpointer(), hooks=[swallow])
+    agent = Agent(ScriptedLLM(responder=respond, latency=0.01), [search_kb, create_ticket],
+                  checkpointer=InMemoryCheckpointer(), hooks=[swallow])
     return agent, swallow, executed
 
 
@@ -163,31 +158,21 @@ def swallowed_metric() -> float:
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="框架的检查依赖 Task.cancelling()（3.11 新增）；3.10 上检查关闭")
-def test_framework_re_raises_a_swallowed_cancellation_before_the_next_step():
+async def test_framework_re_raises_a_swallowed_cancellation_before_the_next_step():
     from production.service.runtime import install_swallowed_cancel_counter
 
     install_swallowed_cancel_counter()
     before = swallowed_metric()
-
-    async def main():
-        agent, swallow, executed = make_agent()  # 注意：没有任何服务侧的"取消闸门"
-        return await disconnect_after_first_tool(agent, "r-fw"), swallow, executed
-
-    state, swallow, executed = asyncio.run(main())
+    agent, swallow, executed = make_agent()  # 注意：没有任何服务侧的"取消闸门"
+    state = await disconnect_after_first_tool(agent, "r-fw")
     assert swallow.swallowed == 1  # 取消确实被吞掉了
     assert state.status == "cancelled" and executed == []  # 调模型之前就补抛了：工单没建
     assert swallowed_metric() == before + 1  # 服务把框架的 warning 记成了指标
 
 
-def test_control_group_without_the_framework_check_the_run_finishes(monkeypatch):
-    import agentkit.aio.agent as aio_agent
-
-    monkeypatch.setattr(aio_agent, "_raise_if_cancel_swallowed", lambda: None)
-
-    async def main():
-        agent, swallow, executed = make_agent()
-        return await disconnect_after_first_tool(agent, "r-ctl"), swallow, executed
-
-    state, swallow, executed = asyncio.run(main())
+async def test_control_group_without_the_framework_check_the_run_finishes(monkeypatch):
+    monkeypatch.setattr(agentkit.agent, "_raise_if_cancel_swallowed", lambda: None)
+    agent, swallow, executed = make_agent()
+    state = await disconnect_after_first_tool(agent, "r-ctl")
     assert swallow.swallowed == 1
     assert state.status == "completed" and executed == ["VPN"]  # 用户早就走了，工单照样建了（修复前压测里看到的样子）

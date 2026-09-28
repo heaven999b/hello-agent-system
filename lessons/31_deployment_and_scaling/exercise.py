@@ -4,7 +4,8 @@
 (b) validate_shutdown_timeline 检查 terminationGracePeriodSeconds、preStop、worker 宽限期、租约、最长任务之间的关系
 (c) evaluate_load_test         从压测样本算 p50/p95/p99、错误率、429 比例，判断是否满足 SLO，并给出最可能的瓶颈
 
-全部是纯函数：不需要 Postgres、Redis、Kubernetes，测试毫秒级完成。
+全部是纯计算函数，写普通的 def 就行（框架是 async 的，但这里没有任何 I/O，不需要 async / await）：
+不需要 Postgres、Redis、Kubernetes，测试毫秒级完成。
 运行测试：make lesson N=31    或    .venv/bin/python -m pytest lessons/31_deployment_and_scaling -v
 """
 
@@ -35,7 +36,7 @@ def desired_replicas(
     参数：
         queue_depth               排队中、可执行的任务数
         in_flight                 正在执行的任务数（它们也占着 worker 的并发名额）
-        per_worker_concurrency    每个 worker 同时处理的任务数（run_async_worker 的 concurrency）
+        per_worker_concurrency    每个 worker 同时处理的任务数（agentkit.distributed.run_worker 的 concurrency）
         target_utilization        希望 worker 的并发名额平均用到多满（0 < u ≤ 1，例如 0.75 留 25% 余量吸收突发）
         min_r / max_r             副本数上下限（min_r 可以是 0：KEDA 支持缩到 0）
         current                   当前副本数
@@ -80,11 +81,11 @@ def validate_shutdown_timeline(
     参数：
         termination_grace   Pod 的 terminationGracePeriodSeconds（从 preStop 开始计时，到点 SIGKILL）
         pre_stop            preStop 钩子耗时（sleep 等）
-        worker_grace        worker 收到 SIGTERM 后等在途任务的时间（run_async_worker 的 grace_period）
+        worker_grace        worker 收到 SIGTERM 后等在途任务的时间（run_worker 的 grace_period）
         lease_seconds       任务租约
         max_job_seconds     最长任务耗时（通常取 p99）
         heartbeat_seconds   续租间隔；None 表示取 lease_seconds / 3
-        lease_renewal       "heartbeat"：整个过程持续续租（run_async_worker 的做法，排空期间也续）；
+        lease_renewal       "heartbeat"：整个过程持续续租（run_worker 的做法，排空期间也续）；
                             "stops_on_sigterm"：收到 SIGTERM 就不再续租；
                             "none"：从不续租（类似没有延长可见性超时的消息队列）
         cleanup_seconds     宽限期结束后的收尾（取消、写检查点、归还任务、flush 追踪、关连接池）

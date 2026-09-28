@@ -24,6 +24,10 @@ class WorkerContext:
     queue: Any  # 已 setup 的队列（SQLiteJobQueue / PostgresJobQueue）
     db: Any = None  # SQLite：队列用的 SQLiteDB，工厂里创建检查点等对象时传 db= 共用连接
     options: dict = field(default_factory=dict)  # --opt key=value
+    # 停机信号：收到 SIGTERM 时被置位。健康检查可以据此在排空期间返回"未就绪"（K8s readinessProbe）
+    stop_event: Any = None
+    # 额外的事件回调 f(name, info)：除了打印 JSON 行，还想把事件转成指标 / 进度推送时，工厂里设置它
+    on_event: Any = None
 
 
 def load_attr(spec: str):

@@ -18,14 +18,14 @@ from .backend import migrate
 async def migrate_all(database_url: str, *, seed: bool = True) -> None:
     from psycopg_pool import AsyncConnectionPool
 
-    from agentkit.contrib.postgres import AsyncPostgresCheckpointer, AsyncPostgresJobQueue
+    from agentkit.contrib.postgres import PostgresCheckpointer, PostgresJobQueue
 
     from .runtime import QUEUE_TABLE, RUNS_TABLE
 
     async with AsyncConnectionPool(database_url, min_size=1, max_size=2, kwargs={"autocommit": True}, open=False) as pool:
         await pool.open(wait=True, timeout=30)
-        await AsyncPostgresCheckpointer(pool, RUNS_TABLE).setup()
-        await AsyncPostgresJobQueue(pool, QUEUE_TABLE).setup()
+        await PostgresCheckpointer(pool, RUNS_TABLE).setup()
+        await PostgresJobQueue(pool, QUEUE_TABLE).setup()
         await migrate(pool, seed=seed)
 
 

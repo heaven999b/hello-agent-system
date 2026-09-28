@@ -59,7 +59,7 @@ class Settings:
     instance_id: str = "local"  # 写进检查点 writer 与 worker_id：K8s 里取 Pod 名（Downward API）
     environment: str = "dev"
 
-    # 模型：litellm（AsyncLiteLLMRouterLLM，推荐）/ openai（AsyncOpenAICompatLLM 直连网关）/ scripted（离线剧本，压测和测试用）
+    # 模型：litellm（LiteLLMRouterLLM，推荐）/ openai（OpenAICompatLLM 直连网关）/ scripted（离线剧本，压测和测试用）
     llm_backend: str = "litellm"
     llm_max_concurrency: int = 32  # 本进程对模型的在途上限（舱壁）；全局配额在网关（第 29 课）
     scripted_latency_s: float = 0.3

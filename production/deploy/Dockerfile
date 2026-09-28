@@ -22,7 +22,7 @@ COPY agentkit ./agentkit
 RUN /opt/venv/bin/pip install ".[postgres,redis,otel,policy,gateway,server]"
 
 # 3.12 而不是 3.11：3.12 之前的 asyncio.wait_for 会在"结果和取消同时到达"时吞掉取消（CPython gh-86296），
-# 本服务依赖的 redis-py、psycopg_pool 内部都在用它（本课实测，讲义 3.6）。agentkit.aio 会在步骤边界补抛被吞掉的取消（3.11+），
+# 本服务依赖的 redis-py、psycopg_pool 内部都在用它（本课实测，讲义 3.6）。agentkit 的 Agent 会在步骤边界补抛被吞掉的取消（3.11+），
 # 但根本修法是 3.12+。代码兼容 3.10+（3.10 上框架的补抛检查关闭），生产镜像请用 3.12+。
 FROM python:3.12-slim AS runtime
 # 固定 UID/GID：K8s 的 securityContext.runAsUser 用同一个数字，文件权限才对得上

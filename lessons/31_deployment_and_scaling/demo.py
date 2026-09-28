@@ -1,7 +1,7 @@
 """第 31 课 Demo：把参考服务（production/）整套拉起来，压一轮、中途 kill -9 一个 worker、再滚动重启一个，然后逐项核对。
 
     python lessons/31_deployment_and_scaling/demo.py --offline     # 离线：带延迟的剧本模型，约 30 秒
-    python lessons/31_deployment_and_scaling/demo.py               # 真实模型：走 .env 里的本地网关，模型并发 ≤ 2，约 15–25 次调用
+    python lessons/31_deployment_and_scaling/demo.py               # 真实模型：走 .env 里的本地网关，模型并发 ≤ 2，十几次模型调用（2026-09-28 实测约 13 次）
 
 不需要 Docker：run_local.LocalStack 起嵌入式 Postgres（pgserver）+ fakeredis TCP 服务 + 1 个 uvicorn API 进程 + 3 个 worker 进程，
 压测和故障注入用 production/loadtest.py。缺少可选依赖时打印安装命令、以退出码 0 结束。

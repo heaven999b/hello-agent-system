@@ -1,15 +1,28 @@
-"""队列 worker：一个进程用 asyncio 同时处理 WORKER_CONCURRENCY 个任务（第 26 课 run_async_worker + AgentJobHandler）。
+"""队列 worker：一个进程用 asyncio 同时处理 WORKER_CONCURRENCY 个任务。
 
-每领到一个任务：
-    1. continue_trace(payload["trace"])：接着 API 那条 trace（第 28 课），外面套一个 CONSUMER span；
-    2. AgentJobHandler 用 job.fence 创建带 fence 的检查点视图，交给进程里唯一的 AsyncAgent（run / resume 的 checkpointer=）；
-       幂等存储是 Redis，模型调用前走 Redis 令牌桶（AsyncRateLimitHook），OTelTracer / PrometheusHook 照常；
-    3. run / resume / approve；paused → 任务正常完成（awaiting_approval）；rate_limited → RetryLater；failed → 退避重试。
+骨架全部来自框架 agentkit.distributed（第 13 课讲原理，第 26 课换成 Postgres）：
+    run_worker        领取（SKIP LOCKED）、背压、每个任务一个续租协程、fence、退避重试 / 死信、SIGTERM 后排空
+    AgentJobHandler   用 job.fence 创建带 fence 的检查点视图，交给进程里唯一的 Agent 去 run / resume / approve；
+                      paused → 任务正常完成（awaiting_approval）；rate_limited → RetryLater；failed → 退避重试
+这个文件只补框架不管的四件事：
+    1. 每个任务外面接上 API 那条 trace：continue_trace(payload["trace"]) + CONSUMER span（第 28 课）；
+    2. 停机时被取消的任务**立刻归还**（框架默认不归还、等租约过期，见下面的时间线）；
+    3. 把 run_worker 的任务事件变成 Redis Streams 里的进度事件 + Prometheus 计数 + 结构化日志（on_event）；
+    4. /healthz、/readyz 由事件循环自己应答；排空期间 /readyz 返回 503。
+
+为什么不直接用框架的 worker 命令行（python -m agentkit.distributed.worker --queue postgresql://... --app ...）？
+它适合第 12、13 课那样"一个工厂函数返回 handler"的 worker，但这个服务需要的四个接口它没有开放：
+    - on_event 固定为"打印一行 JSON"，而这里要在**队列提交之后**推送 completed 等进度事件
+      （先推后提交的话，客户端收到 completed 时任务表里可能还是 leased）；
+    - 停机信号的 stop_event 在命令行内部，工厂拿不到，/readyz 没法在排空时变成 503；
+    - 配置来自命令行参数、没有心跳间隔参数，这个服务的配置全部来自环境变量（12-factor，K8s ConfigMap）；
+    - open_queue 按 URL 自己建连接池、不能传池参数，这里队列、检查点、业务表共用 Runtime 的一个池。
+所以这里直接调用 run_worker + AgentJobHandler（和命令行内部做的是同一件事），只多上面四件事。
 
 SIGTERM（K8s 删除 Pod、滚动发布）时间线：
-    t=0            stop_on_signals 置位 stop_event → /readyz 变 503 → 不再领取新任务
+    t=0            stop_on_signals 置位 stop_event → /readyz 变 503 → 不再领取新任务（满载时也能立刻看到信号）
     0…grace        在途任务继续跑，心跳继续续租（所以租约不必长于宽限期）
-    t=grace        还没做完的任务被取消：AsyncAgent 把检查点记为 cancelled（写工具保持未回答），
+    t=grace        还没做完的任务被取消：Agent 把检查点记为 cancelled（写工具保持未回答），
                    本 worker **立刻归还**任务（release，fence 校验）→ 别的 worker 马上接手，用同一个 call_id 重放
     之后           flush 追踪、关连接池，退出码 0 —— 全部要在 terminationGracePeriodSeconds 之内完成
 kill -9 则什么都来不及做：任务留在 leased，租约过期后被 reap，别的 worker 从最后一次检查点接着跑。
@@ -17,8 +30,6 @@ kill -9 则什么都来不及做：任务留在 leased，租约过期后被 reap
 fence（第 26 课）：每次领取任务，队列从**整张表共用的序列**里取一个新的 fence（nextval），全局单调递增。
 所以同一个 run 后来的任务（审批后的 resume、用户点"继续"的 resume）的 fence 一定比之前任何一次领取都大，
 可以直接接管检查点；被取代的旧持有者再写检查点会得到 CheckpointConflict，队列那一侧也会拒绝它的提交。
-（本课压测时 fence 还是"每个任务各自从 1 数起"，resume 任务会被当成旧持有者拒绝，服务里曾用换算绕行；
-框架改成全局序列之后绕行已删除，见讲义 3.6 与 7。）
 
 启动：python -m production.service.worker
 """
@@ -30,13 +41,17 @@ import json
 import sys
 import time
 
-from agentkit.aio import wait_for  # 取消安全的 wait_for（Python 3.12 之前的 asyncio.wait_for 会吞掉取消，gh-86296）
+from agentkit import wait_for  # 取消安全的 wait_for（Python 3.12 之前的 asyncio.wait_for 会吞掉取消，gh-86296）
 from agentkit.contrib.otel import continue_trace, start_metrics_server
-from agentkit.contrib.postgres import AgentJobHandler, Job, LeaseLost, run_async_worker, stop_on_signals
+from agentkit.distributed import AgentJobHandler, Job, LeaseLost, run_worker, stop_on_signals
 
 from .config import Settings
 from .runtime import Runtime
 from .telemetry import JOB_EVENTS, JOB_RELEASED, log
+
+# 这些事件之后，这次领取就结束了（提交、失败、推迟、被接手、提交出错）：从 inflight 里拿掉
+SETTLED_EVENTS = frozenset({"completed", "failed", "deferred", "ownership_lost", "fence_rejected", "commit_error"})
+
 
 class Worker:
     def __init__(self, rt: Runtime):
@@ -45,31 +60,35 @@ class Worker:
         self.worker_id = self.s.instance_id
         self.stop = asyncio.Event()
         self.started = time.time()
-        # 整个进程共用**一个** AsyncAgent（它可以被并发复用）：模型客户端、工具执行器、Hook 都只有一份。
+        # 整个进程共用**一个** Agent（它可以被并发复用）：模型客户端、工具执行器、Hook 都只有一份。
         # AgentJobHandler 每领到一个任务，就通过 run / resume / approve 的 checkpointer= 传入带本次 fence 的视图。
         self.agent = rt.new_agent()
         self.handler = AgentJobHandler(self.agent, rt.ckpt, defer_seconds=1.0)
+        # run_worker 的事件里只有任务 id（这样事件能直接打成一行 JSON）；推送进度要 run_id，所以按 id 记下在途的任务
+        self.inflight: dict[int, Job] = {}
 
     # ------------------------------------------------------------------ 每个任务
 
     async def handle(self, job: Job):
+        self.inflight[job.id] = job
         run_id = (job.payload or {}).get("run_id")
-        await self.rt.bus.publish(run_id, "claimed", worker=self.worker_id, attempt=job.attempts, fence=job.fence,
-                                  op=job.payload.get("op"))
-        async with continue_trace(job.payload.get("trace")):
-            with self.rt.tracer.span("process agent_jobs", **{
-                "otel.kind": "consumer", "messaging.system": "postgresql", "messaging.destination.name": "agent_jobs",
-                "messaging.operation.type": "process", "messaging.message.id": str(job.id), "run_id": run_id,
-                "job.attempt": job.attempts, "job.fence": job.fence,
-            }):
-                try:
+        try:
+            await self.rt.bus.publish(run_id, "claimed", worker=self.worker_id, attempt=job.attempts, fence=job.fence,
+                                      op=job.payload.get("op"))
+            async with continue_trace(job.payload.get("trace")):
+                with self.rt.tracer.span("process agent_jobs", **{
+                    "otel.kind": "consumer", "messaging.system": "postgresql", "messaging.destination.name": "agent_jobs",
+                    "messaging.operation.type": "process", "messaging.message.id": str(job.id), "run_id": run_id,
+                    "job.attempt": job.attempts, "job.fence": job.fence,
+                }):
                     return await self.handler(job)
-                except asyncio.CancelledError:
-                    # 停机宽限期到了还没做完：AsyncAgent 已经把检查点记为 cancelled。立刻归还任务，别让它空等一个租约。
-                    # 安全性不靠"时机"：归还带 fence 校验；就算检查点的最后一次写入还在路上，接手者的 fence 接管会让它作废。
-                    if self.s.release_on_cancel:
-                        await asyncio.shield(self._release(job))
-                    raise
+        except asyncio.CancelledError:
+            # 停机宽限期到了还没做完：Agent 已经把检查点记为 cancelled。立刻归还任务，别让它空等一个租约。
+            # 安全性不靠"时机"：归还带 fence 校验；就算检查点的最后一次写入还在路上，接手者的 fence 接管会让它作废。
+            self.inflight.pop(job.id, None)  # 被取消的任务不会再有 run_worker 的事件
+            if self.s.release_on_cancel:
+                await asyncio.shield(self._release(job))
+            raise
 
     async def _release(self, job: Job) -> None:
         try:
@@ -79,14 +98,19 @@ class Worker:
         except (LeaseLost, asyncio.TimeoutError, Exception) as e:  # noqa: BLE001 —— 归还失败就等租约过期，结果一样正确，只是慢
             log("release_failed", job_id=job.id, error=f"{type(e).__name__}: {e}")
 
-    # ------------------------------------------------------------------ run_async_worker 的事件回调（同步函数）
+    # ------------------------------------------------------------------ run_worker 的事件回调（同步函数）
 
     def on_event(self, name: str, info: dict) -> None:
         JOB_EVENTS.labels(name).inc()
-        job: Job | None = info.get("job")
+        job_id = info.get("job")
+        job: Job | None = None
+        if job_id is not None:
+            job = self.inflight.pop(job_id, None) if name in SETTLED_EVENTS else self.inflight.get(job_id)
         fields = {k: v for k, v in info.items() if k not in ("job", "result")}
+        if job_id is not None:
+            fields["job_id"] = job_id
         if job is not None:
-            fields.update(job_id=job.id, run_id=job.payload.get("run_id"), attempt=job.attempts, fence=job.fence)
+            fields.update(run_id=job.payload.get("run_id"), attempt=job.attempts, fence=job.fence)
         log(f"job_{name}", **fields)
         if job is None:
             return
@@ -148,7 +172,7 @@ class Worker:
         log("worker_started", worker=self.worker_id, concurrency=self.s.worker_concurrency, lease_s=self.s.lease_seconds,
             grace_s=self.s.worker_grace_seconds, llm=self.s.llm_backend)
         try:
-            stats = await run_async_worker(
+            stats = await run_worker(
                 self.rt.queue, self.handle,
                 worker_id=self.worker_id, stop_event=self.stop, concurrency=self.s.worker_concurrency,
                 lease_seconds=self.s.lease_seconds, heartbeat_interval=self.s.heartbeat_interval,
@@ -158,7 +182,8 @@ class Worker:
         finally:
             if health is not None:
                 health.close()
-        log("worker_stopped", worker=self.worker_id, stats=stats)
+        # inflight_left 应当为 0：每个领取过的任务要么有了结果事件，要么在停机时被取消（e2e 测试据此检查没有泄漏）
+        log("worker_stopped", worker=self.worker_id, stats=stats, inflight_left=len(self.inflight))
         return stats
 
 
@@ -168,6 +193,8 @@ async def amain() -> int:
         start_metrics_server(settings.metrics_port, addr=settings.metrics_addr)
     rt = await Runtime.create(settings)
     try:
+        # Runtime 持有所有要关闭的资源（连接池、Redis、线程池、模型客户端）；Agent 和 AgentJobHandler 只是借用，
+        # 所以这里不调 handler.aclose()（worker 命令行会调它，因为那里 Agent 归 handler 所有）
         await Worker(rt).run()
     finally:
         await rt.aclose()

@@ -40,7 +40,10 @@ async def amain(argv: list[str] | None = None) -> int:
     ap.add_argument("--concurrency", type=int, default=8, help="这个进程同时处理的任务数上限（背压）")
     ap.add_argument("--lease", type=float, default=30.0, help="租约秒数；心跳默认每 1/3 租约续一次")
     ap.add_argument("--poll", type=float, default=0.5, help="队列为空时的轮询间隔")
+    ap.add_argument("--heartbeat", type=float, default=None, help="心跳间隔秒数（默认租约的 1/3）")
     ap.add_argument("--grace", type=float, default=25.0, help="收到 SIGTERM 后等在途任务的最长秒数")
+    ap.add_argument("--release-on-cancel", action="store_true",
+                    help="停机时被取消的任务立刻归还队列（别人马上能领），而不是等租约过期")
     ap.add_argument("--kinds", default=None, help="只领取这些 kind（逗号分隔）")
     ap.add_argument("--max-jobs", type=int, default=None, help="领取这么多个任务后退出（测试用）")
     ap.add_argument("--opt", action="append", default=[], help="传给工厂的选项 key=value，可重复")
@@ -49,18 +52,24 @@ async def amain(argv: list[str] | None = None) -> int:
     worker_id = args.worker_id or f"{socket.gethostname()}-{os.getpid()}"
     queue, db = await open_queue(args.queue)
     options = dict(o.split("=", 1) for o in args.opt)
-    ctx = WorkerContext(queue_url=args.queue, worker_id=worker_id, queue=queue, db=db, options=options)
+    stop = asyncio.Event()
+    stop_on_signals(stop)
+    ctx = WorkerContext(queue_url=args.queue, worker_id=worker_id, queue=queue, db=db, options=options, stop_event=stop)
     handler = load_attr(args.app)(ctx)
     if inspect.isawaitable(handler):
         handler = await handler
 
-    stop = asyncio.Event()
-    stop_on_signals(stop)
+    def on_event(name: str, info: dict) -> None:
+        _print_event(name, info)
+        if ctx.on_event is not None:
+            ctx.on_event(name, info)
+
     try:
         stats = await run_worker(
             queue, handler, worker_id=worker_id, stop_event=stop, concurrency=args.concurrency,
-            lease_seconds=args.lease, poll_interval=args.poll, grace_period=args.grace,
-            kinds=args.kinds.split(",") if args.kinds else None, on_event=_print_event, max_jobs=args.max_jobs,
+            lease_seconds=args.lease, poll_interval=args.poll, heartbeat_interval=args.heartbeat,
+            grace_period=args.grace, kinds=args.kinds.split(",") if args.kinds else None, on_event=on_event,
+            max_jobs=args.max_jobs, release_on_cancel=args.release_on_cancel,
         )
     finally:
         close = getattr(handler, "aclose", None)

@@ -24,7 +24,7 @@ import time
 from typing import Any
 
 # 取消安全的 wait_for：Python 3.12 之前 asyncio.wait_for 在"结果和外部取消同时到达"时会吞掉取消（CPython gh-86296）
-from agentkit.aio import wait_for
+from agentkit import wait_for
 
 log = logging.getLogger("itdesk.events")
 
@@ -73,7 +73,7 @@ def _decode(entry_id, fields: dict) -> tuple[str, str, dict]:
 
 
 class TaskSet:
-    """同步回调里要发异步事件（run_async_worker 的 on_event 是同步函数）：创建任务并持有引用，停机时统一等完。"""
+    """同步回调里要发异步事件（run_worker 的 on_event 是同步函数）：创建任务并持有引用，停机时统一等完。"""
 
     def __init__(self):
         self._tasks: set[asyncio.Task] = set()

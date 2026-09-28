@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -57,7 +58,21 @@ def embedded_postgres():
     """
     pgserver = importlib.import_module("pgserver")
     data_dir = tempfile.mkdtemp(prefix="agentkit_pg_")
-    server = pgserver.get_server(data_dir, cleanup_mode="delete")
+    # pgserver 启动时会用 psutil 扫描进程命令行；macOS 上别的进程恰好在退出时会偶发
+    # SystemError / PermissionError(KERN_PROCARGS2)（多个测试并行时实测约 1/15），和 Postgres 本身无关：重试几次
+    flaky: tuple = (SystemError, PermissionError)
+    try:
+        flaky += (importlib.import_module("psutil").Error,)
+    except ImportError:
+        pass
+    for attempt in range(4):
+        try:
+            server = pgserver.get_server(data_dir, cleanup_mode="delete")
+            break
+        except flaky:
+            if attempt == 3:
+                raise
+            time.sleep(0.2 * (attempt + 1))
     try:
         yield server.get_uri()
     finally:

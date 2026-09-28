@@ -41,6 +41,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from agentkit import wait_for  # noqa: E402  取消安全的 wait_for（3.12 之前 asyncio.wait_for 会吞掉取消，第 30 课）
+
 TERMINAL_EVENTS = {"completed", "failed"}
 
 
@@ -107,7 +109,7 @@ class ApiClient:
         while time.monotonic() < deadline:
             headers = {"Last-Event-ID": after} if after else {}
             try:
-                res = await asyncio.wait_for(
+                res = await wait_for(
                     self.sse("GET", f"/v1/runs/{run_id}/events", who, headers=headers, stop=lambda e: e.get("event") in until),
                     max(0.1, deadline - time.monotonic()))
             except asyncio.TimeoutError:
@@ -549,7 +551,7 @@ def verify(stack, load: Load, metrics: dict[str, float], worker_stats: list[dict
     }
     check("指标与实际数量一致", all(abs(a - b) < 0.5 for a, b in pairs.values()),
           pairs={k: {"metric": a, "actual": b} for k, (a, b) in pairs.items()},
-          # 信息项：取消被依赖库吞掉、由 agentkit.aio 在步骤边界补抛的次数（Python < 3.12 上的 redis-py / psycopg_pool，讲义 3.6）
+          # 信息项：取消被依赖库吞掉、由框架在步骤边界补抛的次数（Python < 3.12 上的 redis-py / psycopg_pool，讲义 3.6）
           swallowed_cancellations=metric_sum(metrics, "itdesk_swallowed_cancellations_total"))
 
     # 被重新领取的次数 = 领取事件总数 - 任务数（kill -9 后被回收、停机时归还、被限流推迟的任务都会再领一次）。
