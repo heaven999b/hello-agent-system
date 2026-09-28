@@ -1,5 +1,8 @@
 """第 14 课练习测试：离线、确定性（ScriptedLLM，不调用任何真实模型）。
 
+CascadeLLM.chat 是 async 的，所以相关测试写成 async def（pytest-asyncio 的 auto 模式，不用加装饰器）。
+costkit.py 里教学实现（共享缓存、对冲取消、多进程）的测试在 test_integration.py。
+
 运行：make lesson N=14    或    .venv/bin/python -m pytest lessons/14_cost_latency -v
 """
 
@@ -135,22 +138,22 @@ def is_json_object(messages, response) -> bool:
         return False
 
 
-def test_cascade_uses_small_model_when_valid():
+async def test_cascade_uses_small_model_when_valid():
     small = ScriptedLLM([reply('{"category": "network"}')], model="small")
     large = ScriptedLLM([], model="large")  # 剧本为空：一旦被调用就会报错
     llm = ex.CascadeLLM(small, large, is_json_object)
-    r = llm.chat(MSGS)
+    r = await llm.chat(MSGS)
     assert r.content == '{"category": "network"}'
     assert len(large.calls) == 0
     assert (llm.calls, llm.escalations, llm.escalation_rate) == (1, 0, 0.0)
     assert llm.wasted.total == 0
 
 
-def test_cascade_escalates_when_rejected_and_counts_wasted_tokens():
+async def test_cascade_escalates_when_rejected_and_counts_wasted_tokens():
     small = ScriptedLLM([reply("我觉得大概是网络问题吧", input_tokens=100, output_tokens=30)], model="small")
     large = ScriptedLLM([reply('{"category": "network"}')], model="large")
     llm = ex.CascadeLLM(small, large, is_json_object)
-    r = llm.chat(MSGS)
+    r = await llm.chat(MSGS)
     assert r.content == '{"category": "network"}'
     assert len(small.calls) == 1 and len(large.calls) == 1
     assert large.calls[0]["messages"] == MSGS, "升级时要把同样的 messages 原样发给大模型"
@@ -158,38 +161,55 @@ def test_cascade_escalates_when_rejected_and_counts_wasted_tokens():
     assert (llm.wasted.input_tokens, llm.wasted.output_tokens) == (100, 30), "被丢弃的小模型回答也花了钱"
 
 
-def test_cascade_escalates_when_small_model_errors():
+async def test_cascade_escalates_when_small_model_errors():
     small = ScriptedLLM([LLMError("429 rate limited", status_code=429, retryable=True)], model="small")
     large = ScriptedLLM([reply('{"ok": true}')], model="large")
     llm = ex.CascadeLLM(small, large, is_json_object)
-    assert llm.chat(MSGS).content == '{"ok": true}'
+    assert (await llm.chat(MSGS)).content == '{"ok": true}'
     assert llm.reasons == {"error": 1}
     assert llm.wasted.total == 0, "小模型没返回任何东西，没有'白花的 token'"
 
 
-def test_cascade_treats_validator_crash_as_rejection():
+async def test_cascade_treats_validator_crash_as_rejection():
     def buggy_validator(messages, response):
         raise KeyError("confidence")  # 校验器自己有 bug
 
     small = ScriptedLLM([reply("x", input_tokens=5, output_tokens=5)], model="small")
     large = ScriptedLLM([reply("from large")], model="large")
     llm = ex.CascadeLLM(small, large, buggy_validator)
-    assert llm.chat(MSGS).content == "from large"
+    assert (await llm.chat(MSGS)).content == "from large"
     assert llm.reasons == {"validator_error": 1}
     assert llm.wasted.total == 10
 
 
-def test_cascade_escalation_rate_and_large_failure_propagates():
+async def test_cascade_escalation_rate_and_large_failure_propagates():
     small = ScriptedLLM([reply("{}"), reply("not json"), reply("{}"), reply("{}"), reply("also not json")], model="small")
     large = ScriptedLLM([reply('{"fixed": 1}'), LLMError("503 unavailable", status_code=503, retryable=True)], model="large")
     llm = ex.CascadeLLM(small, large, is_json_object)
     for _ in range(4):
-        llm.chat(MSGS)
+        await llm.chat(MSGS)
     assert llm.calls == 4 and llm.escalations == 1
     assert llm.escalation_rate == pytest.approx(0.25)
     with pytest.raises(LLMError):  # 大模型也失败：不能吞掉异常，更不能偷偷返回不合格的小模型答案
-        llm.chat(MSGS)
+        await llm.chat(MSGS)
     assert llm.calls == 5 and llm.escalations == 2
+
+
+async def test_cascade_counts_stay_exact_under_concurrency():
+    """50 个会话同时调用同一个 CascadeLLM：两个模型的调用真的重叠了（max_in_flight > 1），计数一个不差 ——
+    读-改-写中间没有 await，协程不会互相插队，所以不需要锁。"""
+    import asyncio
+
+    small = ScriptedLLM(responder=lambda m: reply("{}" if int(m[-1]["content"]) % 5 else "不是 JSON",
+                                                  input_tokens=10, output_tokens=2),
+                        latency=0.02, model="small")
+    large = ScriptedLLM(responder=lambda m: reply('{"fixed": 1}'), latency=0.02, model="large")
+    llm = ex.CascadeLLM(small, large, is_json_object)
+    await asyncio.gather(*(llm.chat([{"role": "user", "content": str(i)}]) for i in range(50)))
+    assert small.max_in_flight > 1, "50 个会话应该同时在等小模型"
+    assert (llm.calls, llm.escalations) == (50, 10)
+    assert llm.reasons == {"rejected": 10}
+    assert (llm.wasted.input_tokens, llm.wasted.output_tokens) == (100, 20)
 
 
 @tool
@@ -198,7 +218,7 @@ def get_weather(city: str) -> str:
     return f"{city}：晴，25°C"
 
 
-def test_cascade_inside_agent_fixes_hallucinated_tool():
+async def test_cascade_inside_agent_fixes_hallucinated_tool():
     """级联对 Agent 透明：小模型编造了不存在的工具 → 校验不过 → 这一步升级到大模型；下一步小模型又能胜任。"""
     allowed = {"get_weather"}
 
@@ -208,7 +228,7 @@ def test_cascade_inside_agent_fixes_hallucinated_tool():
     small = ScriptedLLM([call_tool("delete_everything"), reply("北京今天晴，25°C。")], model="small")
     large = ScriptedLLM([call_tool("get_weather", city="北京")], model="large")
     llm = ex.CascadeLLM(small, large, tool_names_exist)
-    res = Agent(llm, [get_weather]).run("北京天气怎么样？")
+    res = await Agent(llm, [get_weather]).run("北京天气怎么样？")
     assert res.status == "completed" and res.output == "北京今天晴，25°C。"
     assert res.tools_called() == ["get_weather"]
     assert llm.calls == 2 and llm.escalations == 1 and llm.escalation_rate == pytest.approx(0.5)
@@ -248,18 +268,18 @@ def test_cost_by_tenant_puts_untagged_cost_under_unknown():
     assert ex.cost_by_tenant(spans) == {"unknown": 0.005, "acme": 0.002}
 
 
-def _run_for_tenant(tracer, agent, tenant, text):
+async def _run_for_tenant(tracer, agent, tenant, text):
     with tracer.span("request", **{"tenant.id": tenant, "app.feature": "faq"}):
-        return agent.run(text, metadata={"tenant_id": tenant})
+        return await agent.run(text, metadata={"tenant_id": tenant})
 
 
-def test_cost_by_tenant_on_real_exported_traces(tmp_path):
+async def test_cost_by_tenant_on_real_exported_traces(tmp_path):
     path = tmp_path / "traces.jsonl"
     tracer = Tracer(exporter=jsonl_exporter(path))
     expected: dict[str, float] = {}
     for tenant, tokens in [("acme", 1000), ("globex", 3000), ("acme", 2000)]:
         llm = ScriptedLLM([reply("好的", input_tokens=tokens, output_tokens=tokens // 10)])
-        res = _run_for_tenant(tracer, Agent(llm, [], tracer=tracer), tenant, "你好")
+        res = await _run_for_tenant(tracer, Agent(llm, [], tracer=tracer), tenant, "你好")
         expected[tenant] = expected.get(tenant, 0.0) + res.cost_usd
     spans = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     got = ex.cost_by_tenant(spans)
@@ -274,7 +294,7 @@ def refund(order_id: str) -> str:
     return f"订单 {order_id} 已退款"
 
 
-def test_cost_by_tenant_does_not_double_count_resumed_runs(tmp_path):
+async def test_cost_by_tenant_does_not_double_count_resumed_runs(tmp_path):
     """暂停审批 → resume：agent.resume span 上的 cost 是累计值，相加会把 run 阶段的钱算两遍。"""
     path = tmp_path / "traces.jsonl"
     tracer = Tracer(exporter=jsonl_exporter(path))
@@ -283,10 +303,10 @@ def test_cost_by_tenant_does_not_double_count_resumed_runs(tmp_path):
         reply("已为您退款。", input_tokens=5000, output_tokens=100),
     ])
     agent = Agent(llm, [refund], hooks=[PermissionPolicy()], tracer=tracer)
-    res = _run_for_tenant(tracer, agent, "acme", "订单 A1 退款")
+    res = await _run_for_tenant(tracer, agent, "acme", "订单 A1 退款")
     assert res.status == "paused"
     with tracer.span("request", **{"tenant.id": "acme", "app.feature": "approval"}):
-        final = agent.approve(res.run_id, approved=True)
+        final = await agent.approve(res.run_id, approved=True)
     assert final.status == "completed"
 
     spans = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]

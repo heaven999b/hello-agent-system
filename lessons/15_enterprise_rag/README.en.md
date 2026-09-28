@@ -368,7 +368,7 @@ Question: How are raises handled this year? What's the overall budget?
        No information about the overall budget was found in the knowledge base.
 ```
 
-👀 Notice: the three runs use **the same Agent, the same tool, and the same question**; the only difference is the identity passed to `agent.run(..., metadata={"tenant_id": ..., "user_id": ...})`. The model makes no permission decisions — it has never seen an unauthorized document. Wang Li's "no budget found" is a legitimate refusal (`refusal`), and it passes the check.
+👀 Notice: the three runs use **the same Agent, the same tool, and the same question**; the only difference is the identity passed to `await agent.run(..., metadata={"tenant_id": ..., "user_id": ...})`. The model makes no permission decisions — it has never seen an unauthorized document. Wang Li's "no budget found" is a legitimate refusal (`refusal`), and it passes the check.
 
 > 💡 A real anecdote: while building the demo, the all-staff HR-010 originally also said "the overall raise budget is not disclosed to all staff". He Rui retrieved HR-011, yet the real model repeatedly chose not to state the budget — even though the system prompt already said "results have been filtered by the asker's permissions; permission decisions are not your job". We ended up deleting that sentence. This is what Problem 1 means by "the model's judgment is unreliable in both directions": one sentence in a document can sway it, whereas permission-filtering code can't be swayed.
 

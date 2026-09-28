@@ -2,7 +2,7 @@
 
 # Lesson 16: Release, change, and operations — treat a one-line prompt change like a code release
 
-> 🕐 Time: 15 min | 🎯 You'll be able to: design a complete release and operations process for an agent ("versioning → eval gate → shadow comparison → canary rollout → automatic rollback → kill switch → incident postmortem → feedback loop"), and explain what each stage protects against | 📦 Source: [registry.py](registry.py), [rollout.py](rollout.py), [shadow.py](shadow.py), [killswitch.py](killswitch.py), [flywheel.py](flywheel.py) (this lesson), [`agentkit/permissions.py`](../../agentkit/permissions.py), [`agentkit/evals.py`](../../agentkit/evals.py)
+> 🕐 Time: 15 min | 🎯 You'll be able to: design a complete release and operations process for an agent ("versioning → eval gate → shadow comparison → canary rollout → automatic rollback → kill switch → incident postmortem → feedback loop"), and explain what each stage protects against | 📦 Source: [registry.py](registry.py), [rollout.py](rollout.py), [shadow.py](shadow.py), [killswitch.py](killswitch.py), [configcenter.py](configcenter.py), [flywheel.py](flywheel.py), [ops_app.py](ops_app.py), [itbuddy.py](itbuddy.py) (this lesson), [`agentkit/distributed`](../../agentkit/distributed/__init__.py), [`agentkit/permissions.py`](../../agentkit/permissions.py), [`agentkit/evals.py`](../../agentkit/evals.py)
 >
 > 📖 Primary reading: [Expanding on what we missed with sycophancy](https://openai.com/index/expanding-on-sycophancy/) (OpenAI, 2025) — the full postmortem of the GPT-4o rollback that opens this lesson; focus on "How we currently review models before deployment" and "Why did we not catch this in our review process?" to see why offline evals and A/B tests didn't catch it, and why expert testers' concerns were outweighed by the positive metrics.
 
@@ -100,6 +100,8 @@ class PromptVersion:
 
 Traffic allocation is a separate object, `Rollout(stable, candidate, percent, salt, ...)`. It's modified by `start_rollout` / `set_percent` / `promote` / `rollback`, and every step is written to the `audit_log`. The semantics of `rollback`: if a progressive rollout is in progress, abort it and send everyone back to stable; if there's none, move stable back to its predecessor. Either way, it only moves a pointer.
 
+`PromptRegistry` lives in the **control plane** (the process that runs the release pipeline and the rollout controller). Production worker processes don't read it directly: after every change, `release_doc()` exports "all versions + the current traffic allocation," and `publish_release` writes it to the [config center](configcenter.py) (`ConfigCenter`: a versioned document table in SQLite; every change writes an audit row in the same transaction). Each worker process's `ConfigWatcher` sees the new version within one polling interval (measured in Problem 4).
+
 In production: keep version content in git (PR review + CI eval gate). Once it passes, the pipeline writes it to a config service (such as Apollo, Nacos, etcd, or a dedicated feature-flag service; Apollo and Nacos are open-source config services widely used in China). Write audit logs to tamper-proof storage. The admin console can only "select a published version"; it can never edit production content directly.
 
 ---
@@ -144,7 +146,7 @@ def bucket(user_id: str, salt: str) -> int:
 
 The routing unit doesn't have to be the user. B2B products often route by **tenant**, so that employees of the same company see consistent behavior. This avoids the confusion of "my colleague's assistant behaves differently from mine." The cost is fewer routing units (hundreds of tenants instead of hundreds of thousands of users), which makes it statistically harder to reach a conclusion.
 
-**Can a canary prove "nothing got worse"? No.** Do the math (this is output from demo Scenario 3). With a baseline success rate of 91%, detecting "a 2-percentage-point drop in success rate" with 80% power requires at least **3,531** samples per group, by the sample-size formula for a two-proportion test. A 1% canary stage might see only two or three hundred requests a day, so collecting that many would take well over ten days. Therefore:
+**Can a canary prove "nothing got worse"? No.** Do the math (`rollout.min_sample_size`). With a baseline success rate of 91%, detecting "a 2-percentage-point drop in success rate" with 80% power requires at least **3,531** samples per group, by the sample-size formula for a two-proportion test (demo Scenario 3, using the real baseline of 98.0% it measured, still needs 1,134). A 1% canary stage might see only two or three hundred requests a day, so collecting that many would take well over ten days. In demo Scenario 3, v2 collected 42 requests in the 5% stage with a 95.2% success rate, against 98.0% for v1 over the same period: it looks 2.8 points worse, yet the p-value is 0.22; after ramping to 50%, both sides are at 99.0%. Therefore:
 
 - **A canary's job is to limit the blast radius and catch disasters** (error-rate spikes, safety incidents, runaway costs), not to prove that quality didn't degrade.
 - **Subtle quality regressions** have to be caught by the eval set and shadow comparison before release, and by A/B experiments with a large enough sample.
@@ -152,9 +154,13 @@ The routing unit doesn't have to be the user. B2B products often route by **tena
 
 **In this lesson**:
 
-- [`shadow.py`](shadow.py): `shadow_tools` swaps write / dangerous tools for stubs that "record but don't execute." It copies the `Tool` object and replaces only `fn`; the name, description, and parameter schema stay the same, so the model can't tell the difference. `run_shadow` runs both versions concurrently, and `compare` classifies differences in the order "status → sequence of tool names → tool arguments → output similarity."
+- [`shadow.py`](shadow.py): `shadow_tools` swaps write / dangerous tools for stubs that "record but don't execute." It copies the `Tool` object and replaces only `fn`; the name, description, and parameter schema stay the same, so the model can't tell the difference. `compare` classifies differences in the order "status → sequence of tool names → tool arguments → output similarity." Two ways to use it: `run_shadow` is **offline replay** (`asyncio.gather` runs both versions concurrently on the same batch of recorded inputs); `ShadowRunner` is **online shadowing** (see below).
 - [`registry.py`](registry.py): `bucket` / `pick_version`, plus `force_candidate` (internal employees try it first) and `force_stable` (customers who have explicitly opted out of experiments) for "stage 0."
-- [`rollout.py`](rollout.py): `RolloutController` advances based on metrics; `two_proportion_test` and `min_sample_size` handle the statistical judgment for A/B experiments.
+- [`rollout.py`](rollout.py): `metrics_from_runs` computes a stage's success rate, error rate, p95, and cost per task from **real run records**; `RolloutController` advances, holds, or rolls back based on those metrics and writes every change to the config center right away; `two_proportion_test` and `min_sample_size` handle the statistical judgment for A/B experiments.
+
+**The three rules of online shadowing**: the user's request is handled by stable and returned right away; the candidate runs the same input in the background, and its result only goes to analysis. `ShadowRunner.serve()` first *tries* to start the shadow (if it's full, the shadow is dropped; it never waits), then `await`s only stable. Shadows have a concurrency cap (`max_concurrency`) and a timeout (the cancellation-safe `wait_for`, which really stops at the deadline), and `aclose()` cancels every shadow still running at shutdown. Why not "run both versions and return when both are done"? Then the main path's latency is max(stable, candidate): if the candidate is twice as slow, every user is twice as slow. Demo Scenario 2 ② proves these points with timings and in-flight counts: each v2 model call is slower than v1's, and every so often one stalls for 1 second, yet the main path's p50 / p95 are the same as with shadowing off (65 / 66 ms in both cases); shadows peak at 6 in flight (the cap), 44 are dropped because the runner was full, 2 time out and are cancelled, the 4 still running at shutdown are cancelled, and afterwards v2's model has 0 calls in flight. [`test_integration.py`](test_integration.py) verifies the same things with deterministic quantities (a shadow stuck for 30 seconds doesn't slow the main path; when full, shadows are dropped; they're cancelled at shutdown; a shadow error doesn't affect the main path).
+
+**Where the rollout metrics come from**: demo Scenarios 3 and 4 no longer use hard-coded numbers. Three real worker processes (`python -m agentkit.distributed.worker`, started by `WorkerPool`; the app is [ops_app.py](ops_app.py)) handle the "production traffic": each request reads the local config snapshot, picks a prompt version with `pick_version(user_id, rollout)`, runs the agent, and writes the status, the number of failed tool calls (counted by an `after_tool` hook), latency, and cost to a `requests` table; the control plane computes the candidate's and the concurrent stable's metrics with `metrics_from_runs` and hands them to `RolloutController.step`. v3's failures come from a real bug in the new `lookup_asset` tool in [itbuddy.py](itbuddy.py) (legacy asset IDs raise `KeyError`); the baseline's errors come from occasional 504s from the ticketing system (also exceptions really raised by code).
 
 The automatic decision rules (Exercise (c) has you implement them):
 
@@ -175,9 +181,9 @@ def evaluate_stage(stage, baseline, t):
 
 Why is worse cost or latency a `hold` rather than a `rollback`? Because a new model might cost 20% more but raise the success rate by 5 percentage points. That's a business judgment a human has to make, and automatic rollback would block good changes too. When quality or safety gets worse, on the other hand, there's nothing to trade off.
 
-**A real shadow-mode trap** (from an actual run of demo Scenario 2): v2 called `create_ticket`, which had been replaced with a stub. The stub returned "(shadow mode) accepted, not actually executed," and the model copied it verbatim into its answer: "Current system response: create_ticket accepted (shadow mode, not actually executed)." This shows two things. First, shadow output must **never** be shown to users. Second, a stub's return value affects later steps, so in shadow mode the trajectory after a write operation is "distorted." When comparing, focus on "what it tried to call, and with what arguments."
+**A real shadow-mode trap** (from actual runs of demo Scenario 2): v2 called `create_ticket`, which had been replaced with a stub. The stub returned "(shadow mode) accepted, not actually executed," and the model "digests" that return value in its later steps: in an earlier run, the model copied it verbatim into its answer ("Current system response: create_ticket accepted (shadow mode, not actually executed)"); in this re-run, it answered "I've created a high-priority ticket for you… Ticket number: not returned, please check later." This shows two things. First, shadow output must **never** be shown to users. Second, a stub's return value affects later steps, so in shadow mode the trajectory after a write operation is "distorted." When comparing, focus on "what it tried to call, and with what arguments."
 
-In production: after a production request has been handled and the response has already gone back to the user, asynchronously send a fraction of requests (say, 5%) to a shadow queue. An independent worker runs them against the candidate version and writes the results to an analytics store. Keep the canary traffic configuration in the config service. Hand A/B experiments to an experimentation platform, which takes care of randomization, sample-ratio checks, and statistical testing.
+In production: don't run online shadows in the same process as the main path. After a production request has been handled and the response has already gone back to the user, asynchronously send a fraction of requests (say, 5%) to a shadow queue. An independent worker runs them against the candidate version and writes the results to an analytics store. (This lesson's `ShadowRunner` is the minimal in-process version, with the same rules: never wait, stay bounded, be cancellable.) Keep the canary traffic configuration in the config service. Hand A/B experiments to an experimentation platform, which takes care of randomization, sample-ratio checks, and statistical testing.
 
 ---
 
@@ -241,7 +247,25 @@ Two more details:
 - **The denial message should tell the model not to find a workaround.** Models are quite "creative": if the email tool is disabled, the model might open a ticket asking a colleague to send the email instead. So the denial message says explicitly: "Tell the user this feature is temporarily unavailable. Do not try to work around it with other tools."
 - **Hiding tools changes the tool list**, which invalidates the prompt cache (Lessons 04 and 14). For everyday permission control, that's a cost you have to weigh; in an emergency, it's acceptable.
 
-**In this lesson**: [`killswitch.py`](killswitch.py) (Exercise (d) implements its core check, `blocked_reason`), and the automatic rollback in [`RolloutController`](rollout.py). In production: keep switches in a config service or feature-flag service, with a short-lived local cache and a "default value for when the config service is unavailable." Every switch change goes into the audit log and triggers a notification to the on-call channel.
+**Where do switches live, and how do they reach every process?** Production runs several worker processes, so a switch has to be one piece of configuration that all of them share. This lesson's [`ConfigCenter`](configcenter.py) stores it in a SQLite file (the `"flags"` document with a monotonically increasing version number; every change is a `BEGIN IMMEDIATE` transaction that also writes an audit row: who, why, before, after). Each worker process has a `ConfigWatcher`:
+
+```python
+watcher = ConfigWatcher(center, ["flags", "release:itbuddy.system"], poll_interval=0.2)
+await watcher.start()                                   # the config must be readable at startup, or the process takes no traffic
+switch = KillSwitch(lambda: watcher.snapshot("flags"), tools)   # every tool call reads the local snapshot; no database query
+
+# The on-call engineer, in the control plane (any process):
+await center.update("flags", lambda d: {**d, "disabled_tools": ["create_ticket"]},
+                    actor="oncall.zhang", reason="create_ticket is creating duplicate tickets in bulk; disable it")
+```
+
+- **Poll the version number + keep a local snapshot**: every 0.2 seconds, a background task checks the version number (one cheap SELECT); only when it changes does it read the full document and swap the snapshot as a whole. The request path reads memory only, so no request pays a database round trip, and a hiccup in the config center doesn't slow requests down. The price is that a change can take up to one polling interval to take effect.
+- **Fail-static**: if a poll can't read the config center (the database is locked, the network blips), the process keeps serving with the last configuration it read successfully and tries again next round. If it can't read the config **at startup**, it fails outright: with no known configuration, it's better to take no traffic.
+- **Policy for in-flight runs**: the switch is checked before every tool call (`before_tool`), so a run that's already underway when the switch flips is stopped at its next tool call. A tool call that has already started executing is not interrupted halfway (interrupting a write mid-way is more dangerous than letting it finish). `agent_disabled` only blocks new runs.
+
+Demo Scenario 5 measures this on 3 real worker processes (200 repair requests arrive per second, and each needs `create_ticket`; each model call in this batch takes 0.3 seconds, longer than the polling interval, so when the switch flips many runs are halfway through). In one run, the three processes saw the new switch 191 / 8 / 159 ms after it was written (the upper bound is the 200 ms polling interval plus one database read); 17 more tickets were created after the switch was written, all **before** the process that created them saw the new switch, and none after; 28 runs that were already underway when the switch was written were stopped at their next tool call. [`test_integration.py`](test_integration.py) verifies the same thing on 3 real worker processes: every process sees the new version, after which every request is blocked and the write tool never runs again.
+
+**In this lesson**: [`killswitch.py`](killswitch.py) (Exercise (d) implements its core check, `blocked_reason`); `ConfigCenter` / `ConfigWatcher` in [`configcenter.py`](configcenter.py); and the automatic rollback in [`RolloutController`](rollout.py). Limitations: SQLite can only be shared on one machine, and polling means a fixed lag. In production: keep switches in a config service or feature-flag service (etcd, Consul, Apollo, Nacos, or a hosted service like LaunchDarkly), which use watches / long polling / push: clients are notified as soon as the config changes instead of waiting for the next fixed-interval poll, and they work across machines; you still need a local snapshot and a "default value for when the config service is unavailable." Every switch change goes into the audit log and triggers a notification to the on-call channel.
 
 ---
 
@@ -342,79 +366,122 @@ For the full data flywheel — stratified sampling from a flood of traces, dedup
 ## 3. Hands-on: run the demo
 
 ```bash
-python lessons/16_release_ops/demo.py --offline   # offline script, no API key needed
-python lessons/16_release_ops/demo.py             # scenario 2's shadow comparison uses a real model (~15 calls, ~20 s)
+python lessons/16_release_ops/demo.py --offline   # offline script, no API key needed; about 10 seconds
+python lessons/16_release_ops/demo.py             # scenario 2 ①'s offline replay uses a real model (~12 calls); everything else is the same
 ```
 
-The demo simulates a complete release: Scenario 1 is versioning, Scenario 2 shadow comparison, Scenario 3 canary rollout, Scenario 4 automatic rollback, Scenario 5 kill switch, and Scenario 6 feedback loop. Production metrics and user behavior in Scenarios 3–6 are scripted, so the results are the same in both modes.
+The demo simulates a complete release: Scenario 1 is versioning, Scenario 2 shadow comparison (① offline replay, ② online shadowing), Scenario 3 canary rollout, Scenario 4 automatic rollback, Scenario 5 kill switch, and Scenario 6 feedback loop. The code is async (`await agent.run(...)`, entry point `asyncio.run(main())`).
 
-**Scenario 2: shadow comparison** (excerpt of real model output)
+Scenarios 3–5 run on a real "service cluster": one SQLite file in a temporary directory (job queue + config center + record tables) and 3 worker processes (`WorkerPool` → `python -m agentkit.distributed.worker --app ops_app.py:make_handler`). The control plane (the demo process) does only two things: put traffic on the queue and write configuration to the config center; the worker processes poll the config version every 0.2 seconds. The "model" inside the workers is a scripted model (`ScriptedLLM(responder=scripted_model)`, which reads the rules in the system prompt, so switching prompt versions really changes behavior; each call does an `asyncio.sleep` from a latency model). It's the same in both modes: this measures the release machinery, not the model. Failures come from exceptions really raised by tool code, and every metric is computed from run results; traffic is generated with fixed random seeds, so in Scenarios 3 and 4 version assignment and error counts are the same every run, and only the timings vary; Scenario 5's numbers depend on where each process's polling cycle is when the switch is written, so they differ every run. At the end, the worker processes are shut down gracefully with SIGTERM and the temporary directory is deleted.
 
 (Demo output translated from Chinese.)
+
+**Scenario 2 ①: offline replay** (excerpt of real model output)
 
 ```text
 ▶ VPN won't connect, error 809, urgent, I'm leaving on a business trip first thing tomorrow
    v1 tools: ['search_kb']   →   v2 tools: ['create_ticket']
-   v1 output: Please follow the knowledge-base steps: 1. Make sure you're not on guest Wi‑Fi. 2. Log in to GlobalConnect with your employee ID. 3. Error …
-   v2 output: Since this is urgent, I've filed a high-priority ticket. Current system response: create_ticket accepted (shadow mode, not actually executed).
-   text similarity 0.06   verdict: tools_changed  ['search_kb'] → ['create_ticket']
+   v1 output: First make sure you're not on guest Wi‑Fi; log in to GlobalConnect with your employee ID; for error 809, restart the VPN client and try again. If…
+   v2 output: I've created a high-priority ticket for you. Issue: VPN error 809, needs urgent handling. Ticket number: not returned, please check later or contact IT on-call.
+   text similarity 0.12   verdict: tools_changed  ['search_kb'] → ['create_ticket']
 
 ▶ How do I request a new monitor?
    v1 tools: ['search_kb']   →   v2 tools: ['search_kb']
-   text similarity 0.89   verdict: equivalent
+   text similarity 0.91   verdict: equivalent
 
 ▶ Summary (paste into the release review)
-   verdicts {'tools_changed': 1, 'equivalent': 2}   avg similarity 0.63   cost ratio v2/v1 = 1.08
+   verdicts {'tools_changed': 1, 'equivalent': 2}   avg similarity 0.65   cost ratio v2/v1 = 1.07
    write intents intercepted by shadow mode: ['create_ticket'] (none were actually executed)
 ```
 
-👀 What to notice: the `tools_changed` case is exactly the change v2 was meant to make (open a ticket right away for urgent issues), and the other two behave the same. v2's answer repeats the stub's return value verbatim. That's the "real shadow-mode trap" described in Problem 2.
+👀 What to notice: the `tools_changed` case is exactly the change v2 was meant to make (open a ticket right away for urgent issues), and the other two behave the same. v2's answer says "Ticket number: not returned": what it got back was the stub's return value. That's the "real shadow-mode trap" described in Problem 2.
 
-**Scenario 3: canary rollout**
+The output for Scenarios 2 ② through 5 below comes from one offline run (these scenarios are identical in both modes; Apple M1 8GB, macOS 14.4, Python 3.11.7, load average about 4 during the run).
+
+**Scenario 2 ②: online shadowing** (scripted model + latency model: each v1 call takes 30 ms; each v2 call takes 80 ms, and 1 in 10 stalls for 1 second)
 
 ```text
-▶ Stable bucketing by user id: how 10,000 users are distributed at each stage
-     1% →    77 users on v2 (previous stage's rollout users: all still on v2 ✅)
-    10% →   991 users on v2 (previous stage's rollout users: all still on v2 ✅)
-    50% →  5020 users on v2 (previous stage's rollout users: all still on v2 ✅)
-▶ The controller advances window by window (step is called once at the end of each window)
-     1% window:    80 requests, success rate 93.0%, error rate 0.0% → hold     → 1%   (not enough samples: 80 < 200, keep watching)
-     1% window:   260 requests, success rate 91.9%, error rate 1.2% → advance  → 10%   (all metrics within thresholds)
-    10% window:  2450 requests, success rate 91.5%, error rate 1.1% → advance  → 50%   (all metrics within thresholds)
-    50% window: 12100 requests, success rate 91.7%, error rate 1.2% → advance  → full rollout, v2 becomes stable
-▶ Why can the 1% stage only catch 'disasters' and not 'subtle regressions'?
-   1% stage: 260 requests, success rate 91.9% vs baseline 91.0%: diff +0.9%, p-value = 0.60 (far above 0.05; it proves nothing)
-   To detect a '2-percentage-point drop in success rate' with 80% power, you need at least 3,531 samples per group — several days' worth at 1% traffic
+   60 requests, serving 8 at a time; shadow concurrency cap 6, at most 0.3 s per shadow
+                       main path p50      p95      max
+   shadow off              65ms       66ms     66ms
+   shadow on               65ms       66ms     66ms
+   shadows: 16 started, 12 compared, 44 dropped because full, 2 cancelled on timeout, peak in flight 6 (cap 6)
+   when the main path had returned everything, 4 shadows were still running → 4 cancelled at shutdown; v2 model calls in flight afterwards: 0
+   comparison results: {'equivalent': 8, 'candidate_error': 2, 'tools_changed': 2} (candidate_error holds the ones that timed out)
 ```
 
-👀 What to notice: in the first window, a 93% success rate looks even better than the baseline, but with only 80 requests the controller chooses `hold`. The 1% stage actually got 77 users rather than exactly 100; that's the normal variation of hash bucketing.
+👀 What to notice: main-path latency is the same as with shadowing off; shadows are held to at most 6, and the ones that timed out or were still running at shutdown were really cancelled (v2's in-flight model calls go back to zero).
+
+**Scenario 3: canary rollout** (real runs on 3 worker processes)
+
+```text
+▶ Stable bucketing by user id: how 10,000 users are distributed at each stage (preview; doesn't change the live config)
+     5% →   477 users on v2 (previous stage's rollout users: all still on v2 ✅)
+    20% →  2002 users on v2 (previous stage's rollout users: all still on v2 ✅)
+    50% →  5020 users on v2 (previous stage's rollout users: all still on v2 ✅)
+▶ The controller advances window by window (400 real requests per window; every change is written to the config center, and the next batch waits until all 3 processes have switched)
+   rollout started: candidate = v2, salt = 'itbuddy.system:v2', first stage 5%, config version 2
+      config rollout: w0 172ms  w1 176ms  w2 172ms (polling interval 200ms)
+     5% window 1: 400 requests in this batch (25 on v2); stage total on v2 25: success rate 92.0% (baseline 98.7%), error rate 8.0%, p95 72ms (baseline 42ms)
+            → hold     → 5%   (not enough samples: 25 < 40, keep watching)
+     5% window 2: 400 requests in this batch (17 on v2); stage total on v2 42: success rate 95.2% (baseline 98.0%), error rate 4.8%, p95 52ms (baseline 42ms)
+            → advance  → 20%   (all metrics within thresholds)
+      config rollout: w0 99ms  w1 97ms  w2 92ms (polling interval 200ms)
+    20% window 3: 400 requests in this batch (97 on v2); stage total on v2 97: success rate 97.9% (baseline 99.0%), error rate 2.1%, p95 44ms (baseline 42ms)
+            → advance  → 50%   (all metrics within thresholds)
+      config rollout: w0 102ms  w1 79ms  w2 70ms (polling interval 200ms)
+    50% window 4: 400 requests in this batch (197 on v2); stage total on v2 197: success rate 99.0% (baseline 99.0%), error rate 1.0%, p95 45ms (baseline 42ms)
+            → advance  → full rollout, v2 becomes stable   (all metrics within thresholds)
+      config rollout: w0 75ms  w1 79ms  w2 41ms (polling interval 200ms)
+▶ Why can small-traffic stages only catch 'disasters' and not 'subtle regressions'?
+   5% stage total: v2 42 requests, success rate 95.2% vs v1 758 over the same period, 98.0%: diff -2.8%, p-value = 0.22 (not significant: this sample can't say 'better' or 'worse')
+   To detect a 'drop from 98.0% by 2 percentage points' with 80% power, you need at least 1,134 samples per group — 22,680 requests at 5% traffic
+```
+
+👀 What to notice: in the first window v2 had only 25 requests, 2 of which hit a 504 from the ticketing system; an "8%" error rate looks alarming, and p95 is also 70% above the baseline (jitter from machine load; with 25 samples, p95 is just the 24th slowest), but the "not enough samples" rule comes first, so the controller chooses `hold`. Once enough samples accumulate, the metrics are back within thresholds, and after ramping up both sides are at 99%. The 5% stage actually got 477 users rather than exactly 500; that's the normal variation of hash bucketing. After each ramp-up, the "config rollout" line shows how long each of the 3 processes took to see the new configuration (counted from the moment the controller wrote it); all are within the 200 ms polling interval.
 
 **Scenario 4: automatic rollback**
 
 ```text
-     1% window: error rate 1.5%, success rate 90.5% → advance → 10%
-    10% window: error rate 9.3%, success rate 84.0% → rollback → rollout aborted, all traffic back on v2
-   rollback reason: error rate 9.3% > cap 5.0%; success rate 84.0%, more than 3% below the 91.0% baseline
-▶ Audit log (who, when, what, why)
-   publish        by zhang.san    {"version": 1}
+     5% window 1: 400 requests in this batch (21 on v3); stage total on v3 21: success rate 85.7% (baseline 98.4%), error rate 14.3%, p95 41ms (baseline 43ms)
+            → hold     → 5%   (not enough samples: 21 < 40, keep watching)
+     5% window 2: 400 requests in this batch (16 on v3); stage total on v3 37: success rate 89.2% (baseline 98.6%), error rate 10.8%, p95 41ms (baseline 42ms)
+            → hold     → 5%   (not enough samples: 37 < 40, keep watching)
+     5% window 3: 400 requests in this batch (21 on v3); stage total on v3 58: success rate 87.9% (baseline 98.8%), error rate 12.1%, p95 42ms (baseline 42ms)
+            → rollback → rollout aborted, all traffic back on v2   (error rate 12.1% > cap 5.0%; success rate 87.9%, more than 3% below the 98.8% baseline)
+      config rollout: w0 63ms  w1 80ms  w2 31ms (polling interval 200ms)
+   rollback evidence: of v3's 58 requests in this stage, 7 had a tool raise an exception mid-run, failing tools {'lookup_asset': 7}; failing tools across v2's 1142 requests over the same period {'get_ticket_status': 14}
+▶ Config center audit log (who, when, which config changed, why; shared by all processes, persistent)
+   v1   release-bot  stable=v1                      initial launch: v1 at 100%
+   v2   rollout-bot  stable=v1 candidate=v2@5%      start rollout of v2: 5%
    ...
-   rollback       by rollout-bot  {"aborted": 3, "back_to": 2, "reason": "error rate 9.3% > cap 5.0%; ..."}
+   v7   rollout-bot  stable=v2 candidate=v3@5%      start rollout of v3: 5%
+   v8   rollout-bot  stable=v2                      automatic rollback: error rate 12.1% > cap 5.0%; success rate 87.9%, more than 3% below the 98.8% baseline
 ```
+
+👀 What to notice: the rollback rests on real exceptions: all 7 of v3's failures came from the new `lookup_asset` tool, while all of v2's errors over the same period came from the ticketing system's occasional 504s. The rollback itself is "move a pointer + write the config once," and all 3 processes switched back to v2 within 200 ms.
 
 **Scenario 5: kill switch**
 
 ```text
-▶ create_ticket is found creating duplicate tickets in bulk → the on-call engineer disables it in the config service (global)
-   [acme] The printer on floor 3 is jammed, please file a repair request
-       status=completed  tickets=['Printer jam']  blocked: Tool create_ticket has been disabled by kill switch (global). Tell the user this feature is temporarily unavailable…
+▶ create_ticket is found creating duplicate tickets in bulk → the on-call engineer disables it in the config center (global)
+   switch written to the config center: flags v2
+   worker  pid       saw new switch   tickets after   last ticket   in-flight runs blocked
+   w0      52162        191ms              9           180ms               4
+   w1      52163          8ms              0             0ms              18
+   w2      52164        159ms              8           151ms               6
+   (all times are counted from the moment the switch was written; "tickets after" = tickets created after the switch was written, while this process hadn't yet seen it)
+   time until every process applied it: 191ms (upper bound = 200ms polling interval + one database read)
+   300 requests: 62 tickets created, 17 of them after the switch was written but before the creating process saw it; created after the process saw the new switch: 0
+   238 blocked; 28 of them were runs already underway when the switch was written — they were stopped at their next tool call (the before_tool check)
 ▶ Fix released, tool restored; but tenant globex's data is being migrated → read-only mode for globex only
-   [globex] Please file a repair request for the printer
-       status=completed  tickets=['Printer jam']  blocked: The system is currently in read-only mode and can't run modifying operations such as create_ticket right now…
+   [acme] status=completed  blocked tool calls=0  reply: Based on the result: created ticket T-3202 (medium): printer on floor 3 is broken, please…
+   [globex] status=completed  blocked tool calls=1  reply: This feature is temporarily disabled; please try again later or call the IT hotline.
 ▶ The model vendor has a widespread outage and answers turn into gibberish → whole agent disabled, handed off to humans
-   [acme] VPN won't connect
-       status=stopped  tickets=['Printer jam', 'Printer jam']
-       reply: The assistant is under maintenance. We've transferred you to a human support agent.
+   [acme] status=stopped (kill_switch)  reply: The assistant is under maintenance. We've transferred you to a human support agent.
 ```
+
+👀 What to notice: the three processes saw the new switch at different times (depending on where each one's polling cycle was when the switch was written), but all within one polling interval; the handful of "tickets after" were all created before their own process saw the new switch. That's what "at most one polling interval of lag" really means, and a drill should count it in the blast radius. The exact milliseconds differ on every run.
 
 **Scenario 6: feedback loop**: a poorly rated conversation containing a phone number is redacted and lands in `runs/16_release_ops/inbox.jsonl`. A human labels it "should create a ticket," it's written to `regression_cases.jsonl`, and then it's verified with `run_eval` from Lesson 11: the old behavior passes 0%, and the fixed version passes 100%.
 
@@ -441,8 +508,8 @@ Open [exercise.py](exercise.py) and complete four problems:
 
 **(d) `blocked_reason(flags, tool_name, tool_risk, tenant_id)`: kill switch**
 
-- Task: implement three checks: disabled globally, disabled for a tenant, and read-only mode. The prewritten `KillSwitch` hook calls it.
-- Two tests wire it into a real `Agent`. One checks that "after the config changes, the very next call on the same Agent instance is affected immediately." The other checks that "a run already awaiting approval before the switch was flipped is still blocked after it's approved."
+- Task: implement three checks: disabled globally, disabled for a tenant, and read-only mode. The prewritten `KillSwitch` hook calls it. `blocked_reason` is pure computation, so write it as a plain function; `KillSwitch`'s hook methods are plain methods too (they only read an in-memory switch snapshot, no `await` needed).
+- Two tests wire it into a real `Agent` (these two tests are `async def` and `await agent.run(...)` / `await agent.approve(...)`). One checks that "after the config changes, the very next call on the same Agent instance is affected immediately." The other checks that "a run already awaiting approval before the switch was flipped is still blocked after it's approved."
 
 To verify:
 
@@ -451,7 +518,7 @@ make lesson N=16                                                   # run your im
 AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/16_release_ops -v     # check against the reference solution
 ```
 
-All 18 tests are offline and deterministic.
+All tests are offline and deterministic: 18 in `test_exercise.py` (the exercises); 9 in `test_integration.py` (the config center, switches and routing on 3 real worker processes, rollback from real run results, online shadowing; they don't depend on the exercises and pass even before you've finished them). They finish in a few seconds.
 
 ## 5. Going deeper (if you have time)
 
@@ -493,6 +560,9 @@ Once a company has dozens of agents, every stage in this lesson should become a 
 | Stopping an A/B experiment as soon as it looks significant | False positives far above 5% | Fix the sample size in advance, or use sequential testing |
 | Automatically rolling back on higher cost, too | Quality gains that money bought get blocked | Roll back automatically on quality and safety regressions; leave cost and latency regressions to humans |
 | Implementing the kill switch only in `visible_tools` | Runs resumed after a pause, and a model calling tools from memory, can both bypass it | Do the real interception in `before_tool` |
+| Keeping switches in each process's own memory | The on-call engineer changes one process; the others carry on as before | Every process reads the same config center; measure how long each process takes to apply a change |
+| Querying the config center on every tool call | One hiccup in the config center slows down, or fails, every request | Background polling / watch + a local snapshot; keep the last good config when the center can't be read |
+| Making the main path wait for the online shadow | If the candidate is twice as slow, every user is twice as slow | The main path never waits for shadows; shadows have a concurrency cap and a timeout, and are cancelled at shutdown |
 | Switches that have never been drilled | Nobody dares to flip them during an incident, or someone flips one and finds it doesn't work | Drill regularly and write the results into the runbook |
 | Postmortems that blame individuals | People hide problems, and the organization learns nothing | Blameless postmortems, with root causes that land on systems and processes |
 | Storing thumbs-down records without using them | The same mistakes keep coming back | Inbox → labeling → regression eval set → release gate |
@@ -568,6 +638,7 @@ Once a company has dozens of agents, every stage in this lesson should become a 
 - [ ] I can explain the three properties of stable hash bucketing (stickiness, monotonicity, independence across salts), and why the built-in `hash()` won't do
 - [ ] I can work out roughly how many samples it takes to detect a 2-percentage-point change in success rate, and explain why a 1% canary can't prove "nothing got worse"
 - [ ] I can design tiered mitigation measures, and explain why a kill switch must intercept in `before_tool`
+- [ ] I can explain how a switch reaches every worker process, how long it can lag, how in-flight runs are handled, and what happens when the config center can't be read
 - [ ] I can list the five agent-specific incident types and write a blameless postmortem
 - [ ] I can design the "production feedback → labeling → regression eval set" loop, and name its privacy and noise problems
 - [ ] I've completed Exercises (a)(b)(c)(d), and `make lesson N=16` passes

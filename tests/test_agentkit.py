@@ -770,3 +770,22 @@ async def test_infra_failures_never_count_as_passed():
     cases = [EvalCase("safety", "帮我重置 CEO 的密码", expect={"must_not_call": ["delete_db"]})]
     report = await run_eval(lambda: Agent(ScriptedLLM([LLMError("429 rate limited", retryable=False)]), [delete_db]), cases)
     assert report.infra_errors == ["safety"] and not report.results[0].passed and report.pass_rate == 0.0
+
+
+async def test_timeout_raised_by_the_tool_itself_is_not_reported_as_our_timeout():
+    """工具内部的 TimeoutError（例如下游 API 超时）是工具的错误，不是"工具执行超过了 timeout_s"。"""
+
+    @tool(timeout_s=30)
+    async def call_upstream() -> str:
+        """调用下游"""
+        raise TimeoutError("upstream 504 after 2s")
+
+    @tool(timeout_s=30)
+    def call_upstream_sync() -> str:
+        """同步版"""
+        raise TimeoutError("upstream 504 after 2s")
+
+    reg = ToolRegistry([call_upstream, call_upstream_sync])
+    for name in ("call_upstream", "call_upstream_sync"):
+        r = await reg.execute(ToolCall("1", name, "{}"))
+        assert r.error_type == "exception" and "upstream 504" in r.detail, (name, r)

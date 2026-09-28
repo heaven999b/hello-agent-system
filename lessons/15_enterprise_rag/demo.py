@@ -3,6 +3,9 @@
     python lessons/15_enterprise_rag/demo.py             # 真实模型（读取 .env，约 6 次模型调用）
     python lessons/15_enterprise_rag/demo.py --offline   # 离线剧本（ScriptedLLM），无需 API key
 
+Agent 是 async 的：场景 2 里 `res = await agent.run(...)`，脚本入口是 `asyncio.run(main())`。
+其余场景是纯计算（检索、切块、引用校验），仍然是普通函数。
+
 六个场景（只有场景 2 调用模型，其余都是确定性的检索 / 校验逻辑）：
   1. ACL 泄露：服务账号检索 vs 检索后过滤（post-filter）vs 检索前过滤（pre-filter）
   2. Agent + search 工具：同一个问题，三位员工得到三种答案；回答带引用，并用代码校验引用
@@ -18,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import re
 import sys
 from pathlib import Path
@@ -234,7 +238,7 @@ def scripted_answer(messages: list[dict]) -> LLMResponse:
     return LLMResponse(content="".join(parts), usage=Usage(300, 60))
 
 
-def scenario_agent(offline: bool) -> None:
+async def scenario_agent(offline: bool) -> None:
     banner("场景 2：同一个问题，三位员工 —— Agent 的检索以'提问的人'的身份进行")
     question = "今年的调薪是怎么安排的？整体预算是多少？"
     index = IMPL.SecureIndex(CORPUS)
@@ -252,7 +256,10 @@ def scenario_agent(offline: bool) -> None:
             else default_llm()
         )
         agent = Agent(llm, [search_docs], system_prompt=SYSTEM_PROMPT, hooks=[ToolOutputGuard()], max_steps=4)
-        res = agent.run(question, metadata={"tenant_id": tenant, "user_id": uid})  # 身份来自登录态，不来自对话
+        try:
+            res = await agent.run(question, metadata={"tenant_id": tenant, "user_id": uid})  # 身份来自登录态，不来自对话
+        finally:
+            await agent.aclose()  # 真实模式下关掉这个客户端的 HTTP 连接池
         queries = [m for m in res.messages if m.get("role") == "assistant" and m.get("tool_calls")]
         for m in queries:
             for tc in m["tool_calls"]:
@@ -443,7 +450,7 @@ def scenario_poisoning() -> None:
 # =====================================================================
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description="第 15 课 Demo：权限感知 RAG")
     parser.add_argument("--offline", action="store_true", help="使用离线剧本（ScriptedLLM），不调用真实模型")
     args = parser.parse_args()
@@ -452,14 +459,14 @@ def main() -> None:
         print("模式：离线剧本（ScriptedLLM）—— 结果确定、零成本")
     else:
         try:
-            default_llm()
+            await default_llm().aclose()  # 只检查配置：没有 API key 会在构造时报错
         except RuntimeError as e:
             sys.exit(f"❌ {e}\n   没有 API key 也没关系：加上 --offline 参数运行离线版本。")
         print(f"模式：真实模型（{env('LLM_MODEL', 'gpt-5.5')}）—— 每次运行结果可能略有不同")
     print(f"练习实现：{IMPL_NAME}")
 
     scenario_acl()
-    scenario_agent(args.offline)
+    await scenario_agent(args.offline)
     scenario_freshness()
     scenario_grounding()
     scenario_chunking()
@@ -468,4 +475,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

@@ -168,7 +168,9 @@ class KillSwitch(Hook):
     """紧急开关 Hook（已写好，它会调用你实现的 blocked_reason）。
 
     和 PermissionPolicy(deny_tools=...) 的区别：deny_tools 是构造时传入的静态集合，改它要重新部署；
-    KillSwitch 每次都通过 flags_source() 实时读取配置中心，运维改完开关，下一次工具调用立刻生效。
+    KillSwitch 每次都通过 flags_source() 读取当前的开关，运维改完开关，下一次工具调用就按新开关判断。
+    线上 flags_source 是配置中心在本进程的快照（configcenter.ConfigWatcher.snapshot，后台轮询，
+    最多滞后一个轮询间隔）；测试里直接传 lambda: 一个 dict。钩子方法都是普通方法：只读内存，不需要 await。
 
     它在三个地方生效：
       - on_run_start：整个 Agent 被停用（agent_disabled）时，直接结束运行并转人工；

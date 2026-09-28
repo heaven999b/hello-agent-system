@@ -2,7 +2,7 @@
 
 # Lesson 14: Cost and latency optimization — making agents cheaper and faster
 
-> 🕐 Time: 15 min | 🎯 You'll be able to: take an agent's bill and latency distribution, explain where the money and the time go, pick the right optimization for each item, and explain what that optimization costs you | 📦 Source: [costkit.py](costkit.py) (this lesson), [`agentkit/pricing.py`](../../agentkit/pricing.py), [`agentkit/tracing.py`](../../agentkit/tracing.py)
+> 🕐 Time: 15 min | 🎯 You'll be able to: take an agent's bill and latency distribution, explain where the money and the time go, pick the right optimization for each item, and explain what that optimization costs you | 📦 Source: [costkit.py](costkit.py), [cache_app.py](cache_app.py) (this lesson), [`agentkit/distributed`](../../agentkit/distributed/__init__.py), [`agentkit/pricing.py`](../../agentkit/pricing.py), [`agentkit/tracing.py`](../../agentkit/tracing.py)
 >
 > 📖 Primary reading: [FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance](https://arxiv.org/abs/2305.05176) (Chen et al., 2023) — the go-to paper on LLM cascades, whose three strategies (prompt adaptation, LLM approximation including a completion cache, and the LLM cascade) line up with the first three of this lesson's four questions; focus on §3 and the cascade's scoring-function-plus-threshold design, and compare it with the validator in this lesson's `CascadeLLM`.
 
@@ -85,7 +85,7 @@ In this lesson, "optimization" means saving money and time without losing qualit
 
 $$c_s + p \cdot c_l < c_l \iff p < 1 - \frac{c_s}{c_l}$$
 
-If the small model is 10× cheaper, you save money as long as the escalation rate stays below 90%, which looks generous. But **the latency math is much tighter**. A cascade's expected latency is $t_s + p \cdot t_l$, and the small model usually isn't 10× faster. If the small model takes half as long as the large one ($t_s = 0.5\,t_l$), then once the escalation rate passes 50%, the cascade is slower than just using the large model. In one real run of this lesson's demo, the cascade cut cost by 75%, yet average latency rose from 2.77 seconds to 3.86 seconds. This "small" model was no faster than the large one, and the escalated ticket paid for two calls' worth of time, small plus large. **A cheaper model isn't necessarily a faster one. Always measure.**
+If the small model is 10× cheaper, you save money as long as the escalation rate stays below 90%, which looks generous. But **the latency math is much tighter**. A cascade's expected latency is $t_s + p \cdot t_l$, and the small model usually isn't 10× faster. If the small model takes half as long as the large one ($t_s = 0.5\,t_l$), then once the escalation rate passes 50%, the cascade is slower than just using the large model. In one real run of this lesson's demo, the cascade cut cost by 75%, yet average latency barely moved (3.63 seconds vs 3.60 seconds). This "small" model was hardly faster than the large one, and the escalated ticket paid for two calls' worth of time, small plus large (6.4 seconds). **A cheaper model isn't necessarily a faster one. Always measure.**
 
 **The validator is the heart of a cascade.** Common approaches, ordered by reliability:
 
@@ -100,24 +100,27 @@ If the small model is 10× cheaper, you save money as long as the escalation rat
 
 **How to choose**: Start with **A**. Routing by task type is a small change that pays off fast, and it usually saves a big chunk on its own. Then add **B** for tasks whose output can be validated cheaply: structured extraction, classification, tool calls. **C** is only worth the investment once you have enough traffic and enough eval data. Whichever you choose, every change to the routing rules must pass the eval set.
 
-**In this lesson**: [`CascadeLLM`](costkit.py). The core logic is just these few lines (excerpt, with locking and bookkeeping omitted):
+**In this lesson**: [`CascadeLLM`](costkit.py). The core logic is just these few lines (excerpt, with bookkeeping omitted):
 
 ```python
-def chat(self, messages, tools=None, **kwargs):
+async def chat(self, messages, tools=None, **kwargs):
+    self.calls += 1
     try:
-        draft = self.small.chat(messages, tools, **kwargs)
+        draft = await self.small.chat(messages, tools, **kwargs)
     except LLMError:                                   # small model rate-limited / timed out / unavailable: escalate right away
-        return self._escalate("error", messages, tools, kwargs)
+        return await self._escalate("error", messages, tools, kwargs)
     try:
-        ok = bool(self.validator(messages, draft))
+        ok = bool(self.validator(messages, draft))    # the validator is pure computation: a plain function, no await
         reason = "rejected"
     except Exception:                                  # the validator itself has a bug: treat it as "rejected"; never let the request fail
         ok, reason = False, "validator_error"
     if ok:
         return draft
     self.wasted = self.wasted + draft.usage           # discarded small-model answer: money wasted, but still billed
-    return self._escalate(reason, messages, tools, kwargs)
+    return await self._escalate(reason, messages, tools, kwargs)
 ```
+
+**Dozens of concurrent sessions call the same `CascadeLLM` at once, so why are the counters not locked?** In asyncio, a coroutine only gives up control at an `await`. A read-modify-write like `self.calls += 1` or `self.wasted = self.wasted + draft.usage` has no `await` in the middle, so no other coroutine can cut in while it runs: it is atomic. You only need an `asyncio.Lock` for "read → `await` something else → write back" (for example, read a counter, `await` a database call, then write it back). Threads are different: a thread can be switched out between any two bytecodes, and that's when you need a `threading.Lock`. A test in [`test_exercise.py`](test_exercise.py) has 50 sessions call the same `CascadeLLM` at once: the peak number of in-flight calls on both models is above 1 (the calls really overlapped), and every counter is exact.
 
 Three design decisions:
 
@@ -195,19 +198,38 @@ The rule: **neither the results nor the decisions of write operations go into th
 
 A note on "freshness": say a user asks "Where's my ticket at?" Step 1 is a tool call (not cached by default), so the tool queries in real time. The step 2 request includes the latest ticket status, so when the status changes, the key changes. Under the default policy, answers that depend on real-time data never go stale.
 
-**In this lesson**: [`ResponseCache`](costkit.py) (LRU + TTL + hit-rate stats) and [`CachingLLM`](costkit.py). The cache store is shared globally, the decorator is created per request, and the scope comes from the auth system:
+**In this lesson**: [`ResponseCache`](costkit.py) (in-process LRU + TTL + hit-rate stats), [`SQLiteResponseCache`](costkit.py) (shared by every worker process on the same machine), and [`CachingLLM`](costkit.py). The cache store is process-level, the decorator is created per request, and the scope comes from the auth system:
 
 ```python
-CACHE = ResponseCache(ttl_s=600)          # process-level singleton; Redis in production
+CACHE = SQLiteResponseCache("runs/cache.db")   # every worker process shares this file; a single process can also use ResponseCache()
 
-def handle(request, identity):
+async def handle(request, identity):
     llm = CachingLLM(base_llm, CACHE, scope={"tenant_id": identity["tenant_id"], "roles": identity["roles"]})
-    return Agent(llm, tools).run(request.text, metadata=identity)
+    return await Agent(llm, tools).run(request.text, metadata=identity)
 ```
 
-A few more details: on a hit, the returned `usage` is 0 (the call really did cost nothing, and the agent's `cost_usd` and the trace reflect that faithfully). Responses whose `finish_reason` is `length` (truncated), or whose content is empty, aren't cached, so an incomplete answer never gets frozen in place. Exceptions aren't cached either.
+A few more details: on a hit, the returned `usage` is 0 (the call really did cost nothing, and the agent's `cost_usd` and the trace reflect that faithfully). Responses whose `finish_reason` is `length` (truncated), or whose content is empty, aren't cached, so an incomplete answer never gets frozen in place. Exceptions aren't cached either. `ResponseCache.get` / `put` contain no `await`, so within one event loop no other coroutine can interrupt them, and no lock is needed; `CachingLLM` works with both stores (it calls the sync one directly and `await`s the async one).
 
-In production: move the store to Redis (`SET key value EX ttl`, with the eviction policy set to `allkeys-lru`) so that multiple instances share it naturally; monitor hit rate separately by tenant and by feature; when the knowledge base changes, proactively purge the affected entries for each tenant.
+**Several worker processes: an in-process cache is no longer enough.** A service usually runs several worker processes (Lesson 13). Processes share no memory: 3 processes means 3 separate `ResponseCache`s, so the same question misses once in each process, and a restart wipes the cache. `SQLiteResponseCache` puts the cache in a SQLite file that every process shares: an answer computed by process A is a hit in process B. Demo scenario 1b measures two things with real worker processes (`python -m agentkit.distributed.worker`, started by `WorkerPool`; the worker app is [cache_app.py](cache_app.py)):
+
+1. **Cross-process hits**: process A answers acme's "VPN won't connect, what do I do?"; process B (a different pid) asks again and hits, with 0 model calls; the cache table's `writer` column shows the entry was written by A. globex asking the same question on B still misses: the tenant is in the key, across processes too.
+2. **Hit rate**: the same 300 requests (3 tenants × 8 common questions, Zipf-distributed; scripted model, each model call does `asyncio.sleep` for 50 ms), three deployments, total concurrency 12 in every case:
+
+| Deployment | Model calls | Hit rate | Above the theoretical minimum (24) |
+|---|---|---|---|
+| 1 process × concurrency 12, in-process LRU | 40–44 | 85%–87% | 16–20 |
+| 3 processes × concurrency 4, one in-process LRU each | 73–80 | 73%–76% | 49–56 |
+| 3 processes × concurrency 4, shared SQLite cache | 46–53 | 82%–85% | 22–29 |
+
+(Apple M1 8GB, macOS 14.4, Python 3.11.7, SQLite 3.41.2; other jobs were running on the machine, with load average peaking above 60; the table shows the range over 4 runs. The hit rate depends on when requests arrive, so it varies slightly from run to run.)
+
+- Scaling out to 3 processes with an in-process cache each nearly doubles the model calls: every process pays once for the same question.
+- The shared cache brings it back close to the single-process level.
+- All three are well above the theoretical minimum because **several requests miss on the same key at the same time**: when the gate opens, 12 requests arrive together, and a question seen for the first time gets sent to the model by several of them at once (a cache stampede, section 5.2). Across processes, B can also miss during the window "A misses → A calls the model → A writes back," which is why the shared cache ends up slightly above the single process.
+
+The price: every read and write of the shared cache is a database transaction. Measured on this machine in a single process, a hit costs about 13 microseconds with `ResponseCache` and about 0.6 milliseconds with `SQLiteResponseCache` (tens of times slower), but that is still more than three orders of magnitude faster than a model call (seconds). A common pattern is two tiers: an in-process LRU absorbs the hottest few keys at zero cost, and misses fall through to the shared cache. [`test_integration.py`](test_integration.py) uses two independent subprocesses and two `WorkerPool` processes to verify that "B hits the answer A wrote, a different tenant misses, and an in-process cache doesn't hit across processes."
+
+Limitations: SQLite can only be shared on one machine, with one writer at a time. In production: move the store to Redis (`SET key value EX ttl`, with the eviction policy set to `allkeys-lru`) so it's shared across machines and instances with the same interface (`get` / `put` / `skip`); monitor hit rate separately by tenant and by feature; when the knowledge base changes, proactively purge the affected entries for each tenant.
 
 ---
 
@@ -227,39 +249,48 @@ In production: move the store to Redis (`SET key value EX ttl`, with the evictio
 
 **How to choose**: For human-facing interfaces, **A is a must**: it's the cheapest and gives the biggest felt improvement. Then look at the trajectories in your traces. If there are many steps, do **C**; if one turn has several independent tools, do **B**. Use **D** for pre-step classification and guardrails. Use **E** only when "average latency is already acceptable and the tail is what hurts," and the threshold must come from your own latency distribution.
 
-A fact about B: to keep things simple, agentkit's main loop runs multiple tool calls from the same turn **sequentially** (see the `for` loop in [`Agent._run_pending_tools`](../../agentkit/agent.py)). The model may issue the calls in parallel, but they still run one after another. In production, you can run `risk="read"` tools concurrently and keep write tools sequential.
+A fact about B: agentkit's main loop runs multiple read-only tools (`risk="read"`) from the same turn **concurrently** (with `asyncio.gather`, capped at `max_parallel_tools=8`, results written back in the original order). As soon as a turn contains one write / dangerous tool, the calls run one by one in the order the model gave, so side effects stay ordered (see [`Agent._run_pending_tools`](../../agentkit/agent.py)). So three lookups for "orders + shipping + inventory" take the max, while "check inventory → place order" still takes the sum.
 
-**Why does hedging work?** The idea comes from Jeff Dean and Luiz André Barroso's paper *The Tail at Scale* (2013). Tail latency is often **sporadic**: a request just happens to land on a slow node. Send it again and it will most likely land on a healthy one. If you send the second request at the p95 mark, only the slowest 5% of requests get sent twice, for about 5% extra cost, and those 5% now take "p95 + one normal request's time." Simulated results from this lesson's demo. (Demo output translated from Chinese.)
+**Why does hedging work?** The idea comes from Jeff Dean and Luiz André Barroso's paper *The Tail at Scale* (2013). Tail latency is often **sporadic**: a request just happens to land on a slow node. Send it again and it will most likely land on a healthy one. If you send the second request at the p95 mark, only the slowest 5% of requests get sent twice, for about 5% extra cost, and those 5% now take "p95 + one normal request's time." Demo scenario 3 runs 200 requests, at most 20 at a time, against a **latency model** (`ScriptedLLM(latency=...)`: 90% of calls take 20–60 ms, 10% get stuck for 500 ms, fixed random seed). (Demo output translated from Chinese.)
 
 ```text
-                      p50     p90     p99    calls
-   no hedging        40ms    63ms   505ms       60
-   hedge after 80ms  41ms    64ms   141ms       64
-   extra cost: +7% more calls
+                      p50     p90     p99   sent  completed(billed)  cancelled  peak in flight  in flight at end
+   no hedging        41ms    60ms   502ms    200        200               0          20              0
+   hedge after 80ms  41ms    60ms   134ms    216        200              16          24              0
+   extra requests sent: +8%; extra billed calls: +0% (16 losers were cancelled before completing: no response, so no usage)
 ```
 
-**In this lesson**: [`hedged_call`](costkit.py).
+(The requests run concurrently, so under heavy load the "sent / cancelled" counts occasionally differ by one or two; the latency model uses a fixed random seed.)
+
+**In this lesson**: [`hedged_call`](costkit.py), written with asyncio, so the losers are **actually cancelled**:
 
 ```python
-futures = [pool.submit(fn)]
-pending = set(futures)
-while True:
-    can_hedge = len(futures) < max_requests
-    done, pending = wait(pending, timeout=hedge_after_s if can_hedge else None, return_when=FIRST_COMPLETED)
-    if not done:                          # waited long enough and nothing has come back → send a hedge request
-        f = pool.submit(fn); futures.append(f); pending.add(f); continue
-    for f in done:
-        if f.exception() is None:
-            return HedgeOutcome(f.result(), futures.index(f), len(futures), ...)   # use whichever succeeds first
-    ...                                   # all failed: resend immediately on a retryable error, otherwise raise
+pending = {launch()}                          # launch(): asyncio.ensure_future(fn()), recorded in tasks
+try:
+    while True:
+        can_hedge = len(tasks) < max_requests
+        done, pending = await asyncio.wait(pending, timeout=hedge_after_s if can_hedge else None,
+                                           return_when=asyncio.FIRST_COMPLETED)
+        if not done:                          # waited long enough and nothing has come back → send a hedge request
+            pending.add(launch())
+            continue
+        winner = ...                          # the first task in done that completed successfully (failures go to last_error)
+        if winner is not None:
+            cancelled = await _cancel_and_wait(pending)   # cancel() the losers right away and wait until they have really finished
+            return HedgeOutcome(winner.result(), tasks.index(winner), len(tasks), cancelled, clock() - start)
+        ...                                   # all failed: resend immediately on a retryable error, otherwise raise
+finally:
+    await _cancel_and_wait(tasks)             # the caller cancelled hedged_call (say, the user disconnected) → in-flight requests are cancelled too
 ```
+
+What does "cancel" actually do? `task.cancel()` delivers a `CancelledError` to wherever the loser is `await`ing: offline, that's the `asyncio.sleep` inside `ScriptedLLM`; with a real model, it's the line in `OpenAICompatLLM` where httpx reads the response, and that HTTP request is aborted. How do we prove it? [`MeteredLLM`](costkit.py) keeps books around every call: in the table above, the hedged run shows "216 sent, 200 completed, 16 cancelled, 0 in flight at the end", and it completed exactly as many calls as the unhedged run. All 16 losers were cancelled before completing; they never got a response, so this process recorded no usage for them. [`test_integration.py`](test_integration.py) checks three things with deterministic quantities: once a winner appears, the loser receives `CancelledError`, nothing is in flight on return, and only the winner produces usage; when the caller cancels `hedged_call`, both in-flight requests are cancelled; a fast request never triggers a hedge. (The earlier thread-based implementation couldn't do this: Python threads can't be forcibly killed, so the loser had to run to completion in the background.)
 
 Two limitations you need to know:
 
-- **The losing request can't be cancelled**: Python threads can't be forcibly killed, and the HTTP request may already be generating on the server. The tokens it consumes will very likely still be billed (depending on the vendor and whether you're streaming). So `HedgeOutcome.launched` is the number of calls you pay for.
-- **Only hedge calls without side effects**: hedging a "refund" request means refunding twice.
+- **A client-side cancel doesn't mean the server won't bill**: cancelling guarantees that "we stop waiting, the connection is released, and it no longer takes a concurrency slot." The request may already have reached the server and started generating. Whether the server stops generating when the connection drops, and how the part already generated is billed, depends on the vendor's implementation and on whether you're streaming; go by the vendor's documentation and your bill. So the real extra cost comes from the bill, and `HedgeOutcome.launched` (requests sent) is its upper bound.
+- **Only hedge calls without side effects**: hedging a "refund" request means refunding twice. Cancelling only guarantees that you stop waiting, not that the server didn't execute it.
 
-On a real model, demo scenario 3 deliberately sets the threshold to 1.5 seconds (below this model's median latency). The result: 2 requests went out, you paid twice, and latency didn't improve. **With the threshold below median latency, almost every request pays double for almost no benefit.**
+On a real model, demo scenario 3 deliberately sets the threshold to 1.5 seconds (below this model's median latency). In one real run, 2 requests went out, the first came back at 3.0 seconds, and the other was cancelled (metered: 1 completed, 1 cancelled, 0 in flight at the end). Latency didn't improve, but the request was sent twice. **With the threshold below median latency, almost every request goes out twice for almost no benefit.**
 
 In production: do hedging in the model gateway or the HTTP client layer, and enable it only for idempotent read requests; compute the threshold dynamically from the recent latency distribution; monitor the hedge trigger rate and the "hedge win rate." A very low win rate means the threshold is too aggressive.
 
@@ -354,10 +385,10 @@ This is, of course, an idealized model. It assumes the cache hits at every step,
 
 ```python
 with tracer.span("request", **{"tenant.id": identity["tenant_id"], "app.feature": "faq"}):
-    agent.run(text, metadata=identity)
+    await agent.run(text, metadata=identity)
 ```
 
-Why not write them straight onto the `agent.run` span? Because agentkit's `agent.run` span only records `agent.name` and `run_id`; it doesn't copy the tenant over from `metadata`. This is actually common. The framework you use won't necessarily add business tags for you, and the service layer's root span (the equivalent of an HTTP request's server span) is where business tags belong. For attribution, use `trace_id` to join the cost on `agent.run` with the tenant on the root span.
+Why not rely on the `agent.run` span alone? agentkit's `agent.run` span does carry `tenant.id` and `user.id` from `metadata`, but it knows nothing about business dimensions like "which feature, which plan, which entry point." This is common: the framework you use won't necessarily add business tags for you (another framework might not even record the tenant), and the service layer's root span (the equivalent of an HTTP request's server span) is where business tags belong, consistently. For attribution, use `trace_id` to join the cost on `agent.run` with the dimensions on the root span.
 
 There's one more real-world trap: `agent.cost_usd` is **the run's cumulative cost**. When a run pauses for approval and is later `resume`d, the `agent.resume` span records the total of "run phase + resume phase." Add the two spans' costs together and the run phase gets counted twice. Exercise (c) has you handle this.
 
@@ -366,31 +397,32 @@ In production: use a model gateway (LiteLLM, a cloud provider's AI gateway, or y
 ## 3. Hands-on: run the demo
 
 ```bash
-python lessons/14_cost_latency/demo.py --offline   # offline script, no API key needed, simulated latencies
-python lessons/14_cost_latency/demo.py             # real model, about 30 calls, 1-2 minutes
+python lessons/14_cost_latency/demo.py --offline   # offline script, no API key needed, latencies come from a latency model; about 10 seconds
+python lessons/14_cost_latency/demo.py             # real model, about 30 calls, around 1 minute
 ```
 
-In real mode, the large model is `LLM_MODEL` from `.env`, and the small model is `LLM_SMALL_MODEL` (falling back to `LLM_FALLBACK_MODEL` if that isn't set). **All costs are computed with the demo's example prices** (large model $2.5 / $20, small model $0.25 / $2, per million tokens), not any vendor's real prices.
+In real mode, the large model is `LLM_MODEL` from `.env`, and the small model is `LLM_SMALL_MODEL` (falling back to `LLM_FALLBACK_MODEL` if that isn't set). **All costs are computed with the demo's example prices** (large model $2.5 / $20, small model $0.25 / $2, per million tokens), not any vendor's real prices. The code is async (`await agent.run(...)`, entry point `asyncio.run(main())`). The latency comparisons in scenarios 1b and 3 use a scripted model plus a latency model in both modes: they measure caching and cancellation, not the model.
 
-**Scenario 1: exact-match cache** (an excerpt of real-model output; model latency and token counts vary from run to run, so your numbers will differ)
+**Scenario 1: exact-match cache** (an excerpt of real-model output; model latency and token counts vary from run to run, so your numbers will differ. Demo output translated from Chinese.)
 
 ```text
 ▶ Control: no cache, 7 requests processed one by one
-   7 model calls, total cost $0.01274, total time 22.6s
+   7 model calls, total cost $0.01254, total time 14.3s
 
-▶ Experiment: exact-match cache on (ResponseCache shared globally, CachingLLM created per request, scope = tenant + roles)
+▶ Experiment: exact-match cache on (ResponseCache shared within the process, CachingLLM created per request, scope = tenant + roles)
    #  tenant   question                                        cache     latency       cost
-   1  acme     What do I do if the VPN won't connect?          · miss      2.45s   $0.00168
-   2  acme     How do I request a new monitor?                 · miss      2.33s   $0.00156
+   1  acme     What do I do if the VPN won't connect?          · miss      2.64s   $0.00166
+   2  acme     How do I request a new monitor?                 · miss      2.09s   $0.00156
    3  acme     What do I do if the VPN won't connect?          ✅ hit      0.00s   $0.00000
-   4  globex   What do I do if the VPN won't connect?          · miss      2.65s   $0.00168
+   4  globex   What do I do if the VPN won't connect?          · miss      2.45s   $0.00166
    5  acme     What do I do if the VPN won't connect?          ✅ hit      0.00s   $0.00000
-   6  globex   Summarize as a ticket title, max 10 chars: …    · miss      4.12s   $0.00350
+   6  globex   Summarize as a ticket title, max 10 chars: …    · miss      6.72s   $0.00694
    7  globex   What do I do if the VPN won't connect?          ✅ hit      0.00s   $0.00000
 
-   Hit rate 43% (3/7), saved 1248+96 tokens
-   Cost: $0.01274 → $0.00842 (-34%)
-   Avg latency: no cache 3.22s → with cache 1.65s (hits 0.00s / misses 2.89s)
+   Hit rate 43% (3/7), saved 1248+93 tokens
+   Cost: $0.01254 → $0.01182 (-6%)
+   Avg latency: no cache 2.05s → with cache 1.99s (hits 0.00s / misses 3.47s)
+   ⚠️ Hit rate 43%, yet cost dropped only 6%: the hits were all cheap FAQs, and the most expensive request didn't repeat. What a cache saves depends on 'the share of cost from repeated traffic', not the hit rate.
 
 ▶ Trace of the run that hit the cache (llm.chat tokens are 0 → 0: this call cost nothing)
    agent.run  0ms  tokens=0→0  status=completed steps=1 cost=$0.00000
@@ -400,45 +432,79 @@ In real mode, the large model is `LLM_MODEL` from `.env`, and the small model is
 👀 What to notice:
 
 - Request 4: globex asked exactly the same question as acme and **didn't hit**, because the tenant is part of the cache key.
-- **Hit rate is not the same as savings**: the hit rate was 43%, but cost dropped only 34%. Request 6 (a summary) cost $0.0035 on its own, more than two FAQs combined, and it wasn't a repeat. How much a cache saves depends on "the share of cost that comes from repeated traffic." When the two numbers are more than 10 percentage points apart, the demo prints a dedicated ⚠️ warning line.
+- **Hit rate is not the same as savings**: the hit rate was 43%, but cost dropped only 6%. Request 6 (a summary) cost $0.00694 this time, more than the other 3 misses combined. It was much cheaper in the control group (a reasoning model "thinks" for a different amount of time on each call), and it didn't repeat, so it ate up what the cache saved. How much a cache saves depends on "the share of cost that comes from repeated traffic." When the two numbers are more than 10 percentage points apart, the demo prints a dedicated ⚠️ warning line.
 - In the trace of the run that hit the cache, `llm.chat` shows tokens `0→0`. That call really did cost nothing, and cost attribution reflects it faithfully.
-- The requests that missed took anywhere from 2 to 4 seconds. That's the latency variability Problem 3 talks about.
+- The requests that missed took anywhere from 2 to 7 seconds, and average latency barely dropped (2.05s → 1.99s): the 3 saved calls were ~2-second FAQs, while the one summary took 6.7 seconds on its own. That's the latency variability Problem 3 talks about.
 
-**Scenario 2: cascade**
+**Scenario 1b: several worker processes** (identical in both modes: real processes, scripted model + latency model)
+
+```text
+▶ ① A question process A answered is a direct hit in process B (SQLiteResponseCache)
+   process A pid = 46361, process B pid = 46362 (two independent python processes)
+   handled by  tenant   question                    cache     model calls    latency
+   process A   acme     VPN won't connect, what…    · miss    1              304.8ms
+   process B   acme     VPN won't connect, what…    ✅ hit    0                1.4ms
+   process B   globex   VPN won't connect, what…    · miss    1              304.9ms
+   entry in the cache table: written by A0/pid 46361, hit 1 time
+   entry in the cache table: written by B0/pid 46362, hit 0 times
+
+▶ ② The same 300 requests (3 tenants × 8 common questions, Zipf-distributed), once per deployment; total concurrency 12 in every case
+   distinct (tenant, question) pairs: 24 — in theory only 24 model calls are needed; without a cache it's 300
+   deployment                                   model calls  hit rate  above min   time   processes used
+   1 process × concurrency 12, in-process LRU        42        86%        18     0.40s   1/1 (pid 46376)
+   3 processes × concurrency 4, own in-process LRU   73        76%        49     0.52s   3/3 (pid 46379, 46380, 46381)
+   3 processes × concurrency 4, shared SQLite cache  46        85%        22     0.43s   3/3 (pid 46388, 46389, 46390)
+```
+
+👀 What to notice: the cache entry B hit was written by A (the `writer` column), so the answer was reused across processes; see Problem 2 for the comparison of the three deployments. Starting each process, processing, and graceful shutdown (SIGTERM) are all real; the database and logs live in a temporary directory that is deleted at the end.
+
+**Scenario 2: cascade** (the 6 tickets are classified concurrently with `asyncio.gather`, with `asyncio.Semaphore(3)` capping it at 3 at a time)
 
 ```text
    Ticket                                                 Large only      Cascade                Latency A→B
-   VPN won't connect since this morning, error 809…       network/P1      network/P1 (small)     2.1s → 2.8s
-   3rd-floor printer jammed again                         hardware/P2     hardware/P3 (small)    3.2s → 2.5s
-   Excel crashes whenever I open a large file             software/P2     software/P3 (small)    3.5s → 5.3s
-   My computer's been acting strange lately, sometimes…   software/P3     software/P3 (large)    2.3s → 6.2s
-   ...
+   VPN won't connect since this morning, error 809…       network/P1      network/P1 (small)     2.2s → 2.8s
+   New hire Xiao Wang starts tomorrow, needs email and …  account/P2      account/P1 (small)     5.9s → 2.8s
+   3rd-floor printer jammed again                         hardware/P2     hardware/P3 (small)    3.8s → 3.1s
+   Excel crashes whenever I open a large file             software/P2     software/P3 (small)    3.3s → 3.8s
+   My computer's been acting strange lately, sometimes…   software/P3     software/P3 (large)    3.4s → 6.4s
+   Meeting-room projector won't connect to my laptop, …   hardware/P1     hardware/P1 (small)    3.1s → 2.7s
+
    Escalation rate: 17% (1/6), reasons: {'rejected': 1}
-   Discarded small-model output: 500 tokens — wasted, but still billed
-   Cost: A $0.01506  vs  B $0.00374 (-75%)
-   Avg latency: A 2.77s  vs  B 3.86s
-   Agreement with 'large only': category 6/6, priority 4/6 (the mismatches are the cascade's quality cost; keep watching them with the eval set)
+   Discarded small-model output: 506 tokens — wasted, but still billed
+   Cost: A $0.01506  vs  B $0.00371 (-75%)
+   Avg latency: A 3.63s  vs  B 3.60s
+   Peak in flight (calls actually waiting on a model at the same moment, cap 3): A large 3; B small 3, large 1
+   Agreement with 'large only': category 6/6, priority 3/6 (the mismatches are the cascade's quality cost; keep watching them with the eval set)
 ```
 
 👀 What to notice:
 
-- For the ambiguous ticket ("My computer's been acting strange lately…"), the small model's self-reported confidence was too low, so it was escalated to the large model, and its latency was the sum of both calls.
-- Cost dropped 75%, but **latency got worse**: this small model is no faster than the large one (the latency break-even analysis from Problem 1).
-- Every category matched, but two tickets got a different **priority** (P2 vs. P3). A cascade's quality isn't "free." Whether being off by one priority level is a problem is for the eval set and the business owners to decide.
+- For the ambiguous ticket ("My computer's been acting strange lately…"), the small model's self-reported confidence was too low, so it was escalated to the large model, and its latency was the sum of both calls (6.4 seconds).
+- Cost dropped 75%, but **average latency barely moved**: this small model is hardly faster than the large one, and the escalated ticket pays for two calls (the latency break-even analysis from Problem 1).
+- Peak in flight is 3: the 6 tickets really did run concurrently, and the semaphore kept it to at most 3 (counted by `MeteredLLM`, not estimated).
+- Every category matched, but three tickets got a different **priority**. A cascade's quality isn't "free." Whether being off by one priority level is a problem is for the eval set and the business owners to decide.
 
-**Scenarios 3–5**: a hedged-request simulation (see Problem 3; in real mode it also deliberately tries an overly low threshold once on a real model), the context cost curve (see Problem 5), and cost attribution and budget alerts by tenant and feature:
+**Scenario 3: hedged requests** (see Problem 3 for the comparison under the latency model; in real mode it also deliberately tries an overly low threshold once on a real model)
+
+```text
+▶ One try on a real model: the threshold is deliberately set to 1.5 seconds (below this model's median latency)
+   2 requests sent, request 1 came back first, 3.0s, 1 cancelled: A hedged request means sending the same request to several replicas/instances to cut the latency or failure risk of a single request, and using the first successful response…
+   Metered: 1 completed, 1 cancelled, 0 in flight at the end
+```
+
+**Scenarios 4 and 5**: the context cost curve (see Problem 5), and cost attribution and budget alerts by tenant and feature:
 
 ```text
 ▶ By tenant
    acme     5 runs  5 succeeded  cost $0.00490  cost per successful task $0.00098
-   globex   3 runs  3 succeeded  cost $0.00518  cost per successful task $0.00173
+   globex   3 runs  3 succeeded  cost $0.00860  cost per successful task $0.00287
 ▶ By tenant × feature
    acme       faq        cost $0.00490
-   globex     faq        cost $0.00168
-   globex     summary    cost $0.00350
+   globex     faq        cost $0.00166
+   globex     summary    cost $0.00694
 ▶ Budget check (example budgets: acme $0.006 / month, globex $0.003 / month; 80% = warning, 100% = over budget)
    🟡 Warning acme: 82% used
-   🔴 Over budget globex: 173% used
+   🔴 Over budget globex: 287% used
 ```
 
 👀 What to notice: globex has fewer runs than acme but a higher cost, because the "summary" feature is expensive per call. The "tenant × feature" report makes that obvious at a glance. Scenario 5 reads the trace file that scenario 1 exported, `runs/14_cost_latency/traces.jsonl`. Open it and look at `tenant.id` and `app.feature` on the root spans.
@@ -452,10 +518,11 @@ Open [exercise.py](exercise.py) and complete three exercises:
 - Task: compute a cache key for a model request using SHA-256. Dict key order must not affect the result; `tools=None` and `[]` are equivalent; raise `ValueError` if the tenant is empty.
 - Hint: put all four things into **a single** dict, then serialize it with `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False)`. Don't concatenate strings: tenant `"ab"` + model `"c"` and tenant `"a"` + model `"bc"` produce the same string. One test recomputes the key in a separate process, so the built-in `hash()` won't pass.
 
-**(b) `CascadeLLM.chat`: the cascade's escalation logic**
+**(b) `async def CascadeLLM.chat`: the cascade's escalation logic**
 
 - Task: the small model errors → escalate (reason `error`); the validator returns a falsy value → escalate (`rejected`); the validator itself raises → escalate (`validator_error`). Record the usage of discarded small-model answers in `wasted`, and don't swallow exceptions from the large model.
-- One test hands a `CascadeLLM` directly to an `Agent`. The small model invents a tool that doesn't exist, the validator rejects it, and that step escalates to the large model; on the next step, the small model can handle things again.
+- It's an `async def`: `await self.small.chat(...)` and `await self.large.chat(...)`; the validator is a plain function, so call it directly. Forget the `await` and you get a coroutine object instead of an `LLMResponse`, which fails as soon as you read `.usage`.
+- One test hands a `CascadeLLM` directly to an `Agent`. The small model invents a tool that doesn't exist, the validator rejects it, and that step escalates to the large model; on the next step, the small model can handle things again. Another test has 50 sessions call it at once and checks that every counter is exact (no lock needed; see Problem 1 for why).
 
 **(c) `cost_by_tenant(spans)`: attribute cost by tenant**
 
@@ -469,7 +536,7 @@ make lesson N=14                                                  # run your imp
 AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/14_cost_latency -v    # check against the reference solution
 ```
 
-All 18 tests run offline and finish in about 1 second.
+All tests run offline: 19 in `test_exercise.py` (the exercises) and 10 in `test_integration.py` (costkit's shared cache, hedge cancellation, and multi-process workers; they don't depend on the exercises and pass even before you've finished them). They finish in a few seconds.
 
 ## 5. Going deeper (if you have time)
 
@@ -491,7 +558,7 @@ The moment a popular question's cache entry expires, 100 concurrent requests all
 - **Early refresh**: when an entry is close to expiring, one request refreshes it in the background while the others keep using the old value.
 - **TTL with random jitter**: keeps a batch of entries from all expiring at the same moment (the same idea as retry jitter in Lesson 08).
 
-`CachingLLM` doesn't implement any of these. In production with Redis, you can use `SET NX` as a short-lived lock.
+`CachingLLM` doesn't implement any of these, and the impact is measured: in demo scenario 1b the theoretical minimum is 24 model calls, and the actual count is 16–29 higher, almost all of it from "several requests missing on the same key at the same time"; in [`test_integration.py`](test_integration.py), 10 identical requests arriving at once cause 10 model calls. Within one process, single-flight is easy with asyncio: keep a `dict[key, asyncio.Future]` of "keys being computed," and later requests `await` the same Future. Across processes you need a shared, short-lived lock: in SQLite, `INSERT OR IGNORE` a "computing" marker row; in Redis, `SET key NX EX 30`.
 
 ### 5.3 The cost–quality Pareto frontier
 
@@ -515,10 +582,12 @@ Like the timeout hierarchy in Lesson 08, latency can be turned into a budget too
 | No tenant or permission context in the cache key | Leaks across tenants and permission levels; a timing side channel; no way to delete by tenant | Scope comes from the auth system; no tenant, no cache |
 | Caching the results of writes, or "done" answers | Users think the operation completed, but it never ran | Never cache writes; use request-level caching only for requests that are read-only end to end |
 | Computing cache keys with the built-in `hash()` | Results differ per process, so a cache shared across instances never hits | `hashlib.sha256` + canonical JSON |
+| Giving each worker process its own in-process cache, but budgeting with the single-process hit rate | Every process pays once for the same question; measured model calls nearly double | A shared cache (SQLite on one machine, Redis across machines), or two tiers: in-process LRU + shared cache |
 | Treating the cache hit rate as the savings rate | The hits are all cheap requests, so the bill barely moves | Track "cost saved by hits / total cost" |
 | Putting timestamps or usernames at the start of the system prompt | Prompt caching stops working entirely | Stable content first, dynamic content last (Lesson 04) |
 | Sliding the window at every step | The prefix changes every step, so almost nothing but the system prompt hits the cache | Compress in batches with high/low watermarks; append-only the rest of the time |
 | Picking a very low hedge threshold on gut feeling | Almost every request pays double | Set the threshold at p90–p95 of your own latency distribution, and monitor the hedge win rate |
+| Leaving hedge losers to finish in the background instead of cancelling them | They hold connections and concurrency slots, and streaming requests keep generating | `cancel()` the losers as soon as a winner appears, wait until they have really finished, and verify with in-flight counts |
 | Hedging or retrying requests with side effects | Duplicate refunds, duplicate emails | Only hedge read-only requests; use idempotency keys for writes (Lesson 08) |
 | Running offline jobs through the online API | You pay more and compete with online traffic for quota | Use the Batch API for single-step offline jobs |
 | Computing bills from sampled traces | Cost is systematically underestimated | Bill from complete gateway metering; use traces only for analysis |
@@ -576,7 +645,7 @@ Like the timeout hierarchy in Lesson 08, latency can be turned into a budget too
 <summary>Q6: How do hedged requests work, what do they cost, and when can't you use them?</summary>
 
 - How: tail latency is usually sporadic. If nothing has come back by p95, send another request and use whichever returns first, pulling p99 back close to p95.
-- Cost: the extra spend is roughly the share of requests that trigger a hedge; the losing request usually can't be cancelled and is still billed.
+- Cost: the extra requests are roughly the share of requests that trigger a hedge; cancel the losers right away (in asyncio, `cancel()` stops the wait and releases the connection), but the server may already have generated output, and whether that's billed depends on the vendor.
 - When not to use them: requests with side effects (refunds, sending emails); requests that are slow every single time by nature (hedging only doubles the load); when downstream is already overloaded (hedging makes it worse; pair it with Lesson 08's retry budget).
 </details>
 
@@ -597,8 +666,9 @@ Like the timeout hierarchy in Lesson 08, latency can be turned into a budget too
 - [ ] I can compare static routing, cascades, and learned routing, and work out a cascade's break-even points for cost and latency
 - [ ] I can name several ways to build a validator, and explain why self-reported confidence is unreliable
 - [ ] I can compare exact-match caching, semantic caching, and prompt caching, and explain why the cache key must include tenant and permission context
+- [ ] I can explain why an in-process cache and a shared cache have different hit rates once there are several worker processes, and where simultaneous misses (cache stampedes) come from
 - [ ] I can explain the difference between request-level, tool-result-level, and model-call-level caching, and why write operations must not be cached
-- [ ] I can explain why hedged requests lower p99, how to set the threshold, and what they cost
+- [ ] I can explain why hedged requests lower p99, how to set the threshold, what they cost, how the losers get cancelled, and what cancellation does and doesn't guarantee
 - [ ] I can say which tasks suit the Batch API, and why it doesn't fit multi-step agent loops
 - [ ] I can derive the quadratic growth formula for context cost, and explain why "window + cache" doesn't simply stack
 - [ ] I can design a multi-tenant cost attribution and budget alerting scheme, and explain why "cost per successful task" is more useful than total cost

@@ -2,7 +2,7 @@
 
 # 第 14 课：成本与延迟优化 —— 让 Agent 又省钱又快
 
-> 🕐 建议用时：15 分钟 ｜ 🎯 学完你能：拿到一份 Agent 账单和延迟分布，说清钱和时间花在了哪里，为每一项选出合适的优化手段，并讲清它的代价 ｜ 📦 对应源码：[costkit.py](costkit.py)（本课）、[`agentkit/pricing.py`](../../agentkit/pricing.py)、[`agentkit/tracing.py`](../../agentkit/tracing.py)
+> 🕐 建议用时：15 分钟 ｜ 🎯 学完你能：拿到一份 Agent 账单和延迟分布，说清钱和时间花在了哪里，为每一项选出合适的优化手段，并讲清它的代价 ｜ 📦 对应源码：[costkit.py](costkit.py)、[cache_app.py](cache_app.py)（本课）、[`agentkit/distributed`](../../agentkit/distributed/__init__.py)、[`agentkit/pricing.py`](../../agentkit/pricing.py)、[`agentkit/tracing.py`](../../agentkit/tracing.py)
 >
 > 📖 必读：[FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance](https://arxiv.org/abs/2305.05176)（Chen 等, 2023）—— LLM 级联的代表性论文，它的三类手段（提示词适配、模型近似（含补全缓存）、级联）对应本课四个问题中的前三个；重点读 §3 的三类策略和级联里"打分函数 + 阈值"的设计，再对照本课 `CascadeLLM` 的 validator。
 
@@ -85,7 +85,7 @@ $$\text{延迟} \approx \text{排队} + \sum_{\text{每一步}} \left( \text{TTF
 
 $$c_s + p \cdot c_l < c_l \iff p < 1 - \frac{c_s}{c_l}$$
 
-小模型便宜 10 倍时，升级率低于 90% 就省钱，看起来很宽松。但**延迟的账要紧得多**：级联的期望延迟是 $t_s + p \cdot t_l$，而小模型通常不会快 10 倍。如果小模型的耗时是大模型的一半（$t_s = 0.5\,t_l$），升级率超过 50% 时，级联就比直接用大模型还慢。本课 Demo 的一次真实运行里，级联省了 75% 的钱，平均延迟却从 2.77 秒涨到了 3.86 秒：这个"小"模型并不比大模型快，被升级的那张工单还要付"小 + 大"两次时间。**便宜的模型不一定快，一定要实测。**
+小模型便宜 10 倍时，升级率低于 90% 就省钱，看起来很宽松。但**延迟的账要紧得多**：级联的期望延迟是 $t_s + p \cdot t_l$，而小模型通常不会快 10 倍。如果小模型的耗时是大模型的一半（$t_s = 0.5\,t_l$），升级率超过 50% 时，级联就比直接用大模型还慢。本课 Demo 的一次真实运行里，级联省了 75% 的钱，平均延迟却几乎没变（3.63 秒 vs 3.60 秒）：这个"小"模型并不比大模型快多少，被升级的那张工单还要付"小 + 大"两次时间（6.4 秒）。**便宜的模型不一定快，一定要实测。**
 
 **validator 是级联的灵魂**。常见做法按可靠性排序：
 
@@ -100,24 +100,27 @@ $$c_s + p \cdot c_l < c_l \iff p < 1 - \frac{c_s}{c_l}$$
 
 **怎么选**：先做 **A**：按任务类型分流，改动小、见效快，通常就能省下一大块。然后在"输出能被廉价验证"的任务上加 **B**：结构化抽取、分类、工具调用。**C** 只在流量足够大、评估数据足够多时才值得投入。无论选哪种，路由规则的每次改动都要过评估集。
 
-**本课实现**：[`CascadeLLM`](costkit.py)。核心逻辑就这几行（节选，省略了加锁和统计）：
+**本课实现**：[`CascadeLLM`](costkit.py)。核心逻辑就这几行（节选，省略了统计）：
 
 ```python
-def chat(self, messages, tools=None, **kwargs):
+async def chat(self, messages, tools=None, **kwargs):
+    self.calls += 1
     try:
-        draft = self.small.chat(messages, tools, **kwargs)
+        draft = await self.small.chat(messages, tools, **kwargs)
     except LLMError:                                   # 小模型限流 / 超时 / 不可用：直接升级
-        return self._escalate("error", messages, tools, kwargs)
+        return await self._escalate("error", messages, tools, kwargs)
     try:
-        ok = bool(self.validator(messages, draft))
+        ok = bool(self.validator(messages, draft))    # validator 是纯计算：普通函数，不用 await
         reason = "rejected"
     except Exception:                                  # 校验器自己有 bug：按"不合格"处理，不能让请求失败
         ok, reason = False, "validator_error"
     if ok:
         return draft
     self.wasted = self.wasted + draft.usage           # 被丢弃的小模型回答：白花了，但照样计费
-    return self._escalate(reason, messages, tools, kwargs)
+    return await self._escalate(reason, messages, tools, kwargs)
 ```
+
+**同一个 `CascadeLLM` 被几十个并发的会话同时调用，计数为什么不加锁？** asyncio 里协程只在 `await` 处让出控制权。`self.calls += 1`、`self.wasted = self.wasted + draft.usage` 这种"读-改-写"中间没有 `await`，执行时不会被别的协程插队，所以是原子的。只有"读 → `await` 别的东西 → 再写回"才需要 `asyncio.Lock`（比如先读出计数、`await` 一次数据库、再写回去）。多线程就不一样了：线程可以在任意两条字节码之间被切走，那时才需要 `threading.Lock`。[`test_exercise.py`](test_exercise.py) 里有一个测试让 50 个会话同时调用同一个 `CascadeLLM`：两个模型的在途峰值大于 1（真的并发了），计数一个不差。
 
 三个设计决策：
 
@@ -195,19 +198,38 @@ return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 注意"新鲜度"：用户问"我的工单处理到哪了"，第 1 步是工具调用（默认不缓存），工具会实时查询；第 2 步的请求里包含了最新的工单状态，状态一变，键就变了。所以默认策略下，依赖实时数据的回答天然不会过时。
 
-**本课实现**：[`ResponseCache`](costkit.py)（LRU + TTL + 命中率统计）和 [`CachingLLM`](costkit.py)。缓存存储全局共享，装饰器按请求创建，作用域来自认证系统：
+**本课实现**：[`ResponseCache`](costkit.py)（进程内的 LRU + TTL + 命中率统计）、[`SQLiteResponseCache`](costkit.py)（同一台机器上所有 worker 进程共享）和 [`CachingLLM`](costkit.py)。缓存存储是进程级的，装饰器按请求创建，作用域来自认证系统：
 
 ```python
-CACHE = ResponseCache(ttl_s=600)          # 进程级单例；生产中是 Redis
+CACHE = SQLiteResponseCache("runs/cache.db")   # 所有 worker 进程共用这个文件；单进程也可以用 ResponseCache()
 
-def handle(request, identity):
+async def handle(request, identity):
     llm = CachingLLM(base_llm, CACHE, scope={"tenant_id": identity["tenant_id"], "roles": identity["roles"]})
-    return Agent(llm, tools).run(request.text, metadata=identity)
+    return await Agent(llm, tools).run(request.text, metadata=identity)
 ```
 
-另外几个细节：命中时返回的 `usage` 为 0（这次确实没花钱，Agent 的 `cost_usd` 和 trace 会如实反映）；`finish_reason` 为 `length`（被截断）或内容为空的响应不缓存，免得把残缺的答案固化下来；异常不缓存。
+另外几个细节：命中时返回的 `usage` 为 0（这次确实没花钱，Agent 的 `cost_usd` 和 trace 会如实反映）；`finish_reason` 为 `length`（被截断）或内容为空的响应不缓存，免得把残缺的答案固化下来；异常不缓存。`ResponseCache` 的 `get` / `put` 里没有 `await`，在一个事件循环里执行时不会被别的协程打断，所以不需要锁；`CachingLLM` 两种存储都支持（同步的直接调用，async 的 `await`）。
 
-生产级替换：存储换成 Redis（`SET key value EX ttl`，淘汰策略设为 `allkeys-lru`），多实例天然共享；命中率按租户、功能分别监控；知识库更新时按租户主动清理相关条目。
+**多个 worker 进程：进程内缓存不够用了。** 服务端通常跑好几个 worker 进程（第 13 课）。进程之间不共享内存：3 个进程就是 3 份互不相通的 `ResponseCache`，同一个问题要在每个进程里各未命中一次，进程一重启缓存就清零。`SQLiteResponseCache` 把缓存放进一个所有进程共用的 SQLite 文件：进程 A 算出来的答案，进程 B 直接命中。Demo 场景 1b 用真实的 worker 进程（`WorkerPool` 拉起的 `python -m agentkit.distributed.worker`，worker 应用是 [cache_app.py](cache_app.py)）测了两件事：
+
+1. **跨进程命中**：进程 A 回答了 acme 的"VPN 连不上怎么办？"，进程 B（另一个 pid）再问，直接命中，模型调用 0 次；缓存表的 `writer` 列显示这条是 A 写入的。globex 在 B 上问同一句话照样未命中：键里有租户，跨进程也一样；
+2. **命中率**：同一批 300 个请求（3 个租户 × 8 个常见问题，齐夫分布；剧本模型，每次模型调用 `asyncio.sleep` 50 毫秒），三种部署方式，总并发都是 12：
+
+| 部署方式 | 模型调用 | 命中率 | 超出理论最少（24 次） |
+|---|---|---|---|
+| 1 个进程 × 并发 12，进程内 LRU | 40~44 | 85%~87% | 16~20 |
+| 3 个进程 × 并发 4，各自的进程内 LRU | 73~80 | 73%~76% | 49~56 |
+| 3 个进程 × 并发 4，共享 SQLite 缓存 | 46~53 | 82%~85% | 22~29 |
+
+（Apple M1 8GB，macOS 14.4，Python 3.11.7，SQLite 3.41.2；测量时机器上还跑着别的任务，load average 最高到 60 多；表里是 4 次运行的范围。命中率取决于请求到达的时机，每次运行略有不同。）
+
+- 扩到 3 个进程、各用各的进程内缓存，模型调用几乎翻倍：每个进程都要为同一个问题付一次钱；
+- 共享缓存把它拉回到接近单进程的水平；
+- 三种方式都超出理论最少值不少，原因是**同一个键被几个请求同时未命中**：开闸时 12 个请求一起到，第一次出现的问题会被好几个请求同时去问模型（缓存击穿，5.2 节）。跨进程时，"A 查询未命中 → A 调模型 → A 写回"这段时间里，B 也会未命中，所以共享缓存比单进程略多。
+
+代价：共享缓存的每次读写都是一次数据库事务。本机实测单进程命中一次，`ResponseCache` 约 13 微秒，`SQLiteResponseCache` 约 0.6 毫秒（慢几十倍），但比一次模型调用（秒级）快三个数量级以上。常见的做法是两级：进程内 LRU 挡住最热的那一小撮（零开销），未命中再查共享缓存。[`test_integration.py`](test_integration.py) 用两个独立的子进程和两个 `WorkerPool` 进程验证了"B 命中 A 写入的答案、换租户不命中、进程内缓存跨进程不命中"。
+
+局限：SQLite 只能在一台机器上共享，同一时刻只有一个写者。生产级替换：存储换成 Redis（`SET key value EX ttl`，淘汰策略设为 `allkeys-lru`），多机、多实例共享，接口不变（`get` / `put` / `skip`）；命中率按租户、功能分别监控；知识库更新时按租户主动清理相关条目。
 
 ---
 
@@ -227,39 +249,48 @@ def handle(request, identity):
 
 **怎么选**：面向人的界面，**A 是必做项**，成本最低、体感收益最大。然后看 trace 里的轨迹：步数多就做 **C**，同一轮有多个独立工具就做 **B**。前置的分类、护栏用 **D**。**E** 只在"平均延迟已经可以接受、长尾拖后腿"时才用，而且阈值必须来自你自己的延迟分布。
 
-关于 B 的一个事实：agentkit 的主循环为了简单，**按顺序**执行同一轮里的多个工具调用（见 [`Agent._run_pending_tools`](../../agentkit/agent.py) 里的 `for` 循环）。模型虽然一次发起了并行调用，执行时仍然是串行的。生产中可以并发执行 `risk="read"` 的工具，写工具保持串行。
+关于 B 的一个事实：agentkit 的主循环会**并发**执行同一轮里的多个只读工具（`risk="read"`，用 `asyncio.gather`，上限 `max_parallel_tools=8`，结果按原顺序写回）；只要这一轮里有一个写 / 高危工具，就按模型给出的顺序逐个执行，保证副作用有序（见 [`Agent._run_pending_tools`](../../agentkit/agent.py)）。所以"订单 + 物流 + 库存"三个查询的耗时是取最大，而"查库存 → 下单"仍然是相加。
 
-**对冲为什么有效？** 这个思路来自 Jeff Dean 和 Luiz André Barroso 的论文 *The Tail at Scale*（2013）。长尾延迟往往是**偶发**的：某次请求刚好排在一个慢节点上。再发一次，大概率会落到一个正常的节点。如果在 p95 时刻发出第二个请求，只有最慢的 5% 请求会多发一次，额外成本约 5%，而这 5% 请求的延迟变成"p95 + 一次正常请求的耗时"。本课 Demo 的模拟结果：
+**对冲为什么有效？** 这个思路来自 Jeff Dean 和 Luiz André Barroso 的论文 *The Tail at Scale*（2013）。长尾延迟往往是**偶发**的：某次请求刚好排在一个慢节点上。再发一次，大概率会落到一个正常的节点。如果在 p95 时刻发出第二个请求，只有最慢的 5% 请求会多发一次，额外成本约 5%，而这 5% 请求的延迟变成"p95 + 一次正常请求的耗时"。本课 Demo 场景 3 用一个**延迟模型**（`ScriptedLLM(latency=...)`：90% 的调用 20~60 毫秒、10% 卡 500 毫秒，固定随机种子）跑 200 个请求，同时最多 20 个在跑：
 
 ```text
-                      p50     p90     p99   调用次数
-   不对冲            40ms    63ms   505ms       60
-   80ms 后对冲       41ms    64ms   141ms       64
-   多花的钱：+7% 的调用量
+                      p50     p90     p99     发出     完成(计费)    被取消     在途峰值     结束时在途
+   不对冲            41ms    60ms   502ms    200        200      0       20         0
+   80ms 后对冲       41ms    60ms   134ms    216        200     16       24         0
+   多发出的请求：+8%；多计费的调用：+0%（16 个输家在完成前被取消，没有拿到响应，也就没有 usage）
 ```
 
-**本课实现**：[`hedged_call`](costkit.py)。
+（请求是并发执行的，负载高时"发出 / 被取消"的个数偶尔会差一两个；延迟模型用的是固定的随机种子。）
+
+**本课实现**：[`hedged_call`](costkit.py)，用 asyncio 写，输家会被**真正取消**：
 
 ```python
-futures = [pool.submit(fn)]
-pending = set(futures)
-while True:
-    can_hedge = len(futures) < max_requests
-    done, pending = wait(pending, timeout=hedge_after_s if can_hedge else None, return_when=FIRST_COMPLETED)
-    if not done:                          # 等够了还没有任何一个回来 → 发对冲请求
-        f = pool.submit(fn); futures.append(f); pending.add(f); continue
-    for f in done:
-        if f.exception() is None:
-            return HedgeOutcome(f.result(), futures.index(f), len(futures), ...)   # 谁先成功用谁
-    ...                                   # 都失败了：可重试的错误立刻补发，否则抛出
+pending = {launch()}                          # launch()：asyncio.ensure_future(fn())，记进 tasks
+try:
+    while True:
+        can_hedge = len(tasks) < max_requests
+        done, pending = await asyncio.wait(pending, timeout=hedge_after_s if can_hedge else None,
+                                           return_when=asyncio.FIRST_COMPLETED)
+        if not done:                          # 等够了还没有任何一个回来 → 发对冲请求
+            pending.add(launch())
+            continue
+        winner = ...                          # done 里第一个成功完成的任务（失败的记进 last_error）
+        if winner is not None:
+            cancelled = await _cancel_and_wait(pending)   # 输家立刻 cancel()，并等它们真正结束
+            return HedgeOutcome(winner.result(), tasks.index(winner), len(tasks), cancelled, clock() - start)
+        ...                                   # 都失败了：可重试的错误立刻补发，否则抛出
+finally:
+    await _cancel_and_wait(tasks)             # 调用方取消了 hedged_call（例如用户断开）→ 在途请求一起取消
 ```
+
+"取消"具体发生了什么？`task.cancel()` 把 `CancelledError` 送进输家正在 `await` 的地方：离线时是 `ScriptedLLM` 里的 `asyncio.sleep`，真实模型是 `OpenAICompatLLM` 里 httpx 读响应的那一行，这次 HTTP 请求随之被中止。怎么证明？[`MeteredLLM`](costkit.py) 在每次调用外面记账：上表里对冲组"发出 216、完成 200、被取消 16、结束时在途 0"，而且完成数和不对冲时一样多 —— 16 个输家都在完成之前被取消了，没有拿到响应，本进程也就没有为它们记下任何 usage。[`test_integration.py`](test_integration.py) 用确定性的量验证了三件事：胜者出现后输家收到 `CancelledError`、返回时在途为 0、只有胜者产生 usage；调用方取消 `hedged_call` 时两个在途请求都被取消；快请求不会触发对冲。（以前用线程实现时做不到这一点：Python 线程无法被强行终止，输家只能在后台跑完。）
 
 两个必须知道的限制：
 
-- **输掉的请求取消不了**：Python 线程无法被强行终止，HTTP 请求可能已经在服务端开始生成。它消耗的 token 很可能照样计费（取决于厂商以及是否流式）。所以 `HedgeOutcome.launched` 就是你要付的调用次数；
-- **只能对冲没有副作用的调用**：对冲一个"退款"请求，就是退两次款。
+- **客户端取消 ≠ 服务端不计费**：取消能保证的是"我们不再等它、连接释放、不再占并发名额"。请求可能已经到了服务端、已经开始生成；服务端会不会因为连接断开而停止生成、已经生成的部分怎么计费，取决于厂商的实现和是否流式，以厂商文档和账单为准。所以真实的额外成本要看账单，`HedgeOutcome.launched`（发出的请求数）是它的上限；
+- **只能对冲没有副作用的调用**：对冲一个"退款"请求，就是退两次款 —— 取消只能保证不再等它，不能保证服务端没有执行。
 
-Demo 场景 3 在真实模型上故意把阈值设成 1.5 秒（低于这个模型的中位延迟）：结果发出了 2 个请求，钱付了两份，延迟却没有改善。**阈值低于中位延迟时，几乎每个请求都付双份钱，却几乎没有收益。**
+Demo 场景 3 在真实模型上故意把阈值设成 1.5 秒（低于这个模型的中位延迟）：一次真实运行里发出了 2 个请求，第 1 个在 3.0 秒先回来，另一个被取消（计量：完成 1 次、被取消 1 次，结束时在途 0）。延迟没有因此改善，请求却发了两份。**阈值低于中位延迟时，几乎每个请求都要多发一份，却几乎没有收益。**
 
 生产级替换：把对冲做到模型网关或 HTTP 客户端层，只对幂等的读请求开启；阈值根据最近的延迟分布动态计算；监控对冲触发率和"对冲请求胜出率"。胜出率很低，说明阈值设得太激进。
 
@@ -354,10 +385,10 @@ Demo 场景 4 用 [`context_cost`](costkit.py) 算出了四种策略的"折算�
 
 ```python
 with tracer.span("request", **{"tenant.id": identity["tenant_id"], "app.feature": "faq"}):
-    agent.run(text, metadata=identity)
+    await agent.run(text, metadata=identity)
 ```
 
-为什么不直接写在 `agent.run` 的 span 上？因为 agentkit 的 `agent.run` span 只记录了 `agent.name` 和 `run_id`，没有把 `metadata` 里的租户写进去。这其实很常见：你用的框架未必替你打好了业务标签，服务层的根 span（相当于 HTTP 请求的 server span）才是打业务标签的地方。归因时，用 `trace_id` 把 `agent.run` 上的成本和根 span 上的租户关联起来。
+为什么不只看 `agent.run` 的 span？agentkit 的 `agent.run` span 确实带了 `metadata` 里的 `tenant.id` 和 `user.id`，但"这是哪个功能、哪个套餐、哪个入口"这些业务维度它不知道。这很常见：你用的框架未必替你打好了业务标签（换一个框架，可能连租户都没有），服务层的根 span（相当于 HTTP 请求的 server span）才是统一打业务标签的地方。归因时，用 `trace_id` 把 `agent.run` 上的成本和根 span 上的维度关联起来。
 
 还有一个真实的坑：`agent.cost_usd` 是**这个 run 的累计成本**。运行因审批暂停、之后 `resume` 时，`agent.resume` span 上记的是"run 阶段 + resume 阶段"的总和。把两个 span 的成本直接相加，run 阶段的钱就被算了两遍。练习 (c) 会让你处理这个问题。
 
@@ -366,31 +397,32 @@ with tracer.span("request", **{"tenant.id": identity["tenant_id"], "app.feature"
 ## 3. 动手：运行 Demo
 
 ```bash
-python lessons/14_cost_latency/demo.py --offline   # 离线剧本，无需 API key，延迟为模拟值
-python lessons/14_cost_latency/demo.py             # 真实模型，约 30 次调用，1~2 分钟
+python lessons/14_cost_latency/demo.py --offline   # 离线剧本，无需 API key，延迟来自延迟模型；约 10 秒
+python lessons/14_cost_latency/demo.py             # 真实模型，约 30 次调用，1 分钟左右
 ```
 
-真实模式下，大模型用 `.env` 的 `LLM_MODEL`，小模型用 `LLM_SMALL_MODEL`（没配就用 `LLM_FALLBACK_MODEL`）。**所有成本都按 demo 里的示例单价计算**（大模型 $2.5 / $20，小模型 $0.25 / $2，每百万 token），不是任何厂商的真实报价。
+真实模式下，大模型用 `.env` 的 `LLM_MODEL`，小模型用 `LLM_SMALL_MODEL`（没配就用 `LLM_FALLBACK_MODEL`）。**所有成本都按 demo 里的示例单价计算**（大模型 $2.5 / $20，小模型 $0.25 / $2，每百万 token），不是任何厂商的真实报价。代码是 async 的（`await agent.run(...)`，入口 `asyncio.run(main())`）。场景 1b 和场景 3 的延迟对比两种模式都用剧本模型 + 延迟模型：它们测的是缓存和取消，不是模型。
 
 **场景 1：精确缓存**（真实模型输出节选；模型的延迟和 token 数每次都不同，你看到的数字会不一样）
 
 ```text
 ▶ 对照组：不开缓存，依次处理 7 个请求
-   模型调用 7 次，总成本 $0.01274，总耗时 22.6s
+   模型调用 7 次，总成本 $0.01254，总耗时 14.3s
 
-▶ 实验组：开启精确缓存（ResponseCache 全局共享，CachingLLM 按请求创建，作用域 = 租户 + 角色）
+▶ 实验组：开启精确缓存（ResponseCache 进程内共享，CachingLLM 按请求创建，作用域 = 租户 + 角色）
    #  租户     问题                                        缓存         耗时         成本
-   1  acme     VPN 连不上怎么办？                          · 未命中    2.45s   $0.00168
-   2  acme     怎么申请新显示器？                          · 未命中    2.33s   $0.00156
+   1  acme     VPN 连不上怎么办？                          · 未命中    2.64s   $0.00166
+   2  acme     怎么申请新显示器？                          · 未命中    2.09s   $0.00156
    3  acme     VPN 连不上怎么办？                          ✅ 命中     0.00s   $0.00000
-   4  globex   VPN 连不上怎么办？                          · 未命中    2.65s   $0.00168
+   4  globex   VPN 连不上怎么办？                          · 未命中    2.45s   $0.00166
    5  acme     VPN 连不上怎么办？                          ✅ 命中     0.00s   $0.00000
-   6  globex   把这句话总结成 10 个字以内的工单标题：…     · 未命中    4.12s   $0.00350
+   6  globex   把这句话总结成 10 个字以内的工单标题：…     · 未命中    6.72s   $0.00694
    7  globex   VPN 连不上怎么办？                          ✅ 命中     0.00s   $0.00000
 
-   命中率 43%（3/7），省下 1248+96 token
-   成本：$0.01274 → $0.00842（-34%）
-   平均延迟：不开缓存 3.22s → 开缓存 1.65s（命中 0.00s / 未命中 2.89s）
+   命中率 43%（3/7），省下 1248+93 token
+   成本：$0.01254 → $0.01182（-6%）
+   平均延迟：不开缓存 2.05s → 开缓存 1.99s（命中 0.00s / 未命中 3.47s）
+   ⚠️ 命中率 43%，成本却只降了 6%：命中的都是便宜的 FAQ，最贵的请求没有重复。缓存省多少钱，看的是'重复流量占成本的比例'，不是命中率。
 
 ▶ 命中缓存的那次运行，trace 长这样（llm.chat 的 token 是 0 → 0：这次调用没花钱）
    agent.run  0ms  tokens=0→0  status=completed steps=1 cost=$0.00000
@@ -400,45 +432,79 @@ python lessons/14_cost_latency/demo.py             # 真实模型，约 30 次�
 👀 观察：
 
 - 第 4 个请求：globex 问了和 acme 一字不差的问题，**没有命中**，因为缓存键里有租户；
-- **命中率不等于省钱比例**：命中率 43%，成本只降了 34%。第 6 个请求（摘要）一次就花了 $0.0035，比两个 FAQ 加起来还贵，而它没有重复。缓存能省多少，看的是"重复流量占成本的比例"。当两者差距超过 10 个百分点时，Demo 会专门打印一行 ⚠️ 提醒；
+- **命中率不等于省钱比例**：命中率 43%，成本只降了 6%。第 6 个请求（摘要）这一次花了 $0.00694，比其余 3 次未命中加起来还贵；它在对照组里便宜得多（推理型模型每次"想"多久不一样），又没有重复，缓存省下的那点钱被它吃掉了。缓存能省多少，看的是"重复流量占成本的比例"。当两者差距超过 10 个百分点时，Demo 会专门打印一行 ⚠️ 提醒；
 - 命中那次运行的 trace 里，`llm.chat` 的 token 是 `0→0`。这次调用确实没花钱，成本归因会如实反映；
-- 未命中的请求耗时 2~4 秒不等，这就是问题 3 说的延迟波动。
+- 未命中的请求耗时 2~7 秒不等，平均延迟几乎没降（2.05s → 1.99s）：省下的 3 次都是 2 秒左右的 FAQ，而摘要那次一个请求就用了 6.7 秒。这就是问题 3 说的延迟波动。
 
-**场景 2：级联**
+**场景 1b：多个 worker 进程**（两种模式相同：真实进程，剧本模型 + 延迟模型）
+
+```text
+▶ ① 进程 A 回答过的问题，进程 B 直接命中（SQLiteResponseCache）
+   进程 A 的 pid = 46361，进程 B 的 pid = 46362（两个独立的 python 进程）
+   谁处理    租户     问题                  缓存      模型调用        耗时
+   进程 A    acme     VPN 连不上怎么办？    · 未命中  1           304.8ms
+   进程 B    acme     VPN 连不上怎么办？    ✅ 命中   0             1.4ms
+   进程 B    globex   VPN 连不上怎么办？    · 未命中  1           304.9ms
+   缓存表里的条目：写入者 A0/pid 46361，被命中 1 次
+   缓存表里的条目：写入者 B0/pid 46362，被命中 0 次
+
+▶ ② 同一批 300 个请求（3 个租户 × 8 个常见问题，齐夫分布），三种部署方式各跑一遍；总并发都是 12
+   不同的 (租户, 问题) 组合：24 个 —— 理论上最少只需要调用模型 24 次；不开缓存要 300 次
+   部署方式                                模型调用     命中率     超出最少      耗时   参与的进程
+   1 进程 × 并发 12，进程内 LRU              42     86%       18   0.40s   1/1（pid 46376）
+   3 进程 × 并发 4，各自的进程内 LRU         73     76%       49   0.52s   3/3（pid 46379, 46380, 46381）
+   3 进程 × 并发 4，共享 SQLite 缓存         46     85%       22   0.43s   3/3（pid 46388, 46389, 46390）
+```
+
+👀 观察：B 命中的那条缓存是 A 写入的（`writer` 列），答案跨进程复用了；三种部署方式的对比见问题 2。每个进程启动、处理、优雅停机（SIGTERM）都是真的，数据库和日志放在临时目录里，结束后删除。
+
+**场景 2：级联**（6 个工单用 `asyncio.gather` 并发分类，`asyncio.Semaphore(3)` 限制同时最多 3 路）
 
 ```text
    工单                                          全用大模型      级联                耗时 A→B
-   VPN 从今早开始一直连不上，报错 809…           network/P1      network/P1（小）    2.1s → 2.8s
-   3 楼打印机又卡纸了                            hardware/P2     hardware/P3（小）   3.2s → 2.5s
-   Excel 一打开大文件就崩溃                      software/P2     software/P3（小）   3.5s → 5.3s
-   电脑最近有点怪，时快时慢，可能是网络问题，…   software/P3     software/P3（大）   2.3s → 6.2s
-   ...
+   VPN 从今早开始一直连不上，报错 809…           network/P1      network/P1（小）    2.2s → 2.8s
+   新员工小王明天入职，需要开通邮箱和 OA …       account/P2      account/P1（小）    5.9s → 2.8s
+   3 楼打印机又卡纸了                            hardware/P2     hardware/P3（小）   3.8s → 3.1s
+   Excel 一打开大文件就崩溃                      software/P2     software/P3（小）   3.3s → 3.8s
+   电脑最近有点怪，时快时慢，可能是网络问题，…   software/P3     software/P3（大）   3.4s → 6.4s
+   会议室投影仪连不上笔记本，下午两点要给客户…   hardware/P1     hardware/P1（小）   3.1s → 2.7s
+
    升级率：17%（1/6），原因：{'rejected': 1}
-   被丢弃的小模型输出：500 token —— 白花了，但照样计费
-   成本：A $0.01506  vs  B $0.00374（-75%）
-   平均延迟：A 2.77s  vs  B 3.86s
-   与'全用大模型'的结果一致：类别 6/6，优先级 4/6（不一致的部分就是级联的质量代价，要用评估集持续盯住）
+   被丢弃的小模型输出：506 token —— 白花了，但照样计费
+   成本：A $0.01506  vs  B $0.00371（-75%）
+   平均延迟：A 3.63s  vs  B 3.60s
+   在途峰值（同一时刻真正在等模型的调用数，上限 3）：A 大模型 3；B 小模型 3、大模型 1
+   与'全用大模型'的结果一致：类别 6/6，优先级 3/6（不一致的部分就是级联的质量代价，要用评估集持续盯住）
 ```
 
 👀 观察：
 
-- 模棱两可的那张工单（"电脑最近有点怪……"），小模型自报的置信度不够，被升级到了大模型，耗时是两次调用之和；
-- 钱省了 75%，**延迟反而变长了**：这个小模型并不比大模型快（问题 1 的延迟盈亏平衡分析）；
-- 类别全部一致，但有两张工单的**优先级**不同（P2 vs P3）。级联的质量不是"免费的"：优先级判断差一档算不算问题，要由评估集和业务方来定。
+- 模棱两可的那张工单（"电脑最近有点怪……"），小模型自报的置信度不够，被升级到了大模型，耗时是两次调用之和（6.4 秒）；
+- 钱省了 75%，**平均延迟却几乎没变**：这个小模型并不比大模型快多少，升级的那张还要付两次时间（问题 1 的延迟盈亏平衡分析）；
+- 在途峰值 3：6 个工单真的并发了，而且被信号量限制在 3 路以内（`MeteredLLM` 数出来的，不是估算）；
+- 类别全部一致，但有三张工单的**优先级**不同。级联的质量不是"免费的"：优先级判断差一档算不算问题，要由评估集和业务方来定。
 
-**场景 3~5**：对冲请求的模拟（见问题 3，真实模式还会在真实模型上故意用一个过低的阈值试一次）、上下文成本曲线（见问题 5）、按租户和功能的成本归因与预算告警：
+**场景 3：对冲请求**（延迟模型下的对比见问题 3；真实模式还会在真实模型上故意用一个过低的阈值试一次）
+
+```text
+▶ 真实模型上试一次：阈值故意设成 1.5 秒（低于这个模型的中位延迟）
+   发出 2 个请求，第 1 个先回来，耗时 3.0s，取消了 1 个：对冲请求是指为了降低单个请求延迟或失败风险，同时向多个副本/服务实例发起相同请求并采用最先成功响应…
+   计量：完成 1 次、被取消 1 次，结束时在途 0
+```
+
+**场景 4、5**：上下文成本曲线（见问题 5）、按租户和功能的成本归因与预算告警：
 
 ```text
 ▶ 按租户
    acme     运行 5 次  成功 5 次  成本 $0.00490  每次成功任务成本 $0.00098
-   globex   运行 3 次  成功 3 次  成本 $0.00518  每次成功任务成本 $0.00173
+   globex   运行 3 次  成功 3 次  成本 $0.00860  每次成功任务成本 $0.00287
 ▶ 按 租户 × 功能
    acme       faq        成本 $0.00490
-   globex     faq        成本 $0.00168
-   globex     summary    成本 $0.00350
+   globex     faq        成本 $0.00166
+   globex     summary    成本 $0.00694
 ▶ 预算检查（示例预算：acme $0.006 / 月，globex $0.003 / 月；80% 预警，100% 超限）
    🟡 预警 acme：已用 82%
-   🔴 超限 globex：已用 173%
+   🔴 超限 globex：已用 287%
 ```
 
 👀 观察：globex 的运行次数比 acme 少，成本却更高，原因是"摘要"这个功能单价高，"按租户 × 功能"的报表一眼就能看出来。场景 5 读取的是场景 1 导出的 trace 文件 `runs/14_cost_latency/traces.jsonl`，打开它看看根 span 上的 `tenant.id` 和 `app.feature`。
@@ -452,10 +518,11 @@ python lessons/14_cost_latency/demo.py             # 真实模型，约 30 次�
 - 任务：用 SHA-256 为一次模型请求计算缓存键。dict 键顺序不影响结果；`tools=None` 和 `[]` 等价；租户为空时抛 `ValueError`。
 - 提示：把四样东西放进**同一个** dict，再用 `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False)` 序列化。不要用字符串拼接：租户 `"ab"` + 模型 `"c"` 和租户 `"a"` + 模型 `"bc"` 会拼出同一个字符串。有一个测试专门在另一个进程里重新计算键，用内置 `hash()` 是过不了的。
 
-**(b) `CascadeLLM.chat`：级联的升级逻辑**
+**(b) `async def CascadeLLM.chat`：级联的升级逻辑**
 
 - 任务：小模型报错 → 升级（原因 `error`）；validator 返回假值 → 升级（`rejected`）；validator 自己抛异常 → 升级（`validator_error`）。被丢弃的小模型回答的 usage 要记进 `wasted`；大模型的异常不能吞掉。
-- 有一个测试把 `CascadeLLM` 直接交给 `Agent`：小模型编造了一个不存在的工具，validator 拒绝，这一步升级到大模型；下一步小模型又能胜任。
+- 它是 `async def`：`await self.small.chat(...)`、`await self.large.chat(...)`；validator 是普通函数，直接调用。忘了 `await` 的话，拿到的是一个协程对象而不是 `LLMResponse`，取 `.usage` 时就会报错。
+- 有一个测试把 `CascadeLLM` 直接交给 `Agent`：小模型编造了一个不存在的工具，validator 拒绝，这一步升级到大模型；下一步小模型又能胜任。另一个测试让 50 个会话同时调用它，检查计数一个不差（不需要锁，原因见问题 1）。
 
 **(c) `cost_by_tenant(spans)`：按租户归因成本**
 
@@ -469,7 +536,7 @@ make lesson N=14                                                  # 跑你的实
 AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/14_cost_latency -v    # 对照参考答案
 ```
 
-测试全部离线，共 18 个，1 秒左右跑完。
+测试全部离线：`test_exercise.py` 19 个（练习），`test_integration.py` 10 个（costkit 的共享缓存、对冲取消、多进程 worker，不依赖练习，没写完练习时也会通过），几秒内跑完。
 
 ## 5. 深入（给有余力的你）
 
@@ -491,7 +558,7 @@ AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/14_cost_latency -v    # �
 - **提前刷新**：条目快过期时，由一个请求在后台刷新，其他请求继续用旧值；
 - **TTL 加随机抖动**：避免一批条目在同一时刻集中过期（和第 08 课重试抖动的道理一样）。
 
-`CachingLLM` 没有实现这些，生产中用 Redis 时可以用 `SET NX` 做一把短期的锁。
+`CachingLLM` 没有实现这些，影响是实测得到的：Demo 场景 1b 里，理论上最少 24 次模型调用，实际多出 16~29 次，几乎全是"同一个键被几个请求同时未命中"；[`test_integration.py`](test_integration.py) 里 10 个一模一样的请求同时到达，模型被调了 10 次。在一个进程里，single-flight 用 asyncio 很好写：用一个 `dict[key, asyncio.Future]` 记下"正在算的键"，后到的请求 `await` 同一个 Future。跨进程要一把共享的短期锁：SQLite 里可以 `INSERT OR IGNORE` 一行"正在计算"的标记，Redis 用 `SET key NX EX 30`。
 
 ### 5.3 成本和质量的帕累托前沿
 
@@ -515,10 +582,12 @@ AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/14_cost_latency -v    # �
 | 缓存键里没有租户和权限上下文 | 跨租户、跨权限泄露；计时侧信道；无法按租户删除 | 作用域来自认证系统；没有租户就不缓存 |
 | 缓存写操作的结果或"已完成"的答案 | 用户以为操作完成了，实际没有执行 | 写操作不缓存；请求级缓存只用于全程只读的请求 |
 | 用内置 `hash()` 算缓存键 | 每个进程结果不同，多实例共享缓存时永远不命中 | `hashlib.sha256` + 规范化 JSON |
+| 多个 worker 进程各用一份进程内缓存，却按单进程的命中率做预算 | 每个进程都要为同一个问题付一次钱，实测模型调用几乎翻倍 | 共享缓存（单机 SQLite、多机 Redis），或"进程内 LRU + 共享缓存"两级 |
 | 把缓存命中率当成省钱比例 | 命中的都是便宜请求，账单没怎么降 | 统计"命中省下的成本 / 总成本" |
 | system prompt 开头放时间戳、用户名 | 提示词缓存全部失效 | 稳定内容放前面，动态内容放最后（第 04 课） |
 | 滑动窗口每一步都滑 | 前缀每步都变，缓存几乎只剩 system 能命中 | 高低水位成批压缩，平时只追加 |
 | 对冲阈值拍脑袋设得很低 | 几乎每个请求都付双份钱 | 阈值取自己延迟分布的 p90~p95，并监控对冲胜出率 |
+| 对冲的输家不取消，放在后台跑完 | 占着连接和并发名额，流式请求还在继续生成 | 胜者一出现就 `cancel()` 输家，并等它真正结束；用在途计数验证 |
 | 对有副作用的请求做对冲或重试 | 重复退款、重复发邮件 | 只对冲只读请求；写请求用幂等键（第 08 课） |
 | 离线任务走在线接口 | 多付钱，还和在线流量抢限额 | 单步离线任务用批处理 API |
 | 用采样后的 trace 计算账单 | 成本被系统性低估 | 计费走网关全量计量，trace 只用于分析 |
@@ -576,7 +645,7 @@ AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/14_cost_latency -v    # �
 <summary>Q6：对冲请求的原理和代价是什么？什么时候不能用？</summary>
 
 - 原理：长尾延迟通常是偶发的，等到 p95 还没返回就再发一个，谁先回来用谁，把 p99 拉回到接近 p95；
-- 代价：多花的钱约等于触发对冲的比例；输掉的请求往往取消不了，照样计费；
+- 代价：多发的请求约等于触发对冲的比例；输家要立刻取消（asyncio 里 `cancel()` 能让它停止等待、释放连接），但服务端可能已经生成，是否照样计费看厂商；
 - 不能用：有副作用的请求（退款、发邮件）；本来就很慢、且每次都慢的请求（对冲只会让负载翻倍）；下游已经过载时（对冲会雪上加霜，要配合第 08 课的重试预算）。
 </details>
 
@@ -597,8 +666,9 @@ AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/14_cost_latency -v    # �
 - [ ] 我能比较静态路由、级联和学习型路由，并算出级联在成本和延迟上的盈亏平衡点
 - [ ] 我能说出 validator 的几种做法，以及为什么自报置信度不可靠
 - [ ] 我能比较精确缓存、语义缓存和提示词缓存，并说清缓存键为什么必须包含租户和权限上下文
+- [ ] 我能说清多个 worker 进程时，进程内缓存和共享缓存的命中率为什么不同，以及同时未命中（缓存击穿）从哪里来
 - [ ] 我能说清请求级、工具结果级、模型调用级缓存的区别，以及为什么写操作不能缓存
-- [ ] 我能解释对冲请求为什么能降低 p99，以及它的阈值怎么定、代价是什么
+- [ ] 我能解释对冲请求为什么能降低 p99，以及它的阈值怎么定、代价是什么，输家怎么被取消、取消能保证什么不能保证什么
 - [ ] 我能说出批处理 API 适合什么任务，以及它为什么不适合多步 Agent 循环
 - [ ] 我能推导上下文成本的平方增长公式，并解释为什么"窗口 + 缓存"不能简单叠加
 - [ ] 我能设计一个多租户的成本归因和预算告警方案，并说出"每次成功任务的成本"为什么比总成本更有用

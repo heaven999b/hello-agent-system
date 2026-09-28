@@ -1,5 +1,9 @@
 """第 16 课练习测试：离线、确定性（哈希是确定的，模型是剧本，不调用任何真实服务）。
 
+bucket / pick_version / rollout_decision / blocked_reason 都是纯计算，测试是普通函数；
+把 KillSwitch 接到 Agent 上的两个测试要 await agent.run / agent.approve，写成 async def（pytest-asyncio 的 auto 模式）。
+配置中心、多进程开关、在线影子等教学实现的测试在 test_integration.py。
+
 运行：make lesson N=16    或    .venv/bin/python -m pytest lessons/16_release_ops -v
 """
 
@@ -200,7 +204,7 @@ def _email_tools(sent: list):
     return [send_email, search_kb]
 
 
-def test_kill_switch_takes_effect_without_restart():
+async def test_kill_switch_takes_effect_without_restart():
     sent: list[str] = []
     tools = _email_tools(sent)
     flags = {"disabled_tools": ["send_email"]}  # 模拟配置中心里的一份配置
@@ -211,7 +215,7 @@ def test_kill_switch_takes_effect_without_restart():
     ])
     agent = Agent(llm, tools, hooks=[switch])
 
-    res = agent.run("给全员发个通知", metadata={"tenant_id": "acme"})
+    res = await agent.run("给全员发个通知", metadata={"tenant_id": "acme"})
     assert sent == [], "开关打开时，工具绝不能真的执行"
     offered = [t["function"]["name"] for t in (llm.calls[0]["tools"] or [])]
     assert offered == ["search_kb"], "被停用的工具不应再展示给模型"
@@ -219,7 +223,7 @@ def test_kill_switch_takes_effect_without_restart():
     assert "send_email" in denial["content"]
 
     flags["disabled_tools"] = []  # 运维在配置中心关掉开关 —— 同一个 Agent 实例，不重启
-    res2 = agent.run("给全员发个通知", metadata={"tenant_id": "acme"})
+    res2 = await agent.run("给全员发个通知", metadata={"tenant_id": "acme"})
     assert res2.output == "已发送。" and sent == ["all@acme.com"]
 
 
@@ -233,16 +237,16 @@ def refund(order_id: str) -> str:
 REFUNDS: list[str] = []
 
 
-def test_kill_switch_blocks_runs_that_were_paused_before_it_was_flipped():
+async def test_kill_switch_blocks_runs_that_were_paused_before_it_was_flipped():
     """开关打开之前就已暂停等审批的运行：审批通过后恢复，也必须被拦下。"""
     REFUNDS.clear()
     flags: dict = {}
     llm = ScriptedLLM([call_tool("refund", order_id="A1"), reply("退款功能暂时停用，已为您转人工。")])
     agent = Agent(llm, [refund], hooks=[PermissionPolicy(), ex.KillSwitch(lambda: flags, [refund])])
-    res = agent.run("订单 A1 退款", metadata={"tenant_id": "acme"})
+    res = await agent.run("订单 A1 退款", metadata={"tenant_id": "acme"})
     assert res.status == "paused"
 
     flags["disabled_tools"] = ["refund"]  # 发现退款工具有漏洞，紧急停用
-    final = agent.approve(res.run_id, approved=True)  # 审批人不知情，点了批准
+    final = await agent.approve(res.run_id, approved=True)  # 审批人不知情，点了批准
     assert REFUNDS == [], "审批通过也不能绕过紧急开关"
     assert final.status == "completed"

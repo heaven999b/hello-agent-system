@@ -9,7 +9,11 @@
   4. 分流按用户 id 稳定哈希：同一个用户每次都落在同一个版本（粘性），扩量时老的灰度用户不会被"甩回"旧版本；
   5. 每一次发布、扩量、回滚都写审计日志。
 
-这是内存实现。生产中：版本存在 git（评审 + CI 评估门禁）或数据库里，流量配置由配置中心下发，见 README 问题 1。
+PromptRegistry 是**控制面**（发布流水线、灰度控制器所在的那个进程）里的对象：它负责"版本不可变、指针怎么移动"。
+线上的 worker 进程不直接读它 —— 每次变更后，release_doc() 导出"全部版本 + 当前流量分配"，由 rollout.publish_release
+写进配置中心（configcenter.ConfigCenter，所有 worker 进程共享的 SQLite 文档表，带版本号和审计），
+每个 worker 进程的 ConfigWatcher 在 poll_interval 秒内看到新版本，按 pick_version 分流（Demo 场景 3~5 用 3 个真 worker 进程跑）。
+本课的 PromptRegistry 本身存在控制面进程的内存里；生产中版本存在 git（评审 + CI 评估门禁）或数据库里，见 README 问题 1。
 """
 
 from __future__ import annotations
@@ -71,6 +75,18 @@ def pick_version(user_id: str, rollout: Rollout) -> int:
     if user_id in rollout.force_candidate:
         return rollout.candidate
     return rollout.candidate if bucket(user_id, rollout.salt) < rollout.percent else rollout.stable
+
+
+def rollout_to_dict(r: Rollout) -> dict:
+    """Rollout → JSON 友好的字典（写进配置中心）。"""
+    return {**asdict(r), "force_candidate": sorted(r.force_candidate), "force_stable": sorted(r.force_stable)}
+
+
+def rollout_from_dict(d: dict) -> Rollout:
+    """配置中心里读出来的字典 → Rollout（worker 进程里按它分流）。"""
+    return Rollout(stable=int(d["stable"]), candidate=None if d.get("candidate") is None else int(d["candidate"]),
+                   percent=int(d.get("percent", 0)), salt=d.get("salt", ""),
+                   force_candidate=frozenset(d.get("force_candidate", ())), force_stable=frozenset(d.get("force_stable", ())))
 
 
 def _fingerprint(template: str, model: str, params: dict) -> str:
@@ -175,8 +191,16 @@ class PromptRegistry:
         return self._rollouts[name]
 
     def resolve(self, name: str, user_id: str) -> PromptVersion:
-        """线上每个请求调用它：这个用户此刻应该用哪个版本。"""
+        """这个用户此刻应该用哪个版本（控制面里预览用；线上 worker 用配置中心里的 release_doc 做同样的计算）。"""
         return self.get(name, pick_version(user_id, self._rollouts[name]))
+
+    def release_doc(self, name: str) -> dict:
+        """下发给 worker 的文档：全部版本（不可变，所以可以放心缓存）+ 当前的流量分配。"""
+        return {
+            "versions": {str(v.version): {"template": v.template, "model": v.model, "params": v.params,
+                                          "content_hash": v.content_hash} for v in self._versions[name]},
+            "rollout": rollout_to_dict(self._rollouts[name]),
+        }
 
     # ------------------------------------------------------------ 审计
 
@@ -187,8 +211,7 @@ class PromptRegistry:
         """导出为 JSON 友好的结构（可以存档、做 diff、给配置中心下发）。"""
         return {
             "versions": {n: [asdict(v) for v in vs] for n, vs in self._versions.items()},
-            "rollouts": {n: {**asdict(r), "force_candidate": sorted(r.force_candidate), "force_stable": sorted(r.force_stable)}
-                         for n, r in self._rollouts.items()},
+            "rollouts": {n: rollout_to_dict(r) for n, r in self._rollouts.items()},
             "audit_log": self.audit_log,
         }
 

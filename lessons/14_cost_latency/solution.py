@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import threading
 from typing import Callable
 
 from agentkit.llm import LLM, LLMError
@@ -43,19 +42,18 @@ class CascadeLLM:
         self.escalations = 0
         self.reasons: dict[str, int] = {}
         self.wasted = Usage()
-        self._lock = threading.Lock()
+        # 不需要锁：计数的读-改-写中间没有 await，不会被别的协程插队
 
     @property
     def escalation_rate(self) -> float:
         return self.escalations / self.calls if self.calls else 0.0
 
-    def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
-        with self._lock:
-            self.calls += 1
+    async def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+        self.calls += 1
         try:
-            draft = self.small.chat(messages, tools, **kwargs)
+            draft = await self.small.chat(messages, tools, **kwargs)
         except LLMError:
-            return self._escalate("error", messages, tools, kwargs)
+            return await self._escalate("error", messages, tools, kwargs)
 
         try:
             ok = bool(self.validator(messages, draft))
@@ -64,15 +62,13 @@ class CascadeLLM:
             ok, reason = False, "validator_error"
         if ok:
             return draft
-        with self._lock:
-            self.wasted = self.wasted + draft.usage
-        return self._escalate(reason, messages, tools, kwargs)
+        self.wasted = self.wasted + draft.usage
+        return await self._escalate(reason, messages, tools, kwargs)
 
-    def _escalate(self, reason: str, messages, tools, kwargs) -> LLMResponse:
-        with self._lock:
-            self.escalations += 1
-            self.reasons[reason] = self.reasons.get(reason, 0) + 1
-        return self.large.chat(messages, tools, **kwargs)
+    async def _escalate(self, reason: str, messages, tools, kwargs) -> LLMResponse:
+        self.escalations += 1
+        self.reasons[reason] = self.reasons.get(reason, 0) + 1
+        return await self.large.chat(messages, tools, **kwargs)
 
 
 # =====================================================================

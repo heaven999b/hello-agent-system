@@ -2,7 +2,7 @@
 
 一共三题：
   (a) cache_key        缓存键：规范化 + 租户隔离（写错一次 = 一次跨租户数据泄露）
-  (b) CascadeLLM.chat  级联的升级逻辑 + 记账（先小模型，不合格再升级到大模型）
+  (b) CascadeLLM.chat  级联的升级逻辑 + 记账（先小模型，不合格再升级到大模型）—— 写成 async def，await 两个模型
   (c) cost_by_tenant   从 trace 里按租户归因成本（成本治理的第一步：钱花在谁身上）
 
 把每个 `raise NotImplementedError("TODO: ...")` 换成你的实现，然后运行：
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import hashlib  # noqa: F401  （练习 a 会用到）
 import json  # noqa: F401  （练习 a 会用到）
-import threading
 from typing import Callable
 
 from agentkit.llm import LLM, LLMError  # noqa: F401  （练习 b 会用到 LLMError）
@@ -65,8 +64,8 @@ Validator = Callable[[list[Message], LLMResponse], bool]
 class CascadeLLM:
     """级联：先问便宜的小模型，validator 判"合格"就直接用；否则升级到大模型。
 
-    它本身也实现了 LLM 协议（有 .model 和 .chat），所以可以直接交给 Agent 使用：
-        Agent(CascadeLLM(small, large, validator), tools)
+    它本身也实现了 LLM 协议（有 .model 和 async 的 .chat），所以可以直接交给 Agent 使用：
+        await Agent(CascadeLLM(small, large, validator), tools).run("...")
 
     validator(messages, response) -> bool：True 表示小模型的回答可以直接用。
     常见的校验：JSON 能否解析、字段是否齐全、工具名是否存在、有没有拒答话术、自报置信度是否够高……
@@ -87,18 +86,19 @@ class CascadeLLM:
         self.escalations = 0
         self.reasons: dict[str, int] = {}
         self.wasted = Usage()
-        self._lock = threading.Lock()  # 同一个 CascadeLLM 可能被多个线程同时调用，改计数时加锁
+        # 不需要锁：同一个 CascadeLLM 会被很多并发的会话（asyncio 任务）同时调用，但协程只在 await 处让出控制权，
+        # "self.calls += 1" 这种读-改-写中间没有 await，不会被别的协程插队（见 costkit.CascadeLLM 的说明）
 
     @property
     def escalation_rate(self) -> float:
         """升级率 = escalations / calls；一次都没调用过时为 0.0。"""
         return self.escalations / self.calls if self.calls else 0.0
 
-    def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
-        """升级逻辑，按顺序：
+    async def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+        """升级逻辑（这是一个 async 方法：两个模型的 chat 都是 async 的，调用时要 await），按顺序：
 
           1. calls += 1。
-          2. 调用 self.small.chat(messages, tools, **kwargs)：
+          2. await self.small.chat(messages, tools, **kwargs)：
              - 抛出 LLMError（限流、超时、模型不可用……）→ 升级，原因 "error"。
           3. 调用 self.validator(messages, 小模型的回答)：
              - 返回真值 → 直接返回小模型的回答（不升级）；
@@ -106,10 +106,13 @@ class CascadeLLM:
              - validator 自己抛了任何异常 → 升级，原因 "validator_error"
                （校验器有 bug 不能让用户的请求失败，按"不合格"处理）。
              只要是"小模型回答了但被丢弃"（rejected / validator_error），就把它的 usage 累加到 self.wasted。
-          4. 升级：escalations += 1，reasons[原因] += 1，然后返回 self.large.chat(messages, tools, **kwargs)。
+          4. 升级：escalations += 1，reasons[原因] += 1，然后返回 await self.large.chat(messages, tools, **kwargs)。
              大模型也抛异常 → 不要吞掉，直接抛出（交给外层的 ResilientLLM 或 Agent 处理）。
 
         提示：Usage 支持加法：self.wasted = self.wasted + draft.usage
+             validator 是普通函数（纯计算），直接调用，不要 await。
+             忘了 await 会怎样？self.small.chat(...) 只会返回一个"协程对象"而不是 LLMResponse，
+             后面取 .usage 时报 AttributeError（还会有一条 "coroutine was never awaited" 警告）。
         """
         raise NotImplementedError("TODO: 练习 (b) —— 实现级联的升级逻辑")
 
@@ -130,7 +133,7 @@ def cost_by_tenant(spans: list[dict]) -> dict[str, float]:
       1. 租户从哪来：服务层为每个请求开一个**根 span**（parent_id 为 None），把认证系统给出的
          租户写进它的 attrs["tenant.id"]，agent.run 于是成为这个根 span 的子孙：
              with tracer.span("request", **{"tenant.id": "acme", "app.feature": "faq"}):
-                 agent.run(...)
+                 await agent.run(...)
          同一个 trace 的所有 span 共享 trace_id —— 用 trace_id 找到根 span，就知道是哪个租户。
          （租户必须来自认证系统，绝不能从模型输出或用户输入里取。）
       2. 钱在哪：attrs 里带 "agent.cost_usd" 的 span（agent.run，以及审批后恢复时的 agent.resume）。

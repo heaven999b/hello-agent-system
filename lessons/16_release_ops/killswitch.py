@@ -1,6 +1,17 @@
 """紧急开关（kill switch）：出事时几秒内止血，不用发布、不用重启（第 16 课 问题 4）。
 
-开关存在"配置中心"里（这里用一个 dict 模拟），KillSwitch 每次都实时读取：
+开关存在配置中心里（configcenter.ConfigCenter 的 "flags" 文档：SQLite，同一台机器上的所有 worker 进程共享，带版本号和审计）。
+每个 worker 进程有一个 ConfigWatcher 在后台轮询版本号；KillSwitch 每次检查都读它的本地快照：
+
+    watcher = ConfigWatcher(center, ["flags"], poll_interval=0.2)
+    await watcher.start()
+    KillSwitch(lambda: watcher.snapshot("flags"), tools)
+
+值班工程师在任何一个进程里 `await center.update("flags", ..., actor=..., reason=...)`，
+每个 worker 进程最多 poll_interval 秒后生效（Demo 场景 5 在 3 个真 worker 进程上实测）。
+flags_source 只要是"返回当前开关字典"的函数就行：测试里可以直接传 lambda: 一个 dict。
+
+flags 文档的结构：
 
     {
         "agent_disabled": False,               # 整个 Agent 停用 → 直接转人工
@@ -11,6 +22,10 @@
 
 和 PermissionPolicy(deny_tools=...) 的区别：deny_tools 在构造 Agent 时就固定了，改它要重新部署；
 而事故发生时，"改配置 → 生效"必须以秒计。
+
+对在途运行的策略（本课的选择，Demo 场景 5 验证）：开关在**每一次工具调用之前**检查（before_tool），
+所以开关打开时已经在跑的运行，会在它的下一次工具调用处被拦下；已经开始执行的那一次工具调用不会被打断
+（中途打断一个写操作，比让它做完更危险）。整个 Agent 停用（agent_disabled）只挡新的运行（on_run_start）。
 """
 
 from __future__ import annotations

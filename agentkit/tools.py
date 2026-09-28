@@ -272,22 +272,29 @@ class ToolExecutor:
                 return cached
 
         # 4) 带超时执行（三种方式见模块说明）
+        raised: Exception | None = None
         try:
             if t.isolation == "process":
                 output = await run_in_subprocess(t.fn, kwargs, t.timeout_s)
-            elif t.is_async:
-                output = await wait_for(t.fn(**kwargs), t.timeout_s)
             else:
-                loop = asyncio.get_running_loop()
-                # copy_context：把当前的 contextvars（如追踪的 Span 栈）带进工具线程，
-                # 否则工具内部的 Span 会"断链"，无法嵌套在父 Span 下
-                runner = functools.partial(contextvars.copy_context().run, t.fn, **kwargs)
+                if t.is_async:
+                    work = t.fn(**kwargs)
+                else:
+                    loop = asyncio.get_running_loop()
+                    # copy_context：把当前的 contextvars（如追踪的 Span 栈）带进工具线程，
+                    # 否则工具内部的 Span 会"断链"，无法嵌套在父 Span 下
+                    runner = functools.partial(contextvars.copy_context().run, t.fn, **kwargs)
+                    work = loop.run_in_executor(self._threads, runner)
+                # 工具自己抛的异常先"装箱"再带出来：否则工具内部的 TimeoutError（比如下游超时）会被下面的
+                # except 当成"我们的期限到了"，报成"执行超时（>30s）"，原始信息也丢了（第 16 课发现）。
                 # 不用 asyncio.wait_for：3.12 之前它会在"工具刚完成 + 外部取消"同时发生时吞掉取消（timeouts.py）
-                output = await wait_for(loop.run_in_executor(self._threads, runner), t.timeout_s)
-        except asyncio.TimeoutError:
+                output, raised = await wait_for(_capture(work), t.timeout_s)
+        except asyncio.TimeoutError:  # 只可能是我们自己的期限（进程隔离时由 run_in_subprocess 抛出）
             return timeout_result(t)
         except Exception as e:  # noqa: BLE001 —— 工具异常变成观察；CancelledError 是 BaseException，会正常穿透
             return exception_result(t, e)
+        if raised is not None:
+            return exception_result(t, raised)
 
         result = ToolResult(True, format_output(t, output))
         if use_idem:
@@ -297,6 +304,14 @@ class ToolExecutor:
     def close(self) -> None:
         if self._threads is not None:
             self._threads.shutdown(wait=False, cancel_futures=True)
+
+
+async def _capture(work) -> tuple[Any, Exception | None]:
+    """等待工具执行，返回 (结果, None) 或 (None, 工具抛出的异常)。取消（BaseException）照常向外传播。"""
+    try:
+        return await work, None
+    except Exception as e:  # noqa: BLE001
+        return None, e
 
 
 # ------------------------------------------------------------------------------------ 进程隔离

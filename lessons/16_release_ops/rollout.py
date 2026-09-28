@@ -1,7 +1,9 @@
 """基于指标的灰度推进 / 回滚（第 16 课 问题 2、4）。
 
+    metrics_from_runs    从**真实的运行记录**算出一个阶段的指标（成功率、错误率、p95、单次成本）
     evaluate_stage       看一眼当前灰度阶段的指标，给出 advance / hold / rollback 和理由
-    RolloutController    把决策落到 PromptRegistry 上：1% → 10% → 50% → 100%，出事自动回滚
+    RolloutController    把决策落到 PromptRegistry 上：1% → 10% → 50% → 100%，出事自动回滚；
+                         每次变更通过 publish_release 写进配置中心，所有 worker 进程在一个轮询间隔内切换
     two_proportion_test  A/B 实验里"成功率差异是不是真的"（双比例 z 检验）
     min_sample_size      想检测出 X 个百分点的差异，每组至少要多少样本
 
@@ -16,6 +18,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from statistics import NormalDist
+from typing import Iterable
 
 from registry import PromptRegistry
 
@@ -69,21 +72,63 @@ def evaluate_stage(stage: StageMetrics, baseline: StageMetrics, t: Thresholds = 
     return Decision("advance", ["各项指标都在阈值内"])
 
 
+def metrics_from_runs(runs: Iterable[dict]) -> StageMetrics:
+    """从真实的运行记录算出一个阶段（或基线）的指标。每条记录至少有：
+        status       RunResult.status
+        errors       这次运行里出错的工具调用数（异常 / 超时；worker 用一个 after_tool 钩子数出来）
+        latency_ms   这次运行的耗时
+        cost_usd     这次运行的成本
+        safety       （可选）已确认的安全事件数
+    错误 = 没有正常完成，或者中途有工具出错；成功 = 正常完成且没有出错（生产中还会叠加点踩、在线评估）。
+    """
+    runs = list(runs)
+    n = len(runs)
+    if n == 0:
+        return StageMetrics(0, 0.0, 0.0, 0.0, 0.0)
+    errors = sum(1 for r in runs if r["status"] != "completed" or r["errors"] > 0)
+    latencies = sorted(r["latency_ms"] for r in runs)
+    return StageMetrics(
+        requests=n,
+        success_rate=(n - errors) / n,
+        error_rate=errors / n,
+        p95_latency_ms=latencies[math.ceil(0.95 * n) - 1],
+        cost_per_task=sum(r["cost_usd"] for r in runs) / n,
+        safety_incidents=sum(int(r.get("safety", 0)) for r in runs),
+    )
+
+
 STAGES = (1, 10, 50, 100)
 
 
-class RolloutController:
-    """灰度控制器：每个观察窗口结束时调用一次 step()，它根据指标推进、暂停或回滚。"""
+async def publish_release(center, registry: PromptRegistry, name: str, *, actor: str, reason: str) -> int:
+    """把"全部版本 + 当前流量分配"写进配置中心（configcenter.ConfigCenter），返回新的配置版本号。
+    所有 worker 进程的 ConfigWatcher 会在一个轮询间隔内看到它。"""
+    return await center.set(f"release:{name}", registry.release_doc(name), actor=actor, reason=reason)
 
-    def __init__(self, registry: PromptRegistry, name: str, *, stages: tuple[int, ...] = STAGES,
+
+class RolloutController:
+    """灰度控制器：每个观察窗口结束时调用一次 step()，它根据指标推进、暂停或回滚。
+
+    center（可选）：配置中心。给了它，每次推进 / 推全 / 回滚都会立刻 publish_release，
+    published 记下最近一次下发的配置版本号 —— 调用方可以据此确认"所有 worker 都已经切过去了"。
+    """
+
+    def __init__(self, registry: PromptRegistry, name: str, *, center=None, stages: tuple[int, ...] = STAGES,
                  thresholds: Thresholds = Thresholds(), actor: str = "rollout-bot"):
         self.registry, self.name, self.stages, self.thresholds, self.actor = registry, name, stages, thresholds, actor
+        self.center = center
+        self.published: int | None = None
         self.log: list[tuple[int, Decision]] = []
 
-    def start(self, candidate: int, **kwargs) -> None:
-        self.registry.start_rollout(self.name, candidate, self.stages[0], actor=self.actor, **kwargs)
+    async def _publish(self, reason: str) -> None:
+        if self.center is not None:
+            self.published = await publish_release(self.center, self.registry, self.name, actor=self.actor, reason=reason)
 
-    def step(self, stage: StageMetrics, baseline: StageMetrics) -> Decision:
+    async def start(self, candidate: int, **kwargs) -> None:
+        self.registry.start_rollout(self.name, candidate, self.stages[0], actor=self.actor, **kwargs)
+        await self._publish(f"开始灰度 v{candidate}：{self.stages[0]}%")
+
+    async def step(self, stage: StageMetrics, baseline: StageMetrics) -> Decision:
         r = self.registry.rollout(self.name)
         if r.candidate is None:
             raise RuntimeError("没有进行中的灰度")
@@ -91,12 +136,15 @@ class RolloutController:
         self.log.append((r.percent, d))
         if d.action == "rollback":
             self.registry.rollback(self.name, actor=self.actor, reason="；".join(d.reasons))
+            await self._publish("自动回滚：" + "；".join(d.reasons))
         elif d.action == "advance":
             later = [p for p in self.stages if p > r.percent]
             if later and later[0] < 100:
                 self.registry.set_percent(self.name, later[0], actor=self.actor, reason="指标达标，扩量")
+                await self._publish(f"指标达标，扩量到 {later[0]}%")
             else:
                 self.registry.promote(self.name, actor=self.actor)
+                await self._publish(f"指标达标，v{r.candidate} 推全")
         return d
 
 
