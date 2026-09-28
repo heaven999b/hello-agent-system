@@ -47,10 +47,13 @@ async def amain(argv: list[str] | None = None) -> int:
     ap.add_argument("--kinds", default=None, help="只领取这些 kind（逗号分隔）")
     ap.add_argument("--max-jobs", type=int, default=None, help="领取这么多个任务后退出（测试用）")
     ap.add_argument("--opt", action="append", default=[], help="传给工厂的选项 key=value，可重复")
+    ap.add_argument("--queue-opt", action="append", default=[],
+                    help="传给队列构造函数的数值选项 key=value，例如 base_backoff=0.2、max_attempts=3，可重复")
     args = ap.parse_args(argv)
 
     worker_id = args.worker_id or f"{socket.gethostname()}-{os.getpid()}"
-    queue, db = await open_queue(args.queue)
+    queue_kwargs = {k: (float(v) if "." in v else int(v)) for k, v in (o.split("=", 1) for o in args.queue_opt)}
+    queue, db = await open_queue(args.queue, **queue_kwargs)
     options = dict(o.split("=", 1) for o in args.opt)
     stop = asyncio.Event()
     stop_on_signals(stop)

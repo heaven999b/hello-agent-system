@@ -6,9 +6,14 @@
   1. 事件流模拟器   simulate_day()        一天里的日历、邮件、工单、告警，以及"用户在专注 / 开会"这类状态事件
   2. 用户模型       UserModel             带置信度和证据的推断；贝叶斯式更新（update_belief）、用户纠正、遗忘、时间衰减
   3. 打扰决策器     should_interrupt()    期望收益 × 置信度 − 打扰成本；勿扰时段、专注状态、频率上限、紧急事件越权
-  4. 建议卡片       make_card()           LLM + complete_json 生成结构化建议（只建议，不执行）
+  4. 建议卡片       make_card()           LLM + complete_json 生成结构化建议（只建议，不执行）；async，要 await
 
 run_day() 把它们串起来跑完一天，并用一个"模拟用户"（知道每个事件的真实需求）给策略打分。
+
+⚠️ simulate_day / run_day 是**离散事件模拟器**，不是运行时：时间是整数分钟的虚拟时钟，一整天在一个 for 循环里
+瞬间跑完，没有真实的等待、没有别的进程、没有队列。它的用途是确定、可复现的策略对比、打分和练习 ——
+同样的输入永远得到同样的数字。真实的调度器（按墙钟醒来）、跨进程的事件表、任务队列和幂等，
+见 proactive_runtime.py（Demo 第 8 部分）。决策器 should_interrupt 两边共用。
 
 练习 (a)(b)(c) 要你重写的 update_belief / should_interrupt / forget / explain，这里都有完整版（demo 用它们）。
 先别看，自己写一遍；卡住了再回来对照。
@@ -43,7 +48,7 @@ def at(text: str) -> int:
 
 
 # =====================================================================
-# 1. 事件流模拟器
+# 1. 事件流模拟器（离散事件模拟：整数分钟的虚拟时钟，不是真实调度器）
 # =====================================================================
 
 
@@ -510,8 +515,11 @@ class CardResult:
 _CLAIMS_EXECUTION = re.compile(r"已(经)?(为你|帮你|替你|自动)|我已(经)?(把|将|给|为|帮)")
 
 
-def make_card(llm: LLM, events: list[Event], model: UserModel, decision: Decision | None = None, now: int | None = None) -> CardResult:
-    """为一条事件（或一次摘要里的多条事件，按重要性从高到低排好）生成建议卡片，并对模型输出做事后检查。"""
+async def make_card(
+    llm: LLM, events: list[Event], model: UserModel, decision: Decision | None = None, now: int | None = None
+) -> CardResult:
+    """为一条事件（或一次摘要里的多条事件，按重要性从高到低排好）生成建议卡片，并对模型输出做事后检查。
+    async：`result = await make_card(...)`（要调用模型）。提示词拼装和事后检查是纯计算。"""
     keys = list(dict.fromkeys(KIND_PROFILE[e.kind][0] for e in events))
     beliefs = model.context_for(keys)  # 只发相关、非敏感的推断
     lines = [f"- 事件 ID：{e.id}｜{hhmm(e.t)}｜来源：{e.source}｜{'【紧急】' if e.urgent else ''}{e.title}" for e in events]
@@ -528,7 +536,7 @@ def make_card(llm: LLM, events: list[Event], model: UserModel, decision: Decisio
         + "\n\n用户模型中相关的推断（带把握度）：\n" + "\n".join(belief_lines)
         + "\n\n可选的下一步：\n" + "\n".join(f"- {a}" for a in actions)
     )
-    card = complete_json(llm, prompt, SuggestionCard, system=CARD_SYSTEM)
+    card = await complete_json(llm, prompt, SuggestionCard, system=CARD_SYSTEM)
 
     warnings = []
     allowed = {b["key"] for b in beliefs}
@@ -572,7 +580,8 @@ OFFLINE_CARDS: dict[str, dict] = {
 
 
 def offline_card_llm() -> ScriptedLLM:
-    """离线模式的"模型"：从提示词里读出事件 ID，返回对应的剧本卡片。"""
+    """离线模式的"模型"：从提示词里读出事件 ID，返回对应的剧本卡片。
+    用 responder（按提示词内容作答）而不是按顺序消费的剧本：几张卡片并发生成时，请求到达的顺序不固定。"""
     import json
 
     def respond(messages: list[dict]) -> LLMResponse:
@@ -587,11 +596,11 @@ def offline_card_llm() -> ScriptedLLM:
         }
         return LLMResponse(content=json.dumps(card, ensure_ascii=False))
 
-    return ScriptedLLM([respond] * 20, model="scripted-cards")
+    return ScriptedLLM(responder=respond, model="scripted-cards")
 
 
 # =====================================================================
-# 5. 跑完一天 + 模拟用户打分
+# 5. 跑完一天 + 模拟用户打分（模拟器：虚拟时钟，瞬间跑完）
 # =====================================================================
 
 

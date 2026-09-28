@@ -8,6 +8,8 @@
 七节：
   1. 先审查 benchmark：ABC checklist + 探针 Agent，揭穿 v0 的漏洞，再确认 v1 修好了
   2. 跑评估：两个 prompt 版本 × 16 个任务 × k 次（环境重置、并发 ≤ 2、结果缓存、基础设施错误单独处理）
+     harness 是 async 的：所有试验在一个事件循环里并发（asyncio + 并发上限，没有线程）；
+     离线模式也会用剧本模型真实跑一遍 harness，打印同时在途峰值，证明并发真的发生、上限守住了
   3. 只看点估计
   4. 加上置信区间 —— 以及同一版本几轮之间的波动
   5. 配对检验：逐任务对比 + 配对 bootstrap + McNemar；样本量；45/50 vs 43/50
@@ -15,11 +17,13 @@
   7. 成对 LLM 评委：不交换顺序 vs 交换顺序；与人工标注的一致率和 kappa
 
 真实模式的结果缓存在 lessons/22_eval_methodology/runs/：同一天再跑不会重复调用模型（--fresh 强制重跑）。
+入口是 asyncio.run(main())。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import importlib.util
 import json
@@ -27,7 +31,6 @@ import random
 import sys
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 from types import ModuleType
@@ -38,7 +41,7 @@ from pydantic import BaseModel, Field
 HERE = Path(__file__).resolve().parent
 RUNS = HERE / "runs"
 OFFLINE = HERE / "offline_results.json"
-MAX_WORKERS = 2  # 本地网关被多人共用：并发调用控制在 2 以内
+MAX_CONCURRENCY = 2  # 本地网关被多人共用：同时在途的模型调用控制在 2 以内
 
 
 def _load_sibling(name: str) -> ModuleType:
@@ -193,7 +196,7 @@ def append_jsonl(path: Path, rows: list[dict]) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-def run_real(args, tasks: list, llm) -> tuple[list[dict], dict]:
+async def run_real(args, tasks: list, llm) -> tuple[list[dict], dict]:
     """真实运行：缓存命中的直接复用，其余并发（≤ 2）执行；基础设施错误重试一轮，仍失败就中止。"""
     cache_path = RUNS / "trials.jsonl"
     cache = {} if args.fresh else load_jsonl(cache_path)
@@ -207,32 +210,27 @@ def run_real(args, tasks: list, llm) -> tuple[list[dict], dict]:
                 if key in cache:
                     rows.append({**cache[key], "version": v})
                 else:
-                    jobs.append((key, v, prompt, t, k))
+                    jobs.append(rb.TrialJob(key, v, prompt, t, k))
     hits = len(rows)
-    print(f"缓存命中 {hits} 次，需要新跑 {len(jobs)} 次试验（并发 {MAX_WORKERS}）……")
+    print(f"缓存命中 {hits} 次，需要新跑 {len(jobs)} 次试验（并发 {MAX_CONCURRENCY}）……")
     t0 = time.time()
 
-    def work(job):
-        key, v, prompt, t, k = job
-        r = rb.run_trial(llm, prompt, t, k, as_of=as_of)
-        return {"key": key, "version": v, **r.__dict__}
+    def progress(i: int, total: int) -> None:
+        if i % 16 == 0 or i == total:
+            print(f"  进度 {i}/{total}  已用 {time.time() - t0:.0f}s")
 
     for attempt in (1, 2):
-        new_rows, errors = [], []
-        with ThreadPoolExecutor(MAX_WORKERS) as pool:
-            futures = [pool.submit(work, j) for j in jobs]
-            for i, fut in enumerate(as_completed(futures), 1):
-                row = fut.result()
-                (errors if row["error"] else new_rows).append(row)
-                if i % 16 == 0 or i == len(futures):
-                    print(f"  进度 {i}/{len(futures)}  已用 {time.time() - t0:.0f}s")
+        # 所有试验在一个事件循环里并发，同时在途 ≤ MAX_CONCURRENCY；返回的行按 jobs 的顺序
+        results = await rb.run_trials(llm, jobs, as_of=as_of, concurrency=MAX_CONCURRENCY, on_progress=progress)
+        new_rows = [r for r in results if not r["error"]]
+        errors = [r for r in results if r["error"]]
         append_jsonl(cache_path, new_rows)  # 只缓存成功的试验；出错的下次还会重跑
         rows += new_rows
         if not errors:
             break
         print(f"  ⚠️ {len(errors)} 次试验因基础设施错误失败（例：{errors[0]['error'][:120]}）")
         err_keys = {e["key"] for e in errors}
-        jobs = [j for j in jobs if j[0] in err_keys]
+        jobs = [j for j in jobs if j.key in err_keys]
         if attempt == 2:
             sys.exit(
                 "评估中止：重试后仍有基础设施错误。不要把'模型 API 不可用'记成'Agent 失败'（ABC T.3）。\n"
@@ -250,7 +248,23 @@ def run_real(args, tasks: list, llm) -> tuple[list[dict], dict]:
     return rows, meta
 
 
-def section_run(args, tasks: list, llm) -> tuple[dict, dict]:
+async def harness_smoke(tasks: list) -> None:
+    """离线模式也把 harness 真实跑一遍：剧本模型按参考解作答（每次调用 50ms），2 个版本 × 16 个任务 × 1 次。
+    统计用的是构造数据，但调度、环境重置、停止条件、评分这条代码路径和真实模式完全相同。"""
+    llm = rb.scripted_oracle_llm(tasks, latency=0.05)
+    jobs = [rb.TrialJob(f"smoke|{v}|{t.id}", v, prompt, t, 0) for v, prompt in VERSIONS.items() for t in tasks]
+    t0 = time.perf_counter()
+    rows = await rb.run_trials(llm, jobs, concurrency=MAX_CONCURRENCY)
+    secs = time.perf_counter() - t0
+    print(
+        f"[离线] harness 冒烟：剧本模型按参考解作答（每次调用 {llm.latency * 1000:.0f}ms），{len(jobs)} 次试验 → "
+        f"{sum(r['passed'] for r in rows)}/{len(rows)} 通过；模型调用 {llm.call_count} 次（作出决定即停：每次试验 1 次）；\n"
+        f"       同时在途峰值 {llm.max_in_flight}（上限 {MAX_CONCURRENCY}）；耗时 {secs:.2f}s"
+        f"（一个接一个跑至少要 {len(jobs) * llm.latency:.1f}s，上限 2 时至少 {len(jobs) * llm.latency / MAX_CONCURRENCY:.1f}s）"
+    )
+
+
+async def section_run(args, tasks: list, llm) -> tuple[dict, dict]:
     section("第 2 节：跑评估 —— 同一个 Agent 的两个 prompt 版本，每题跑 k 次")
     print(
         "四元组：请求 = 客户留言 + 订单快照；环境 = 每次试验一个新账本 + 3 个决策工具 + 政策；\n"
@@ -260,9 +274,10 @@ def section_run(args, tasks: list, llm) -> tuple[dict, dict]:
     if args.offline:
         data = json.loads(OFFLINE.read_text(encoding="utf-8"))["trials"]
         rows, meta = data["rows"], {"model": data["model"], "runs": data["runs"]}
+        await harness_smoke(tasks)
         print(f"[离线] {data['note']}")
     else:
-        rows, meta = run_real(args, tasks, llm)
+        rows, meta = await run_real(args, tasks, llm)
     k = meta["runs"]
     outcomes: dict[str, dict[str, list[bool]]] = {v: {t.id: [False] * k for t in tasks} for v in VERSIONS}
     decisions: dict[str, dict[str, list[str]]] = {v: {t.id: [""] * k for t in tasks} for v in VERSIONS}
@@ -275,7 +290,7 @@ def section_run(args, tasks: list, llm) -> tuple[dict, dict]:
         print(
             f"本次新跑 {meta['new_trials']} 次、缓存命中 {meta['cache_hits']} 次；"
             f"总 token {meta['tokens']:,}，估算成本 ${meta['cost_usd']:.4f}（按 agentkit/pricing.py 的占位价格）\n"
-            "harness 做了什么：每次试验新建账本和 Agent（环境重置）；并发 ≤ 2（共享网关）；\n"
+            "harness 做了什么：每次试验新建账本和 Agent（环境重置）；一个事件循环里并发，同时在途 ≤ 2（共享网关）；\n"
             "按（模型, prompt 指纹, 日期, 任务, 第几次）缓存到 runs/trials.jsonl —— 缓存用来'断点续跑'和'重新分析'，\n"
             "不是用来'少采样'：第几次也是键的一部分，所以 3 次就是 3 次独立的采样。"
         )
@@ -519,7 +534,7 @@ def load_pairs() -> list[dict]:
     return rows
 
 
-def collect_verdicts(args, pairs: list[dict], judge_llm) -> tuple[dict, str]:
+async def collect_verdicts(args, pairs: list[dict], judge_llm) -> tuple[dict, str]:
     """返回 {(pair_id, 'xy' | 'yx'): 'A' | 'B'}：xy 表示 x 在前，yx 表示 y 在前。"""
     if args.offline:
         data = json.loads(OFFLINE.read_text(encoding="utf-8"))["judge"]
@@ -538,24 +553,26 @@ def collect_verdicts(args, pairs: list[dict], judge_llm) -> tuple[dict, str]:
             else:
                 todo.append((key, p, order, first, second))
 
-    def work(job):
+    from agentkit.workflows import parallel
+
+    async def work(job):
         key, p, order, first, second = job
-        v = complete_json(judge_llm, JUDGE_PROMPT.format(context=p["context"], first=first, second=second), PairVerdict)
+        v = await complete_json(judge_llm, JUDGE_PROMPT.format(context=p["context"], first=first, second=second), PairVerdict)
         return {"key": key, "pair": p["id"], "order": order, "verdict": v.winner, "reason": v.reason}
 
-    print(f"评委模型 {judge_llm.model}：缓存命中 {len(out)} 次，新调用 {len(todo)} 次（并发 {MAX_WORKERS}）……")
-    with ThreadPoolExecutor(MAX_WORKERS) as pool:
-        new_rows = list(pool.map(work, todo))
+    print(f"评委模型 {judge_llm.model}：缓存命中 {len(out)} 次，新调用 {len(todo)} 次（并发 {MAX_CONCURRENCY}）……")
+    # 两种顺序的判决都先并发收集齐，再交给纯函数 debiased_pairwise 回放（练习 c 的 judge 是普通函数）
+    new_rows = await parallel([lambda j=j: work(j) for j in todo], max_concurrency=MAX_CONCURRENCY)
     append_jsonl(cache_path, new_rows)
     for r in new_rows:
         out[(r["pair"], r["order"])] = r["verdict"]
     return out, judge_llm.model
 
 
-def section_judge(args, judge_llm) -> None:
+async def section_judge(args, judge_llm) -> None:
     section("第 7 节：成对 LLM 评委 —— 不交换顺序 vs 交换顺序，再和人工标注对一对")
     pairs = load_pairs()
-    verdicts, model = collect_verdicts(args, pairs, judge_llm)
+    verdicts, model = await collect_verdicts(args, pairs, judge_llm)
     print(
         f"评委 {model}。8 组'同一工单的两条客服回复'，人工标注：4 组有明确优劣（金额错 / 违规 / 冗长 / 生硬），\n"
         "4 组两条都合格（tie）。评委被要求必须二选一 —— 两条差不多时，它靠什么选，就暴露出来了。\n"
@@ -614,7 +631,7 @@ def section_judge(args, judge_llm) -> None:
 # =====================================================================
 
 
-def main() -> None:
+async def main() -> None:
     global IMPL
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--offline", action="store_true", help="用预置数据，无需 API key")
@@ -629,23 +646,29 @@ def main() -> None:
     tasks = rb.load_tasks()
 
     llm = judge_llm = None
+    clients = []
     if not args.offline:
         from agentkit import ResilientLLM, default_llm
 
-        llm = ResilientLLM(default_llm(args.model), max_attempts=4, base_delay=1.0)
-        judge_llm = ResilientLLM(default_llm(args.judge_model or args.model), max_attempts=4, base_delay=1.0)
+        clients = [default_llm(args.model), default_llm(args.judge_model or args.model)]
+        llm = ResilientLLM(clients[0], max_attempts=4, base_delay=1.0)
+        judge_llm = ResilientLLM(clients[1], max_attempts=4, base_delay=1.0)
 
-    section_audit(tasks)
-    outcomes, decisions = section_run(args, tasks, llm)
-    k = len(next(iter(outcomes["A"].values())))
-    section_point(outcomes)
-    section_ci(outcomes, tasks, k)
-    section_paired(outcomes, tasks, k, decisions)
-    section_small()
-    section_judge(args, judge_llm)
-    if not args.offline and judge_llm.model == llm.model:
-        print(f"\n⚠️ 评委和被测 Agent 用的是同一个模型（{llm.model}），有自我偏好的风险；生产中请用 --judge-model 换一个不同家族的模型。")
+    try:
+        section_audit(tasks)  # 探针 Agent 是纯规则，不调用模型：普通函数
+        outcomes, decisions = await section_run(args, tasks, llm)
+        k = len(next(iter(outcomes["A"].values())))
+        section_point(outcomes)  # 第 3–6 节是纯统计
+        section_ci(outcomes, tasks, k)
+        section_paired(outcomes, tasks, k, decisions)
+        section_small()
+        await section_judge(args, judge_llm)
+        if not args.offline and judge_llm.model == llm.model:
+            print(f"\n⚠️ 评委和被测 Agent 用的是同一个模型（{llm.model}），有自我偏好的风险；生产中请用 --judge-model 换一个不同家族的模型。")
+    finally:
+        for c in clients:
+            await c.aclose()  # 关掉 HTTP 连接池（sys.exit 中止评估时也会执行）
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

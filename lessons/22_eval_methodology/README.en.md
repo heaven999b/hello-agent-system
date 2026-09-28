@@ -208,7 +208,7 @@ flowchart LR
 
 - **Environment reset**: every trial starts from a clean environment. Anthropic's article notes that unnecessary shared state between trials (leftover files, cached data, resource exhaustion) causes **correlated failures** that come from infrastructure rather than the agent, and shared state can also inflate scores: in internal evals they saw Claude gain an unfair advantage by examining **the git history left by previous trials**. This lesson's `run_trial` creates a new ledger and a new agent every time.
 - **Infrastructure errors ≠ agent failures** (ABC T.3): the first time we tried one model in this lesson, the gateway returned 503 and the agent's status was `failed`. A scorer that only looks at the ledger would have recorded "made no decision". `run_trial` marks this case as `infra_error`; the demo retries once and aborts the whole eval if it still fails.
-- **Parallelism**: model calls are I/O bound, so a thread pool is enough. Concurrency is bounded by the model API's quotas (Lessons 12 and 13); this lesson's shared gateway is capped at 2.
+- **Concurrency**: model calls are I/O bound, so one event loop is enough; no threads needed. `run_trials` hands every trial to `agentkit.workflows.parallel`, which uses an asyncio semaphore to cap how many trials are in flight (section 2.8). The cap is bounded by the model API's quotas (Lessons 12 and 13); this lesson's shared gateway is capped at 2.
 - **Caching**: each trial is cached by (model, prompt fingerprint, date, task, trial index). The cache exists for **resuming and re-analysis**, not for "sampling less": the trial index is part of the key, so 3 trials are 3 independent samples. Every input that affects the output belongs in the cache key; this lesson's requests contain a date, so the date is in the key.
 - **Cost control**: PRs run a stratified smoke set; the full set runs nightly (Lesson 11, problem 4). The logic of the framework and scorers is covered by deterministic tests (this lesson's probe agents are an example).
 - **CI integration**: Lesson 11's `release_gate` already has a pass-rate threshold, a safety veto, zero regressions, and a cost budget. Add this lesson's statistics: **to claim an improvement, require the lower bound of the paired difference interval to be > 0; to call a regression, use a paired test, not the difference of two totals.**
@@ -336,7 +336,7 @@ def debiased_pairwise(judge, x, y) -> str:
 ```
 
 - **Translate "which position won" into "which answer won"** so the two verdicts can be compared directly.
-- **`judge` is an injected function**: a real LLM, recorded verdicts, and a fake judge in tests all share one signature, `judge(first, second) -> "A" | "B" | "tie"`. The demo's offline mode simply wraps recorded verdicts in a `judge` function.
+- **`judge` is an injected function**: a real LLM, recorded verdicts, and a fake judge in tests all share one signature, `judge(first, second) -> "A" | "B" | "tie"`. The demo's offline mode simply wraps recorded verdicts in a `judge` function. In real mode, calling the judge has to be `await`ed; the demo first collects both orders' verdicts for every pair concurrently with `parallel` (at most 2 in flight), then wraps them in a plain function for `debiased_pairwise`. The debiasing logic stays a pure function, easy to test and reuse.
 - **Bad format raises an error**: if the judge returns "C" or an empty string, raise `ValueError` rather than quietly calling it a tie. Silently swallowing format errors makes a broken judge look "cautious".
 - **What it removes, and what it doesn't**: a judge that always picks the first position can only produce ties after this, never a fake winner. But a preference the judge keeps after swapping (say, always favoring the reply with more explanation) isn't position bias, and swapping can't remove it; that takes rubrics and human calibration.
 
@@ -368,6 +368,30 @@ def score(task, ledger, status="completed") -> tuple[bool, str]:
 - **Reference solution**: `decide(snapshot)` writes the policy as code. `label_mismatches()` uses it to check every human label (ABC T.7, T.9) and proves every task is solvable (Anthropic Step 2).
 - **Dates**: what a task freezes is "days since delivery"; when rendering the request, dates are shifted to the day of the run. For why, see [section 5.1](#51-the-trap-we-fell-into-the-real-date-injected-by-the-model-gateway).
 
+The harness's execution part lives in the same file, and it's async:
+
+```python
+async def run_trial(llm, system_prompt, task, trial=0, as_of=None) -> TrialResult:
+    ledger = Ledger()                                     # a fresh ledger, fresh tools, and a fresh agent per trial
+    agent = Agent(llm, make_tools(ledger), system_prompt=system_prompt,
+                  max_steps=MAX_STEPS, hooks=[StopAfterDecision(ledger)])
+    res = await agent.run(render_request(task, as_of or date.today()))
+    if res.status == "failed":                            # the model call still failed after retries: an infrastructure error, not an agent failure
+        return TrialResult(task.id, trial, False, "infra_error", ..., error=res.stop_reason)
+    passed, reason = score(task, ledger, res.status)
+    ...
+
+async def run_trials(llm, jobs, *, as_of=None, concurrency=2, on_progress=None) -> list[dict]:
+    async def one(job):
+        r = await run_trial(llm, job.system_prompt, job.task, job.trial, as_of=as_of)
+        ...                                               # progress callback; returns {"key", "version", **r}
+    return await parallel([lambda j=j: one(j) for j in jobs], max_concurrency=concurrency)
+```
+
+- **One event loop, no threads**: while waiting on the model, a coroutine yields the event loop and other trials move forward; `parallel` (asyncio plus a semaphore) keeps at most `concurrency` trials in flight and returns results in `jobs` order.
+- **Concurrency doesn't break environment resets**: the ledger, tools, and agent are created per trial, so coroutines share no mutable state.
+- **How it's proven**: [`test_exercise.py`](test_exercise.py) runs the 16 tasks with a scripted model, `scripted_oracle_llm` (calls the decision tool the reference solution picks, waiting 20 ms per call): with limits of 1 / 2 / 4, the peak number of model calls in flight is exactly 1 / 2 / 4; 16 × 3 = 48 trials with a limit of 8 all pass with exactly 48 model calls (if trials shared a ledger, `StopAfterDecision` would stop later trials before any model call, and the scorer would see multiple decisions); when one task's model call raises a 503, only that trial is marked `infra_error`, and the other 15 finish normally.
+
 v0 is "the version a colleague wrote in an afternoon", with the ABC ID next to each flaw: one ledger shared and never reset (T.4); `get_order` returns internal label fields to the agent (T.5); days computed from the system date (T.6); a wrong label on YS-1007 (T.7); refund tasks graded by the substring "退款" ("refund") (O.b.1 / O.b.2); rejection tasks count as correct "as long as no refund was issued" (O.g.3).
 
 The audit method: write a few **probe agents that never call a model** and are designed to game the benchmark, then see how much they score:
@@ -385,12 +409,19 @@ Probes are deterministic and cost nothing, so they can live in CI: whenever the 
 
 ```bash
 python lessons/22_eval_methodology/demo.py --offline                               # offline, seconds, no API key
-python lessons/22_eval_methodology/demo.py                                         # real model (the default in .env), about 3 minutes
+python lessons/22_eval_methodology/demo.py                                         # real model (the default in .env), about 2.5 minutes
 python lessons/22_eval_methodology/demo.py --model claude-haiku-4-5-20251001       # a different model under test
 python lessons/22_eval_methodology/demo.py --judge-model gpt-5.5 --runs 2          # a different judge; only 2 runs per task
 ```
 
-Real mode: 2 prompt versions × 16 tasks × 3 runs = 96 trials, each usually a single model call; the judge makes 8 pairs × 2 orders = 16 calls. Results are cached in `runs/`, so running again the same day doesn't call the model again. **Sections 2–5 of offline mode use constructed teaching data** (the pass / fail pattern was designed for the demonstration; the failure types come from real runs), and section 7 replays judge verdicts recorded from a real run. Sections 1 and 6 don't call a model, so both modes print the same thing.
+Real mode: 2 prompt versions × 16 tasks × 3 runs = 96 trials, each usually a single model call; the judge makes 8 pairs × 2 orders = 16 calls. Results are cached in `runs/`, so running again the same day doesn't call the model again. **Sections 2–5 of offline mode use constructed teaching data** (the pass / fail pattern was designed for the demonstration; the failure types come from real runs), and section 7 replays judge verdicts recorded from a real run. Sections 1 and 6 don't call a model, so both modes print the same thing. Section 2 of offline mode also starts by really running the harness with a scripted model (scheduling, environment resets, the stopping criterion, and scoring go through the same code path as real mode):
+
+```
+[offline] harness smoke test: scripted model answers per the reference solution (50ms per call), 32 trials → 32/32 passed; 32 model calls (stop once a decision is made: 1 per trial);
+          in-flight peak 2 (limit 2); 0.92s (one at a time would take at least 1.6s; with a limit of 2, at least 0.8s)
+```
+
+The in-flight peak and call count are the same every time; the elapsed time varies a little with machine load (this line is from one run on an Apple M1 8GB, Python 3.11.7).
 
 (Demo output translated from Chinese.)
 
@@ -438,7 +469,7 @@ Sample size: how many tasks to reliably detect a difference as large as "A 72.9%
 
 Read in three steps: the point estimate says "B is 10 points better"; the separate intervals overlap heavily, so it's unclear; the paired bootstrap interval excludes 0, so the evidence leans toward B, but McNemar on majority votes is not significant, and 16 tasks is far below the estimated 134. Conclusion: "the direction may be right, but we need more tasks to decide".
 
-**Real runs (2026-09-27).** We ran two models under test, five runs in total; three of them revolve around the benchmark's date problem (see [section 5.1](#51-the-trap-we-fell-into-the-real-date-injected-by-the-model-gateway)):
+**Real runs.** We ran two models under test, six runs in total: ①–⑤ on 2026-09-27 with the earlier thread-pool harness, ⑥ on 2026-09-28 with the current async one. Three of them revolve around the benchmark's date problem (see [section 5.1](#51-the-trap-we-fell-into-the-real-date-injected-by-the-model-gateway)):
 
 | Run | Model under test | How dates in the request were handled | A (policy only) | B (policy + checklist) |
 |---|---|---|---|---|
@@ -447,8 +478,9 @@ Read in three steps: the point estimate says "B is 10 points better"; the separa
 | ③ | claude-haiku-4-5 | Frozen, plus "use the snapshot's date" added to the policy, the checklist, and the request | 39/48 (81.2%) | 48/48 (100%) |
 | ④ | claude-haiku-4-5 | **Relative dates: shifted to the day of the run (final version)** | 47/48 (97.9%) | 48/48 (100%) |
 | ⑤ | gpt-5.5 | Relative dates (final version) | 48/48 | 48/48 |
+| ⑥ | gpt-5.5 | Relative dates (final version), async harness | 48/48 | 48/48 |
 
-- **gpt-5.5 saturates this benchmark**: both versions score 48/48, so no difference can show (Anthropic roadmap Step 7). The demo suggests harder tasks or a weaker model. It was never misled by the injected date either. One run of 96 trials used about 106K tokens and took about 2.7 minutes (concurrency 2).
+- **gpt-5.5 saturates this benchmark**: both versions score 48/48, so no difference can show (Anthropic roadmap Step 7). The demo suggests harder tasks or a weaker model. It was never misled by the injected date either. One run of 96 trials used about 106K tokens (106,274 in ⑥); ⑤ took about 2.7 minutes with the thread-pool harness, ⑥ took 146 seconds with the async one (also concurrency 2; about 23 seconds per 16 trials). Each was run only once, so the gap says nothing about which version is faster: both have the same concurrency cap, and the time is dominated by the model's response time.
 - **haiku's ② → ③ → ④ is a complete example of measuring the wrong thing**: in ② B looked 6 points worse than A, in ③ B looked 19 points better. The two "conclusions" point in opposite directions, and both measured whether the model gets misled by the injected real date. After fixing the environment (④), A has one failure left (YS-1008, trial 1: `refund 2599.00`, forgetting that amounts over 2,000 must be escalated).
 - **Statistics for the final version ④**: B - A = +2.1%, 95% interval [+0.0%, +6.2%], which includes 0; under McNemar there are no discordant tasks at all. Conclusion: no evidence that "B is better".
 
@@ -459,6 +491,8 @@ Read in three steps: the point estimate says "B is 10 points better"; the separa
 | gpt-5.5 | 8/8 | 8 | 4/8 |
 | gpt-5.6-luna | 8/8 | 8 | 4/8 |
 | claude-haiku-4-5 (this is what offline mode replays) | 7/8 | 7 | 5/8 |
+
+On 2026-09-28 we re-ran the gpt-5.5 judge once with the async verdict-collection code (16 calls, in-flight peak 2, 24.5 seconds); all three columns matched the gpt-5.5 row above exactly.
 
 ```
 Pair Human  Asked once (x first)  Swapped (y first)  Debiased  Note
@@ -631,7 +665,7 @@ In *Adding Error Bars to Evals*, Evan Miller gives five recommendations: compute
 <summary>Q7: Your eval harness must run thousands of trials a day. What are the key design points?</summary>
 
 - A clean environment per trial (container, test database, fresh agent instance) to prevent correlated failures and cheating;
-- Concurrency bounded by model API quotas, with rate limiting and retries; count infrastructure errors separately and abort above a threshold instead of recording them as agent failures;
+- Run trials concurrently on asyncio within one process, with the concurrency cap bounded by model API quotas, plus rate limiting and retries; count infrastructure errors separately and abort above a threshold instead of recording them as agent failures;
 - Cache keys that include every input affecting the output (model, prompt fingerprint, environment version, task, trial index), for resuming and re-analysis;
 - Store full transcripts for spot checks;
 - Reports with intervals and paired tests; CI integration: PRs run a stratified smoke set, the full set runs before release.

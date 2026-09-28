@@ -13,6 +13,9 @@
 这里改成由 harness 在验证通过后改，Agent 的工具根本写不了这两个文件 —— 用代码保证，而不是靠提示词。
 
 系统没有 git 时自动降级为"快照"：每次提交把工作区复制到 .harness_snapshots/NNNN/。
+
+harness 是 async 的：编码 Agent 要 await；跑 pytest、跑 git 都用 aci_tools.run_command（asyncio 子进程），
+等子进程的时候事件循环不被卡住，超时 / 取消时整个进程组被杀掉。
 """
 
 from __future__ import annotations
@@ -22,13 +25,12 @@ import importlib.util
 import json
 import os
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Callable
+from typing import Awaitable, Callable
 
 HERE = Path(__file__).resolve().parent
 
@@ -45,7 +47,7 @@ def _load_sibling(name: str) -> ModuleType:
 
 
 _aci = _load_sibling("aci_tools")
-read_tree, run_pytest = _aci.read_tree, _aci.run_pytest  # 复用：读工作区文件、在子进程里跑 pytest
+read_tree, run_pytest, run_command = _aci.read_tree, _aci.run_pytest, _aci.run_command  # 复用：读工作区、跑 pytest、跑命令
 
 FEATURES_FILE = "features.json"
 PROGRESS_FILE = "PROGRESS.md"
@@ -59,7 +61,8 @@ STATE_FILES = (FEATURES_FILE, PROGRESS_FILE, MARKER_FILE)  # 只允许 harness �
 
 
 class GitVCS:
-    """每完成一个功能提交一次：既是"存档点"（坏了可以回退），也是写给下一个会话看的工作日志（git log）。"""
+    """每完成一个功能提交一次：既是"存档点"（坏了可以回退），也是写给下一个会话看的工作日志（git log）。
+    所有方法都是 async 的（git 在子进程里跑，不阻塞事件循环）；SnapshotVCS 提供同样的接口。"""
 
     name = "git"
 
@@ -70,40 +73,44 @@ class GitVCS:
     def available() -> bool:
         return shutil.which("git") is not None
 
-    def _git(self, *args: str) -> str:
+    async def _git(self, *args: str) -> str:
         # 隔离用户的全局 git 配置：别人的 commit 签名、钩子、默认分支名都不应该影响 demo 的行为
         env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "TMPDIR", "SYSTEMROOT") if k in os.environ}
         env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
         cmd = ["git", "-c", "user.name=lesson24-harness", "-c", "user.email=harness@example.invalid",
                "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", *args]
-        return subprocess.run(cmd, cwd=self.root, env=env, capture_output=True, text=True, check=True, timeout=30).stdout
+        res = await run_command(cmd, cwd=self.root, env=env, timeout=30)
+        if res.timed_out or res.returncode != 0:
+            raise RuntimeError(f"git {' '.join(args)} 失败（{'超时' if res.timed_out else f'退出码 {res.returncode}'}）：{res.stderr.strip()[:300]}")
+        return res.stdout
 
-    def init(self) -> None:
-        self._git("init", "-q")
+    async def init(self) -> None:
+        await self._git("init", "-q")
         (self.root / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n", encoding="utf-8")
 
-    def commit(self, message: str) -> str:
-        self._git("add", "-A")
-        self._git("commit", "-q", "--allow-empty", "-m", message)
-        return self._git("rev-parse", "--short", "HEAD").strip()
+    async def commit(self, message: str) -> str:
+        await self._git("add", "-A")
+        await self._git("commit", "-q", "--allow-empty", "-m", message)
+        return (await self._git("rev-parse", "--short", "HEAD")).strip()
 
-    def log(self, n: int = 10) -> list[str]:
-        return self._git("log", f"-n{n}", "--format=%h %s").splitlines()
+    async def log(self, n: int = 10) -> list[str]:
+        return (await self._git("log", f"-n{n}", "--format=%h %s")).splitlines()
 
-    def dirty_files(self) -> list[str]:
-        return [line[3:] for line in self._git("status", "--porcelain", "--untracked-files=all").splitlines()]
+    async def dirty_files(self) -> list[str]:
+        return [line[3:] for line in (await self._git("status", "--porcelain", "--untracked-files=all")).splitlines()]
 
-    def set_aside(self, message: str) -> list[str]:
+    async def set_aside(self, message: str) -> list[str]:
         """把未提交的改动挪到一边（git stash，含未跟踪文件）：工作区回到最后一次提交，但改动没丢，需要时还能找回。"""
-        files = self.dirty_files()
+        files = await self.dirty_files()
         if files:
-            self._git("stash", "push", "--include-untracked", "-q", "-m", message)
+            await self._git("stash", "push", "--include-untracked", "-q", "-m", message)
         return files
 
 
 class SnapshotVCS:
     """没有 git 时的降级方案：每次"提交"把工作区完整复制一份。朴素，但接班所需的三件事它都能做：
-    记录历史（log）、发现未提交的改动（dirty_files）、回到上一个存档点（set_aside）。"""
+    记录历史（log）、发现未提交的改动（dirty_files）、回到上一个存档点（set_aside）。
+    接口和 GitVCS 一样是 async 的；里面只是读写小仓库的几个文件（毫秒级），所以直接做同步文件 IO。"""
 
     name = "snapshot"
     DIR = ".harness_snapshots"
@@ -112,7 +119,7 @@ class SnapshotVCS:
         self.root = root
         self.dir = root / self.DIR
 
-    def init(self) -> None:
+    async def init(self) -> None:
         self.dir.mkdir(exist_ok=True)
 
     def _entries(self) -> list[dict]:
@@ -125,7 +132,7 @@ class SnapshotVCS:
     def _digest(tree: dict[str, str]) -> dict[str, str]:
         return {rel: hashlib.sha256(text.encode("utf-8")).hexdigest() for rel, text in tree.items()}
 
-    def commit(self, message: str) -> str:
+    async def commit(self, message: str) -> str:
         n = len(self._entries()) + 1
         snap_id = f"snap-{n:04d}"
         tree = read_tree(self.root)
@@ -138,17 +145,17 @@ class SnapshotVCS:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         return snap_id
 
-    def log(self, n: int = 10) -> list[str]:
+    async def log(self, n: int = 10) -> list[str]:
         return [f"{e['id']} {e['message']}" for e in reversed(self._entries())][:n]
 
-    def dirty_files(self) -> list[str]:
+    async def dirty_files(self) -> list[str]:
         entries = self._entries()
         last = entries[-1]["files"] if entries else {}
         now = self._digest(read_tree(self.root))
         return sorted(rel for rel in set(last) | set(now) if last.get(rel) != now.get(rel))
 
-    def set_aside(self, message: str) -> list[str]:
-        files = self.dirty_files()
+    async def set_aside(self, message: str) -> list[str]:
+        files = await self.dirty_files()
         entries = self._entries()
         if not files or not entries:
             return files
@@ -202,7 +209,7 @@ class Harness:
     def is_initialized(self) -> bool:
         return (self.root / MARKER_FILE).exists()
 
-    def initialize(self, goal: str, features: list[dict]) -> str:
+    async def initialize(self, goal: str, features: list[dict]) -> str:
         """写功能清单、进度文件，做第一次提交。原文里这一步由一个专门的"初始化 Agent"根据需求生成；
         这里功能清单由调用方给出（demo 里是写死的 3 个功能），重点演示它的格式和用法。"""
         if self.is_initialized():
@@ -224,8 +231,8 @@ class Harness:
         ]
         (self.root / PROGRESS_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
         (self.root / MARKER_FILE).write_text(json.dumps({"vcs": self.vcs.name, "created_at": _now()}), encoding="utf-8")
-        self.vcs.init()
-        return self.vcs.commit("chore: 初始化 harness（功能清单 + 进度文件）")
+        await self.vcs.init()
+        return await self.vcs.commit("chore: 初始化 harness（功能清单 + 进度文件）")
 
     # ------------------------------------------------------------ 状态读写
 
@@ -257,11 +264,11 @@ class Harness:
 
     # ------------------------------------------------------------ 接班
 
-    def orient(self, session: int) -> str:
+    async def orient(self, session: int) -> str:
         """新会话的第一件事。对应原文让 Agent 每次开工先做的几步：pwd → 读 git log 和进度文件 → 读功能清单
         → 先跑一遍基本测试确认环境没坏。这里由 harness 用代码做完，把结果写成一份"接班简报"交给 Agent。"""
         notes: list[str] = []
-        dropped = self.vcs.set_aside(f"会话 {session} 开始前发现的未提交改动")
+        dropped = await self.vcs.set_aside(f"会话 {session} 开始前发现的未提交改动")
         if dropped:
             notes.append(f"发现未提交的改动（{', '.join(dropped)}）：上个会话没验证完就中断了。"
                          "未验证的改动不可信，已挪到一边（"
@@ -269,7 +276,7 @@ class Harness:
                          + "），工作区回到最后一次提交。")
         done = [f for f in self.features() if f["passes"]]
         if done:
-            run = run_pytest(self.root, [f["verify"] for f in done], self.test_timeout)
+            run = await run_pytest(self.root, [f["verify"] for f in done], self.test_timeout)
             if run.ok:
                 notes.append(f"环境检查：已完成功能的测试全部通过（{run.headline()}）。")
             else:
@@ -284,12 +291,12 @@ class Harness:
         todo = [f for f in items if not f["passes"]]
         nxt = todo[0] if todo else None
         self.append_progress("", f"## 会话 {session} · 开始（{_now()}）", *[f"- {n}" for n in notes])
-        self.vcs.commit(f"docs: 会话 {session} 接班记录")  # 先把接班记录提交：后面验证失败回退时不会连它一起丢掉
+        await self.vcs.commit(f"docs: 会话 {session} 接班记录")  # 先把接班记录提交：后面验证失败回退时不会连它一起丢掉
         briefing = [
             f"【接班简报 · 会话 {session}】你没有之前会话的任何记忆，以下信息来自仓库里的文件和 git 历史。",
             f"工作目录：{self.root}",
             "最近的提交：",
-            *[f"  {line}" for line in self.vcs.log(5)],
+            *[f"  {line}" for line in await self.vcs.log(5)],
             f"进度文件 {PROGRESS_FILE}（最后几行）：",
             *[f"  {line}" for line in self.progress_tail(10)],
             f"功能清单：共 {len(items)} 个，已完成 {len(items) - len(todo)} 个"
@@ -301,35 +308,37 @@ class Harness:
 
     # ------------------------------------------------------------ 验证 + 提交
 
-    def verify(self, feature: dict):
+    async def verify(self, feature: dict):
         """harness 亲自验证，不采信 Agent 的"我做完了"：新功能的测试 + 所有已完成功能的回归测试。"""
         done = [f["verify"] for f in self.features() if f["passes"] and f["id"] != feature["id"]]
-        return run_pytest(self.root, [feature["verify"], *done], self.test_timeout)
+        return await run_pytest(self.root, [feature["verify"], *done], self.test_timeout)
 
-    def run_session(self, session: int, worker: Callable[[dict, str], str], max_features: int = 2) -> SessionReport:
+    async def run_session(
+        self, session: int, worker: Callable[[dict, str], Awaitable[str]], max_features: int = 2
+    ) -> SessionReport:
         """跑一个会话：接班 → 最多做 max_features 个功能（模拟上下文窗口的容量）→ 写小结并提交。
 
-        worker(feature, briefing) -> 摘要：真正干活的编码 Agent（demo 里是一个带 ACI 工具的 agentkit Agent，
+        worker(feature, briefing) -> 摘要：async 函数，真正干活的编码 Agent（demo 里是一个带 ACI 工具的 agentkit Agent，
         每个功能都新建一个，互不共享对话历史）。
         """
-        report = SessionReport(session=session, briefing=self.orient(session))
+        report = SessionReport(session=session, briefing=await self.orient(session))
         report.stopped_because = "会话预算用完（模拟上下文窗口耗尽）"
         for _ in range(max_features):
             feature = self.next_feature()
             if feature is None:
                 report.stopped_because = "功能清单全部完成"
                 break
-            summary = (worker(feature, report.briefing) or "").strip().replace("\n", " ")[:200]
-            run = self.verify(feature)
+            summary = (await worker(feature, report.briefing) or "").strip().replace("\n", " ")[:200]
+            run = await self.verify(feature)
             if run.ok:
                 self._set_passes(feature["id"], True)
                 self.append_progress(f"- ✅ {feature['id']} {feature['title']}：{summary}（harness 验证：{run.headline()}）")
-                sha = self.vcs.commit(f"feat({feature['id']}): {feature['title']}")
+                sha = await self.vcs.commit(f"feat({feature['id']}): {feature['title']}")
                 report.completed.append(f"{feature['id']}@{sha}")
             else:
                 # 验证不过：不提交半成品。改动挪到一边，记录原因，停止本会话 —— 别在坏掉的地基上继续盖楼。
                 reason = "; ".join(f"{n}: {b}" for n, b in run.failures[:2]) or run.headline()
-                self.vcs.set_aside(f"{feature['id']} 验证失败的改动")
+                await self.vcs.set_aside(f"{feature['id']} 验证失败的改动")
                 self.append_progress(f"- ❌ {feature['id']} 验证失败，改动已挪到一边：{reason[:200]}")
                 report.failed.append(feature["id"])
                 report.stopped_because = f"{feature['id']} 验证失败"
@@ -337,5 +346,5 @@ class Harness:
         nxt = self.next_feature()
         self.append_progress(f"- 会话 {session} 结束：{report.stopped_because}。"
                              + (f"下一步：{nxt['id']} {nxt['title']}" if nxt else "全部功能已完成。"))
-        self.vcs.commit(f"docs: 会话 {session} 小结")
+        await self.vcs.commit(f"docs: 会话 {session} 小结")
         return report

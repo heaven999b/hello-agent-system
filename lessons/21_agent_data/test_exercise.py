@@ -1,19 +1,26 @@
 """第 21 课练习测试：离线、确定、毫秒级。
 
 运行：make lesson N=21    或    .venv/bin/python -m pytest lessons/21_agent_data -v
+
+前三组测试练习（纯计算，普通函数）；最后一组测试 data_kit 里要调模型的两步（async）：
+并发真的发生、上限守得住、结果顺序不乱、一个失败其余立即取消。这组不依赖练习，两种模式下都应通过。
 """
 
 from __future__ import annotations
 
+import json
 import random
+import time
 from collections import Counter
 
 import pytest
 
+from agentkit import LLMError, ScriptedLLM, reply
 from agentkit.evals import EvalCase
-from agentkit.testing import load_exercise
+from agentkit.testing import load_exercise, load_sibling
 
 ex = load_exercise(__file__)
+dk = load_sibling(__file__, "data_kit")
 
 
 # =====================================================================
@@ -208,3 +215,93 @@ def test_split_rejects_bad_ratios():
     for bad in ({}, {"train": 0.7, "test": 0.2}, {"train": 1.2, "test": -0.2}):
         with pytest.raises(ValueError):
             ex.split_no_leak(recs, lambda r: r["group"], bad, seed=0)
+
+
+# =====================================================================
+# data_kit 的 async 部分（不是练习）：合成与核查的并发
+# =====================================================================
+
+KB = "【退货政策】签收后 7 天内可申请无理由退货；生鲜商品不支持无理由退货。【退款时效】退货签收入库后 1-3 个工作日内原路退款。"
+SEEDS = [dk.Seed(f"S{i}", f"种子问题 {i}：签收后几天能退货？", "7 天内") for i in range(1, 4)]
+
+
+def _synth_reply(seed_id: str) -> str:
+    cases = [dict(input=f"{seed_id} 的第 {j} 个改写问题，签收后能退吗", dimension="口语化改写", answer_type="answerable",
+                  reference_answer="签收后 7 天内可申请无理由退货。", must_contain=["7 天"], evidence="签收后 7 天内可申请无理由退货")
+             for j in range(2)]
+    return json.dumps({"cases": cases}, ensure_ascii=False)
+
+
+def _seed_of(messages) -> str:
+    prompt = messages[-1]["content"]
+    return next(s.id for s in SEEDS if s.input in prompt)
+
+
+async def test_synthesize_cases_runs_seeds_concurrently_and_keeps_order():
+    # 第 1 个种子最慢、第 3 个最快：完成顺序和输入顺序相反，结果仍按种子顺序
+    llm = ScriptedLLM(responder=lambda m: reply(_synth_reply(_seed_of(m))), latency=lambda n: {1: 0.15, 2: 0.10, 3: 0.05}[n])
+    cands = await dk.synthesize_cases(llm, SEEDS, {"口语化改写": "换个说法"}, KB, per_seed=2, max_concurrency=3)
+    assert [c.seed_id for c in cands] == ["S1", "S1", "S2", "S2", "S3", "S3"]
+    assert [c.id for c in cands[:2]] == ["syn-S1-1", "syn-S1-2"]
+    assert llm.call_count == 3 and llm.max_in_flight == 3  # 三个种子的请求同时在途
+
+
+async def test_synthesize_cases_respects_max_concurrency():
+    llm = ScriptedLLM(responder=lambda m: reply(_synth_reply(_seed_of(m))), latency=0.03)
+    await dk.synthesize_cases(llm, SEEDS, {"口语化改写": "换个说法"}, KB, per_seed=2, max_concurrency=2)
+    assert llm.call_count == 3 and llm.max_in_flight == 2
+
+
+async def test_synthesize_cases_one_failure_cancels_the_rest():
+    answered = []
+
+    def responder(messages):
+        seed = _seed_of(messages)
+        answered.append(seed)
+        if seed == "S1":
+            raise LLMError("400 bad request", status_code=400)
+        return reply(_synth_reply(seed))
+
+    # S1 很快失败；S2、S3 还在等模型（5 秒）：它们应当被立即取消，而不是在后台继续花钱
+    llm = ScriptedLLM(responder=responder, latency=lambda n: 0.01 if n == 1 else 5.0)
+    t0 = time.perf_counter()
+    with pytest.raises(LLMError):
+        await dk.synthesize_cases(llm, SEEDS, {"口语化改写": "换个说法"}, KB, per_seed=2, max_concurrency=3)
+    assert answered == ["S1"]  # S2、S3 在拿到回复之前就被取消了
+    assert llm.call_count == 3 and llm.in_flight == 0  # 发出过 3 个请求，现在一个都不在途
+    assert time.perf_counter() - t0 < 4.0  # 宽松上限：没有等满 5 秒
+
+
+def _candidates(n: int) -> list:
+    return [dk.Candidate(id=f"c{i}", seed_id="S1", dimension="口语化改写", input=f"第 {i} 道题：{'生鲜冷冻水果牛排海鲜'[i]}签收后能退吗",
+                         answer_type="answerable", reference_answer="签收后 7 天内可申请无理由退货。", must_contain=["7 天"],
+                         evidence="签收后 7 天内可申请无理由退货") for i in range(n)]
+
+
+def _check_responder(messages):
+    question = messages[-1]["content"].split("问题：", 1)[1].split("\n", 1)[0]
+    ok = not question.startswith("第 3 道题")  # 第 3 道题：核查员判定参考答案没有依据
+    return reply(json.dumps({"reason": "依据知识库", "kb_covers_question": True, "reference_supported": ok, "keywords_necessary": True}))
+
+
+@pytest.mark.parametrize("limit", [1, 2, 4])
+async def test_filter_candidates_llm_checks_are_concurrent_within_limit(limit):
+    cands = _candidates(6)
+    llm = ScriptedLLM(responder=_check_responder, latency=0.03)
+    kept, rejected = await dk.filter_candidates(cands, knowledge=KB, llm=llm, dup_threshold=0.99, max_concurrency=limit)
+    assert llm.call_count == 6
+    assert llm.max_in_flight == limit  # 上限多少，峰值就是多少：真并发，也没有超
+    assert [c.id for c in kept] == ["c0", "c1", "c2", "c4", "c5"]  # 结果按原顺序对应，没有错位
+    assert [r.candidate.id for r in rejected] == ["c3"] and rejected[0].reason.startswith("llm:reference_unsupported")
+
+
+async def test_filter_candidates_failed_check_is_rejected_not_fatal():
+    def responder(messages):
+        if "第 1 道题" in messages[-1]["content"]:
+            raise LLMError("503", status_code=503, retryable=True)
+        return _check_responder(messages)
+
+    llm = ScriptedLLM(responder=responder, latency=0.01)
+    kept, rejected = await dk.filter_candidates(_candidates(3), knowledge=KB, llm=llm, dup_threshold=0.99, max_concurrency=3)
+    assert [c.id for c in kept] == ["c0", "c2"]  # 一道题核查失败，不影响其他题
+    assert [(r.candidate.id, r.reason) for r in rejected] == [("c1", "llm:check_failed")]

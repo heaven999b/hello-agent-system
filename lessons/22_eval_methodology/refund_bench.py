@@ -14,21 +14,26 @@
 还有两样东西帮助我们相信这个 benchmark：
     oracle_decide(task)   参考解（reference solution）：把政策写成代码，证明每个任务可解、标注没写错
     FlawedBenchV0         v0 版本：结构相同，但藏着 ABC 能查出来的漏洞；PROBES 是用来揭穿它的"探针 Agent"
+
+harness（run_trial / run_trials）是 async 的：一次试验里 Agent 要 await 模型；很多次试验在同一个事件循环里并发，
+同时在途的试验数有上限（共享网关）。探针 Agent 和评分器是纯计算，保持普通函数。
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Annotated, Callable
+from typing import Annotated, Callable, Sequence
 
 from pydantic import Field
 
-from agentkit import Agent, Hook, StopRun, Tool, tool
+from agentkit import Agent, Hook, ScriptedLLM, StopRun, Tool, call_tool, tool
 from agentkit.llm import LLM
+from agentkit.workflows import parallel
 
 HERE = Path(__file__).resolve().parent
 BENCH_TODAY = "2026-09-19"  # tasks.jsonl 里的签收日期以这一天为基准；v1 渲染时平移到运行当天，v0 直接拿系统日期算
@@ -273,15 +278,16 @@ def _describe(d: Decision) -> str:
     return f"reject {d.note}" if d.action == "reject" else "escalate"
 
 
-def run_trial(llm: LLM, system_prompt: str, task: RefundTask, trial: int = 0, as_of: date | None = None) -> TrialResult:
+async def run_trial(llm: LLM, system_prompt: str, task: RefundTask, trial: int = 0, as_of: date | None = None) -> TrialResult:
     """跑一次试验：新账本 → 新工具 → 新 Agent → 运行 → 按终态评分。as_of 默认是运行当天。
 
     "每次试验一个干净环境"是 harness 的第一原则：上一次留下的状态（账本、文件、缓存）
-    会让试验之间不再独立，失败会成片地相关，甚至让 Agent 通过"偷看上一轮"作弊。"""
+    会让试验之间不再独立，失败会成片地相关，甚至让 Agent 通过"偷看上一轮"作弊。
+    并发跑很多次试验时这一点更要紧：每次试验的账本、工具、Agent 都是自己的，协程之间不共享任何可变状态。"""
     ledger = Ledger()
     agent = Agent(llm, make_tools(ledger), system_prompt=system_prompt, max_steps=MAX_STEPS, hooks=[StopAfterDecision(ledger)])
     t0 = time.time()
-    res = agent.run(render_request(task, as_of or date.today()))
+    res = await agent.run(render_request(task, as_of or date.today()))
     if res.status == "failed":  # 模型调用在重试、降级之后仍然失败（ABC T.3：要识别出来，不能算作 Agent 失败）
         return TrialResult(task.id, trial, False, "infra_error", "（无）", res.usage.total, res.cost_usd,
                            round(time.time() - t0, 2), error=res.stop_reason)
@@ -289,6 +295,63 @@ def run_trial(llm: LLM, system_prompt: str, task: RefundTask, trial: int = 0, as
     ds = ledger.decisions
     desc = ", ".join(_describe(d) for d in ds) or "（无）"
     return TrialResult(task.id, trial, passed, reason, desc, res.usage.total, res.cost_usd, round(time.time() - t0, 2))
+
+
+@dataclass(frozen=True)
+class TrialJob:
+    """一次待跑的试验：哪个版本（system prompt）、哪个任务、第几次。key 是结果缓存的键。"""
+
+    key: str
+    version: str
+    system_prompt: str
+    task: RefundTask
+    trial: int
+
+
+async def run_trials(
+    llm: LLM,
+    jobs: Sequence[TrialJob],
+    *,
+    as_of: date | None = None,
+    concurrency: int = 2,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> list[dict]:
+    """harness 的调度部分：所有试验在**一个事件循环**里并发执行，同时在途最多 concurrency 个。
+
+    - 不需要线程：等模型的时候协程让出事件循环，别的试验接着推进；
+    - 上限来自模型 API 的配额（本课的共享网关是 2），超出的试验在本进程里排队，而不是把网关打出 429；
+    - 返回的行按 jobs 的顺序排列，和完成的先后无关；on_progress(已完成, 总数) 在每次试验完成时调用；
+    - 基础设施错误（模型调用重试后仍失败）由 run_trial 标成 error，不会让其他试验停下来；
+      其他异常（harness 自己的 bug）会取消其余试验并抛出 —— 宁可停下来修，也不要记下一堆错误的分数。
+    """
+    done = 0
+
+    async def one(job: TrialJob) -> dict:
+        nonlocal done
+        r = await run_trial(llm, job.system_prompt, job.task, job.trial, as_of=as_of)
+        done += 1  # 读-改-写之间没有 await：单个事件循环里不会被别的协程打断，不需要锁
+        if on_progress is not None:
+            on_progress(done, len(jobs))
+        return {"key": job.key, "version": job.version, **r.__dict__}
+
+    return await parallel([lambda j=j: one(j) for j in jobs], max_concurrency=concurrency)
+
+
+def scripted_oracle_llm(tasks: Sequence[RefundTask], latency: float = 0.05) -> ScriptedLLM:
+    """剧本模型：按参考解调用决策工具（每次调用等待 latency 秒）。只用来测试 harness 本身 ——
+    并发是否真的发生、上限是否守住、环境是否每次重置 —— 不代表任何真实模型的能力。"""
+    by_id = {t.id: t for t in tasks}
+
+    def respond(messages):
+        order_id = re.search(r"订单号：(\S+)", messages[-1]["content"]).group(1)
+        d = oracle_decide(by_id[order_id])
+        if d["action"] == "refund":
+            return call_tool("issue_refund", order_id=order_id, amount=d["amount"])
+        if d["action"] == "escalate":
+            return call_tool("escalate", order_id=order_id, reason="应退金额超过 2000 元")
+        return call_tool("reject_refund", order_id=order_id, rule=d["rule"])
+
+    return ScriptedLLM(responder=respond, latency=latency)
 
 
 # =====================================================================

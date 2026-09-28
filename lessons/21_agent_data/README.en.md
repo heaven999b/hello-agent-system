@@ -169,11 +169,11 @@ To mine data from traces, the application layer has to record input and output e
 
 ```python
 with tracer.span("app.request", **{"app.input": redact_pii(v.text)}) as span:
-    res = agent.run(v.text, metadata={"tenant_id": "xiaoman", "user_id": v.user})
+    res = await agent.run(v.text, metadata={"tenant_id": "xiaoman", "user_id": v.user})
     span.set(**{"app.output": redact_pii(res.output or "")})
 ```
 
-The `agent.run` span nests under `app.request` automatically (the Tracer keeps a span stack in contextvars), and the whole tree is exported as one trace.
+The `agent.run` span nests under `app.request` automatically (the Tracer keeps a span stack in contextvars), and the whole tree is exported as one trace. `Agent.run` is async: while it `await`s, the event loop can move other sessions forward. contextvars are copied per asyncio Task, so concurrent requests each have their own span stack and never attach to the wrong parent. Section 1 of the demo still replays one run at a time: this is "last month's traffic," and the order itself is data (section 2.3's "asked again within 5 minutes" is decided by start times).
 
 ### 2.2 From spans to "one run"
 
@@ -246,7 +246,7 @@ Exercise (b)'s `stratified_sample` is a different kind of stratification: it all
 ### 2.8 Synthetic data: generation
 
 ```python
-cands = dk.synthesize_cases(llm, SEEDS, DIMENSIONS, KNOWLEDGE, per_seed=[4, 3, 3])
+cands = await dk.synthesize_cases(llm, SEEDS, DIMENSIONS, KNOWLEDGE, per_seed=[4, 3, 3], max_concurrency=2)
 ```
 
 Why "seeds × dimensions" instead of a single "generate 100 test questions"? Without constraints, the model keeps producing what it considers typical: clean, complete, one question at a time. Those are easier than real users' questions, and similar to each other. **Seeds** anchor the topics in real traffic; **dimensions** force coverage of the variations you care about:
@@ -259,6 +259,8 @@ Why "seeds × dimensions" instead of a single "generate 100 test questions"? Wit
 | Outside the knowledge base | For something the knowledge base doesn't cover, does it admit it doesn't know, or make up an answer |
 
 The output is constrained by `complete_json` into a structured `SynthCase`: question, dimension, should-answer or should-decline, reference answer, required keywords, and **verbatim evidence from the knowledge base**. Requiring verbatim evidence lets the next step catch "fabricated quotes" with plain string matching, at zero cost.
+
+Each seed is one model call, independent of the others, so `synthesize_cases` is an async function that uses [`agentkit.workflows.parallel`](../../agentkit/workflows.py) to send them out together on one event loop: at most `max_concurrency` in flight (the model gateway is shared), results returned in seed order, and if any seed fails, the requests that haven't finished are cancelled right away instead of burning money in the background. [`test_exercise.py`](test_exercise.py) checks all three with `ScriptedLLM(latency=...)`: the in-flight peak of the three requests is 3 (with a limit of 3) or 2 (with a limit of 2); when they finish in reverse order, the results are still in seed order; when the first seed fails, the other two requests, still waiting on the model, are cancelled and never get a reply.
 
 The first version of the prompt exposed two problems in a real run (gpt-5.5):
 
@@ -276,6 +278,8 @@ The principle is **cheap checks first, model calls last**:
 | Keywords and evidence appear verbatim in the knowledge base | Fabricated "quotes", fabricated numbers | Free |
 | Keyword length | Whole sentences used as keywords, which trips the rule grader | Free |
 | LLM check: can the knowledge base answer it, does the reference answer follow from the knowledge base, is every keyword necessary | The question writer passing off common knowledge as knowledge-base content; a mislabeled should-decline; over-specified expectations | 1 call per question |
+
+The rule checks are pure computation and must run in order ("near-duplicate of an already-kept question" depends on what was kept before). The LLM checks are one call per question, independent of each other, so they go out concurrently through `parallel`, at most `max_concurrency` in flight (default 2). If checking one question fails (model error, structured output that can't be repaired), only that question is rejected as `llm:check_failed`; the others are unaffected. This used to be a thread pool. No threads are needed now: while waiting on the model, a coroutine yields the event loop, so a single thread keeps several requests on the wire at once.
 
 The LLM checker's own prompt needs calibration too. The first version said "judge only by the knowledge base; don't use your own common sense." It then rejected a good question because "the knowledge base doesn't say a seafood gift box counts as fresh food." The prompt now says "you may make common-sense classifications and inferences, but you may not complete the answer with rules, numbers, or promises from outside the knowledge base." **Validators make mistakes too. Regularly look at what they reject and what they let through.**
 
@@ -305,10 +309,20 @@ Exercise (c)'s `split_no_leak` is a greedy algorithm: shuffle the groups, sort t
 
 ```bash
 .venv/bin/python lessons/21_agent_data/demo.py --offline   # offline script, no API key, about 1 second
-.venv/bin/python lessons/21_agent_data/demo.py             # real model: about 50 calls, concurrency ≤ 2, about 3 minutes
+.venv/bin/python lessons/21_agent_data/demo.py             # real model: about 50 calls, concurrency ≤ 2, about 2.5 minutes
 ```
 
 Section 1 produces 40 runs. In real mode only 6 call the real model; the other 34 are scripted "historical traffic": mining needs some volume, and running all of it on a real model is too expensive. Section 2 is nearly identical in both modes; sections 3 and 4 differ the most. The excerpts below come from one real run (gpt-5.5). (Demo output translated from Chinese.)
+
+**Is the concurrency real?** Question writing, checking, and judging in sections 3 and 4 are all sent concurrently (at most 2 in flight). The demo wraps the model in a counter (`InFlightLLM`: increments the in-flight count on entering `chat`, decrements it on return, records the peak) and prints the call count, in-flight peak, and elapsed time after each step. Here is one run of the async version against gpt-5.5 on 2026-09-28 (the whole demo took 2 min 34 s; Apple M1 8GB, macOS 14.4, Python 3.11.7, through a local gateway):
+
+```text
+   Question writing: 3 model calls, in-flight peak 2 (limit 2), 27.33s
+   Checking: 10 model calls, in-flight peak 2 (limit 2), 33.30s
+   (judges, concurrency ≤ 2: v1 12 calls, in-flight peak 2, 24.03s; v2 12 calls, in-flight peak 2, 34.88s)
+```
+
+A peak of 2 means two requests really were waiting on the model at the same time, and the limit was never exceeded. In offline mode the scripted model waits 50 ms per call (20 ms for the judges) and also prints a peak of 2; the 12 judge calls take about 0.14 s (one at a time would take at least 12 × 20 ms = 0.24 s).
 
 **Section 1: real model vs script**
 
@@ -367,7 +381,7 @@ What to notice: ① 40 runs contain 11 tool paths, 7 of which appear only once o
 
 What to notice:
 
-- **Distribution shift**: across three real runs, synthetic questions averaged 25–27 Chinese characters, versus 13 for production questions. Real users say "怎么退货" ("how do I return this?"); the model writes "I got it 5 days ago, is it too late to return? It isn't damaged." More information, so it's easier to answer.
+- **Distribution shift**: across four real runs, synthetic questions averaged 25–27 Chinese characters, versus 13 for production questions. Real users say "怎么退货" ("how do I return this?"); the model writes "I got it 5 days ago, is it too late to return? It isn't damaged." More information, so it's easier to answer.
 - **Its "imagination" is narrow**: 2 of the 3 outside-the-knowledge-base questions ask about courier pickup, and the previous run did the same. A dimension only guarantees "there is a question of this kind," not that questions of this kind differ from each other. You can put the already generated questions into the prompt and ask for different ones, or list the topics the knowledge base doesn't cover and let the model pick.
 - **Automatic filtering can't replace humans**: syn-S1-1 asks "it isn't damaged, can I return it?", yet its required keywords include "生鲜" ("fresh food"); a correct answer doesn't need to mention fresh food at all. The LLM checker let it through, and it let the identical problem through in the previous run too.
 - The offline script plants 5 typical problems: nearly identical to the seed, a whole sentence as a keyword, a fabricated knowledge-base quote, a question the knowledge base can answer labeled should-decline, and a reference answer that sneaks in a promise the knowledge base doesn't make ("10 yuan compensation if late"). The first three are caught by the free rule checks; the last two by the LLM checker.
@@ -389,7 +403,7 @@ What to notice:
 
 What to notice:
 
-- Across three real runs, both judges produced exactly the same results.
+- Across four real runs (the latest being the async run above), both judges produced exactly the same results.
 - **Judge v1's 67% agreement sounds OK, but its kappa is only 0.23.** It let 4 of the 5 bad answers through (TPR 20%): a made-up refund time, "refund done" without any tool call, a wrong invoice validity period, and agreeing with "30-day returns." v1 can't see the knowledge base or the tool log, so all it can judge is "does this look like a good answer." Fluent, confident, and responsive, and it passes.
 - **Judge v2 agrees with annotator A perfectly (kappa 1.00), even more than the other human annotator, B, does (0.68).** Not because the judge beats humans, but because v2's rubric was written while looking at these 12 cases and following A's judgments. It learned A's taste and "overfit" to these 12 cases. **Data used to revise a rubric can't then be used to report the judge's accuracy.** That's exactly the leakage from section 1.2. Re-test on a batch the rubric has never seen; that's what exercise (c) is for.
 - In the offline script, v2 disagrees with A on c09 ("prices dropped, can I get the difference back?"; the answer doesn't mention that flash-sale and clearance items are excluded from price protection), and B happens to fail it too. The rubric doesn't say how to handle "incomplete but not wrong." What needs fixing is the **annotation guideline**, not tuning the judge to match one person (sections 5.3, 5.4).

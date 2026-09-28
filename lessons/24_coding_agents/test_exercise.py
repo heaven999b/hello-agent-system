@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
@@ -177,3 +178,36 @@ def test_is_test_file_protects_tests_and_configs():
 def test_is_test_file_allows_source_files():
     for p in ["pricing.py", "src/contest.py", "latest.py", "testing_utils.py", "docs/testing.md", "receipt.py", "README.md"]:
         assert not ex.is_test_file(p), p
+
+
+# =====================================================================
+# SubmitReview 的人工审批（不是练习）：approver 可以是普通函数，也可以是 async 函数
+# =====================================================================
+
+
+@pytest.mark.parametrize("make_approver", ["sync", "async"])
+async def test_submit_review_approver_can_be_sync_or_async(tmp_path, make_approver):
+    from agentkit import ToolCall
+    from agentkit.testing import load_sibling
+
+    aci = load_sibling(__file__, "aci_tools")
+    (tmp_path / "app.py").write_text("x = 1\n")
+    ws = aci.Workspace(tmp_path)
+    (tmp_path / "app.py").write_text("x = 2\n")  # 一处普通修改：启发式审查不会拦
+    seen = []
+
+    if make_approver == "sync":
+        def approver(diff, findings):
+            seen.append(diff)
+            return False
+    else:
+        async def approver(diff, findings):
+            await asyncio.sleep(0)  # 假装在等人点"批准"
+            seen.append(diff)
+            return False
+
+    review = aci.SubmitReview(ws, approver=approver)
+    verdict = await review.before_tool(None, ToolCall(id="c1", name="submit", arguments="{}"), None)
+    assert verdict and "人工审查没有通过" in verdict
+    assert len(seen) == 1 and "+x = 2" in seen[0]
+    assert await review.before_tool(None, ToolCall(id="c2", name="run_tests", arguments="{}"), None) is None

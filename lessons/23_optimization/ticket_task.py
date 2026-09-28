@@ -244,13 +244,18 @@ def _rule_sentence(rule: str) -> str:
 
 
 class SimulatedLLM:
-    """离线模式的确定性模拟模型（实现 agentkit 的 LLM 接口：chat(messages) -> LLMResponse）。"""
+    """离线模式的确定性模拟模型（实现 agentkit 的 LLM 接口：`await chat(messages) -> LLMResponse`）。
+
+    chat 是 async 的，但里面没有 await：一次调用从开始到返回不会被别的协程打断。
+    所以哪怕调用方并发地发请求，"同一个请求第几次出现"的计数也按发出的顺序递增，结果完全确定。
+    它不模拟延迟（离线 Demo 要几秒跑完）；要看并发对延迟的影响，用 ScriptedLLM(latency=...)（Demo 场景 6）。
+    """
 
     def __init__(self, model: str = "sim-model"):
         self.model = model
         self._seen: dict[str, int] = {}  # 同一个请求第几次出现：让"重复采样"得到不同的样本
 
-    def chat(self, messages: list[Message], tools=None, **kwargs) -> LLMResponse:
+    async def chat(self, messages: list[Message], tools=None, **kwargs) -> LLMResponse:
         text_all = "\n".join(m.get("content") or "" for m in messages)
         key = hashlib.sha256(text_all.encode("utf-8")).hexdigest()
         k = self._seen.get(key, 0)

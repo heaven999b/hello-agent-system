@@ -13,17 +13,21 @@
     paired_bootstrap          配对 bootstrap：提升是真的，还是 20 条样本上的噪声？
 
 设计原则：优化器只和两个接口打交道 —— "给一条指令，在一批样本上跑出 (输出, 分数, 反馈)"
-（Task.run）和"一个会说话的 LLM"。换成 Agent、换成别的任务，优化器本身不用改。
+（await Task.run）和"一个会说话的 LLM"（await llm.chat）。换成 Agent、换成别的任务，优化器本身不用改。
+
+并发：要调模型的函数都是 async 的。一次评估里的多条样本、一次测试时计算里的 N 次采样，
+都在同一个事件循环里并发发出（agentkit.workflows.parallel，有并发上限），不用线程。
+纯计算的部分（select_topk、pareto_front、自一致性投票、配对 bootstrap……）保持普通函数。
 """
 
 from __future__ import annotations
 
 import math
 import random
-import threading
+import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Protocol, Sequence
+from typing import Awaitable, Callable, Iterable, Protocol, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -73,11 +77,16 @@ Feedback = Callable[[Example, str], str]  # (样本, 模型原始输出) -> 给�
 
 
 class MeteredLLM:
-    """记账装饰器：数一数每个优化器调用了多少次模型、花了多少钱。
+    """记账装饰器：数一数每个优化器调用了多少次模型、花了多少钱、等了多久。
 
     为什么要单独记账：优化是"花钱买质量"。只报"准确率 +15 个点"不报"花了 300 次调用"，
     就没法和"换个更大的模型""多采样几次"这些方案公平比较（第 14 课的成本视角）。
-    线程安全：评估时会用线程池并发调用。
+
+    为什么不加锁：评估时很多协程同时调用 chat，但它们都在**同一个事件循环**里。协程只在 await 处让出控制权，
+    下面 `await self.llm.chat(...)` 返回之后的几行"读-改-写"中间没有 await，执行时不会被别的协程插队，
+    所以计数是准确的。只有"读 → await 别的东西 → 再写回"才需要 asyncio.Lock；
+    多线程才需要 threading.Lock（线程可能在任意两条字节码之间被切走）。test_exercise.py 里有一个测试让 40 个
+    协程同时调用它，计数一个不差。in_flight / max_in_flight 是"同时在途的调用数"，用来证明并发真的发生了。
     """
 
     def __init__(self, llm: LLM, name: str | None = None):
@@ -87,20 +96,28 @@ class MeteredLLM:
         self.calls = 0
         self.usage = Usage()
         self.cost_usd = 0.0
-        self._lock = threading.Lock()
+        self.latency_s = 0.0  # 所有调用的耗时之和（不是墙钟时间：并发时两者不同）
+        self.in_flight = 0
+        self.max_in_flight = 0
 
-    def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
-        resp = self.llm.chat(messages, tools, **kwargs)
-        with self._lock:
-            self.calls += 1
-            self.usage = self.usage + resp.usage
-            self.cost_usd += estimate_cost(resp.usage, resp.model or self.model)
+    async def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        t0 = time.perf_counter()
+        try:
+            resp = await self.llm.chat(messages, tools, **kwargs)
+        finally:
+            self.in_flight -= 1
+        # 以下是同步的读-改-写：没有 await 夹在中间，不会被别的协程打断，不需要锁
+        self.latency_s += time.perf_counter() - t0
+        self.calls += 1
+        self.usage = self.usage + resp.usage
+        self.cost_usd += estimate_cost(resp.usage, resp.model or self.model)
         return resp
 
     def snapshot(self) -> tuple[int, float]:
         """(调用次数, 成本)。两次快照相减 = 这一段花了多少。"""
-        with self._lock:
-            return self.calls, self.cost_usd
+        return self.calls, self.cost_usd
 
 
 # =====================================================================
@@ -143,8 +160,9 @@ class Program:
         msgs.append({"role": "user", "content": f"{self.input_prefix}{x}"})
         return msgs
 
-    def __call__(self, x: str) -> str:
-        return self.llm.chat(self.messages(x), **self.chat_kwargs).content or ""
+    async def __call__(self, x: str) -> str:
+        """调用一次模型，返回原始输出。是 async 的：`out = await program(x)`。"""
+        return (await self.llm.chat(self.messages(x), **self.chat_kwargs)).content or ""
 
     def with_(self, *, instruction: str | None = None, demos: Sequence[Demo] | None = None, llm: LLM | None = None) -> "Program":
         return Program(
@@ -168,43 +186,43 @@ class Record:
 
 
 class Task(Protocol):
-    """优化器眼中的"被优化系统"：给一条指令，在一批样本上跑，返回每条的记录。"""
+    """优化器眼中的"被优化系统"：给一条指令，在一批样本上跑，返回每条的记录（async）。"""
 
-    def run(self, instruction: str, examples: Sequence) -> list[Record]: ...
+    async def run(self, instruction: str, examples: Sequence) -> list[Record]: ...
 
 
-def _run_all(fns: Sequence[Callable[[], object]], workers: int) -> list:
-    if workers <= 1 or len(fns) <= 1:
-        return [f() for f in fns]
-    return parallel(fns, max_workers=workers)
+async def _run_all(fns: Sequence[Callable[[], Awaitable]], max_concurrency: int) -> list:
+    """执行一批"返回协程的函数"，按输入顺序返回结果。max_concurrency <= 1 时一个接一个 await。"""
+    if max_concurrency <= 1 or len(fns) <= 1:
+        return [await f() for f in fns]
+    return await parallel(fns, max_concurrency=max_concurrency)
 
 
 @dataclass
 class ProgramTask:
-    """把 Program + 评分函数包装成 Task。workers > 1 时并发调用模型（真实模型请 ≤ 2~4）。"""
+    """把 Program + 评分函数包装成 Task。max_concurrency > 1 时，一批样本的模型调用并发发出
+    （同时在途最多 max_concurrency 个；共享网关上请 ≤ 2~4）。结果按样本顺序返回。"""
 
     program: Program
     metric: Metric
     feedback: Feedback | None = None
-    workers: int = 1
+    max_concurrency: int = 1
     errors: int = 0  # 重试之后仍然失败的调用数：不为 0 时，分数里混进了"网关故障"，要在报告里说明
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
-    def run(self, instruction: str, examples: Sequence[Example], demos: Sequence[Demo] | None = None) -> list[Record]:
+    async def run(self, instruction: str, examples: Sequence[Example], demos: Sequence[Demo] | None = None) -> list[Record]:
         prog = self.program.with_(instruction=instruction, demos=demos)
 
-        def one(ex: Example) -> Record:
+        async def one(ex: Example) -> Record:
             try:
-                out = prog(ex.input)
+                out = await prog(ex.input)
             except Exception as e:  # noqa: BLE001  重试之后仍然失败：记 0 分，不让一条样本拖垮整轮优化
-                with self._lock:
-                    self.errors += 1
+                self.errors += 1  # 同一个事件循环里、中间没有 await：不需要锁
                 out = f"[调用失败] {type(e).__name__}: {e}"
             score = float(self.metric(ex, out))
             fb = self.feedback(ex, out) if self.feedback else ""
             return Record(ex.input, out, score, fb)
 
-        return _run_all([lambda ex=ex: one(ex) for ex in examples], self.workers)
+        return await _run_all([lambda ex=ex: one(ex) for ex in examples], self.max_concurrency)
 
 
 @dataclass
@@ -213,15 +231,19 @@ class AgentTask:
 
     make_agent(instruction) 每次返回一个新 Agent；cases 是 EvalCase 列表；graders 默认用 rule_grader。
     反馈 = 没通过的 Check 的 detail（例如"没有调用 verify_identity"）—— 这正是 GEPA 想要的文字反馈。
+    concurrency：同时在跑的用例数（交给 run_eval）。
     """
 
     make_agent: Callable[[str], object]
     graders: Sequence[Callable] = ()
+    concurrency: int = 4
 
-    def run(self, instruction: str, examples: Sequence) -> list[Record]:
+    async def run(self, instruction: str, examples: Sequence) -> list[Record]:
         from agentkit.evals import rule_grader, run_eval
 
-        report = run_eval(lambda: self.make_agent(instruction), examples, list(self.graders) or [rule_grader])
+        report = await run_eval(
+            lambda: self.make_agent(instruction), examples, list(self.graders) or [rule_grader], concurrency=self.concurrency
+        )
         records = []
         for case, r in zip(examples, report.results):
             failed = [f"{c.name}: {c.detail}" for c in r.checks if not c.passed]
@@ -240,20 +262,22 @@ def mean(xs: Sequence[float]) -> float:
 # =====================================================================
 
 
-def bootstrap_demos(
-    program: Callable[[str], str],
+async def bootstrap_demos(
+    program: Callable[[str], Awaitable[str]],
     trainset: Sequence[Example],
     metric: Metric,
     max_demos: int,
     *,
     threshold: float = 1.0,
 ) -> list[Demo]:
-    """按训练集顺序运行 program，把"评分 ≥ threshold"的 (输入, 程序输出) 收集为示例，最多 max_demos 条。
+    """按训练集顺序运行 program（async：`await program(x)`），把"评分 ≥ threshold"的 (输入, 程序输出)
+    收集为示例，最多 max_demos 条。
 
     三个细节：
     - 示例的输出用**程序自己的输出**（含推理过程），而不是标准答案 —— 这是 bootstrap 的价值所在：
       标注数据里通常只有答案，没有"怎么想的"，程序跑通的轨迹把中间步骤也带上了；
-    - 收集够了就停，不再浪费调用；
+    - 收集够了就停，不再浪费调用 —— 所以这里**故意一条接一条**地 await，不并发：
+      并发发出去的请求收不回来，"够了就停"就省不下钱（想要快，见 bootstrap_fewshot 的做法）；
     - 某条样本调用失败（异常）就跳过，继续下一条。
     """
     demos: list[Demo] = []
@@ -261,7 +285,7 @@ def bootstrap_demos(
         return demos
     for ex in trainset:
         try:
-            out = program(ex.input)
+            out = await program(ex.input)
         except Exception:  # noqa: BLE001
             continue
         if float(metric(ex, out)) >= threshold:
@@ -283,7 +307,7 @@ class OptResult:
         return mean(self.dev_scores)
 
 
-def bootstrap_fewshot(
+async def bootstrap_fewshot(
     task: ProgramTask,
     trainset: Sequence[Example],
     devset: Sequence[Example],
@@ -301,10 +325,11 @@ def bootstrap_fewshot(
     3. 每个候选在 dev 上评估，取 dev 分数最高的（同分取先出现的）。
 
     为什么步骤 1 不直接调用 bootstrap_demos：真实模型要并发跑训练集才不慢。
-    这里先并发拿到全部输出，再按训练集顺序过滤 —— 结果和顺序调用 bootstrap_demos 完全一样。
+    这里先并发拿到全部输出，再按训练集顺序过滤 —— 结果和顺序调用 bootstrap_demos 完全一样
+    （代价：训练集每条都要调用一次，不能"够了就停"；这里要的是整个示例池，本来就要全跑）。
     """
     instruction = task.program.instruction
-    records = task.run(instruction, trainset, demos=[])
+    records = await task.run(instruction, trainset, demos=[])
     pool = [Demo(ex.input, r.output) for ex, r in zip(trainset, records) if r.score >= 1.0]
     log(f"示例池：训练集 {len(trainset)} 条里有 {len(pool)} 条评分通过，可以当示例")
     if not pool:
@@ -326,7 +351,7 @@ def bootstrap_fewshot(
     best: OptResult | None = None
     history = []
     for i, demos in enumerate(candidates):
-        scores = [r.score for r in task.run(instruction, devset, demos=demos)]
+        scores = [r.score for r in await task.run(instruction, devset, demos=demos)]
         history.append({"candidate": i, "demos": demos, "dev": mean(scores)})
         log(f"候选 {i}：{len(demos)} 条示例 → dev {mean(scores):.0%}")
         if best is None or mean(scores) > best.dev:
@@ -383,7 +408,7 @@ def opro_meta_prompt(task_description: str, exemplars: Sequence[str], top: Seque
     )
 
 
-def opro_optimize(
+async def opro_optimize(
     task: Task,
     optimizer_llm: LLM,
     devset: Sequence,
@@ -415,32 +440,33 @@ def opro_optimize(
     per_case: dict[str, list[float]] = {}
     log_rows: list[dict] = []
 
-    def score(ins: str, round_no: int) -> None:
+    async def score(ins: str, round_no: int) -> None:
         key = ins.strip()
         if key in per_case:  # 同一条指令不重复花钱
             return
         if seed_scores and key in seed_scores:
             s = seed_scores[key]
         else:
-            s = [r.score for r in task.run(key, devset)]
+            s = [r.score for r in await task.run(key, devset)]
         per_case[key] = s
         history.append((key, mean(s)))
         log_rows.append({"round": round_no, "instruction": key, "dev": mean(s)})
         log(f"[第 {round_no} 轮] dev {mean(s):.0%} ← {_novel_snippet(key, seed_instructions, 64)}")
 
+    # 候选指令一条接一条地评估：每次评估内部已经并发（task 的并发上限），再叠一层并发就会超出网关配额
     for ins in seed_instructions:
-        score(ins, 0)
+        await score(ins, 0)
     for r in range(1, rounds + 1):
         top = select_topk(history, keep_top)
         shown = rng.sample(list(exemplars), min(n_exemplars, len(exemplars))) if exemplars else []
         prompt = opro_meta_prompt(task_description, shown, top, per_round)
         try:
-            proposals = complete_json(optimizer_llm, prompt, Proposals).instructions
+            proposals = (await complete_json(optimizer_llm, prompt, Proposals)).instructions
         except Exception as e:  # noqa: BLE001  优化器输出坏了：这一轮作废，继续
             log(f"[第 {r} 轮] 优化器输出无法解析，跳过：{e}")
             continue
         for ins in [p for p in proposals if p.strip()][:per_round]:
-            score(ins, r)
+            await score(ins, r)
 
     best_ins, _ = select_topk(history, 1)[0]
     return OptResult(best_ins, [], per_case[best_ins], log_rows)
@@ -529,7 +555,7 @@ class Candidate:
         return mean(self.dev_scores)
 
 
-def gepa_optimize(
+async def gepa_optimize(
     task: Task,
     reflect_llm: LLM,
     trainset: Sequence,
@@ -558,7 +584,7 @@ def gepa_optimize(
     本课的程序只有一个模块，合并没有意义。
     """
     rng = random.Random(seed)
-    dev0 = seed_dev_scores if seed_dev_scores is not None else [r.score for r in task.run(seed_instruction, devset)]
+    dev0 = seed_dev_scores if seed_dev_scores is not None else [r.score for r in await task.run(seed_instruction, devset)]
     pool = [Candidate(seed_instruction.strip(), list(dev0), None, 0)]
     order = list(range(len(trainset)))
     rng.shuffle(order)
@@ -570,7 +596,7 @@ def gepa_optimize(
         parent = pool[parent_idx]
         batch = [trainset[order[(cursor + k) % len(order)]] for k in range(minibatch_size)]
         cursor += minibatch_size
-        recs = task.run(parent.instruction, batch)
+        recs = await task.run(parent.instruction, batch)
         row = {"iteration": it, "parent": parent_idx, "front": front, "freq": freq, "parent_batch": sum(r.score for r in recs)}
         if all(r.score >= 1.0 for r in recs):
             row["status"] = "skip"
@@ -578,13 +604,13 @@ def gepa_optimize(
             rows.append(row)
             continue
         try:
-            refl = complete_json(reflect_llm, reflection_prompt(parent.instruction, recs, task_description), Reflection)
+            refl = await complete_json(reflect_llm, reflection_prompt(parent.instruction, recs, task_description), Reflection)
         except Exception as e:  # noqa: BLE001
             row["status"] = "reflect_error"
             log(f"[迭代 {it}] 反思模型输出无法解析，跳过：{e}")
             rows.append(row)
             continue
-        child_recs = task.run(refl.instruction, batch)
+        child_recs = await task.run(refl.instruction, batch)
         child_batch = sum(r.score for r in child_recs)
         row.update(diagnosis=refl.diagnosis, child_batch=child_batch, instruction=refl.instruction.strip())
         fails = [r for r in recs if r.score < 1.0]
@@ -595,7 +621,7 @@ def gepa_optimize(
             log(f"          新指令在小批上 {child_batch:.0f}/{len(batch)}，没有严格变好 → 拒绝（省下一次 dev 评估）")
             rows.append(row)
             continue
-        dev_scores = [r.score for r in task.run(refl.instruction, devset)]
+        dev_scores = [r.score for r in await task.run(refl.instruction, devset)]
         pool.append(Candidate(refl.instruction.strip(), dev_scores, parent_idx, it))
         row.update(status="accept", child=len(pool) - 1, dev=mean(dev_scores))
         log(f"          新指令在小批上 {child_batch:.0f}/{len(batch)} → 接受为候选 #{len(pool) - 1}，dev {mean(dev_scores):.0%}")
@@ -626,9 +652,14 @@ def _one_line(text: str, n: int) -> str:
 # =====================================================================
 
 
-def sample_n(fn: Callable[[], str], n: int, workers: int = 1) -> list[str]:
-    """把同一个请求采样 n 次（依赖模型本身的随机性；温度为 0 时 n 次可能一模一样）。"""
-    return _run_all([fn] * n, workers)
+async def sample_n(fn: Callable[[], Awaitable[str]], n: int, max_concurrency: int | None = None) -> list[str]:
+    """把同一个请求采样 n 次（依赖模型本身的随机性；温度为 0 时 n 次可能一模一样）。
+
+    fn 每次调用返回一个新协程（例如 lambda: program(x)）。n 次采样**同时发出**（默认全部并发；
+    max_concurrency 限制同时在途的个数）：用户等待的时间约等于"最慢的那一次"，而不是 n 次之和 ——
+    但调用次数（成本）仍然是 n 倍。并发上限小于 n 时，延迟约为 ceil(n / 上限) 次调用。
+    """
+    return await _run_all([fn] * n, max_concurrency or n)
 
 
 def self_consistency(answers: Sequence[str]) -> tuple[str, float]:

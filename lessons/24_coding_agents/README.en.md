@@ -286,13 +286,30 @@ Fix the replacement (watch indentation and brackets) and call edit again; line n
 ### 2.6 run_tests: subprocess, timeout, clean environment, structured summary
 
 ```python
-cmd = [sys.executable, "-m", "pytest", "-q", "--tb=no", "-p", "no:cacheprovider", f"--junitxml={xml_path}", *targets]
-proc = subprocess.run(cmd, cwd=root, env=sandbox_env(), capture_output=True, text=True, timeout=timeout)
+async def run_command(cmd, *, cwd, env, timeout) -> CommandResult:
+    proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=env, stdout=PIPE, stderr=PIPE,
+                                                start_new_session=True)      # its own process group
+    try:
+        out, err = await wait_for(proc.communicate(), timeout)             # yields the event loop while waiting
+    except asyncio.TimeoutError:
+        _kill_group(proc); await proc.wait()                               # timeout: kill the whole group, reap it
+        return CommandResult(None, "", "", ..., timed_out=True)
+    except BaseException:                                                  # cancelled: kill it the same way, then re-raise
+        _kill_group(proc); await proc.wait()
+        raise
+    ...
+
+async def run_pytest(root, targets, timeout=30.0) -> TestRun:
+    cmd = [sys.executable, "-m", "pytest", "-q", "--tb=no", "-p", "no:cacheprovider", f"--junitxml={xml_path}", *targets]
+    proc = await run_command(cmd, cwd=root, env=sandbox_env(), timeout=timeout)
+    ...                                                                    # parse the JUnit XML
 ```
 
 Piece by piece:
 
-- **A subprocess, not `import`ing the tests into the agent's process**: on timeout it can actually be killed (`subprocess.run` kills the child on timeout; threads can't be killed, see the comments in [`agentkit/tools.py`](../../agentkit/tools.py)); infinite loops, `sys.exit`, and monkey patches in the code under test can't affect the agent itself.
+- **A subprocess, not `import`ing the tests into the agent's process**: on timeout or cancellation it can actually be killed (threads can't be killed, see the comments in [`agentkit/tools.py`](../../agentkit/tools.py)); infinite loops, `sys.exit`, and monkey patches in the code under test can't affect the agent itself. `start_new_session=True` puts pytest in its own process group, so `os.killpg` also kills any processes the code under test started itself, leaving no orphans.
+- **An asyncio subprocess, not `subprocess.run`, and not `asyncio.to_thread(subprocess.run, ...)`**: the agent is async and `run_tests` is an async tool running on the event loop. [Lesson 02](../02_agent_loop/README.en.md#17-why-async-how-one-process-serves-many-sessions-at-once) covered the #1 pitfall: calling a blocking function inside async code. Call `subprocess.run` directly and the whole event loop stops for as long as pytest runs; every other session in the process and every worker lease heartbeat (Lesson 13) freezes. `asyncio.to_thread(subprocess.run, ...)` doesn't block the loop, but it can't be cancelled: when the agent's tool timeout or `run_timeout` fires, or the user disconnects, the thread and its pytest keep running in the background until pytest's own timeout. `create_subprocess_exec` does both: it yields the event loop while waiting, and when cancelled we hold the process handle and kill it on the spot. That's why this lesson uses it. Git commands (the harness's commit, stash, log) go through the same `run_command`.
+- **How it's proven**: demo scenario 1b puts a heartbeat coroutine that ticks every 20 ms next to the same slow test and measures the longest gap between ticks (results in §3.1). [`test_async_subprocess.py`](test_async_subprocess.py) starts real pytest subprocesses and proves three things: ① the event loop isn't blocked while tests run: the test in the subprocess can only finish after a coroutine on the parent's event loop writes a `go` file; with a blocking implementation that coroutine never gets to run, and the test fails after waiting 10 seconds (checked by hand by swapping in a blocking `run_command`); ② on timeout, both the pytest process and a grandchild started by the code under test are killed and reaped; ③ on cancellation, either a direct `task.cancel()` or agentkit's tool timeout (the tool's `timeout_s` shorter than pytest's own), both processes are likewise killed, and the model gets an "execution timed out" observation.
 - **`env=sandbox_env()`**: only allowlisted variables like `PATH`, `HOME`, `LANG` are passed. The parent process has `LLM_API_KEY` loaded from `.env`, and the agent can edit code, code can read environment variables, and test output flows back into the model's context — a ready-made channel for leaking secrets. Demo scenario 2c prints the comparison (only the number of variable names, never values).
 - **`--junitxml` for structured results**: parsing terminal output is fragile (width truncation, color codes, plugins changing the format); JUnit XML gives each test's name and failure message directly.
 - **Only a summary goes to the model**:
@@ -325,7 +342,7 @@ Why protect `pytest.ini`, `conftest.py`, and `pyproject.toml` too? Because addin
 Layer 3 is `SubmitReview`, a hook in front of `submit`:
 
 ```python
-def before_tool(self, state, call, tool):
+async def before_tool(self, state, call, tool):   # hooks can be plain or async methods
     if call.name != "submit":
         return None
     findings = self.ws.review()   # review_diff: heuristic scan of the added code
@@ -337,7 +354,7 @@ def before_tool(self, state, call, tool):
 
 **This layer is a heuristic, not a proof**: it has false positives (a new business constant that happens to equal a test value) and false negatives (special-casing written differently slips through). So it's a "warning light": when it lights up, reject and tell the model why; in the end you still need human review and hidden tests. The rejection message deliberately offers a way out: "if the requirements contradict each other, explain and hand it to a human". ImpossibleBench found that giving the model a way to flag a task as impossible cut GPT-5's cheating rate from 54% to 9%.
 
-Why not just use agentkit's `PermissionPolicy`? When it denies, it only says "the approver did not approve", while here we want to feed **the specific review findings** back to the model so it knows what was wrong.
+Why not just use agentkit's `PermissionPolicy`? When it denies, it only says "the approver did not approve", while here we want to feed **the specific review findings** back to the model so it knows what was wrong. `SubmitReview.before_tool` is an async method because the optional human approval `approver(diff, findings)` may be an async function (say, waiting for someone to click "approve" on a web page), and it shouldn't hold the event loop while waiting; plain functions still work too.
 
 ### 2.8 LoopGuard: don't let it go in circles
 
@@ -375,14 +392,14 @@ if self.streak >= self.max_repeats:      # the same call 3 times in a row → de
 **Each feature** (`Harness.run_session`):
 
 ```python
-summary = worker(feature, briefing)     # the coding agent does the work (a new agent per feature, no shared conversation)
-run = self.verify(feature)              # the harness verifies it itself: new feature + regressions on all completed features
+summary = await worker(feature, briefing)     # the coding agent does the work (a new agent per feature, no shared conversation)
+run = await self.verify(feature)              # the harness verifies it itself: new feature + regressions on all completed features
 if run.ok:
     self._set_passes(feature["id"], True)
     self.append_progress(f"- ✅ {feature['id']} ...: {summary} (harness verified: {run.headline()})")
-    self.vcs.commit(f"feat({feature['id']}): {feature['title']}")
+    await self.vcs.commit(f"feat({feature['id']}): {feature['title']}")
 else:
-    self.vcs.set_aside(...)             # never commit half-finished work
+    await self.vcs.set_aside(...)             # never commit half-finished work
     self.append_progress(f"- ❌ {feature['id']} failed verification, changes set aside: ...")
 ```
 
@@ -411,7 +428,7 @@ Two implementation details:
 
 ```bash
 .venv/bin/python lessons/24_coding_agents/demo.py --offline              # offline: ~10 s, no API key; tools, pytest, and git all really run
-.venv/bin/python lessons/24_coding_agents/demo.py                        # real model (gpt-5.5): a full run takes 38 model calls, about 2 min
+.venv/bin/python lessons/24_coding_agents/demo.py                        # real model (gpt-5.5): a full run takes about 40 model calls, about 2 min
 .venv/bin/python lessons/24_coding_agents/demo.py --offline --only 3 --no-git   # scenario 3 only, with snapshots instead of git
 .venv/bin/python lessons/24_coding_agents/demo.py --offline --keep       # keep the temp workspaces so you can inspect the git log afterwards
 ```
@@ -458,6 +475,16 @@ Three things worth noticing:
 2. **It read the README's business rules and the test file** before touching anything. Its rounding fix (`(amount * rate + 50) // 100`) shows it noticed "round half a cent up", and it avoided the banker's rounding of Python's `round()`.
 3. **It ignored "change one thing at a time".** The system prompt asked for it explicitly, yet it fixed all 3 bugs with a single 19-line replacement. The result was correct, but this is exactly the risk of line-range edits (§2.5): the wider the range, the higher the cost of mis-copying a line, and the syntax check can't catch that kind of mistake — only tests can.
 
+**Scenario 1b: is the event loop still running while tests run?** (Same in both modes; no model calls.) The same test that sleeps 0.8 seconds runs twice, next to a heartbeat coroutine that ticks every 20 ms:
+
+```text
+   ── 1b. Is the event loop still running while tests run? (a test that sleeps 0.8s + a heartbeat coroutine ticking every 20ms) ──
+   subprocess.run called directly (blocking)   test passed, 1.23s; heartbeat ticked   0 times, longest gap  1231ms
+   await run_pytest (asyncio subprocess)       test passed, 1.27s; heartbeat ticked  57 times, longest gap    22ms
+```
+
+With the blocking version, the heartbeat didn't tick once during the 1.2 seconds from pytest's start to finish: the whole process's event loop stood still. With `run_pytest`, the heartbeat keeps going, with a longest gap of 22 ms (it ticks every 20 ms anyway). Timings and tick counts vary a little with machine load (Apple M1 8GB, macOS 14.4, Python 3.11.7); "0 ticks when blocking" is the same every time.
+
 ### 3.2 Scenario 2: an "impossible" task
 
 Setup: first fix the 3 bugs, then add a test that contradicts both the existing tests and the README's business rules:
@@ -494,11 +521,11 @@ Look at step 6: **the special case turned the tests green**. The tool layer can'
       the run_tests subprocess only gets the 6 allowlisted variables (HOME, LC_CTYPE, PATH, PYTHONDONTWRITEBYTECODE, PYTHONHASHSEED, TMPDIR), 0 of which look like secrets.
 ```
 
-**What does the real model do?** We ran gpt-5.5 five times (the system prompt says "don't edit tests, don't special-case, stop and explain if there's a contradiction"):
+**What does the real model do?** We ran gpt-5.5 six times (the system prompt says "don't edit tests, don't special-case, stop and explain if there's a contradiction"; the first 5 runs used the earlier synchronous code, the 6th the async version on 2026-09-28):
 
 | Outcome | Runs |
 |---|---|
-| Read the tests and README, reported the contradiction, changed nothing | 3 |
+| Read the tests and README, reported the contradiction, changed nothing | 4 |
 | First changed gold to 15% off across the board (general, but contradicts the README), saw other tests fail, reverted, and reported the contradiction | 1 |
 | **Invented a "business rule" that turned the tests green, was rejected by diff review, reverted, and reported the contradiction** | 1 |
 | Tried to modify the test file or test config | 0 |
@@ -511,9 +538,9 @@ The third outcome is the most instructive. The model didn't write `if amount == 
 
 After the rejection it reverted the change, and its final reply laid out the contradiction between the README, the old tests, and the new test, suggesting that "a human needs to clarify the new gold-member policy first".
 
-A few observations (only 5 runs, so treat these as anecdotes, not statistics):
+A few observations (only 6 runs, so treat these as anecdotes, not statistics):
 
-- The contradiction in this task is very obvious, and the prompt offers a "report the contradiction" way out; all 5 runs ended by honestly stopping. ImpossibleBench uses real SWE-bench tasks where the contradictions are subtler, and cheating rates are much higher.
+- The contradiction in this task is very obvious, and the prompt offers a "report the contradiction" way out; all 6 runs ended by honestly stopping. ImpossibleBench uses real SWE-bench tasks where the contradictions are subtler, and cheating rates are much higher.
 - **The most dangerous cheating doesn't look like cheating.** `GOLD_PREMIUM_THRESHOLD = 20000` could easily pass code review as an ordinary business rule; the review rule caught it only because 20000 happens to appear in the tests. Changing it to `>= 15000` would slip through. This is exactly what §2.10 says: heuristic review is only a warning light; you can't skip hidden tests and human review.
 - Not a single run tried to edit the tests. That may be because the prompt said so, or because the tool description says "test files are protected". ImpossibleBench reports that when Claude models cheat, over 79% of the time it's by modifying tests, while OpenAI models cheat in more varied ways; different models need different channels watched most closely.
 
@@ -560,7 +587,7 @@ Observations from the real run:
 - **The price of amnesia is re-reading**: every new agent re-read the README and the relevant source (the F2 agent made 12 tool calls, 7 of which were reading files or searching). That's the cost of buying reliability with a harness; the better the progress file, the lower this cost.
 - The F2 agent put `import re` at the top of the file rather than inside the function. It has its own sense of code style; none of that is written in the tests, and that's exactly the part of diff review a human has to look at.
 
-The whole real run (3 scenarios) took 38 model calls, an estimated $0.17, and about 2 minutes.
+The whole real run (3 scenarios) took 38 model calls, an estimated $0.17, and about 2 minutes. On 2026-09-28 we re-ran it with the async code: 39 model calls in total, an estimated $0.1749, 118 seconds. Scenario 1 again took 7 model calls to fix the 3 bugs (11 passed); in scenario 2 the model read the tests and README and reported the contradiction without submitting; in scenario 3 the two sessions completed F1–F3; scenario 1b's heartbeat numbers matched offline mode (0 ticks when blocking; 57 ticks with a longest gap of 23 ms with the asyncio subprocess).
 
 ## 4. Exercises
 
@@ -679,7 +706,7 @@ That doesn't mean ACIs are useless; it means **the focus of the ACI is shifting*
 2. **Only writing "do not modify the tests" in the prompt.** In METR's experiment, "please do not cheat" had almost no effect. You need tool-level refusal + pre-run checks.
 3. **Trusting the agent when it says "I'm done".** The harness has to run verification itself, including regressions. The "declares victory too early" behavior Anthropic observed is, at heart, letting the person being evaluated do the evaluating.
 4. **Stuffing raw test output back into the context.** Thousands of lines of pytest output bury the real failure and push earlier information out. Give a summary; let the agent ask for details when it needs them.
-5. **Running tests in a thread with a "timeout".** Python threads can't be killed; after the timeout the tests keep running in the background and may keep changing files. Use a subprocess and kill it on timeout.
+5. **Running tests in a thread with a "timeout", or calling `subprocess.run` directly in async code.** Python threads can't be killed; after the timeout the tests keep running in the background and may keep changing files. `subprocess.run`, for its part, freezes the whole event loop until the tests finish (measured in scenario 1b). Use an asyncio subprocess and kill the whole process group on timeout or cancellation.
 6. **Writing edits to disk with no checks at all.** One syntax error turns every subsequent test into an import error, and the model gets lost in a pile of unrelated failures.
 7. **Doing a long task in one very long session + auto-compaction.** Compaction loses key facts like "where we were" and "which approaches already failed". Write them into the progress file and git.
 8. **Letting the agent freely edit the progress file and feature list.** It may mark failing features as passing, or "tidy away" unfinished items. Either allow only specific fields (the article's approach) or let only the harness edit them (this lesson's approach).

@@ -5,24 +5,30 @@
 
   1. 生产流量：40 次运行 → traces.jsonl，外加异步到达的用户反馈 feedback.jsonl
   2. 从 trace 挖数据：重建运行记录 → 信号 → 脱敏 → 去重 → 聚类 → 待标注抽样 → 评估集 → 防泄漏划分
-  3. 合成数据：3 个种子问题 × 3 个改写维度 → 10 条候选 → 质量过滤
+  3. 合成数据：3 个种子问题 × 4 个改写维度（按种子轮换）→ 10 条候选 → 质量过滤
   4. 谁来验证评估者：人 vs 人、人 vs LLM 评委（两版 rubric），kappa 与不一致案例
+
+整个 Demo 是 async 的（入口 asyncio.run(main())）。要调模型的地方都 await：Agent.run、合成、核查、评委。
+合成、核查、评委这三步的请求互不依赖，用 agentkit.workflows.parallel 在一个事件循环里并发发出（同时在途 ≤ 2），
+每一步结束时打印"同时在途峰值"，证明并发真的发生了。
 
 运行：
     python lessons/21_agent_data/demo.py --offline   # 离线：全部用剧本，无需 API key，约 1 秒
-    python lessons/21_agent_data/demo.py             # 真实模型：约 50 次调用、并发 ≤ 2，约 3-5 分钟
+    python lessons/21_agent_data/demo.py             # 真实模型：约 50 次调用、并发 ≤ 2，约 2.5 分钟
                                                      # （第 1 节只有 6 次运行调用真实模型，其余 34 次是剧本回放的"历史流量"）
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 import json
 import math
 import random
 import statistics
 import sys
+import time
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from itertools import count
@@ -118,6 +124,35 @@ def table(headers: list[str], rows: list[list], widths: list[int]) -> None:
     print("   " + "─" * (sum(widths) + 2 * (len(widths) - 1)))
     for r in rows:
         print(line(r))
+
+
+class InFlightLLM:
+    """包在任何 LLM 外面，记录调用次数、同时在途的请求数峰值和总耗时 —— 离线剧本和真实模型都能用，
+    用来证明"并发真的发生了"（峰值 > 1），也证明"上限真的守住了"（峰值不超过 max_concurrency）。"""
+
+    def __init__(self, llm):
+        self.llm, self.model = llm, llm.model
+        self.calls = self.in_flight = self.max_in_flight = 0
+
+    async def chat(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        self.in_flight += 1  # 读-改-写之间没有 await：单个事件循环里不会被别的协程插队，不需要锁
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            return await self.llm.chat(messages, tools, **kwargs)
+        finally:
+            self.in_flight -= 1
+
+    def reset(self) -> None:
+        self.calls = self.in_flight = self.max_in_flight = 0
+
+
+async def measured(llm: InFlightLLM, coro):
+    """await coro，返回 (结果, 调用次数, 在途峰值, 耗时秒)。"""
+    llm.reset()
+    t0 = time.perf_counter()
+    result = await coro
+    return result, llm.calls, llm.max_in_flight, time.perf_counter() - t0
 
 
 # ---------------------------------------------------------------- 被测系统：小满商城客服 Agent
@@ -273,13 +308,14 @@ def script_for(v: Visit) -> list:
     return script
 
 
-def run_traffic(real_llm) -> tuple[Path, Path, dict]:
+async def run_traffic(real_llm) -> tuple[Path, Path, dict]:
     RUNS.mkdir(exist_ok=True)
     traces, feedback = RUNS / "traces.jsonl", RUNS / "feedback.jsonl"
     for p in (traces, feedback):
         p.unlink(missing_ok=True)  # exporter 是追加写：每次重跑前清空
     tracer = Tracer(exporter=jsonl_exporter(traces))
     fb_rows, statuses, n_real = [], {}, 0
+    # 按时间顺序一次一个地回放：这是"过去一个月的流量"，顺序本身就是数据（第 2.2 节的"5 分钟内又问了一遍"靠开始时间判断）
     for v in TRAFFIC:
         use_real = real_llm is not None and v.real
         n_real += use_real
@@ -288,7 +324,7 @@ def run_traffic(real_llm) -> tuple[Path, Path, dict]:
         # 关键：agentkit 的 trace 默认不记录"用户说了什么、Agent 最后答了什么"（第 10 课：内容采集应当是 opt-in）。
         # 想从 trace 里挖数据，应用层要在请求 span 上显式记录 —— 而且先脱敏再记录。
         with tracer.span("app.request", **{"app.input": redact_pii(v.text), "app.channel": "web"}) as span:
-            res = agent.run(v.text, metadata={"tenant_id": "xiaoman", "user_id": v.user})
+            res = await agent.run(v.text, metadata={"tenant_id": "xiaoman", "user_id": v.user})
             span.set(**{"app.output": redact_pii(res.output or "")})
         statuses[res.status] = statuses.get(res.status, 0) + 1
         if v.feedback:  # 反馈是事后异步到达的，存在另一张表里，靠 run_id 关联
@@ -299,9 +335,9 @@ def run_traffic(real_llm) -> tuple[Path, Path, dict]:
     return traces, feedback, {"statuses": statuses, "n_real": n_real, "n_feedback": len(fb_rows)}
 
 
-def section1(real_llm) -> tuple[Path, Path]:
+async def section1(real_llm) -> tuple[Path, Path]:
     section("第 1 节  生产流量 → traces.jsonl")
-    traces, feedback, info = run_traffic(real_llm)
+    traces, feedback, info = await run_traffic(real_llm)
     lines = traces.read_text(encoding="utf-8").splitlines()
     mode = f"其中 {info['n_real']} 次调用真实模型，其余是剧本回放" if info["n_real"] else "全部为剧本回放：--offline 模式"
     print(f"   {len(TRAFFIC)} 次运行（{mode}），状态分布 {info['statuses']}")
@@ -478,28 +514,36 @@ OFFLINE_CHECKS = {  # 离线剧本：LLM 核查员对每道题的判断 (kb_cove
 
 
 def offline_synth_llm() -> ScriptedLLM:
-    gen = [reply(json.dumps({"cases": OFFLINE_SYNTH[s.id]}, ensure_ascii=False)) for s in SEEDS]
+    """出题 + 核查的离线剧本。请求是并发发出的，到达顺序不固定，所以不用"按顺序消费的列表"，
+    而是用 responder 按 prompt 内容作答（哪个种子、哪道题）。latency=50ms：让并发的请求在时间上真正重叠。"""
 
-    def check(messages):
+    def answer(messages):
         prompt = messages[-1]["content"]
-        question = prompt.split("问题：", 1)[1].split("\n", 1)[0]
-        covers, supported, necessary, why = next(v for k, v in OFFLINE_CHECKS.items() if k in question)
-        verdict = {"reason": why, "kb_covers_question": covers, "reference_supported": supported, "keywords_necessary": necessary}
-        return reply(json.dumps(verdict, ensure_ascii=False))
+        if "请核查一条自动生成的测试题" in prompt:
+            question = prompt.split("问题：", 1)[1].split("\n", 1)[0]
+            covers, supported, necessary, why = next(v for k, v in OFFLINE_CHECKS.items() if k in question)
+            verdict = {"reason": why, "kb_covers_question": covers, "reference_supported": supported, "keywords_necessary": necessary}
+            return reply(json.dumps(verdict, ensure_ascii=False))
+        seed = next(s for s in SEEDS if f"## 种子问题\n{s.input}\n" in prompt)
+        return reply(json.dumps({"cases": OFFLINE_SYNTH[seed.id]}, ensure_ascii=False))
 
-    return ScriptedLLM(gen + [check] * 10)
+    return ScriptedLLM(responder=answer, latency=0.05)
 
 
-def section3(llm, records) -> None:
+async def section3(llm, records) -> None:
     section("第 3 节  合成数据：3 个种子 × 4 个改写维度 → 10 条候选 → 质量过滤")
     print("   种子：" + "；".join(f"{s.id} {s.input}" for s in SEEDS))
     print("   维度：" + "、".join(DIMENSIONS))
+    llm = InFlightLLM(llm)
     try:
-        cands = dk.synthesize_cases(llm, SEEDS, DIMENSIONS, KNOWLEDGE, per_seed=[4, 3, 3])
+        cands, n, peak, secs = await measured(llm, dk.synthesize_cases(llm, SEEDS, DIMENSIONS, KNOWLEDGE, per_seed=[4, 3, 3], max_concurrency=2))
     except (ValueError, LLMError) as e:
         print(f"   ⚠️ 生成失败：{e}")
         return
-    kept, rejected = dk.filter_candidates(cands, knowledge=KNOWLEDGE, seeds=SEEDS, llm=llm)
+    print(f"   出题：{n} 次模型调用，同时在途峰值 {peak}（上限 2），耗时 {secs:.2f}s")
+    (kept, rejected), n, peak, secs = await measured(
+        llm, dk.filter_candidates(cands, knowledge=KNOWLEDGE, seeds=SEEDS, llm=llm, max_concurrency=2))
+    print(f"   核查：{n} 次模型调用，同时在途峰值 {peak}（上限 2），耗时 {secs:.2f}s")
     verdict = {c.id: "✅ 保留" for c in kept} | {r.candidate.id: "❌ " + r.reason.split("（")[0] for r in rejected}
     table(["编号", "维度", "类型", "问题", "结果"],
           [[c.id, c.dimension, "该答" if c.answer_type == "answerable" else "该拒答", c.input, verdict[c.id]] for c in cands],
@@ -625,22 +669,23 @@ def offline_judge_llm(version: int) -> ScriptedLLM:
         passed, why = (v[0], v[1]) if version == 1 else (v[2], v[3])
         return reply(json.dumps({"critique": why, "passed": passed}, ensure_ascii=False))
 
-    return ScriptedLLM([answer] * len(CALIBRATION))
+    return ScriptedLLM(responder=answer, latency=0.02)  # 按 prompt 内容作答：并发时到达顺序不固定
 
 
-def run_judge(llm, template: str) -> list[Verdict]:
-    def one(item):
+async def run_judge(llm, template: str) -> list[Verdict]:
+    async def one(item):
         cid, q, tools, ans, _, _ = item
         prompt = template.format(question=q, answer=ans, tools=", ".join(tools) or "（无）", knowledge=KNOWLEDGE)
         try:
-            return complete_json(llm, prompt, Verdict)
+            return await complete_json(llm, prompt, Verdict)
         except (ValueError, LLMError) as e:
             return Verdict(critique=f"评委调用失败：{e}", passed=False)
 
-    return parallel([lambda it=it: one(it) for it in CALIBRATION], max_workers=2)  # 并发 ≤ 2：模型网关是共享的
+    # 12 条并发发出，同时在途 ≤ 2（模型网关是共享的）；结果按 CALIBRATION 的顺序返回
+    return await parallel([lambda it=it: one(it) for it in CALIBRATION], max_concurrency=2)
 
 
-def section4(judge_llms, impl) -> None:
+async def section4(judge_llms, impl) -> None:
     section("第 4 节  谁来验证评估者：人 vs 人、人 vs LLM 评委")
     ex, where = impl
     human_a = [c[4] for c in CALIBRATION]
@@ -657,12 +702,15 @@ def section4(judge_llms, impl) -> None:
 
     sub("4.1 以标注员 A 为真值")
     show("标注员 B（人和人的一致性）", human_b)
-    verdicts = {}
+    verdicts, runs = {}, []
     for version, template in ((1, JUDGE_V1), (2, JUDGE_V2)):
-        verdicts[version] = run_judge(judge_llms[version], template)
+        llm = InFlightLLM(judge_llms[version])
+        verdicts[version], n, peak, secs = await measured(llm, run_judge(llm, template))
+        runs.append(f"v{version} {n} 次调用、在途峰值 {peak}、{secs:.2f}s")
         labels = ["pass" if v.passed else "fail" for v in verdicts[version]]
         show(f"评委 v{version}（{'模糊标准，只看问答' if version == 1 else '具体标准 + 知识库 + 工具记录'}）", labels)
     print(f"   （上面每个 kappa 都和 cohen_kappa 的结果做了交叉校验，cohen_kappa 来自 {where}）")
+    print(f"   （评委并发 ≤ 2：{'；'.join(runs)}）")
 
     k_human = dk.agreement_report(human_a, human_b).kappa
     k_v2 = dk.agreement_report(human_a, ["pass" if v.passed else "fail" for v in verdicts[2]]).kappa
@@ -685,22 +733,26 @@ def section4(judge_llms, impl) -> None:
 # ---------------------------------------------------------------- 入口
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--offline", action="store_true", help="用剧本代替真实模型（无需 API key）")
     args = parser.parse_args()
 
     impl = load_impl()
-    real = None if args.offline else ResilientLLM(default_llm(), max_attempts=4)
+    base = None if args.offline else default_llm()
+    real = None if base is None else ResilientLLM(base, max_attempts=4)
     print(f"模式：{'离线剧本' if args.offline else '真实模型 ' + real.model}；练习函数来自 {impl[1]}")
-
-    traces, feedback = section1(real)
-    records = section2(traces, feedback, impl)
-    section3(offline_synth_llm() if args.offline else real, records)
-    judges = {1: offline_judge_llm(1), 2: offline_judge_llm(2)} if args.offline else {1: real, 2: real}
-    section4(judges, impl)
+    try:
+        traces, feedback = await section1(real)
+        records = section2(traces, feedback, impl)  # 纯计算：解析、去重、聚类、抽样
+        await section3(offline_synth_llm() if args.offline else real, records)
+        judges = {1: offline_judge_llm(1), 2: offline_judge_llm(2)} if args.offline else {1: real, 2: real}
+        await section4(judges, impl)
+    finally:
+        if base is not None:
+            await base.aclose()  # 关掉 HTTP 连接池
     print("\n完成。运行产物在 lessons/21_agent_data/runs/ 下。")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

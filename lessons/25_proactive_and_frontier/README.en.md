@@ -2,13 +2,13 @@
 
 # Lesson 25: Proactive agents and the frontier — knowing when to speak up, and what's still unsolved
 
-> 🕐 Time: 20 min | 🎯 You'll be able to: design a proactive agent that speaks up only when it should, using a user model, an interruption decider, and suggestion cards, and explain its privacy and trust boundaries; form evidence-based views on the frontier directions and open problems in agents; plan what to do after this course | 📦 Source: [`proactive_kit.py`](proactive_kit.py) (event stream, user model, interruption decider, suggestion cards), [`agentkit/workflows.py`](../../agentkit/workflows.py) (`complete_json`)
+> 🕐 Time: 20 min | 🎯 You'll be able to: design a proactive agent that speaks up only when it should, using a user model, an interruption decider, and suggestion cards, and explain its privacy and trust boundaries; form evidence-based views on the frontier directions and open problems in agents; plan what to do after this course | 📦 Source: [`proactive_kit.py`](proactive_kit.py) (event stream simulator, user model, interruption decider, suggestion cards), [`proactive_runtime.py`](proactive_runtime.py) (a real scheduler, event table, job queue, and idempotency), [`agentkit/workflows.py`](../../agentkit/workflows.py) (`complete_json`), [`agentkit/distributed`](../../agentkit/distributed/__init__.py) (job queue, worker processes)
 >
 > 📖 Primary reading: [Creating General User Models from Computer Use](https://arxiv.org/abs/2505.10831) (Shaikh et al., UIST 2025) — focus on the four GUM modules (Propose / Retrieve / Revise / Audit) and on how GUMBO uses Horvitz's expected-utility formula to decide whether to interrupt. It connects the 1999 mixed-initiative ideas to today's LLM user models, so reading this one paper gets you both.
 
 > 📍 This is the last lesson of **Part 3** and of the whole course. It maps to the "Proactive Agents" week (week 11) and the final "Open Problems" lecture of Stanford's CS329Z (Fall 2026); we recommend pairing it with that course's public required readings. This project has no affiliation with Stanford University.
 >
-> 🧭 **Core path (20 min)**: §0 → §1.1–1.3 → §2.3 the interruption decider → §3 run the demo (focus on parts 3 and 6) → §5.2 open problems → §5.3 course recap and next steps.
+> 🧭 **Core path (20 min)**: §0 → §1.1–1.3 → §2.3 the interruption decider → §2.7 running it for real → §3 run the demo (focus on parts 3, 6, and 8) → §5.2 open problems → §5.3 course recap and next steps.
 > Sections marked **📖 Optional** can be skipped on a first read.
 
 ## 0. In one sentence
@@ -39,7 +39,7 @@ This lesson first answers "when should it speak up?" with a minimal runnable sys
 
 [Lesson 05 §3.6](../05_agent_architectures/README.en.md#36-event-driven--ambient-agents) covered event-driven (ambient) agents: subscribe to an event stream and handle each event as it arrives. That is an **architecture** question: how events come in, how they queue, how to stay idempotent, and how people take part through an inbox.
 
-This lesson is about an **interaction** question: once an event is processed, should the agent interrupt this person? When? With what message? Based on what? An event-driven agent can go its whole life without talking to anyone (say, auto-labeling tickets). The core output of a proactive agent is exactly "the thing it says to a person."
+This lesson is about an **interaction** question: once an event is processed, should the agent interrupt this person? When? With what message? Based on what? An event-driven agent can go its whole life without talking to anyone (say, auto-labeling tickets). The core output of a proactive agent is exactly "the thing it says to a person." The two do overlap: a proactive agent also has to really receive events, wake up on time, and not speak twice when triggers repeat or processes crash. §2.7 runs that part with real processes and a real job queue.
 
 ### 1.2 Mixed initiative: Horvitz's 1999 principles
 
@@ -124,7 +124,7 @@ Five baseline rules, each with a counterpart in this lesson's code:
 
 ## 2. Building it from scratch
 
-All the source is in [`proactive_kit.py`](proactive_kit.py), which depends only on the standard library and agentkit.
+The event stream simulator, user model, decider, and suggestion cards are in [`proactive_kit.py`](proactive_kit.py); the real scheduler, event table, and job queue are in [`proactive_runtime.py`](proactive_runtime.py) (§2.7). Both depend only on the standard library and agentkit.
 
 ### 2.1 The event stream simulator: separate "what the agent sees" from "what the user actually needs"
 
@@ -144,6 +144,8 @@ class Truth:            # known only to the simulated user
     deadline: int | None = None
     need: str = ""
 ```
+
+**This is a discrete-event simulator, not a scheduler.** Time is a virtual clock of integer minutes; `run_day` processes events in time order inside one `for` loop, and a whole day finishes instantly, with no real waiting and no other processes. The upside is full determinism: the same input always gives the same numbers, which is what you want for comparing policies, writing tests, and sensitivity analysis. The real runtime is in §2.7.
 
 **Why two types?** The easiest mistake when evaluating a proactive agent is letting the policy "peek" at the answers. `simulate_day()` returns `(events, truth)`; the decider only gets `events`, and only the scorer uses `truth`. It's the same principle as "keep eval data isolated from the system under test" in [Lesson 22](../22_eval_methodology/README.en.md).
 
@@ -286,7 +288,7 @@ class SuggestionCard(BaseModel):
     uses_beliefs: list[str]  # user-model keys it cites
 ```
 
-`make_card` generates the card with [`complete_json`](../../agentkit/workflows.py) (Lesson 06's "structured output + automatic repair"), then runs two post-checks: does `uses_beliefs` contain keys that weren't in the prompt (the model inventing grounds)? Does the card text contain phrases like "I've already done it for you" that claim an action was executed (violating "suggest, don't execute")? **Don't trust that the model followed the system prompt. Check.**
+`make_card` is an async function: it generates the card with `await complete_json(...)` ([`agentkit/workflows.py`](../../agentkit/workflows.py), Lesson 06's "structured output + automatic repair"), then runs two post-checks: does `uses_beliefs` contain keys that weren't in the prompt (the model inventing grounds)? Does the card text contain phrases like "I've already done it for you" that claim an action was executed (violating "suggest, don't execute")? **Don't trust that the model followed the system prompt. Check.**
 
 While tuning the prompt against a real model (gpt-5.5), we saw three things worth writing down:
 
@@ -312,6 +314,57 @@ Satisfaction is a **proxy metric**. All the numbers are assumptions, written in 
 
 **The conclusions depend on these assumptions, and that's the point**: the sensitivity analysis in §3 shows that once the interruption cost is set to 0, the best policy changes.
 
+### 2.7 Running it for real: a scheduler, an event table, a job queue, and idempotency
+
+All the parts above run inside the simulator: `run_day` uses integer minutes as its clock, and a whole day finishes instantly in one `for` loop. That's great for comparing policies and writing tests, but it can't answer the questions a real running system faces: who wakes up when? Which process do events come from? What if the timer fires on two replicas at once? If the process sending a notification crashes after sending but before acknowledging, will the retried job send it again?
+
+[`proactive_runtime.py`](proactive_runtime.py) runs a short stretch with real components (single machine, zero external dependencies: one SQLite file, 5 OS processes). The decision is made by the same `should_interrupt`:
+
+```mermaid
+flowchart LR
+    P["Producer process<br/>writes events (alert-7731 delivered twice)"] -->|INSERT| EV[("events table")]
+    EV -->|"reads new rows every 50ms"| W["Main process: watch_events<br/>decider should_interrupt"]
+    W -->|"say it now: enqueue (notify:source ID)"| Q[("Job queue<br/>UNIQUE(tenant, idempotency key)")]
+    W -->|"save for later"| DI[("digest_items table")]
+    W -->|"focus / meeting"| US[("user_state table")]
+    A["Main process: timer A"] -->|"every 1s: enqueue (digest:period number)"| Q
+    B["Another process: timer B"] -->|"same idempotency key"| Q
+    Q -->|"claim, 1-second lease"| K["Worker processes × 2<br/>WorkerPool"]
+    DI --> K
+    US --> K
+    K -->|"INSERT OR IGNORE<br/>primary key = idempotency key"| N[("notifications table")]
+```
+
+Three key points:
+
+**1. The timer aligns to the wall clock, and the idempotency key depends only on the period number.**
+
+```python
+target = (math.floor(time.time() / period) + 1) * period   # the next whole period
+await asyncio.sleep(target - time.time())                  # really waits; meanwhile the event loop runs other coroutines
+key = f"digest:{round(target / period)}"
+job_id = await queue.enqueue("digest", {...}, tenant_id=TENANT, idempotency_key=key)
+```
+
+Replicas that fire in the same period compute the same key, so the queue holds only one job (`SQLiteJobQueue`'s `UNIQUE(tenant_id, idempotency_key)`: a duplicate enqueue returns the existing job's id). That's much simpler than "elect a leader and let only one replica run the timer", and leader election can itself go wrong (two replicas both believing they're the leader). In the demo, A in this process and B in another process fire every period and get the same job id.
+
+**2. The watcher doesn't remember "which events it has handled."** A duplicate delivery from the producer, or a watcher restart that loses its cursor, can get the same event decided twice. Then it's enqueued twice, and the idempotency key `notify:<source ID>` deduplicates it. When the enqueue returns an existing job's id, that's a duplicate trigger and doesn't count as a new interruption (the rate limit isn't charged twice).
+
+**3. The side effect itself must be idempotent.** A queue can only guarantee "at least once": if a worker crashes after sending a notification but before acknowledging the job, the lease expires and another worker claims and re-runs it. So "send a notification" is written like this:
+
+```python
+cur = c.execute("INSERT OR IGNORE INTO notifications VALUES (?, ...)", (key, ...))   # the idempotency key is the primary key
+outcome = "sent" if cur.rowcount else "duplicate_skipped"                            # conflict = already sent
+```
+
+It commits in the same transaction as the execution record. The digest job works the same way: in one `BEGIN IMMEDIATE` transaction it reads `user_state` (in focus or a meeting: skip this round), takes the items not yet sent, marks them, and writes the notification, so two workers can't send the same batch twice.
+
+In a real system, "sending a notification" means calling an external push service (email, chat, mobile push), which can't share a transaction with your local database. The usual approaches are to pass the idempotency key downstream (many push and payment APIs accept an `Idempotency-Key`), or to write a "to be sent" record first (an outbox) and have a separate sender process deduplicate by key.
+
+**How it's proven**: part 8 of the demo runs the whole thing, with a timeline taken from the SQLite tables and the worker processes' event logs (results in §3). [`test_live_runtime.py`](test_live_runtime.py) really starts these 5 processes and asserts: the five process ids are all different and the events were written by the producer process; the two triggers of the duplicate delivery got the same job; each period has exactly one digest job, and in at least one period both replicas fired; the timer's idempotency keys match the wall-clock periods; the SEV1 job ran twice (in two different worker processes) yet there's only 1 notification, and one worker exited with code 1; every "say it now" event is notified exactly once, and the item saved during focus lands in exactly one digest, sent only after focus ended.
+
+**Limitations**: single machine (SQLite can only be shared on one machine; for multiple machines switch to Postgres, Lesson 26); the timer doesn't catch up: periods during which every replica was down are simply lost (in production use a durable scheduler such as Temporal Schedules, Lesson 28); polling the event table adds tens of milliseconds of latency (in production use a message queue or Postgres `LISTEN/NOTIFY` to push).
+
 ## 3. Hands-on: run the demo
 
 ```bash
@@ -319,7 +372,7 @@ Satisfaction is a **proxy metric**. All the numbers are assumptions, written in 
 .venv/bin/python lessons/25_proactive_and_frontier/demo.py --offline   # offline: scripted cards, everything else identical
 ```
 
-Apart from part 5, the demo is a deterministic simulation, and both modes print exactly the same output. In real mode the whole demo makes 3 model calls (about 2,700 input tokens and 600 output tokens per run).
+Parts 1–4, 6, and 7 are a deterministic simulation, and both modes print exactly the same output; part 5 generates its 3 cards concurrently (at most 2 in flight); part 8 uses real processes and the wall clock, takes about 5 seconds, and doesn't call the model. In real mode the whole demo makes 3 model calls (about 2,700 input tokens and 600 output tokens per run; a re-run with the async version on 2026-09-28: 3 calls, in-flight peak 2, 2,763 input and 562 output tokens, and card 3 again cited `cares_staging_alerts`).
 
 (Demo output translated from Chinese.)
 
@@ -400,6 +453,59 @@ With implicit feedback alone, the system has to be "ignored" twice before it lea
 
 Part 7 shows that after `forget`, the same signal can't be learned back; that sensitive inferences stay out of the prompt by default; and time decay: after 14 days, "on call this week" (half-life 7 days) drops from 95% to 68%, while "wants reminders before meetings" (half-life 60 days) only goes from 83% to 80%.
 
+**Part 8: running it for real** (same in both modes, no model calls; below is the complete output of one run, Apple M1 8GB, macOS 14.4, Python 3.11.7)
+
+```text
+   Processes: main pid 64353 (event watcher + timer A) | producer pid 64356 | timer B pid 64357 | worker w0 pid 64354, worker w1 pid 64355
+
+   Timeline (seconds since the workers came up; sources: the events / decisions / triggers / handler_runs tables in SQLite + the workers' event logs):
+   [+ 0.28s] timers A, B │ period 1 (digest:1790577007) fired 2 times → digest job #1
+   [+ 0.59s] producer    │ wrote act-01: 13:30 enter focus mode
+   [+ 0.63s] main        │ act-01 state change: focus on (written to user_state)
+   [+ 0.89s] producer    │ wrote mail-481: 13:40 Tech weekly #129
+   [+ 0.90s] main        │ mail-481 🔕 don't say it (benefit × confidence too low)
+   [+ 1.19s] producer    │ wrote alert-7731: 13:50 [SEV1] prod API p99 latency 3.2…
+   [+ 1.21s] main        │ alert-7731 🔔 say it now (urgent: overrides focus/quiet hours/rate limit) → enqueued notify job #3
+   [+ 1.25s] worker w1   │ job #3 attempt 1: notification sent
+   [+ 1.25s] worker w1   │ 💥 notification sent, job not yet acknowledged → process exits on the spot (os._exit(1))
+   [+ 1.28s] timers A, B │ period 2 (digest:1790577008) fired 2 times → digest job #4
+   [+ 1.32s] worker w0   │ job #4 attempt 1: digest (0 items) user in focus → not this round
+   [+ 1.49s] producer    │ wrote alert-7731 (duplicate delivery): 13:50 [SEV1] prod API p99 latency 3.2…
+   [+ 1.53s] main        │ alert-7731 🔔 say it now (urgent: overrides focus/quiet hours/rate limit) → enqueue returned existing job #3
+   [+ 1.80s] producer    │ wrote mail-482: 14:20 Colleague: could you review PR…
+   [+ 1.84s] main        │ mail-482 📥 save it for later (in focus/meeting → next break's digest)
+   [+ 2.11s] producer    │ wrote act-02: 14:55 focus ends
+   [+ 2.16s] main        │ act-02 state change: focus off (written to user_state)
+   [+ 2.28s] timers A, B │ period 3 (digest:1790577009) fired 2 times → digest job #7
+   [+ 2.32s] worker w0   │ job #7 attempt 1: digest (1 item) sent
+   [+ 2.42s] producer    │ wrote cal-19: 15:05 the 15:30 1:1 conflicts with a new cross-team…
+   [+ 2.47s] main        │ cal-19 🔔 say it now (worth it, and the user is free) → enqueued notify job #9
+   [+ 2.53s] worker w0   │ job #9 attempt 1: notification sent
+   [+ 2.68s] worker w0   │ job #3 attempt 2: notification already sent → skipped
+   [+ 2.73s] producer    │ wrote mail-483: 15:10 Manager: send me the Q3 latency analysis…
+   [+ 2.73s] main        │ mail-483 🔔 say it now (worth it, and the user is free) → enqueued notify job #10
+   [+ 2.74s] worker w0   │ job #10 attempt 1: notification sent
+   [+ 3.28s] timers A, B │ period 4 (digest:1790577010) fired 2 times → digest job #11
+   [+ 4.28s] timers A, B │ period 5 (digest:1790577011) fired 2 times → digest job #13
+   [+ 5.28s] timers A, B │ period 6 (digest:1790577012) fired 2 times → digest job #15
+
+▶ Measured
+   Events: the producer (another process) wrote 8, 1 of them a duplicate delivery; decisions: say it now 4, save for later 1, don't say 1, state changes 2
+   Enqueue dedup: notify fired 4 times → 3 jobs; digest timer A fired 6 times, B 6 times → 6 digest jobs (in 6 periods both replicas fired and got the same job id)
+   Execution dedup: job #3 (notify:alert-7731) ran 2 times: attempt 1 w1 sent → attempt 2 w0 already sent → skipped; 1 row for this notification in notifications; worker exit codes [0, 1]
+   Notifications: 4 in total (3 immediate + 1 digest): 🔔 [SEV1] prod API p99…; 📬 Digest: Colleague: could you…; 🔔 the 15:30 1:1 conflicts…; 🔔 Manager: send me the Q3…
+   Timer accuracy: 12 fires, 0.6–2.8ms after their whole-second targets on the wall clock
+   Latency (event first written → notification written, wall clock): alert-7731 60ms; cal-19 109ms; mail-483 9ms (the SEV1 job was acknowledged only after attempt 2, 1.42s after attempt 1: 1-second lease + backoff)
+   Jobs: 9/9 succeeded; the whole experiment took 5.4s
+```
+
+Process ids, times, and job ids differ on every run, and the number of periods can differ by one (depending on where in the second the run starts); the deduplication and crash-retry results are the same every time: the duplicated SEV1 has one job, each period has one digest job, and after the crash-and-retry there's still only one notification. A few numbers worth a look:
+
+- **Both layers of idempotency really kicked in**: notify fired 4 times → 3 jobs (the duplicate delivery was stopped by enqueue dedup); the two timer replicas fired 6 times each → 6 digest jobs; job #3 ran twice, and the second run, in another worker process, found "already sent", so there's only one notification.
+- **The timer is punctual**: all 12 fires landed within 3 ms after their whole-second targets (`asyncio.sleep` wakes on time); the SEV1 took 60 ms from being written to its notification being sent, mostly two layers of polling (the watcher's 50 ms, the worker's 50 ms claim interval).
+- **A crash costs time, not duplicates**: the SEV1 job was acknowledged only 1.42 seconds after its first attempt (1-second lease + backoff). The notification went out before the crash, so the user didn't wait longer; had the crash happened before sending, the user would have waited those extra 1.4 seconds. Shorter leases mean faster takeover but more frequent heartbeats (Lesson 13).
+- **The digest respects the user's state**: in period 2 the user was still in focus; the worker read `user_state.focus = 1` and skipped that round; the first period after focus ended pushed out the saved PR review request.
+
 ## 4. Exercise
 
 Open [`exercise.py`](exercise.py) and complete three tasks:
@@ -415,7 +521,7 @@ make lesson N=25
 # or: .venv/bin/python -m pytest lessons/25_proactive_and_frontier -v
 ```
 
-22 tests, offline and deterministic, done in milliseconds. `proactive_kit.py` has full versions of these four functions; try writing them yourself first and compare when you get stuck.
+The exercise's 22 tests (`test_exercise.py`) are offline and deterministic and finish in milliseconds; all four functions are pure computation, so plain functions are fine. `make lesson N=25` also runs the 6 tests in [`test_live_runtime.py`](test_live_runtime.py), which really start 5 processes to run §2.7's runtime (about 5 seconds) and have nothing to do with the exercise. `proactive_kit.py` has full versions of these four functions; try writing them yourself first and compare when you get stuck.
 
 ## 5. Going deeper
 
@@ -525,6 +631,8 @@ If the whole course had to fit in three sentences:
 | Cards claiming "I already did it for you" | The user thinks it's handled when it isn't; or the agent really did overstep and act | The system prompt says suggest only; post-checks catch "done for you"-style wording; execution requires user confirmation |
 | Watching only the acceptance rate | You optimize toward clickbait-style notifications: more opens, fewer satisfied users | Also watch interruption counts, the "stop reminding me" rate, and the share of users who turn the feature off |
 | Treating public leaderboard scores as your own | Production performance falls far short of expectations | Use leaderboards to pick models; ship based on your own eval set and pass^k |
+| Letting only one replica run the timer, guarded by "leader election" | When election goes wrong, two replicas send together; with only one replica you worry about it dying | Run the timer on every replica, compute the idempotency key from the wall-clock period, and dedupe at enqueue (§2.7) |
+| Assuming the queue guarantees "exactly once" | A worker crashes after sending the notification, the job re-runs, and the same reminder goes out twice | The queue only guarantees at least once; make the side effect itself dedupe by key (a primary key, a downstream Idempotency-Key, an outbox) |
 
 ## 7. Interview & design review questions
 

@@ -4,20 +4,24 @@
     python lessons/25_proactive_and_frontier/demo.py --offline   # 离线：卡片用剧本（ScriptedLLM），其余部分完全相同
 
 模拟后端工程师小林（本周值班）的一天：22 条事件（日历、邮件、工单、告警）+ 12 条状态变化（专注、开会、下班）。
-七个部分：
+八个部分：
   1. 一天的事件流
   2. 用户模型：带证据和置信度的推断（以及一条错误推断）
   3. 三种策略对比：从不打扰 / 每件事都打扰 / 决策器
   4. 决策器的一天：每条事件为什么被"现在说 / 攒着说 / 不说"
-  5. 建议卡片：LLM + complete_json 生成结构化建议，并做事后检查
+  5. 建议卡片：LLM + complete_json 生成结构化建议，并做事后检查（3 张卡片并发生成）
   6. 用户纠正错误推断之后，行为怎么变
   7. 遗忘、敏感推断与时间衰减
-除了第 5 部分，其余部分都是确定性的：两种模式输出一致。
+  8. 真的跑起来：生产者进程 + 两个定时器副本 + 事件监听 + 2 个 worker 进程，幂等与崩溃重试（约 6 秒）
+第 1–4、6、7 部分用的是离散事件模拟器（proactive_kit.run_day：整数分钟的虚拟时钟，瞬间跑完），完全确定，
+两种模式输出一致；第 8 部分是真实的进程、真实的墙钟和任务队列（proactive_runtime.py），不调用模型，数字每次略有不同。
+入口是 asyncio.run(main())。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 import sys
 import unicodedata
@@ -25,6 +29,7 @@ from pathlib import Path
 from types import ModuleType
 
 from agentkit import ResilientLLM, default_llm
+from agentkit.workflows import parallel
 
 HERE = Path(__file__).resolve().parent
 
@@ -102,16 +107,22 @@ REASON_TEXT = {
 
 
 class CountingLLM:
-    """给 LLM 套一层计数：演示结束时报告调用次数和 token 用量。"""
+    """给 LLM 套一层计数：演示结束时报告调用次数、token 用量和同时在途的峰值。"""
 
     def __init__(self, inner):
         self.inner, self.model = inner, inner.model
         self.calls = 0
         self.input_tokens = self.output_tokens = 0
+        self.in_flight = self.max_in_flight = 0
 
-    def chat(self, messages, tools=None, **kwargs):
-        resp = self.inner.chat(messages, tools, **kwargs)
-        self.calls += 1
+    async def chat(self, messages, tools=None, **kwargs):
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            resp = await self.inner.chat(messages, tools, **kwargs)
+        finally:
+            self.in_flight -= 1
+        self.calls += 1  # 读-改-写之间没有 await：同一个事件循环里不会被打断，不需要锁
         self.input_tokens += resp.usage.input_tokens
         self.output_tokens += resp.usage.output_tokens
         return resp
@@ -206,21 +217,28 @@ def part4_timeline(report) -> None:
              "      · 11:10 和 13:10 两次 staging 告警都是误报：错误推断的代价，就是这两次'没用的打扰'。")
 
 
-def part5_cards(llm, events, model, offline: bool) -> None:
+async def part5_cards(llm, events, model, offline: bool) -> None:
     banner("5. 建议卡片：LLM + complete_json（只建议，不执行）")
-    info("只为 3 个时刻生成卡片（真实模式下 = 约 3 次模型调用）。提示词里只放和事件相关、非敏感的推断。\n")
+    info("只为 3 个时刻生成卡片（真实模式下 = 约 3 次模型调用，并发 ≤ 2）。提示词里只放和事件相关、非敏感的推断。\n")
     by_id = {e.id: e for e in events}
     jobs = [
         ([by_id["e02"]], pk.Decision("interrupt", "worth_it", 1.9), None, "08:35 会前提醒"),
         ([by_id["e11"]], pk.Decision("interrupt", "urgent_override", 7.0), None, "13:50 SEV1（专注中，越权打扰）"),
         ([by_id["e03"], by_id["e05"]], pk.Decision("defer", "busy", 0.7), pk.at("09:55"), "09:55 专注结束后的摘要"),
     ]
-    for i, (evs, decision, now, label) in enumerate(jobs):
-        step(f"卡片 {i + 1}：{label}")
+
+    async def one(evs, decision, now):
         try:
-            result = pk.make_card(llm, evs, model, decision, now=now)
-        except Exception as e:  # 真实模型可能失败：演示继续，但如实报告
-            info(f"❌ 生成失败：{type(e).__name__}: {str(e)[:160]}")
+            return await pk.make_card(llm, evs, model, decision, now=now)
+        except Exception as e:  # noqa: BLE001 —— 真实模型可能失败：演示继续，但如实报告
+            return e
+
+    # 三张卡片互不依赖：并发生成（同时在途 ≤ 2），按原顺序打印
+    results = await parallel([lambda j=j: one(j[0], j[1], j[2]) for j in jobs], max_concurrency=2)
+    for i, ((evs, decision, now, label), result) in enumerate(zip(jobs, results)):
+        step(f"卡片 {i + 1}：{label}")
+        if isinstance(result, Exception):
+            info(f"❌ 生成失败：{type(result).__name__}: {str(result)[:160]}")
             continue
         c = result.card
         info(f"┌ {c.title}")
@@ -236,7 +254,7 @@ def part5_cards(llm, events, model, offline: bool) -> None:
             for line in result.prompt.splitlines():
                 info(f"   │ {line}")
     if not offline:
-        takeaway(f"本部分共调用模型 {llm.calls} 次，输入 {llm.input_tokens} tokens、输出 {llm.output_tokens} tokens。\n"
+        takeaway(f"本部分共调用模型 {llm.calls} 次（同时在途峰值 {llm.max_in_flight}），输入 {llm.input_tokens} tokens、输出 {llm.output_tokens} tokens。\n"
                  "      决定'要不要打扰'的是便宜、确定的决策器；模型只负责'怎么说'。")
     else:
         takeaway("离线模式用剧本返回卡片，但走的是同一条 complete_json + 事后检查的路径。\n"
@@ -310,13 +328,99 @@ def part7_privacy(model) -> None:
              "      用户能看（explain）、能改（correct）、能删（forget），推断会过期（decay）—— 这是主动式 Agent 的信任底线。")
 
 
-def main() -> None:
+async def part8_live() -> None:
+    banner("8. 真的跑起来：真实的进程、墙钟和任务队列（不是模拟器）")
+    info("前面几部分的时间是整数分钟的虚拟时钟，一整天在一个 for 循环里瞬间跑完。这一部分用真实的组件跑一小段（proactive_runtime.py）：")
+    info("  · 生产者进程按真实的时间间隔（0.3 秒）往 SQLite 的 events 表写 8 条事件，alert-7731 故意投递两次；")
+    info("  · 本进程里的协程每 50ms 读一次新事件 → 决策器 → 值得说的入队 notify 任务（幂等键 notify:<事件源 ID>），攒着说的进摘要表；")
+    info("  · 摘要定时器按真实墙钟每 1 秒触发一次（幂等键 digest:<周期编号>），跑两个副本：本进程的 A、另一个进程的 B；")
+    info("  · 2 个 worker 进程（WorkerPool）领任务、发通知；处理 SEV1 的 worker 发完通知、确认任务之前被 os._exit(1) 杀掉。")
+    rt = _load_sibling("proactive_runtime")
+    r = await rt.run_live(HERE / "runs" / "live")
+
+    names = {r.main_pid: "主进程", r.producer["pid"]: "生产者", r.scheduler_b["pid"]: "定时器 B"}
+    workers = {pid: f"worker w{i}" for i, pid in enumerate(r.worker_pids)}
+    info()
+    info(f"进程：主进程 pid {r.main_pid}（事件监听 + 定时器 A）｜生产者 pid {r.producer['pid']}｜定时器 B pid {r.scheduler_b['pid']}｜"
+         + "、".join(f"{v} pid {k}" for k, v in workers.items()))
+    lines: list[tuple[float, str, str]] = []
+    seen: set[str] = set()
+    for e in r.events:
+        dup = "（重复投递）" if e["source_id"] in seen else ""
+        seen.add(e["source_id"])
+        lines.append((e["written_at"], "生产者", f"写入 {e['source_id']}{dup}：{hhmm(e['minute'])} {clip(e['title'], 30)}"))
+    state_text = {"focus_start": "进入专注", "focus_end": "专注结束", "meeting_start": "开会", "meeting_end": "会议结束"}
+    for d in r.decisions:
+        if d["action"] == "state":
+            lines.append((d["t"], "主进程", f"{d['source_id']} 状态变化：{state_text.get(d['reason'], d['reason'])}（写进 user_state 表）"))
+            continue
+        what = f"{ACTION_TEXT[d['action']]}（{REASON_TEXT.get(d['reason'], d['reason'])}）"
+        if d["job_id"] is not None:
+            what += f" → {'入队返回已有任务' if d['duplicate'] else '入队 notify 任务'} #{d['job_id']}"
+        lines.append((d["t"], "主进程", f"{d['source_id']} {what}"))
+    for n, (key, by_who) in enumerate(sorted(r.digest_windows().items()), 1):
+        fires = [t for t in r.triggers if t["key"] == key]
+        who = "、".join(sorted(by_who))
+        ids = sorted({j for js in by_who.values() for j in js})
+        lines.append((min(t["fired_at"] for t in fires), f"定时器 {who}",
+                      f"第 {n} 个周期（{key}）触发 {len(fires)} 次 → 摘要任务 #{', #'.join(map(str, ids))}"))
+    outcome_text = {"sent": "发出", "duplicate_skipped": "已经发过 → 跳过", "busy_skip": "用户在专注 → 这一轮不推",
+                    "nothing_pending": "没有攒着的 → 不推"}
+    for h in r.handler_runs:
+        if h["outcome"] == "nothing_pending":
+            continue
+        kind = "通知" if h["key"].startswith("notify:") else f"摘要（{h['items']} 条）"
+        lines.append((h["t"], f"worker {h['worker']}", f"任务 #{h['job_id']} 第 {h['attempt']} 次执行：{kind}{outcome_text[h['outcome']]}"))
+    for ev in r.worker_events:
+        if ev["event"] == "crash_injected":
+            lines.append((ev["t"], f"worker {ev['worker_id']}", "💥 通知已发出、任务还没确认 → 进程当场退出（os._exit(1)）"))
+    info()
+    info("时间线（相对 worker 上线的秒数；来源：SQLite 里的 events / decisions / triggers / handler_runs 表 + worker 的事件日志）：")
+    for t, who, text in sorted(lines, key=lambda x: x[0]):
+        info(f"[+{t - r.t0:5.2f}s] {pad(who, 12)}│ {text}")
+
+    notify_triggers = [t for t in r.triggers if t["kind"] == "notify"]
+    notify_jobs = {t["job_id"] for t in notify_triggers}
+    windows = r.digest_windows()
+    digest_fires = [t for t in r.triggers if t["kind"] == "digest"]
+    both = sum(1 for w in windows.values() if len(w) == 2)
+    crash_key = "notify:alert-7731"
+    crash_runs = r.runs_for(crash_key)
+    crash_job = r.job_by_key(crash_key)
+    n_sent = [n for n in r.notifications if n["key"] == crash_key]
+    late = r.lateness_ms()
+    lat = {sid: r.latency_ms(sid) for sid in ("alert-7731", "cal-19", "mail-483")}
+    digests = [n for n in r.notifications if n["kind"] == "digest"]
+    ok = sum(j.status == "succeeded" for j in r.jobs)
+    step("实测")
+    info(f"事件：生产者（另一个进程）写入 {len(r.events)} 条，其中 {len(r.events) - len({e['source_id'] for e in r.events})} 条是重复投递；"
+         f"决策：现在说 {r.watcher['interrupt']} 次、攒着说 {r.watcher['defer']} 次、不说 {r.watcher['drop']} 次，状态变化 {r.watcher['state_change']} 次")
+    info(f"入队去重：notify 触发 {len(notify_triggers)} 次 → {len(notify_jobs)} 个任务；"
+         f"摘要定时器 A 触发 {r.fired_a} 次、B 触发 {r.scheduler_b['fired']} 次 → {len(windows)} 个摘要任务"
+         f"（其中 {both} 个周期两个副本都触发了，拿到的是同一个任务 id）")
+    info(f"执行去重：任务 #{crash_job.id if crash_job else '?'}（{crash_key}）执行了 {len(crash_runs)} 次："
+         + " → ".join(f"第 {h['attempt']} 次 {h['worker']} {outcome_text[h['outcome']]}" for h in crash_runs)
+         + f"；notifications 里这条通知 {len(n_sent)} 条；worker 退出码 {r.worker_exit_codes}")
+    info(f"通知：共 {len(r.notifications)} 条（即时 {len(r.notifications) - len(digests)} 条 + 摘要 {len(digests)} 条）："
+         + "；".join(clip(n["text"], 24) for n in r.notifications))
+    info(f"定时器准时度：{len(late)} 次触发，比墙钟上的整秒目标晚 {min(late):.1f}–{max(late):.1f}ms")
+    info("延迟（事件第一次写入 → 通知写入，墙钟）：" + "；".join(f"{k} {v:.0f}ms" for k, v in lat.items() if v is not None)
+         + (f"（SEV1 的任务在第 {len(crash_runs)} 次执行后才确认，距第一次执行 {crash_runs[-1]['t'] - crash_runs[0]['t']:.2f}s：租约 1 秒 + 退避）"
+            if len(crash_runs) > 1 else ""))
+    info(f"任务：{ok}/{len(r.jobs)} succeeded；整个实验用时 {r.elapsed:.1f}s")
+    takeaway("两层幂等：同一个触发不管触发几次（重复投递、两个定时器副本），队列里只有一个任务；\n"
+             "      同一个任务不管执行几次（worker 崩溃、租约过期后被别人接手），通知只发一次（notifications 的主键）。\n"
+             "      队列只保证'至少执行一次'，'效果只发生一次'要靠副作用本身幂等 —— 这对主动式 Agent 尤其要紧：重复打扰比不打扰更伤信任。")
+
+
+async def main() -> None:
     parser = argparse.ArgumentParser(description="第 25 课 Demo：主动式 Agent")
     parser.add_argument("--offline", action="store_true", help="建议卡片用离线剧本（ScriptedLLM），不调用真实模型")
     args = parser.parse_args()
 
+    base = None
     if args.offline:
-        print("🔌 离线模式：建议卡片用剧本生成；其余部分是确定性模拟，与真实模式输出一致。")
+        print("🔌 离线模式：建议卡片用剧本生成；其余部分是确定性模拟（第 8 部分是真实进程），与真实模式相同。")
         llm = pk.offline_card_llm()
     else:
         try:
@@ -328,13 +432,18 @@ def main() -> None:
 
     events, truth = pk.simulate_day()
     model = pk.initial_user_model()
-    part1_events(events, truth)
-    part2_user_model(model)
-    decider_report = part3_compare(events, truth, model)
-    part4_timeline(decider_report)
-    part5_cards(llm, events, model, args.offline)
-    part6_correction(events, truth, model)
-    part7_privacy(model)
+    try:
+        part1_events(events, truth)  # 第 1–4、6、7 部分：模拟器，纯计算
+        part2_user_model(model)
+        decider_report = part3_compare(events, truth, model)
+        part4_timeline(decider_report)
+        await part5_cards(llm, events, model, args.offline)
+        part6_correction(events, truth, model)
+        part7_privacy(model)
+        await part8_live()
+    finally:
+        if base is not None:
+            await base.aclose()  # 关掉 HTTP 连接池
 
     banner("小结")
     info("1. 主动 = 发现需求 + 决定时机 + 说清理由。难的是后两件：什么时候不该开口。")
@@ -342,7 +451,8 @@ def main() -> None:
     info("3. 护栏：频率上限防轰炸；紧急事件可以越权，但把握太低时不行。")
     info("4. 用户模型：每条推断带证据和置信度；显式纠正 > 隐式反馈；敏感推断默认不用；推断会过期。")
     info("5. LLM 只负责'怎么说'，并且只建议、不执行；输出要做事后检查（引用了不存在的推断？声称已执行？）。")
+    info("6. 真的跑起来要靠真实的调度器、事件表和任务队列；触发会重复、进程会崩溃，幂等键保证同一件事只说一次。")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

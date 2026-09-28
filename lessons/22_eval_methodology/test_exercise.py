@@ -1,6 +1,9 @@
 """第 22 课练习测试：离线、确定、毫秒级。
 
 运行：make lesson N=22    或    .venv/bin/python -m pytest lessons/22_eval_methodology -v
+
+前三组测试练习（纯统计，普通函数）；最后一组测试 refund_bench 的 async harness：
+并发真的发生、上限守得住、并发下每次试验的环境仍然互相隔离、基础设施错误单独标记。这组不依赖练习。
 """
 
 from __future__ import annotations
@@ -9,9 +12,11 @@ import random
 
 import pytest
 
-from agentkit.testing import load_exercise
+from agentkit import LLMError
+from agentkit.testing import load_exercise, load_sibling
 
 ex = load_exercise(__file__)
+rb = load_sibling(__file__, "refund_bench")
 
 
 # =====================================================================
@@ -187,3 +192,55 @@ def test_verdict_normalization_and_invalid_output():
     for bad in ("C", "", "x", "first"):
         with pytest.raises(ValueError):
             ex.debiased_pairwise(lambda f, s, bad=bad: bad, "x 回复", "y 回复")
+
+
+# =====================================================================
+# refund_bench 的 async harness（不是练习）
+# =====================================================================
+
+TASKS = rb.load_tasks()
+
+
+def _jobs(k: int = 1) -> list:
+    return [rb.TrialJob(f"{t.id}|{i}", "A", "你是退款助手。", t, i) for t in TASKS for i in range(k)]
+
+
+@pytest.mark.parametrize("limit", [1, 2, 4])
+async def test_run_trials_concurrency_is_real_and_bounded(limit):
+    llm = rb.scripted_oracle_llm(TASKS, latency=0.02)
+    jobs = _jobs()
+    rows = await rb.run_trials(llm, jobs, concurrency=limit)
+    assert llm.max_in_flight == limit  # 上限是几，在途峰值就是几
+    assert llm.call_count == len(jobs)  # 作出决定即停：每次试验恰好 1 次模型调用
+    assert [r["key"] for r in rows] == [j.key for j in jobs]  # 按 jobs 的顺序返回
+    assert all(r["passed"] for r in rows)
+
+
+async def test_run_trials_environment_stays_isolated_under_concurrency():
+    """16 个任务 × 3 次，同时在途 8 个。如果试验之间共用账本，StopAfterDecision 会让后面的试验一次模型都不调，
+    评分器也会看到"多于一个决定"—— 全部通过、调用次数恰好等于试验数，说明并发下每次试验仍是干净的环境。"""
+    llm = rb.scripted_oracle_llm(TASKS, latency=0.01)
+    progress = []
+    rows = await rb.run_trials(llm, _jobs(3), concurrency=8, on_progress=lambda i, n: progress.append((i, n)))
+    assert llm.max_in_flight == 8
+    assert all(r["passed"] and r["decision"].count(",") == 0 for r in rows)
+    assert llm.call_count == len(rows) == 48
+    assert progress == [(i, 48) for i in range(1, 49)]
+
+
+async def test_run_trials_infra_error_is_marked_and_does_not_stop_others():
+    oracle = rb.scripted_oracle_llm(TASKS, latency=0.0)
+
+    def respond(messages):
+        if "订单号：YS-1003" in messages[-1]["content"]:
+            raise LLMError("503 Service Unavailable", status_code=503, retryable=False)
+        return oracle.responder(messages)
+
+    from agentkit import ScriptedLLM
+
+    llm = ScriptedLLM(responder=respond, latency=0.01)
+    rows = await rb.run_trials(llm, _jobs(), concurrency=4)
+    bad = [r for r in rows if r["error"]]
+    assert [r["task_id"] for r in bad] == ["YS-1003"]
+    assert bad[0]["reason"] == "infra_error" and bad[0]["error"].startswith("llm_error")
+    assert sum(r["passed"] for r in rows) == len(TASKS) - 1  # 其余试验照常完成，没有被取消

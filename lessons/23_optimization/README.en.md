@@ -214,7 +214,7 @@ OPRO and GEPA don't depend on `Program` directly. They depend on a very small in
 
 ```python
 class Task(Protocol):
-    def run(self, instruction: str, examples: Sequence) -> list[Record]: ...
+    async def run(self, instruction: str, examples: Sequence) -> list[Record]: ...
 
 @dataclass
 class Record:
@@ -226,29 +226,34 @@ class Record:
 
 `ProgramTask` wraps "program + metric + feedback function" as a `Task`; `AgentTask` in section 2.8 wraps an agent as a `Task`. **The instruction optimizers only talk to this interface**, so switching tasks, or switching to an agent, requires no change to the optimizers.
 
+`run` is async: the examples in one evaluation are independent, so `ProgramTask` sends them out concurrently on one event loop with `agentkit.workflows.parallel` (`max_concurrency`, 2 on the shared gateway) and returns results in example order; if an example's model call still fails after retries, it scores 0 and is counted in `errors` instead of stopping the whole evaluation. The optimizers themselves evaluate **one candidate after another**: each evaluation is already concurrent inside, and stacking another layer of concurrency would exceed the gateway quota. The demo also wraps the real model in `ResilientLLM(max_concurrency=2)` as a master switch: however much concurrency sits above it, at most 2 requests are on the wire at once.
+
 ### 2.2 Keep the books before you optimize
 
 ```python
 class MeteredLLM:
-    def chat(self, messages, tools=None, **kwargs):
-        resp = self.llm.chat(messages, tools, **kwargs)
-        with self._lock:                        # evals call concurrently, so lock
-            self.calls += 1
-            self.usage = self.usage + resp.usage
-            self.cost_usd += estimate_cost(resp.usage, resp.model or self.model)
+    async def chat(self, messages, tools=None, **kwargs):
+        ...                                     # in-flight count +1, note the start time
+        resp = await self.llm.chat(messages, tools, **kwargs)
+        ...                                     # in-flight count -1
+        self.calls += 1                         # no await between read and write: no lock needed
+        self.usage = self.usage + resp.usage
+        self.cost_usd += estimate_cost(resp.usage, resp.model or self.model)
         return resp
 ```
+
+**Why no lock?** The earlier version evaluated concurrently with a thread pool, and `MeteredLLM` held a `threading.Lock`: a thread can be switched out between any two bytecodes, so a read-modify-write like `self.calls += 1` could lose counts. Now every call is a coroutine on the same event loop, and coroutines only give up control at `await`. There's no `await` in the three lines after `await self.llm.chat(...)` returns, so no other coroutine can cut in; they're atomic. Only "read → `await` something else → write back" needs an `asyncio.Lock`. [`test_exercise.py`](test_exercise.py) has a test with 40 coroutines calling the same `MeteredLLM` at once: the in-flight peak is 40 (really concurrent), and the call and token counts are exact. The same goes for `ProgramTask.errors`, whose lock is also gone.
 
 **Why keep separate books**: optimization is **buying quality with money**. Report "+15 points of accuracy" without "300 calls spent" and you can't compare it fairly with "use a bigger model" or "sample a few more times". The demo wraps the task model and the optimizer in separate `MeteredLLM`s and snapshots them before and after each step; the difference is that step's spend. It sits outside `ResilientLLM` (Lesson 08), so it counts **logical calls**, and retries aren't double-counted.
 
 ### 2.3 BootstrapFewShot
 
-The core is a single loop (exercise b has you write it):
+The core is a single loop (exercise b has you write it, as an async function):
 
 ```python
 for ex in trainset:
     try:
-        out = program(ex.input)
+        out = await program(ex.input)            # finish one await before starting the next
     except Exception:
         continue                                 # rate limit, timeout: skip this one
     if float(metric(ex, out)) >= threshold:
@@ -257,7 +262,9 @@ for ex in trainset:
             break                                # stop once you have enough; don't spend more
 ```
 
-`bootstrap_fewshot` adds a random search on top: candidate 0 is the first k in order, the other candidates are k demos drawn after a seeded shuffle, and each set is evaluated on dev, keeping the best. To keep it fast with a real model, it runs the whole training set **concurrently** first and then filters in training-set order, which gives exactly the same result as calling `bootstrap_demos` sequentially.
+**No concurrency here, on purpose**: `asyncio.gather` would send the whole training set at once, and requests already sent can't be recalled, so "stop once you have enough" would save nothing. A test checks this with a fake program: after 2 demos are collected, the remaining examples are never called, and there's never more than 1 call in flight.
+
+`bootstrap_fewshot` adds a random search on top: candidate 0 is the first k in order, the other candidates are k demos drawn after a seeded shuffle, and each set is evaluated on dev, keeping the best. It needs the whole pool anyway, so it runs the whole training set **concurrently** first and then filters in training-set order, which gives exactly the same result as calling `bootstrap_demos` sequentially (the test makes completion order differ from send order; the results with concurrency 1 and 4 match item by item, and candidate 0 equals the result of calling `bootstrap_demos` sequentially).
 
 ### 2.4 OPRO
 
@@ -266,9 +273,9 @@ for r in range(1, rounds + 1):
     top = select_topk(history, keep_top)                  # exercise a
     shown = rng.sample(exemplars, n_exemplars)            # a few different task examples each round
     prompt = opro_meta_prompt(task_description, shown, top, per_round)
-    proposals = complete_json(optimizer_llm, prompt, Proposals).instructions
+    proposals = (await complete_json(optimizer_llm, prompt, Proposals)).instructions
     for ins in proposals[:per_round]:
-        score(ins, r)                                     # full evaluation on dev, written back to history
+        await score(ins, r)                               # full evaluation on dev (concurrent inside), written back to history
 ```
 
 Three details:
@@ -330,6 +337,22 @@ Two design points:
 
 The demo samples each example only once, then computes "single sample, vote, best-of-N" from the same set of samples. That keeps the comparison fair and saves calls.
 
+**Send the N samples at once**:
+
+```python
+async def sample_n(fn, n, max_concurrency=None):
+    return await _run_all([fn] * n, max_concurrency or n)   # fn returns a new coroutine each time; all n go out together
+```
+
+Sampling one after another, the user waits for the sum of N calls; sending them together, the user waits only for the slowest one, and the number of calls (the cost) doesn't drop at all. Scenario 6 of the demo measures this with a scripted model with fixed latency (50 ms per call), on the first 4 test tickets with 5 samples each:
+
+```text
+   one at a time (concurrency 1)    per-ticket wait  261ms   20 model calls   in-flight peak 1
+   5 at once (concurrency 5)        per-ticket wait   53ms   20 model calls   in-flight peak 5
+```
+
+With a real model, the gateway quota also applies: this lesson's shared gateway allows only 2 concurrent requests, so 5 samples go out in 3 batches. In a real run on 2026-09-28 (gpt-5.5), a single call averaged 2.4 seconds, and 5 samples per ticket averaged a 6.9-second wait, about 2.8× a single call (one at a time would be 5×). So test-time compute has to be planned together with the concurrency quota: double N and either latency or quota has to grow with it.
+
 ### 2.7 Is the improvement real: the paired bootstrap
 
 ```python
@@ -349,9 +372,11 @@ The same optimizers can optimize an agent's system prompt directly, scored with 
 class AgentTask:
     make_agent: Callable[[str], Agent]        # given an instruction, return a fresh agent
     graders: Sequence[Callable] = ()
+    concurrency: int = 4                      # how many cases run at once
 
-    def run(self, instruction, examples):
-        report = run_eval(lambda: self.make_agent(instruction), examples, list(self.graders) or [rule_grader])
+    async def run(self, instruction, examples):
+        report = await run_eval(lambda: self.make_agent(instruction), examples,
+                                list(self.graders) or [rule_grader], concurrency=self.concurrency)
         ...  # feedback = the detail of every failed Check
 ```
 
@@ -370,12 +395,12 @@ The `Check.detail` produced by Lesson 11's `rule_grader` (for example `期望顺
 
 ```bash
 .venv/bin/python lessons/23_optimization/demo.py --offline   # offline: deterministic simulated model, a few seconds
-.venv/bin/python lessons/23_optimization/demo.py             # real model: about 540 calls, concurrency 2, about 16 minutes in our run
+.venv/bin/python lessons/23_optimization/demo.py             # real model: about 540 calls, concurrency 2, 14–16 minutes in our runs
 ```
 
 The task is IT ticket classification: 7 categories, 20 tickets each in train / dev / test. Each split has 8 "trap" tickets, each tied to one of the **company's own rules** (USB drives that don't work go to security, all printer issues go to hardware, software licenses go through access approval...), plus 12 routine tickets. Some rules contradict common sense, so the model can only learn them from the instruction, the examples, or feedback.
 
-Below are excerpts from one real run: gpt-5.5 as both the task model and the optimizer, concurrency 2, 540 calls in total, 962 seconds. (Demo output translated from Chinese.)
+Below are excerpts from one real run: gpt-5.5 as both the task model and the optimizer, concurrency 2, 540 calls in total, 962 seconds (that run still used the earlier thread-pool code). On 2026-09-28 we re-ran it with the current async version (same gpt-5.5, concurrency 2): 541 calls, 858 seconds. Its results are shown after Scenario 5 for comparison. (Demo output translated from Chinese.)
 
 **Scenario 1: baseline**
 
@@ -490,6 +515,20 @@ This is the most important table in the lesson: **what the optimizer learned is 
 1. Switching to #3 now because of this table would be **selecting on test**, and that 100% would immediately become an optimistic estimate. The right move is to enlarge dev and decide the tie-break rule **in advance** (for example, prefer the later descendant on ties, since each generation strictly beat its parent on a training minibatch; or prefer the shorter one, to control cost), then validate on a fresh test set;
 2. Even if #3 really is better, its prompt is 14× the baseline's length. Whether the quality gain is worth that cost is a calculation you make against your call volume.
 
+**Results of the async re-run** (2026-09-28; same data and code logic, model outputs differ every run):
+
+```text
+   Method            dev    test   Δdev   Δtest  Opt. calls (task/optimizer)  Opt. cost  Input tokens per ticket
+   Baseline          80%    80%    +0     +0     -                            -          127
+   BootstrapFewShot  80%    70%    +0     -10    80/0                         $0.0984    394
+   OPRO              90%    90%    +10    +10    120/3                        $0.2271    491
+   GEPA reflection   95%    90%    +15    +10    95/3                         $0.2420    1758
+   GEPA + demos      95%    90%    +15    +10    195/3                        $0.3974    2025
+   (OPRO's and GEPA's +10 on test are not significant: 95% interval [-15, +35], 4 wins, 2 losses)
+```
+
+This time OPRO and GEPA both gained 10 points on test, but the interval still crosses 0; BootstrapFewShot, as in the earlier run, tied on dev and lost 10 points on test. Both runs point the same way: the improvement may be real, and 20 test tickets can't prove it.
+
 **Scenario 6: test-time compute**
 
 ```text
@@ -501,6 +540,8 @@ This is the most important table in the lesson: **what the optimizer learned is 
    For comparison: GEPA-optimized instruction, 1 sample  80%     1
    Sampling spent 100 calls, $0.1112; 4 tickets were answered wrong unanimously in all 5 samples
 ```
+
+(This run didn't print latency yet; for the async re-run's latency numbers see section 2.6: with 5 samples at concurrency ≤ 2, each ticket waited 6.9 seconds on average, about 2.8× a single call. In that run 3 tickets were unanimously wrong; same conclusion.)
 
 Observation: even the "perfect verifier" ceiling is 80%, which means that on the 4 tickets it got wrong, the model **never once** answered correctly in 5 samples. It isn't right sometimes and wrong other times; it consistently doesn't know the company rule. This matches Snell et al.'s finding: on problems the model simply can't do, test-time compute buys nothing. The only fix for these errors is to give the model the knowledge (prompt, examples, retrieval).
 
@@ -515,7 +556,7 @@ Open [`exercise.py`](exercise.py) and implement three functions:
 | Task | What to do | How the tests check it |
 |---|---|---|
 | (a) `select_topk(history, k)` | Pick the top k from an "instruction → score" history: descending score, ties keep first appearance, remove duplicate instructions (differences only in leading/trailing whitespace count as duplicates; keep the highest score and the first-appearance position) | Sorting, ties, dedup (a re-evaluation raised the score), whitespace variants, edge cases for k, input not mutated |
-| (b) `bootstrap_demos(program, trainset, metric, max_demos)` | Run the program in training-set order, collect only passing (input, program output) pairs, stop once full, skip on exceptions | Only passing ones, program output rather than gold label, no calls after the cap, no calls when `max_demos=0`, partial scores and threshold, skipping exceptions |
+| (b) `async def bootstrap_demos(program, trainset, metric, max_demos)` | `await program(...)` one example at a time in training-set order, collect only passing (input, program output) pairs, stop once full, skip on exceptions | Only passing ones, program output rather than gold label, no calls after the cap, never more than 1 call in flight, no calls when `max_demos=0`, partial scores and threshold, skipping exceptions |
 | (c) `pareto_front(candidates)` | Return the names of candidates no other candidate dominates, in input order; identical score vectors don't dominate each other | Domination, trade-offs, identical vectors both kept, identical vectors dominated by a third are both removed, empty input, `ValueError` on length mismatch |
 
 ```bash
@@ -526,7 +567,7 @@ make lesson N=23
 Hints:
 
 - (a) Keep a dict of "instruction → (best score, first index)", then `sorted(key=lambda kv: (-score, index))`;
-- (b) The tests check which inputs `program` was called with: one extra call after the cap is a failure;
+- (b) `program` is an async function (like `optkit.Program`), so (b) must be `async def`, with `out = await program(ex.input)` in the loop; callers write `demos = await bootstrap_demos(...)`. The tests check which inputs `program` was called with: one extra call after the cap is a failure; they also check how many calls are in flight, so sending everything at once with `asyncio.gather` fails;
 - (c) Write `dominates(a, b)` first, and mind "every element ≥ and at least one >": two identical vectors don't dominate each other.
 
 ## 5. Going deeper

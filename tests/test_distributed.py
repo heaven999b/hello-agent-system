@@ -555,3 +555,22 @@ async def test_agent_job_carries_conversation_history(tmp_path):
     job = (await q.list_jobs())[0]
     assert job.result["output"] == "你之前说的是：我的工号是 E-42"
     await db.close()
+
+
+async def test_queue_options_reach_worker_processes(tmp_path):
+    """--queue-opt 传到 worker 进程里的队列：max_attempts=1 时，领了就被 kill 的任务直接进死信。"""
+    db = str(tmp_path / "jobs.db")
+    q = SQLiteJobQueue(db)
+    await q.setup()
+    jid = await q.enqueue("rec", {}, tenant_id="t", max_attempts=1)
+    async with WorkerPool(f"sqlite:///{db}", f"{APPS}:make_recording_app", n=1, lease=0.5, poll=0.02,
+                          options={"hold": 30}, queue_options={"base_backoff": 0.01, "max_backoff": 0.02},
+                          log_dir=tmp_path / "logs") as pool:
+        await eventually(lambda: pool.events("claimed"), what="任务被领取")
+        pool.kill(0)
+        pool.restart(0)
+        await eventually(lambda: _status(q, jid, "dead"), timeout=20, what="毒消息进死信")
+
+
+async def _status(q, jid, status):
+    return (await q.get(jid)).status == status

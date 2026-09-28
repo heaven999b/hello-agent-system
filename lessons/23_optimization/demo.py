@@ -1,6 +1,6 @@
 """第 23 课 Demo：优化 —— 用数据和预算，系统地让 LM 程序变好。
 
-    python lessons/23_optimization/demo.py             # 真实模型（读取 .env；约 540 次调用、并发 2，实测约 16 分钟）
+    python lessons/23_optimization/demo.py             # 真实模型（读取 .env；约 540 次调用、并发 2，实测 14～16 分钟）
     python lessons/23_optimization/demo.py --offline   # 离线确定性模拟（SimulatedLLM），无需 API key，几秒钟
 
 任务：IT 工单分类（7 个类别，8 条"公司特有"的易错规则），train / dev / test 各 20 条。
@@ -10,7 +10,11 @@
   3. OPRO：优化器只看"指令 → 总分"的历史，提出新指令
   4. GEPA 式反思：优化器读失败轨迹 + 文字反馈，针对性改写；帕累托前沿选父代
   5. 汇总 + 显著性：配对 bootstrap 判断 test 上的提升是不是噪声；标出"dev 涨、test 不涨"的过拟合
-  6. 测试时计算：同一个基线，采样 5 次做自一致性投票 / best-of-N，和"改提示词"比一比
+  6. 测试时计算：同一个基线，采样 5 次做自一致性投票 / best-of-N，和"改提示词"比一比；
+     再用固定延迟的剧本模型实测"5 次采样同时发出"和"一个接一个"的延迟差别
+
+整个 Demo 是 async 的（入口 asyncio.run(main())）：每次评估里的多条样本、每条工单的 N 次采样，
+都在一个事件循环里并发发出，同时在途的调用数有上限（--workers，默认 2；离线和真实模式走同一条代码路径）。
 
 价格用 agentkit/pricing.py 里的**示例单价**（不是任何厂商的报价），只为了让成本对比有数可算。
 """
@@ -18,6 +22,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 import time
@@ -58,7 +63,7 @@ from ticket_task import (  # noqa: E402
     parse_label,
 )
 
-from agentkit import ResilientLLM, default_llm  # noqa: E402
+from agentkit import ResilientLLM, ScriptedLLM, default_llm, reply  # noqa: E402
 from agentkit.config import env  # noqa: E402
 from agentkit.context import estimate_tokens  # noqa: E402
 
@@ -125,43 +130,67 @@ def prompt_tokens(prog: Program) -> int:
     return estimate_tokens(prog.messages(TEST[0].input))
 
 
+async def ttc_latency_probe(base: Program, n: int, tickets, latency: float = 0.05) -> None:
+    """测试时计算的延迟账：同一个程序换成"每次调用固定 latency 秒"的剧本模型，
+    每条工单采样 n 次，比较"一个接一个"和"n 次同时发出"用户要等多久。剧本延迟是确定的，数字可以复现。"""
+    for label, limit in (("一个接一个（并发 1）", 1), (f"{n} 次同时发出（并发 {n}）", n)):
+        llm = ScriptedLLM(responder=lambda m: reply("看起来是设备问题。\n类别：hardware"), latency=latency)
+        prog = base.with_(llm=llm)
+        t0 = time.perf_counter()
+        for ex in tickets:  # 工单一条接一条地来（像线上的请求一样）；每条内部的 n 次采样按 limit 并发
+            await sample_n(lambda ex=ex: prog(ex.input), n, max_concurrency=limit)
+        per_ticket = (time.perf_counter() - t0) / len(tickets)
+        info(f"{pad(label, 26)}每条工单等 {per_ticket * 1000:4.0f}ms   模型调用 {llm.call_count} 次   同时在途峰值 {llm.max_in_flight}")
+
+
 # ---------------------------------------------------------------- 主流程
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description="第 23 课 Demo：提示词优化、测试时计算与显著性")
     parser.add_argument("--offline", action="store_true", help="使用确定性模拟模型，不调用真实模型")
     parser.add_argument("--task-model", default=None, help="被优化的任务模型（默认 .env 的 LLM_MODEL）")
     parser.add_argument("--optimizer-model", default=None, help="OPRO / GEPA 用的优化器模型（默认同上）")
-    parser.add_argument("--workers", type=int, default=2, help="真实模型的并发数（共享网关时请 ≤ 2）")
+    parser.add_argument("--workers", type=int, default=2, help="同时在途的模型调用上限（离线和真实模式都用；共享网关时请 ≤ 2）")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     t_start = time.time()
+    workers = max(1, args.workers)
+    clients = []
     if args.offline:
         task_raw, opt_raw = SimulatedLLM("sim-task"), SimulatedLLM("sim-optimizer")
-        workers = 1
         print("模式：离线确定性模拟（SimulatedLLM）—— 结果固定、零成本。模拟模型把本课要讲的现象显式写了出来，")
-        print("      数字只用来演示流程；真实模型的结果见讲义第 3 节。")
+        print(f"      数字只用来演示流程；真实模型的结果见讲义第 3 节。并发 {workers}（和真实模式同一条代码路径）。")
     else:
         try:
-            # 熔断阈值调高：几百次调用里偶尔连续失败几次很正常，不能因此让后面的评估全部"快速失败"记 0 分
-            task_raw = ResilientLLM(default_llm(args.task_model), max_attempts=4, base_delay=1.0, failure_threshold=20)
-            opt_raw = ResilientLLM(default_llm(args.optimizer_model), max_attempts=4, base_delay=1.0, failure_threshold=20)
+            clients = [default_llm(args.task_model), default_llm(args.optimizer_model)]
         except RuntimeError as e:
             sys.exit(f"❌ {e}\n   没有 API key 也没关系：加上 --offline 参数运行离线版本。")
-        workers = max(1, args.workers)
+        # 熔断阈值调高：几百次调用里偶尔连续失败几次很正常，不能因此让后面的评估全部"快速失败"记 0 分。
+        # max_concurrency 是对网关的总闸（舱壁）：不管上面怎么并发，同一时刻最多 workers 个请求在路上
+        task_raw = ResilientLLM(clients[0], max_attempts=4, base_delay=1.0, failure_threshold=20, max_concurrency=workers)
+        opt_raw = ResilientLLM(clients[1], max_attempts=4, base_delay=1.0, failure_threshold=20, max_concurrency=workers)
         print(f"模式：真实模型（任务模型 {task_raw.model}，优化器 {opt_raw.model}，并发 {workers}）—— 每次运行结果会不同")
-        print("      预计约 540 次模型调用；在共享网关上实测约 16 分钟。")
+        print("      预计约 540 次模型调用；在共享网关上实测 14～16 分钟。")
 
     task_llm, opt_llm = MeteredLLM(task_raw, "任务模型"), MeteredLLM(opt_raw, "优化器")
     ledger = Ledger(task_llm, opt_llm)
     base = Program(task_llm, BASELINE_INSTRUCTION, output_format=OUTPUT_FORMAT, input_prefix=INPUT_PREFIX)
-    task = ProgramTask(base, metric, feedback, workers=workers)
+    task = ProgramTask(base, metric, feedback, max_concurrency=workers)
 
-    def run_scores(instruction: str, dataset, demos=None) -> list[float]:
-        return [r.score for r in task.run(instruction, dataset, demos=demos)]
+    async def run_scores(instruction: str, dataset, demos=None) -> list[float]:
+        return [r.score for r in await task.run(instruction, dataset, demos=demos)]
 
+    try:
+        await run_all_scenarios(args, workers, t_start, task_raw, task_llm, opt_llm, ledger, base, task, run_scores)
+    finally:
+        for c in clients:
+            await c.aclose()  # 关掉 HTTP 连接池
+
+
+async def run_all_scenarios(args, workers, t_start, task_raw, task_llm, opt_llm, ledger, base, task, run_scores) -> None:
+    """六个场景依次跑完（每个场景内部的模型调用是并发的）。"""
     rows: list[dict] = []  # 汇总表
 
     # ================================================================ 场景 1
@@ -170,10 +199,10 @@ def main() -> None:
     info("规则：在 train 上找示例/反馈，在 dev 上挑候选，test 只在最后报告 —— 优化过程中一眼都不看")
     step("基线指令")
     show_instruction(BASELINE_INSTRUCTION)
-    base_dev_recs = task.run(BASELINE_INSTRUCTION, DEV)
+    base_dev_recs = await task.run(BASELINE_INSTRUCTION, DEV)
     base_dev = [r.score for r in base_dev_recs]
     opt_cost = ledger.take()
-    base_test = run_scores(BASELINE_INSTRUCTION, TEST)
+    base_test = await run_scores(BASELINE_INSTRUCTION, TEST)
     ledger.take()
     info(f"dev {pct(mean(base_dev))}   test {pct(mean(base_test))}   （评估 dev + test 共 {len(DEV) + len(TEST)} 次调用）")
     tags = per_tag_accuracy(DEV, base_dev)
@@ -190,13 +219,13 @@ def main() -> None:
     # ================================================================ 场景 2
     banner("场景 2：BootstrapFewShot —— 从成功轨迹里收集示例")
     step("用基线程序跑训练集，把评分通过的 (工单, 模型输出) 收进示例池；再在 dev 上比较 3 组示例组合")
-    boot = bootstrap_fewshot(task, TRAIN, DEV, max_demos=4, num_candidates=3, seed=args.seed, log=info)
+    boot = await bootstrap_fewshot(task, TRAIN, DEV, max_demos=4, num_candidates=3, seed=args.seed, log=info)
     boot_cost = ledger.take()
     trap_inputs = {ex.input for ex in TRAIN if ex.tag != "常规"}
     n_trap_demo = sum(1 for d in boot.demos if d.input in trap_inputs)
     info(f"选中的 {len(boot.demos)} 条示例里，易错工单占 {n_trap_demo} 条（基线本来就会做的题，才会被收进示例池）")
     boot_prog = base.with_(demos=boot.demos)
-    boot_test = run_scores(BASELINE_INSTRUCTION, TEST, demos=boot.demos)
+    boot_test = await run_scores(BASELINE_INSTRUCTION, TEST, demos=boot.demos)
     ledger.take()
     info(f"最佳组合：dev {pct(boot.dev)}   test {pct(mean(boot_test))}   优化花了 {boot_cost['task_calls']} 次调用，${boot_cost['cost']:.4f}")
     rows.append({"name": "BootstrapFewShot", "dev": boot.dev_scores, "test": boot_test, **boot_cost, "prompt_tokens": prompt_tokens(boot_prog),
@@ -206,7 +235,7 @@ def main() -> None:
     # ================================================================ 场景 3
     banner("场景 3：OPRO —— LLM 当优化器，只看'指令 → 总分'的历史")
     step("每轮：把历史前 5 名（按分数升序）+ 3 条训练样例写进元提示词 → 优化器一次写 3 条新指令 → 各在 dev 上评估")
-    opro = opro_optimize(
+    opro = await opro_optimize(
         task,
         opt_llm,
         DEV,
@@ -222,7 +251,7 @@ def main() -> None:
     opro_cost = ledger.take()
     step("OPRO 选出的指令")
     show_instruction(opro.instruction)
-    opro_test = run_scores(opro.instruction, TEST)
+    opro_test = await run_scores(opro.instruction, TEST)
     ledger.take()
     info(f"dev {pct(opro.dev)}   test {pct(mean(opro_test))}   "
          f"优化花了 任务模型 {opro_cost['task_calls']} 次 + 优化器 {opro_cost['opt_calls']} 次，${opro_cost['cost']:.4f}")
@@ -233,7 +262,7 @@ def main() -> None:
     # ================================================================ 场景 4
     banner("场景 4：GEPA 式反思 —— 读失败轨迹 + 文字反馈，针对性地改写")
     step("每次迭代：帕累托前沿里抽父代 → 训练集取 5 条跑一遍 → 反思模型读轨迹和标注备注 → 新指令在小批上严格变好才上 dev")
-    gepa, pool = gepa_optimize(
+    gepa, pool = await gepa_optimize(
         task,
         opt_llm,
         TRAIN,
@@ -253,7 +282,7 @@ def main() -> None:
         info(f"#{i}  dev {pct(c.dev):>4}  （{parent}，第 {c.iteration} 次迭代）")
     step("GEPA 选出的指令")
     show_instruction(gepa.instruction)
-    gepa_test = run_scores(gepa.instruction, TEST)
+    gepa_test = await run_scores(gepa.instruction, TEST)
     ledger.take()
     info(f"dev {pct(gepa.dev)}   test {pct(mean(gepa_test))}   "
          f"优化花了 任务模型 {gepa_cost['task_calls']} 次 + 优化器 {gepa_cost['opt_calls']} 次，${gepa_cost['cost']:.4f}")
@@ -261,9 +290,9 @@ def main() -> None:
                  "prompt_tokens": prompt_tokens(base.with_(instruction=gepa.instruction)), "instruction": gepa.instruction, "demos": []})
 
     step("加一步：GEPA 的指令 + Bootstrap 的示例（指令和示例一起用，MIPROv2 联合搜索的思路）")
-    combo_dev = run_scores(gepa.instruction, DEV, demos=boot.demos)
+    combo_dev = await run_scores(gepa.instruction, DEV, demos=boot.demos)
     combo_cost = ledger.take()
-    combo_test = run_scores(gepa.instruction, TEST, demos=boot.demos)
+    combo_test = await run_scores(gepa.instruction, TEST, demos=boot.demos)
     ledger.take()
     info(f"dev {pct(mean(combo_dev))}   test {pct(mean(combo_test))}")
     combo_cost = {k: combo_cost[k] + boot_cost[k] + gepa_cost[k] for k in combo_cost}
@@ -316,7 +345,13 @@ def main() -> None:
     banner("场景 6：测试时计算 —— 不改提示词，多采样几次行不行？")
     n = 5
     step(f"基线程序在 test 上每条采样 {n} 次（共 {n * len(TEST)} 次调用），比较四种用法")
-    samples = [sample_n(lambda ex=ex: base(ex.input), n, workers) for ex in TEST]
+    samples, waits = [], []
+    lat0, calls0 = task_llm.latency_s, task_llm.calls
+    for ex in TEST:  # 工单一条接一条；每条的 n 次采样同时发出（受并发上限 workers 约束）
+        t0 = time.perf_counter()
+        samples.append(await sample_n(lambda ex=ex: base(ex.input), n, max_concurrency=workers))
+        waits.append(time.perf_counter() - t0)
+    per_call = (task_llm.latency_s - lat0) / max(1, task_llm.calls - calls0)
     ttc_cost = ledger.take()
     single = [metric(ex, s[0]) for ex, s in zip(TEST, samples)]
     votes = [self_consistency([parse_label(o) for o in s]) for s in samples]
@@ -331,6 +366,13 @@ def main() -> None:
     info(f"{pad(f'best-of-{n} + 完美验证器（作弊上限 pass@{n}）', 40)}{pad(pct(mean(oracle)), 8)}{n}")
     info(f"{pad('对照：GEPA 优化后的指令，单次采样', 40)}{pad(pct(mean(gepa_test)), 8)}1")
     info(f"采样花了 {ttc_cost['task_calls']} 次调用，${ttc_cost['cost']:.4f}；有 {unanimous_wrong} 条工单 {n} 次全票一致地答错")
+    if not args.offline:  # 离线模拟模型没有延迟，这两个数没有意义
+        info(f"延迟（真实模型）：单次调用平均 {per_call:.1f}s；每条工单 {n} 次采样（并发 ≤ {workers}）平均等 {mean(waits):.1f}s，"
+             f"约为单次的 {mean(waits) / per_call:.1f} 倍（一个接一个就是 {n} 倍）")
+    step(f"延迟实测：测试时计算让每个请求的调用次数变成 {n} 倍，等待时间呢？（剧本模型，每次调用固定 50ms，取 test 前 4 条）")
+    await ttc_latency_probe(base, n, TEST[:4])
+    info(f"{n} 次采样同时发出，用户只等最慢的那一次；调用次数（成本）一点没少。并发受网关配额限制时（比如上限 2），")
+    info(f"延迟约为 ceil({n}/2)=3 次调用 —— 这也是为什么测试时计算和并发配额要一起规划（第 12、14 课）。")
     takeaway("投票只能消除'时对时错'的随机错误；模型'稳定地不知道'的公司规则，采样再多次也是全票答错。"
              "best-of-N 的上限由验证器决定：只会查格式的验证器几乎没用，'完美验证器'那一行是你永远拿不到的天花板。")
 
@@ -358,4 +400,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

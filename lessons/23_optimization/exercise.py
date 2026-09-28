@@ -3,7 +3,9 @@
 一共三题：
   (a) select_topk      OPRO 的"记忆"：从"指令 → 分数"的历史里挑出前 k 名（排序、同分、去重）
   (b) bootstrap_demos  BootstrapFewShot 的核心：跑训练集，只把评分通过的 (输入, 程序输出) 收集成示例
+                       —— 它要调用模型，所以是 async 函数：写 `async def`，`await program(...)`
   (c) pareto_front     GEPA 的父代池：找出不被任何其他候选支配的候选
+（a）（c）是纯计算，写普通函数。
 
 把每个 `raise NotImplementedError("TODO: ...")` 换成你的实现，然后运行：
 
@@ -19,7 +21,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Callable, Sequence
+from typing import Awaitable, Callable, Sequence
 
 
 def _load_sibling(name: str) -> ModuleType:
@@ -73,8 +75,8 @@ def select_topk(history: Sequence[tuple[str, float]], k: int) -> list[tuple[str,
 # =====================================================================
 
 
-def bootstrap_demos(
-    program: Callable[[str], str],
+async def bootstrap_demos(
+    program: Callable[[str], Awaitable[str]],
     trainset: Sequence,
     metric: Callable[[object, str], float],
     max_demos: int,
@@ -83,15 +85,19 @@ def bootstrap_demos(
 ) -> list:
     """用当前程序跑训练集，把评分通过的 (输入, 程序输出) 收集成示例（DSPy BootstrapFewShot 的核心步骤）。
 
+    这是一个 async 函数：program 要调用模型，是 async 的，写 `output = await program(example.input)`；
+    调用方也要 `demos = await bootstrap_demos(...)`。
+
     参数：
-      program(input_text) -> output_text   当前的 LM 程序（比如"指令 + 模型"）
+      program(input_text) -> output_text   当前的 LM 程序（比如"指令 + 模型"，optkit.Program 的实例），async
       trainset                             Example 列表（有 .input 和 .label）
       metric(example, output) -> 分数      True/False 或 0~1 的分数
       max_demos                            最多收集几条
       threshold                            分数 >= threshold 才算通过（默认 1.0；True 等于 1.0）
 
     要求：
-      1. **按 trainset 的顺序**逐条运行，结果是确定的（同样的输入永远得到同样的示例列表）；
+      1. **按 trainset 的顺序**逐条运行：一条 await 完再调用下一条（不要用 asyncio.gather 一次全发出去 ——
+         发出去的请求收不回来，第 3 条"收满就停"就省不下钱）；结果是确定的（同样的输入永远得到同样的示例列表）；
       2. 只收集 metric 通过的，返回 Demo(input=样本的输入, output=程序的输出)；
          注意 output 是**程序自己的输出**（含推理过程），不是 example.label ——
          这正是 bootstrap 的价值：标注里只有答案，程序跑通的轨迹把"怎么想的"也带上了；
@@ -99,7 +105,7 @@ def bootstrap_demos(
       4. max_demos <= 0 时直接返回 []，一次都不调用 program；
       5. program 对某条样本抛异常（限流、超时……）时跳过这条，继续下一条。
 
-    提示：一个 for 循环 + try/except + 提前 break 就够了。
+    提示：一个 for 循环 + try/except + 提前 break 就够了，循环里 `await program(...)`。
     """
     raise NotImplementedError("TODO: 实现 bootstrap_demos")
 

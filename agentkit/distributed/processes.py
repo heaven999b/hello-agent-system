@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -99,6 +100,7 @@ class WorkerPool:
         grace: float = 10.0,
         kinds: Iterable[str] | None = None,
         options: dict | None = None,
+        queue_options: dict | None = None,
         env: dict | None = None,
         log_dir: str | Path | None = None,
         name: str = "w",
@@ -121,6 +123,8 @@ class WorkerPool:
             self._common += ["--kinds", ",".join(kinds)]
         for k, v in (options or {}).items():
             self._common += ["--opt", f"{k}={v}"]
+        for k, v in (queue_options or {}).items():  # 例如 {"base_backoff": 0.2}：租约过期后的重新排队退避
+            self._common += ["--queue-opt", f"{k}={v}"]
         self.python = python
         self.workers = [self._make(i, f"{name}{i}") for i in range(n)]
 
@@ -161,6 +165,16 @@ class WorkerPool:
                 w.signal(signal.SIGKILL)
                 w.wait(5)
         return [w.returncode for w in self.workers]
+
+    async def astop(self, timeout: float = 15.0) -> list[int | None]:
+        """stop() 的 async 版：等进程退出是阻塞的，放进线程，不卡住调用方的事件循环。"""
+        return await asyncio.to_thread(self.stop, timeout)
+
+    async def __aenter__(self) -> "WorkerPool":
+        return self.start()
+
+    async def __aexit__(self, *exc) -> None:
+        await self.astop()
 
     def __enter__(self) -> "WorkerPool":
         return self.start()

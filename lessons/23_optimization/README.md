@@ -214,7 +214,7 @@ OPRO 和 GEPA 不直接依赖 `Program`，而是依赖一个很小的接口（Bo
 
 ```python
 class Task(Protocol):
-    def run(self, instruction: str, examples: Sequence) -> list[Record]: ...
+    async def run(self, instruction: str, examples: Sequence) -> list[Record]: ...
 
 @dataclass
 class Record:
@@ -226,29 +226,34 @@ class Record:
 
 `ProgramTask` 把"程序 + 评分函数 + 反馈函数"包装成 `Task`；2.8 节的 `AgentTask` 把 Agent 包装成 `Task`。**指令优化器只和这个接口打交道**，所以换任务、换成 Agent，都不用改优化器本身。
 
+`run` 是 async 的：一次评估里的多条样本互不依赖，`ProgramTask` 用 `agentkit.workflows.parallel` 在一个事件循环里并发发出（`max_concurrency`，共享网关上是 2），结果按样本顺序返回；某条样本的模型调用在重试后仍然失败，记 0 分、计入 `errors`，不让整轮评估停下来。优化器本身是**一个候选接一个候选**地评估：每次评估内部已经并发，再叠一层并发就会超出网关配额。Demo 还给真实模型套了 `ResilientLLM(max_concurrency=2)` 作为总闸：不管上面怎么并发，同一时刻最多 2 个请求在路上。
+
 ### 2.2 先记账，再优化
 
 ```python
 class MeteredLLM:
-    def chat(self, messages, tools=None, **kwargs):
-        resp = self.llm.chat(messages, tools, **kwargs)
-        with self._lock:                        # 评估会并发调用，要加锁
-            self.calls += 1
-            self.usage = self.usage + resp.usage
-            self.cost_usd += estimate_cost(resp.usage, resp.model or self.model)
+    async def chat(self, messages, tools=None, **kwargs):
+        ...                                     # 在途计数 +1，记开始时间
+        resp = await self.llm.chat(messages, tools, **kwargs)
+        ...                                     # 在途计数 -1
+        self.calls += 1                         # 读-改-写之间没有 await：不需要锁
+        self.usage = self.usage + resp.usage
+        self.cost_usd += estimate_cost(resp.usage, resp.model or self.model)
         return resp
 ```
+
+**为什么不用加锁？** 以前的版本用线程池并发评估，`MeteredLLM` 里有一把 `threading.Lock`：线程可能在任意两条字节码之间被切走，`self.calls += 1` 这种"读-改-写"会丢数。现在所有调用都是同一个事件循环里的协程，协程只在 `await` 处让出控制权；`await self.llm.chat(...)` 返回之后的三行中间没有 `await`，执行时不会被别的协程插队，所以是原子的。只有"读 → `await` 别的东西 → 再写回"才需要 `asyncio.Lock`。[`test_exercise.py`](test_exercise.py) 里有一个测试让 40 个协程同时调用同一个 `MeteredLLM`：在途峰值 40（确实并发了），调用次数和 token 一个不差。`ProgramTask.errors` 同理，锁也删掉了。
 
 **为什么要单独记账**：优化是在**花钱买质量**。只报"准确率 +15 个点"而不报"花了 300 次调用"，就没法和"换个更大的模型""多采样几次"公平比较。Demo 给任务模型和优化器各套一个 `MeteredLLM`，每一步前后各拍一次快照，相减就是这一步的开销。它套在 `ResilientLLM` 外面（第 08 课），所以记的是**逻辑调用次数**，重试不重复计数。
 
 ### 2.3 BootstrapFewShot
 
-核心只有一个循环（练习 b 让你自己写）：
+核心只有一个循环（练习 b 让你自己写，是 async 函数）：
 
 ```python
 for ex in trainset:
     try:
-        out = program(ex.input)
+        out = await program(ex.input)            # 一条 await 完再下一条
     except Exception:
         continue                                 # 限流、超时：跳过这条
     if float(metric(ex, out)) >= threshold:
@@ -257,7 +262,9 @@ for ex in trainset:
             break                                # 够了就停，别再花钱
 ```
 
-`bootstrap_fewshot` 在这之上加一层随机搜索：候选 0 是按顺序的前 k 条，其余候选是用固定种子打乱后取的 k 条，每组在 dev 上评估，取最高分。为了不慢，真实模型下先**并发**跑完训练集，再按训练集顺序过滤，结果和顺序调用 `bootstrap_demos` 完全一致。
+**这里故意不并发**：`asyncio.gather` 一次把整个训练集发出去，请求就收不回来了，"收满就停"一分钱也省不下。测试用一个假程序检查了这一点：收满 2 条之后后面的样本一次都没被调用，同时在途的调用从来不超过 1 个。
+
+`bootstrap_fewshot` 在这之上加一层随机搜索：候选 0 是按顺序的前 k 条，其余候选是用固定种子打乱后取的 k 条，每组在 dev 上评估，取最高分。它要的是整个示例池，本来就要把训练集跑完，所以先**并发**跑完训练集，再按训练集顺序过滤，结果和顺序调用 `bootstrap_demos` 完全一致（测试里让完成顺序和发出顺序不同，并发 1 和并发 4 的结果逐项相同，候选 0 等于顺序调用 `bootstrap_demos` 的结果）。
 
 ### 2.4 OPRO
 
@@ -266,9 +273,9 @@ for r in range(1, rounds + 1):
     top = select_topk(history, keep_top)                  # 练习 a
     shown = rng.sample(exemplars, n_exemplars)            # 每轮换几条任务样例
     prompt = opro_meta_prompt(task_description, shown, top, per_round)
-    proposals = complete_json(optimizer_llm, prompt, Proposals).instructions
+    proposals = (await complete_json(optimizer_llm, prompt, Proposals)).instructions
     for ins in proposals[:per_round]:
-        score(ins, r)                                     # 在 dev 上完整评估，写回 history
+        await score(ins, r)                               # 在 dev 上完整评估（内部并发），写回 history
 ```
 
 三个细节：
@@ -330,6 +337,22 @@ def best_of_n(candidates, verifier):
 
 Demo 对同一批样本只采样一次，然后用同一组样本分别计算"单次、投票、best-of-N"的结果，这样几种用法的比较是公平的，也省调用。
 
+**N 次采样要同时发出**：
+
+```python
+async def sample_n(fn, n, max_concurrency=None):
+    return await _run_all([fn] * n, max_concurrency or n)   # fn 每次返回一个新协程，n 次一起发出
+```
+
+一个接一个地采样，用户要等 N 次调用之和；同时发出，只等最慢的那一次，调用次数（成本）一点没少。Demo 场景 6 用固定延迟的剧本模型（每次调用 50 毫秒）实测，取 test 前 4 条、每条采样 5 次：
+
+```text
+   一个接一个（并发 1）      每条工单等  261ms   模型调用 20 次   同时在途峰值 1
+   5 次同时发出（并发 5）    每条工单等   53ms   模型调用 20 次   同时在途峰值 5
+```
+
+真实模型下还要受网关配额限制：本课的共享网关只允许 2 个并发，5 次采样要分 3 批。2026-09-28 的一次真实运行（gpt-5.5）：单次调用平均 2.4 秒，每条工单 5 次采样平均等 6.9 秒，约为单次的 2.8 倍（一个接一个就是 5 倍）。所以测试时计算要和并发配额一起规划：N 翻倍，要么延迟跟着涨，要么配额跟着涨。
+
 ### 2.7 提升是不是真的：配对 bootstrap
 
 ```python
@@ -349,9 +372,11 @@ lo, hi = boots[int(alpha / 2 * n_boot)], boots[int((1 - alpha / 2) * n_boot) - 1
 class AgentTask:
     make_agent: Callable[[str], Agent]        # 给一条指令，返回一个新 Agent
     graders: Sequence[Callable] = ()
+    concurrency: int = 4                      # 同时在跑的用例数
 
-    def run(self, instruction, examples):
-        report = run_eval(lambda: self.make_agent(instruction), examples, list(self.graders) or [rule_grader])
+    async def run(self, instruction, examples):
+        report = await run_eval(lambda: self.make_agent(instruction), examples,
+                                list(self.graders) or [rule_grader], concurrency=self.concurrency)
         ...  # 反馈 = 没通过的 Check 的 detail
 ```
 
@@ -370,12 +395,12 @@ class AgentTask:
 
 ```bash
 .venv/bin/python lessons/23_optimization/demo.py --offline   # 离线：确定性模拟模型，几秒钟
-.venv/bin/python lessons/23_optimization/demo.py             # 真实模型：约 540 次调用，并发 2，实测约 16 分钟
+.venv/bin/python lessons/23_optimization/demo.py             # 真实模型：约 540 次调用，并发 2，实测 14–16 分钟
 ```
 
 任务是 IT 工单分类：7 个类别，train / dev / test 各 20 条。每份数据有 8 条"易错工单"，每条对应一条**公司自己的规定**（U 盘用不了归安全组、打印机问题一律归硬件组、软件许可证走权限审批……），另外 12 条是常规工单。这些规定有的和常识相反，模型只能从指令、示例或反馈里学到。
 
-下面是一次真实运行的节选：gpt-5.5 同时当任务模型和优化器，并发 2，共 540 次调用，用时 962 秒。
+下面是一次真实运行的节选：gpt-5.5 同时当任务模型和优化器，并发 2，共 540 次调用，用时 962 秒（这次用的还是之前线程池版的代码）。2026-09-28 用现在的 async 版重跑了一次（同样 gpt-5.5、并发 2）：541 次调用，用时 858 秒。那次的结果放在场景 5 后面对照。
 
 **场景 1：基线**
 
@@ -490,6 +515,20 @@ class AgentTask:
 1. 现在根据这张表改选 #3，就是在**用 test 挑候选**，那个 100% 立刻变成一个偏高的估计。正确的做法是扩大 dev，并把"同分怎么选"作为规则**事先定好**（比如同分时取更晚的后代，因为每一代都在训练小批上严格赢过了父代；或者同分时取更短的，控制成本），然后用一份新的 test 验证；
 2. 即使 #3 真的更好，它的提示词也是基线的 14 倍长。质量提升值不值这个成本，要按调用量算一笔账。
 
+**async 版重跑的结果**（2026-09-28，同一份数据和代码逻辑，模型输出每次不同）：
+
+```text
+   方法              dev    test   Δdev   Δtest  优化调用(任务/优化器)   优化成本  每单输入token
+   基线              80%    80%    +0     +0     -                       -         127
+   BootstrapFewShot  80%    70%    +0     -10    80/0                    $0.0984   394
+   OPRO              90%    90%    +10    +10    120/3                   $0.2271   491
+   GEPA 式反思       95%    90%    +15    +10    95/3                    $0.2420   1758
+   GEPA + 示例       95%    90%    +15    +10    195/3                   $0.3974   2025
+   （OPRO / GEPA 在 test 上的 +10 都不显著：95% 区间 [-15, +35]，赢 4 条、输 2 条）
+```
+
+这一次 OPRO 和 GEPA 在 test 上都涨了 10 个点，但区间依然跨过 0；BootstrapFewShot 和上一次一样是 dev 打平、test 掉 10 个点。两次运行的结论方向一致：提升可能是真的，20 条 test 证明不了。
+
 **场景 6：测试时计算**
 
 ```text
@@ -501,6 +540,8 @@ class AgentTask:
    对照：GEPA 优化后的指令，单次采样       80%     1
    采样花了 100 次调用，$0.1112；有 4 条工单 5 次全票一致地答错
 ```
+
+（这次运行还没有打印延迟；async 版重跑的延迟数字见 2.6 节：5 次采样并发 ≤ 2 时，每条工单平均等 6.9 秒，约为单次调用的 2.8 倍。那次运行里全票答错的是 3 条，结论相同。）
 
 观察：连"完美验证器"的上限都是 80%，说明对答错的 4 张工单，模型 5 次采样**一次都没答对**。它不是时对时错，而是稳定地不知道公司规定。这正对应 Snell et al. 的结论：在模型根本不会的题上，加测试时计算没有收益。要修这类错误，只能把知识交给模型（提示词、示例、检索）。
 
@@ -515,7 +556,7 @@ class AgentTask:
 | 题目 | 要做什么 | 测试怎么验证 |
 |---|---|---|
 | (a) `select_topk(history, k)` | 从"指令 → 分数"的历史里挑前 k 名：分数降序，同分先出现的在前，去掉重复指令（只差首尾空白也算重复，保留最高分、位置按第一次出现） | 排序、同分、去重（重评估后分数变高）、空白变体、k 的边界、不修改输入 |
-| (b) `bootstrap_demos(program, trainset, metric, max_demos)` | 按训练集顺序跑程序，只收集评分通过的 (输入, 程序输出)，收满就停，异常就跳过 | 只收通过的、用程序输出而不是标准答案、收满后不再调用、`max_demos=0` 时不调用、部分分数与阈值、异常跳过 |
+| (b) `async def bootstrap_demos(program, trainset, metric, max_demos)` | 按训练集顺序一条一条 `await program(...)`，只收集评分通过的 (输入, 程序输出)，收满就停，异常就跳过 | 只收通过的、用程序输出而不是标准答案、收满后不再调用、同时在途的调用不超过 1 个、`max_demos=0` 时不调用、部分分数与阈值、异常跳过 |
 | (c) `pareto_front(candidates)` | 返回不被任何其他候选支配的候选名，按输入顺序；完全相同的分数向量互不支配 | 支配、各有所长、相同向量都保留、相同向量被第三者支配时一起出局、空输入、长度不一致抛 `ValueError` |
 
 ```bash
@@ -526,7 +567,7 @@ make lesson N=23
 提示：
 
 - (a) 用一个 dict 记录"指令 → (最高分, 第一次出现的下标)"，然后 `sorted(key=lambda kv: (-分数, 下标))`；
-- (b) 测试会检查 `program` 被调用了哪些输入：收满之后多调用一次都算错；
+- (b) `program` 是 async 函数（和 `optkit.Program` 一样），所以 (b) 要写成 `async def`，循环里 `out = await program(ex.input)`；调用方是 `demos = await bootstrap_demos(...)`。测试会检查 `program` 被调用了哪些输入：收满之后多调用一次都算错；也会检查同时在途的调用数，用 `asyncio.gather` 一次全发出去会失败；
 - (c) 先写 `dominates(a, b)`，注意"每一项 ≥ 且至少一项 >"：两个完全相同的向量谁也不支配谁。
 
 ## 5. 深入

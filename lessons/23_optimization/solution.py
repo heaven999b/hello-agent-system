@@ -6,7 +6,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Callable, Sequence
+from typing import Awaitable, Callable, Sequence
 
 
 def _load_sibling(name: str) -> ModuleType:
@@ -52,8 +52,8 @@ def select_topk(history: Sequence[tuple[str, float]], k: int) -> list[tuple[str,
 # =====================================================================
 
 
-def bootstrap_demos(
-    program: Callable[[str], str],
+async def bootstrap_demos(
+    program: Callable[[str], Awaitable[str]],
     trainset: Sequence,
     metric: Callable[[object, str], float],
     max_demos: int,
@@ -65,7 +65,7 @@ def bootstrap_demos(
         return demos  # 一次都不调用
     for ex in trainset:
         try:
-            output = program(ex.input)
+            output = await program(ex.input)  # 一条接一条：收满就停，后面的请求根本不发
         except Exception:  # noqa: BLE001  限流、超时……跳过这条，别让一条样本拖垮整个收集过程
             continue
         if float(metric(ex, output)) >= threshold:

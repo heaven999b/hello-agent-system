@@ -8,6 +8,11 @@
     run_tests()                           在子进程里跑 pytest：有超时、环境变量白名单（不带密钥），输出压缩成摘要
     submit()                              交卷：先跑测试（必须全绿），再生成 diff 交给审查
 
+run_tests / submit 是 async 工具：pytest 用 asyncio.create_subprocess_exec 启动，等它的时候事件循环照常转
+（第 02 课：async 代码里不能直接调用阻塞函数，subprocess.run 会把整个事件循环卡住，直到测试跑完）；
+超时或被取消（Agent 的 run_timeout、用户断开）时杀掉 pytest 的整个进程组。open_file / search / edit 是普通函数，
+agentkit 把它们放进线程池执行，同样不阻塞事件循环。
+
 再加三道护栏：
 
     测试保护      edit 拒绝写测试文件 / 测试配置；run_tests 前校验测试文件哈希，被改过就从基线恢复
@@ -21,13 +26,14 @@ Workspace 通过 helpers 参数使用它们：默认用 solution.py 的参考实
 from __future__ import annotations
 
 import ast
+import asyncio
 import difflib
 import hashlib
 import importlib.util
 import json
 import os
 import re
-import subprocess
+import signal
 import sys
 import tempfile
 import time
@@ -39,7 +45,7 @@ from typing import Annotated, Callable
 
 from pydantic import Field
 
-from agentkit import Hook, StopRun, Tool, ToolError
+from agentkit import Hook, StopRun, Tool, ToolError, maybe_await, wait_for
 
 HERE = Path(__file__).resolve().parent
 TEMPLATE = HERE / "toy_repo"
@@ -147,6 +153,60 @@ def window_bounds(n: int, center: int, window: int) -> tuple[int, int]:
 
 
 # =====================================================================
+# 子进程：不阻塞事件循环，超时 / 取消时杀掉整个进程组
+# =====================================================================
+
+
+@dataclass
+class CommandResult:
+    returncode: int | None
+    stdout: str
+    stderr: str
+    seconds: float
+    timed_out: bool = False
+
+
+def _kill_group(proc: asyncio.subprocess.Process) -> None:
+    """杀掉子进程所在的整个进程组：被测代码自己再起的子进程（孙进程）也一起杀，不留孤儿。"""
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)  # start_new_session=True：子进程是组长，组号 = 它的 pid
+        elif proc.returncode is None:
+            proc.kill()
+    except (ProcessLookupError, PermissionError):
+        pass  # 已经全部退出了
+
+
+async def run_command(cmd: list[str], *, cwd: str | Path, env: dict[str, str], timeout: float) -> CommandResult:
+    """在子进程里执行命令，**不阻塞事件循环**。harness 里所有子进程（pytest、git）都走这里。
+
+    - asyncio.create_subprocess_exec：等子进程时协程让出事件循环，同一进程里的其他会话、心跳照常推进。
+      反面教材是在 async 函数里直接调用 subprocess.run：它会把整个事件循环卡住，直到子进程结束（第 02 课的阻塞陷阱）；
+    - 超时：agentkit.wait_for 到点 → 杀掉整个进程组 → await proc.wait() 回收（不留僵尸进程）→ 返回 timed_out；
+    - 被取消（Agent 的 run_timeout、工具超时、用户断开）：同样先杀进程组、回收，再把 CancelledError 原样抛出 ——
+      这是它比 asyncio.to_thread(subprocess.run, ...) 强的地方：线程取消不了，被放弃的 pytest 会在后台一直跑到自己的超时；
+    - 正常结束后也清理一次进程组：被测代码留在后台的进程不会活过这次测试。
+    """
+    t0 = time.perf_counter()
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=str(cwd), env=env, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=(os.name == "posix"),
+    )
+    try:
+        out, err = await wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        _kill_group(proc)
+        await proc.wait()
+        return CommandResult(None, "", "", time.perf_counter() - t0, timed_out=True)
+    except BaseException:  # CancelledError：调用方不要结果了，子进程也不能再跑
+        _kill_group(proc)
+        await proc.wait()
+        raise
+    _kill_group(proc)
+    return CommandResult(proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace"), time.perf_counter() - t0)
+
+
+# =====================================================================
 # 运行测试：子进程 + 超时 + 干净环境 + 结构化摘要
 # =====================================================================
 
@@ -178,24 +238,26 @@ class TestRun:
         return ", ".join(parts)
 
 
-def run_pytest(root: Path, targets: list[str], timeout: float = 30.0) -> TestRun:
-    """在独立子进程里运行 pytest，用 JUnit XML 拿结构化结果（比解析终端输出可靠得多）。
+async def run_pytest(root: Path, targets: list[str], timeout: float = 30.0) -> TestRun:
+    """在独立子进程里运行 pytest，用 JUnit XML 拿结构化结果（比解析终端输出可靠得多）。async：`run = await run_pytest(...)`。
 
     为什么是子进程而不是在当前进程里 import 测试？
-      1. 超时后能真正杀掉（subprocess.run 超时会 kill 子进程）；线程做不到（见 agentkit/tools.py 的注释）；
+      1. 超时或被取消时能真正杀掉（杀整个进程组，见 run_command）；线程做不到（见 agentkit/tools.py 的注释）；
       2. 被测代码的死循环、sys.exit、猴子补丁都影响不到 Agent 进程本身；
       3. 环境变量走白名单，密钥不会进入被测代码的视野。
     """
     fd, xml_path = tempfile.mkstemp(prefix="lesson24_junit_", suffix=".xml")  # 报告写在工作区外，不污染仓库
     os.close(fd)
     cmd = [sys.executable, "-m", "pytest", "-q", "--tb=no", "-p", "no:cacheprovider", f"--junitxml={xml_path}", *targets]
-    t0 = time.time()
     try:
-        proc = subprocess.run(cmd, cwd=root, env=sandbox_env(), capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
+        proc = await run_command(cmd, cwd=root, env=sandbox_env(), timeout=timeout)
+    except BaseException:
         os.unlink(xml_path)
-        return TestRun(timed_out=True, seconds=time.time() - t0)
-    run = TestRun(seconds=time.time() - t0)
+        raise
+    if proc.timed_out:
+        os.unlink(xml_path)
+        return TestRun(timed_out=True, seconds=proc.seconds)
+    run = TestRun(seconds=proc.seconds)
     try:
         tree = ET.parse(xml_path)
         for case in tree.iter("testcase"):
@@ -480,10 +542,10 @@ class Workspace:
             self._event("protected_files_restored", paths=restored)
         return restored
 
-    def run_tests(self) -> str:
+    async def run_tests(self) -> str:
         """运行本仓库的测试（pytest，独立子进程，限时 30 秒），返回摘要：通过/失败数，以及每个失败测试的断言信息。"""
         restored = self.verify_protected_files()
-        run = run_pytest(self.root, self.test_targets, self.test_timeout)
+        run = await run_pytest(self.root, self.test_targets, self.test_timeout)
         self.last_run = run
         out = []
         if restored:
@@ -505,10 +567,10 @@ class Workspace:
 
     # ------------------------------------------------------------ 工具 5：submit
 
-    def submit(self) -> str:
+    async def submit(self) -> str:
         """完成修改后调用：先重新跑一遍测试（必须全部通过），再生成 diff 作为最终提交。提交前还会经过 diff 审查。"""
         self.verify_protected_files()
-        run = run_pytest(self.root, self.test_targets, self.test_timeout)
+        run = await run_pytest(self.root, self.test_targets, self.test_timeout)
         self.last_run = run
         if self.require_green_to_submit and not run.ok:
             raise ToolError(f"提交被拒绝：测试没有全部通过（{run.headline()}）。先 run_tests 看失败原因。")
@@ -522,6 +584,8 @@ class Workspace:
     # ------------------------------------------------------------ 打包成 agentkit 工具
 
     def tools(self) -> list[Tool]:
+        """open_file / search / edit 是普通函数（agentkit 放进线程池执行）；run_tests / submit 是 async 函数，
+        在事件循环里 await 子进程。工具超时（timeout_s）到了，agentkit 会取消 run_tests，run_command 随即杀掉 pytest。"""
         return [
             Tool(self.open_file, max_output_chars=6000),
             Tool(self.search, max_output_chars=4000),
@@ -543,12 +607,13 @@ class SubmitReview(Hook):
     而这里我们想把**具体的审查意见**反馈给模型，让它知道错在哪 —— 错误即观察（第 03 课）。
     """
 
-    def __init__(self, workspace: Workspace, approver: Callable[[str, list[str]], bool] | None = None):
+    def __init__(self, workspace: Workspace, approver: Callable[[str, list[str]], object] | None = None):
+        """approver(diff, findings) -> bool，可以是普通函数，也可以是 async 函数（比如要等人在网页上点"批准"）。"""
         self.ws = workspace
         self.approver = approver
         self.rejections: list[dict] = []  # 每次打回：{"findings": [...], "diff": 当时的 diff}
 
-    def before_tool(self, state, call, tool) -> str | None:
+    async def before_tool(self, state, call, tool) -> str | None:
         if call.name != "submit":
             return None
         findings = self.ws.review()
@@ -558,7 +623,7 @@ class SubmitReview(Hook):
             return ("拒绝提交：diff 审查发现可疑改动：\n- " + "\n- ".join(findings)
                     + "\n请撤销这些改动，改为通用的修复。如果你认为测试或需求之间存在矛盾、无法用通用修复同时满足，"
                       "请不要再尝试绕过，直接在最终回复里说明矛盾在哪里，交给人类决定。")
-        if self.approver is not None and not self.approver(self.ws.diff(), findings):
+        if self.approver is not None and not await maybe_await(self.approver(self.ws.diff(), findings)):
             self.ws._event("human_rejected")
             return "拒绝提交：人工审查没有通过这次修改。请在最终回复里说明你的修改和理由。"
         return None

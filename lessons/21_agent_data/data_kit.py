@@ -12,6 +12,10 @@
 
     人工标签 vs 评委标签 ──agreement_report──► 一致率、kappa、TPR / TNR
 
+要调模型的两步（synthesize_cases、filter_candidates）是 async 函数：同一个事件循环里同时发出多个请求，
+用 agentkit.workflows.parallel 限制同时在途的请求数（max_concurrency），不需要线程。
+其余全部是纯计算（解析、去重、聚类、抽样、统计），保持普通函数。
+
 练习（exercise.py）里的 cohen_kappa / stratified_sample / split_no_leak 是这条流水线上的另外三块拼图。
 """
 
@@ -25,7 +29,6 @@ import random
 import re
 import unicodedata
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Literal, Sequence, TypeVar
@@ -35,7 +38,7 @@ from pydantic import BaseModel, Field
 from agentkit import redact_pii
 from agentkit.evals import EvalCase
 from agentkit.llm import LLM, LLMError
-from agentkit.workflows import complete_json
+from agentkit.workflows import complete_json, parallel
 
 T = TypeVar("T")
 
@@ -617,42 +620,53 @@ SYNTH_PROMPT = """你在为一个 AI 助手构造评估用例（测试题），�
 4. 带错误前提的问题（比如把时限说错）仍然是 answerable，正确答案要纠正这个前提。"""
 
 
-def synthesize_cases(
+async def synthesize_cases(
     llm: LLM,
     seeds: Sequence[Seed],
     dimensions: dict[str, str],
     knowledge: str,
     per_seed: int | Sequence[int] = 3,
+    *,
+    max_concurrency: int = 2,
 ) -> list[Candidate]:
     """每个种子调用一次模型，按给定维度生成 per_seed 条变体（用 complete_json 保证结构化输出）。
 
     为什么要"种子 + 维度"，而不是一句"帮我生成 100 条测试题"？
     不给约束，模型会反复生成它自己觉得典型的问题：干净、完整、单一意图 —— 比真实用户的问题简单得多，
     而且彼此高度相似。种子把主题锚定在真实流量上，维度强制覆盖你关心的变化方向。
+
+    各种子的生成互不依赖，所以并发发出，同时在途最多 max_concurrency 个（模型网关是共享的，别把配额打满）。
+    结果按种子顺序返回，和完成的先后无关；任何一个种子失败（模型报错、结构化输出修不好），
+    其余还没完成的请求立即取消，异常原样抛出（agentkit.workflows.parallel 的语义）。
     """
     names = list(dimensions)
     counts = [per_seed] * len(seeds) if isinstance(per_seed, int) else list(per_seed)
-    out: list[Candidate] = []
-    for s_idx, (seed, k) in enumerate(zip(seeds, counts)):
+
+    async def one(s_idx: int, seed: Seed, k: int) -> list[Candidate]:
         # 每个种子从不同的维度开始轮换：种子少、每个种子生成的条数也少时，各维度在整体上仍然都能覆盖到
         dims = [names[(s_idx + i) % len(names)] for i in range(k)]
         dim_text = "\n".join(f"{i + 1}. {d}：{dimensions[d]}" for i, d in enumerate(dims))
         prompt = SYNTH_PROMPT.format(knowledge=knowledge, seed=seed.input, reference=seed.reference, k=k, dimensions=dim_text)
-        batch = complete_json(llm, prompt, SynthBatch)
-        for i, c in enumerate(batch.cases[:k]):
-            out.append(
-                Candidate(
-                    id=f"syn-{seed.id}-{i + 1}",
-                    seed_id=seed.id,
-                    dimension=c.dimension,
-                    input=c.input.strip(),
-                    answer_type=c.answer_type,
-                    reference_answer=c.reference_answer.strip(),
-                    must_contain=[m.strip() for m in c.must_contain if m.strip()],
-                    evidence=c.evidence.strip(),
-                )
+        batch = await complete_json(llm, prompt, SynthBatch)
+        return [
+            Candidate(
+                id=f"syn-{seed.id}-{i + 1}",
+                seed_id=seed.id,
+                dimension=c.dimension,
+                input=c.input.strip(),
+                answer_type=c.answer_type,
+                reference_answer=c.reference_answer.strip(),
+                must_contain=[m.strip() for m in c.must_contain if m.strip()],
+                evidence=c.evidence.strip(),
             )
-    return out
+            for i, c in enumerate(batch.cases[:k])
+        ]
+
+    per_seed_results = await parallel(
+        [lambda s_idx=s_idx, seed=seed, k=k: one(s_idx, seed, k) for s_idx, (seed, k) in enumerate(zip(seeds, counts))],
+        max_concurrency=max_concurrency,
+    )
+    return [c for batch in per_seed_results for c in batch]
 
 
 # =====================================================================
@@ -720,7 +734,7 @@ def _cheap_reason(
     return None
 
 
-def filter_candidates(
+async def filter_candidates(
     candidates: Sequence[Candidate],
     *,
     knowledge: str,
@@ -730,7 +744,7 @@ def filter_candidates(
     max_chars: int = 200,
     dup_threshold: float = 0.6,
     max_keyword_chars: int = 8,
-    max_workers: int = 2,
+    max_concurrency: int = 2,
 ) -> tuple[list[Candidate], list[Rejection]]:
     """对合成候选做质量过滤，返回 (保留, 拒绝及原因)。
 
@@ -738,6 +752,9 @@ def filter_candidates(
     只把幸存者交给 LLM 做最贵的检查。LLM 检查的核心问题是：
     **期望答案能不能从给定知识推出来** —— 出题模型最常见的错误，就是把自己的常识当成了知识库内容；
     顺带检查必含关键词是不是都必需（出题模型爱把知识库里的无关规则也塞进期望，导致规则评分误判）。
+
+    LLM 核查并发发出，同时在途最多 max_concurrency 个；单题核查失败只记为拒绝，不影响其他题。
+    规则检查是纯计算，而且要按顺序做（"和已保留的题目近重复"依赖前面保留了谁），所以不并发。
     """
     kb = _squash(knowledge)
     seed_text = {s.id: s.input for s in seeds}
@@ -755,16 +772,16 @@ def filter_candidates(
     if llm is None:
         return survivors, rejected
 
-    def check(c: Candidate) -> AnswerCheck | None:
+    async def check(c: Candidate) -> AnswerCheck | None:
         keywords = "、".join(c.must_contain) or "（无）"
         prompt = CHECK_PROMPT.format(knowledge=knowledge, question=c.input, reference=c.reference_answer, keywords=keywords)
         try:
-            return complete_json(llm, prompt, AnswerCheck)
+            return await complete_json(llm, prompt, AnswerCheck)
         except (ValueError, LLMError):  # 核查失败的题宁可不要，也不能默认放行
             return None
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:  # 限制并发：别把共享的模型配额打满
-        verdicts = list(pool.map(check, survivors))
+    # 限制并发：别把共享的模型配额打满。结果按 survivors 的顺序返回
+    verdicts = await parallel([lambda c=c: check(c) for c in survivors], max_concurrency=max_concurrency)
     kept = []
     for c, v in zip(survivors, verdicts):
         if v is None:
