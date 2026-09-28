@@ -13,8 +13,9 @@ ResilientLLM 用"装饰器模式"把这些能力套在任何 LLM 外面，对 Ag
   （它是 BaseException，下面所有 `except Exception` 都不会捕获它）；
 - 流式输出只能在"第一个 token 之前"重试或降级：已经推给用户的半句话收不回来，中途失败只能如实报错。
 
-这里的熔断器状态在本进程内存里：多个 worker 进程各有一份。进程之间共享熔断状态
-见 agentkit.distributed.SQLiteCircuitBreaker（单机多进程）与第 29 课的网关（多机）。
+这里的熔断器状态在本进程内存里：多个 worker 进程各有一份，一个进程早已熔断，别的进程还在往故障的下游发请求。
+进程之间共享熔断状态：ResilientLLM(breaker_factory=...) 换成 agentkit.distributed.SQLiteCircuitBreaker
+（单机多进程），多机放到网关层（第 29 课）。
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import time
 from typing import AsyncIterator, Awaitable, Callable, Sequence, TypeVar
 
 from .llm import LLM, LLMError, StreamDone, StreamEvent
+from .tools import maybe_await
 from .types import LLMResponse, Message
 
 T = TypeVar("T")
@@ -117,6 +119,10 @@ class CircuitBreaker:
             return "half_open"
         return "open"
 
+    async def current_state(self) -> str:
+        """与 state 相同；共享熔断器（SQLiteCircuitBreaker）要查数据库，所以统一提供一个 async 版本。"""
+        return self.state
+
     def record_failure(self) -> None:
         self.failures += 1
         if self.state == "half_open" or self.failures >= self.failure_threshold:
@@ -156,6 +162,8 @@ class ResilientLLM:
 
     max_concurrency：同一时刻对单个模型的最大在途请求数。超出的请求在本进程内排队，
     而不是一起打到网关上触发 429 —— 这是"背压"最朴素的形式。
+    breaker_factory：按模型名创建熔断器的函数。默认每个 ResilientLLM 在内存里建一个 CircuitBreaker；
+    多个 worker 进程要共享熔断状态时传 lambda model: SQLiteCircuitBreaker(db, model, ...)。
     """
 
     def __init__(
@@ -171,13 +179,13 @@ class ResilientLLM:
         max_concurrency: int | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock=time.monotonic,
+        breaker_factory: Callable[[str], object] | None = None,
     ):
+        make_breaker = breaker_factory or (
+            lambda model: CircuitBreaker(model, failure_threshold, reset_timeout, clock, record_if=record_if)
+        )
         self.chain = [
-            (
-                llm,
-                CircuitBreaker(llm.model, failure_threshold, reset_timeout, clock, record_if=record_if),
-                asyncio.Semaphore(max_concurrency) if max_concurrency else None,
-            )
+            (llm, make_breaker(llm.model), asyncio.Semaphore(max_concurrency) if max_concurrency else None)
             for llm in [primary, *fallbacks]
         ]
         self.model = primary.model
@@ -218,7 +226,7 @@ class ResilientLLM:
     async def stream(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> AsyncIterator[StreamEvent]:
         errors = []
         for llm, breaker, sem in self.chain:
-            if breaker.state == "open":
+            if await breaker.current_state() == "open":
                 errors.append(f"{llm.model}: 熔断中")
                 continue
             for attempt in range(1, self.max_attempts + 1):
@@ -238,13 +246,13 @@ class ResilientLLM:
                     finally:
                         if sem is not None:
                             sem.release()
-                    breaker.record_success()
+                    await maybe_await(breaker.record_success())
                     return
                 except LLMError as e:
                     if started:
                         raise  # 已经把部分内容推给了用户：不能静默重试，否则用户会看到重复的文字
-                    breaker.record_failure()
-                    if attempt < self.max_attempts and is_retryable(e) and breaker.state != "open":
+                    await maybe_await(breaker.record_failure())
+                    if attempt < self.max_attempts and is_retryable(e) and await breaker.current_state() != "open":
                         delay = backoff_delay(attempt, self.base_delay)
                         self.events.append(f"retry(stream) {llm.model} #{attempt} after {delay:.2f}s: {e}")
                         await self.sleep(delay)

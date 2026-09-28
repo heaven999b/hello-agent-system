@@ -55,13 +55,13 @@ flowchart TD
     J -->|"是"| V{"Schema 校验通过?"}
     V -->|"否"| OBS
     V -->|"是"| C["注入 ctx 可信身份"]
-    C --> R["带超时执行"]
+    C --> R["带超时执行<br/>async 工具直接 await，同步工具进线程池"]
     R -->|"ToolError / 异常 / 超时"| OBS
     R -->|"成功"| T["序列化 + 截断"]
     T --> OK["结果观察 喂回模型"]
 ```
 
-所有调用都经过 [`ToolRegistry.execute()`](../../agentkit/tools.py) 这**唯一的关口**。校验、身份注入、超时、截断、幂等都在这里做，工具函数本身只写业务逻辑。
+所有调用都经过 [`await ToolRegistry.execute()`](../../agentkit/tools.py) 这**唯一的关口**（`Agent` 内部用的 `ToolExecutor.execute()` 是同一套逻辑）。校验、身份注入、超时、截断、幂等都在这里做，工具函数本身只写业务逻辑。它是 async 的：一个会话在等工具的时候，同一个进程里的其他会话照常推进（[第 02 课](../02_agent_loop/README.md) 1.7 节）。
 
 ## 2. 从玩具到生产：逐层实现
 
@@ -146,19 +146,26 @@ def search_expenses(status: str) -> list:
 模型输出的参数**一定**会出错：不合法的 JSON、缺字段、类型不对、越界、编造的参数。[`ToolRegistry.execute()`](../../agentkit/tools.py) 把所有问题都变成一段文字反馈给模型，而不是抛异常让 Agent 崩溃：
 
 ```python
+# Tool.parse_arguments：返回 (参数 dict, None) 或 (None, 给模型看的错误说明)
 # 1) 解析 JSON —— 模型可能输出不合法的 JSON
 try:
-    raw = json.loads(call.arguments or "{}")
-    ...
+    raw = json.loads(arguments or "{}")
+    if not isinstance(raw, dict):
+        raise ValueError("参数必须是 JSON 对象")
 except (json.JSONDecodeError, ValueError) as e:
-    return ToolResult(False, f"错误：参数不是合法的 JSON 对象（{e}）。请重新生成参数。", "invalid_args")
+    return None, f"错误：参数不是合法的 JSON 对象（{e}）。请重新生成参数。"
 
 # 2) 按 Schema 校验 —— 缺字段、类型错、越界、多余字段都在这里拦下
 try:
-    args = t.args_model.model_validate(raw)
+    args = self.args_model.model_validate(raw)
 except ValidationError as e:
     problems = "\n".join(f"- {'.'.join(map(str, err['loc'])) or '参数'}: {err['msg']}" for err in e.errors())
-    return ToolResult(False, f"错误：参数校验失败：\n{problems}\n请修正后重试。", "invalid_args")
+    return None, f"错误：参数校验失败：\n{problems}\n请修正后重试。"
+
+# ToolExecutor.execute 里：有错误就变成一条观察返回，而不是抛异常
+kwargs, error = t.parse_arguments(call.arguments)
+if error is not None:
+    return ToolResult(False, error, "invalid_args")
 ```
 
 Demo 第 4 部分展示了校验层的真实输出（不调用模型）：
@@ -300,14 +307,53 @@ def reset_password(...): ...
 
 风险等级是**工具的元数据**，由写工具的人声明，不由模型判断。第 09 课的 `PermissionPolicy` 据此决定是否要求审批，第 08 课的幂等存储只对 `write` / `dangerous` 生效。MCP 协议里对应的概念是工具注解 `readOnlyHint` / `destructiveHint` / `idempotentHint`（见 2.11）。
 
-### 2.7 超时与输出截断
+### 2.7 async 工具、超时与输出截断
 
 ```python
 @tool(timeout_s=5, max_output_chars=4000)
 def search_logs(...): ...
 ```
 
-- **超时**：一个卡住的工具不能拖住整个 Agent。注意 agentkit 用线程实现超时，而 **Python 线程无法被强制终止** —— 超时后函数可能还在后台跑。生产中，不可信或高风险的工具（执行代码、访问外网）应该放进独立进程或沙箱（容器、gVisor、Firecracker）里执行。
+**工具可以是 `async def`。** 调 HTTP API、查数据库、访问缓存这类要等 I/O 的工具，推荐写成 async，配合 async 客户端。这是 Demo 第 5 部分里的例子：
+
+```python
+@tool(timeout_s=0.3)
+async def fetch_invoice_pdf(expense_id: str) -> str:
+    """从电子发票平台下载报销单的发票 PDF，返回下载链接。"""
+    try:
+        await asyncio.sleep(5)  # 真实系统里是 await httpx.AsyncClient().get(...)：平台今天特别慢
+        TRACE.append("async 工具：下载完成")
+        return f"https://invoice.example/{expense_id}.pdf"
+    except asyncio.CancelledError:
+        TRACE.append("async 工具：在 await 处收到 CancelledError，连接释放，没有继续执行")
+        raise  # 收尾之后必须重新抛出
+```
+
+`@tool` 对两种函数一视同仁：Schema 一样从签名生成，`ctx` 一样注入。区别在**怎么执行**，这也决定了超时（或者整个运行被取消）时真正发生什么：
+
+| 工具类型 | 怎么执行 | 超时时真正发生什么 | 适合 |
+|---|---|---|---|
+| `async def` 工具 | 直接在事件循环里 `await` | **真正取消**：工具在它正在等待的 `await` 处收到 `CancelledError`，可以在 `except` / `finally` 里收尾，连接被释放 | 有 async 客户端的 I/O：HTTP API、数据库、缓存 |
+| 普通 `def` 工具 | 放进线程池执行（`ToolExecutor`），不阻塞事件循环 | 调用方按时拿到 `timeout` 结果，但 **Python 线程无法被强制终止**：函数会在后台跑完，副作用照样发生 | 纯计算；只有同步 SDK 的库 |
+| `@tool(isolation="process")` | 在子进程里执行 | **硬超时**：直接 kill 子进程 | CPU 密集、可能死循环的第三方代码、不可信代码（代价：每次都要启动子进程；参数和返回值要能 pickle；函数必须是模块级的） |
+
+Demo 第 5 部分把三种工具放进同一个 `ToolRegistry`，超时都设得很短（不调用模型；Apple M1、8 GB，系统负载偏高时实测）：
+
+```text
+▶ fetch_invoice_pdf: error_type=timeout，调用方 0.30s 后拿到结果
+    · async 工具：在 await 处收到 CancelledError，连接释放，没有继续执行
+▶ mark_invoice_verified: error_type=timeout，调用方 0.30s 后拿到结果
+▶ ocr_receipt: error_type=timeout，调用方 0.51s 后拿到结果
+▶ 超时 1.2 秒之后：
+    · 同步工具：EX-1009 已标记为已验真（此时调用方早就收到超时了）
+    · 还活着的子进程：0 个（ocr_receipt 的子进程在超时那一刻就被 kill 了）
+```
+
+最危险的是中间那一行：同步的**写**工具超时了，模型和用户都以为"没做成"，它却在后台做完了；如果模型接着重试，就做了两次。所以同步的写工具要么给足超时，要么配合幂等键（第 08 课），绝不能把"超时"当成"没执行"。不可信或高风险的工具（执行代码、访问外网）还需要比子进程更强的隔离：容器、gVisor、Firecracker（[第 19 课](../19_mcp_and_sandbox/README.md)）。
+
+**两个 async 陷阱**（[第 02 课](../02_agent_loop/README.md) 1.7 节）：`async def` 工具里**不要**调用阻塞函数（`time.sleep`、`requests.get`、同步数据库驱动）—— 它会卡住整个事件循环，所有会话一起停；只有同步版本的库，就把工具写成普通 `def`（交给线程池），或者在 async 工具里 `await asyncio.to_thread(...)`。另外，在 async 工具里捕获 `CancelledError` 做完收尾之后**必须重新抛出**，否则取消就失效了。
+
+- **超时**：一个卡住的工具不能拖住整个 Agent。每个工具都有 `timeout_s`（默认 30 秒），超时后模型收到一条 `timeout` 观察，可以换个方式或告诉用户。
 - **截断**：一个返回 10 万行日志的工具会瞬间撑爆上下文窗口。agentkit 截断后会追加一句 `...[输出已截断，原始长度 N 字符]`，让模型知道信息不完整。Anthropic 在 [Writing effective tools for agents](https://www.anthropic.com/engineering/writing-tools-for-agents) 中提到，Claude Code 默认把工具响应限制在 25,000 tokens。
 
 截断是最后一道保险，更好的做法是**在工具设计层面就不返回大量数据**：提供过滤参数（`status`、时间范围）、分页（`limit` + `total` + 提示）、搜索而不是全量读取。练习里的 `search_orders` 就要求在结果被截断时返回 `note`，告诉模型"共 7 条只显示了 5 条，可以用 status 过滤或调大 limit"。
@@ -409,7 +455,7 @@ MCP 规范本身也强调了本课的原则：服务器**必须**校验所有输
 .venv/bin/python lessons/03_tools/demo.py --offline  # 离线剧本，复现真实模型的典型表现
 ```
 
-Demo 分 5 部分：
+Demo 分 6 部分：
 
 | 部分 | 内容 | 该观察什么 |
 |---|---|---|
@@ -418,6 +464,7 @@ Demo 分 5 部分：
 | 实验 B | 错误信息的三种写法 | v1 放弃或靠猜，v2 撞墙后自我纠正（3 次模型调用），v3 一次做对（2 次） |
 | 实验 C | 模型传身份 vs 系统注入身份 | 糟糕设计下越权 + 内部字段泄露；良好设计下模型**根本没有能力**越权 |
 | 第 4 部分 | 校验层实拍（不调用模型） | 每种错误变成了什么样的观察；"别人的单据"和"不存在"返回同一句话 |
+| 第 5 部分 | async 工具与三种超时语义（不调用模型） | async 工具被真正取消；同步的写工具超时后仍在后台做完；进程隔离的死循环被 kill |
 
 真实模型的输出每次措辞略有不同，实验 B 的 v1 尤其不稳定 —— 这本身就是结论：**把正确性寄托在模型"猜对"上是不可靠的**。
 
@@ -442,7 +489,9 @@ make lesson N=03
 .venv/bin/python -m pytest lessons/03_tools
 ```
 
-30 个测试覆盖：Schema 质量（枚举、范围、描述、必填项、身份不暴露、风险等级）、越权访问、`ToolError` 路径、经过 `ToolRegistry.execute` 的校验错误，以及用 `Agent` 跑通的端到端流程。其中少数"护栏型"测试（比如身份参数不暴露）在你动手之前就能通过 —— 它们的作用是防止你在修改时把好的设计改坏。
+30 个测试覆盖：Schema 质量（枚举、范围、描述、必填项、身份不暴露、风险等级）、越权访问、`ToolError` 路径、经过 `ToolRegistry.execute` 的校验错误，以及用 `Agent` 跑通的端到端流程。其中少数"护栏型"测试（比如身份参数不暴露、多传身份参数被校验层拒绝）在你动手之前就能通过 —— 它们的作用是防止你在修改时把好的设计改坏。
+
+你写的两个工具是普通 `def`：它们只做计算和读写内存里的字典，不等任何 I/O，不需要 async（agentkit 会把它们放进线程池执行）。经过注册表和 `Agent` 的测试是 `async def test_...`，里面写的是 `await reg.execute(...)`、`await Agent(...).run(...)`。
 
 ## 5. 深入（给有余力的你）
 
@@ -454,7 +503,7 @@ make lesson N=03
 
 **让工具支持不同详细程度。** 同一个查询，有时模型只需要 ID 列表，有时需要完整详情。Anthropic 建议可以给工具加一个 `response_format` 参数（如 `"concise"` / `"detailed"`），由模型按需选择，在信息量和 token 成本之间取得平衡。
 
-**沙箱与副作用隔离。** 一旦工具能执行代码、访问文件系统或外网，它就需要和 Agent 主进程隔离：资源限制（CPU、内存、时长）、网络出口白名单、只读文件系统、最小权限的凭证。"工具出错不能拖垮 Agent"不只是 `try/except` 的问题，也是进程和权限边界的问题。
+**沙箱与副作用隔离。** 一旦工具能执行代码、访问文件系统或外网，它就需要和 Agent 主进程隔离：资源限制（CPU、内存、时长）、网络出口白名单、只读文件系统、最小权限的凭证。"工具出错不能拖垮 Agent"不只是 `try/except` 的问题，也是进程和权限边界的问题。agentkit 里的第一步是 `@tool(isolation="process")`（2.7 节：超时即 kill），更强的 OS 级沙箱见第 19 课。
 
 ## 6. 常见坑与反模式
 
@@ -471,6 +520,8 @@ make lesson N=03
 11. **读写合一的大工具**（`manage_order(action=...)`），无法按操作分级授权。
 12. **写操作不考虑重复执行**：重试一次就重复扣款、重复建单。
 13. **无条件信任第三方 MCP 服务器的工具描述和注解**。
+14. **在 `async def` 工具里调用阻塞函数**（`time.sleep`、`requests.get`、同步数据库驱动），整个进程的所有会话一起卡住。换 async 客户端，或者写成普通 `def` 交给线程池。
+15. **把同步工具的超时当成"没执行"**。线程杀不掉，超时之后它可能还在后台完成写操作（Demo 第 5 部分）；写操作要配幂等键，CPU 密集或不可信的代码用 `isolation="process"`。
 
 ## 7. 面试 & 设计评审问题
 
@@ -538,6 +589,15 @@ make lesson N=03
 - 它的工具输出同样按不可信数据处理（第 09 课）。
 </details>
 
+<details>
+<summary>Q8：一个工具设置了 timeout_s=5，超时之后它真的停了吗？</summary>
+
+- 看它是怎么执行的。`async def` 工具：会，超时在它正在等待的 `await` 处抛 `CancelledError`，连接被释放，可以在 `finally` 里收尾。
+- 普通 `def` 工具：不会。它在线程池里跑，调用方按时拿到超时结果，但 Python 线程无法被强制终止，函数会在后台跑完，写操作照样生效。
+- `isolation="process"` 的工具：会，子进程直接被 kill；代价是进程启动开销、参数要能 pickle。
+- 设计上的推论：写操作不能把"超时"当成"没执行"，要配幂等键；I/O 型工具优先写成 async；CPU 密集或不可信的代码放进子进程或沙箱。
+</details>
+
 ## 8. 自测清单
 
 - [ ] 我能解释 ACI 是什么，以及模型"使用接口"和人有什么不同
@@ -550,6 +610,7 @@ make lesson N=03
 - [ ] 我能说出返回值设计的 4 条原则
 - [ ] 我能说出合并和拆分工具的原则
 - [ ] 我能说出 MCP 和 ToolRegistry 的对应关系，以及接入第三方 MCP 服务器的风险
+- [ ] 我能说出 async 工具、普通同步工具、`isolation="process"` 工具在超时时分别会发生什么
 - [ ] 我的 `search_orders` 和 `cancel_order` 通过了全部 30 个测试
 
 ## 延伸阅读

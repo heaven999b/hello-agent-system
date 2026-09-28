@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import threading
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -139,14 +139,14 @@ def test_visible_tools_filters_per_principal():
     assert p.visible_tools(RunState(metadata={}), names) == []
 
 
-def test_before_tool_pauses_for_approval_then_resumes_with_audit_trail():
+async def test_before_tool_pauses_for_approval_then_resumes_with_audit_trail():
     audit = []
     p = make_policy(audit=audit.append)
     llm = ScriptedLLM([call_tool("reset_password", target_user_id="bob"), reply("已发送")])
     agent = Agent(llm, TOOLS, hooks=[p])
-    res = agent.run("帮 bob 重置密码", metadata=IAN)
+    res = await agent.run("帮 bob 重置密码", metadata=IAN)
     assert res.status == "paused" and "call_tool_unattended" in res.output
-    res = agent.approve(res.run_id, True, by="sec-oncall")
+    res = await agent.approve(res.run_id, True, by="sec-oncall")
     assert res.ok and res.output == "已发送"
     ids = [(r["action"], r["allowed"], tuple(r["policy_ids"])) for r in audit]
     assert ("call_tool", True, ("it-admin-all-tools",)) in ids and ("call_tool_unattended", False, ()) in ids
@@ -154,44 +154,68 @@ def test_before_tool_pauses_for_approval_then_resumes_with_audit_trail():
     assert res.metadata["policy_decisions"][0]["policy_ids"] == ["it-admin-all-tools"]
 
 
-def test_denied_call_becomes_observation_and_sync_approver_is_used():
+async def test_denied_call_becomes_observation_and_sync_or_async_approver_is_used():
     llm = ScriptedLLM([call_tool("reset_password", target_user_id="bob"), reply("无法操作")])
-    res = Agent(llm, TOOLS, hooks=[make_policy()]).run("帮 bob 重置密码", metadata=ALICE)
+    res = await Agent(llm, TOOLS, hooks=[make_policy()]).run("帮 bob 重置密码", metadata=ALICE)
     tool_msg = next(m for m in res.messages if m["role"] == "tool")
     assert res.ok and "reset-self-only" in tool_msg["content"]
+
     seen = []
-    p = make_policy(approver=lambda call, state: seen.append(call.name) or False)
+    p = make_policy(approver=lambda call, state: seen.append(call.name) or False)  # 普通函数
     llm = ScriptedLLM([call_tool("reset_password", target_user_id="bob"), reply("审批没通过")])
-    res = Agent(llm, TOOLS, hooks=[p]).run("帮 bob 重置密码", metadata=IAN)
+    res = await Agent(llm, TOOLS, hooks=[p]).run("帮 bob 重置密码", metadata=IAN)
     assert seen == ["reset_password"] and "没有批准" in next(m for m in res.messages if m["role"] == "tool")["content"]
 
+    async def reject(call, state):  # async 函数：必须 await 它的结果，不能把协程对象当成"批准"
+        await asyncio.sleep(0)
+        seen.append(f"async:{call.name}")
+        return False
 
-def test_invalid_arguments_are_not_sent_to_approvers():
+    llm = ScriptedLLM([call_tool("reset_password", target_user_id="bob"), reply("审批没通过")])
+    res = await Agent(llm, TOOLS, hooks=[make_policy(approver=reject)]).run("帮 bob 重置密码", metadata=IAN)
+    assert seen[-1] == "async:reset_password"
+    assert "没有批准" in next(m for m in res.messages if m["role"] == "tool")["content"]  # 被拒绝，工具没有执行
+
+
+async def test_invalid_arguments_are_not_sent_to_approvers():
     seen = []
     p = make_policy(approver=lambda call, state: seen.append(call) or True)
     llm = ScriptedLLM([call_tool("reset_password", wrong_field="bob"), reply("参数错了")])
-    res = Agent(llm, TOOLS, hooks=[p]).run("重置", metadata=IAN)
+    res = await Agent(llm, TOOLS, hooks=[p]).run("重置", metadata=IAN)
     assert seen == [] and "参数校验失败" in next(m for m in res.messages if m["role"] == "tool")["content"]
 
 
-def test_concurrent_decisions_from_many_threads_are_consistent():
-    """同一个 CedarPolicy 实例被 8 个线程同时使用（多线程 Web 服务的常态）：判定结果不能串。"""
-    p = make_policy()
-    expected = {"alice": False, "ian": True, "mallory": False}
-    people = {"alice": ALICE, "ian": IAN, "mallory": MALLORY}
-    mismatches = []
-    barrier = threading.Barrier(8)
+async def test_concurrent_runs_sharing_one_policy_keep_decisions_apart():
+    """30 个运行并发共用一个 CedarPolicy：alice / ian / mallory 轮流，都被"诱导"去重置 bob 的密码。
+    async approver 每次都让出事件循环，各会话的判定交错进行 —— 但判定结果、审计记录不能串到别人身上。"""
+    audit, approved_for = [], []
 
-    def worker(i: int):
-        barrier.wait()
-        for k in range(150):
-            who = ["alice", "ian", "mallory"][(i + k) % 3]
-            if p.authorize(people[who], reset_password, "call_tool", BOB).allowed != expected[who]:
-                mismatches.append(who)
+    async def approver(call, state):
+        await asyncio.sleep(0.001)  # 模拟去审批系统查一条记录：此刻别的会话在推进
+        approved_for.append(state.metadata["user_id"])
+        return True
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert mismatches == [] and len(p.decisions) == 8 * 150
+    p = make_policy(approver=approver, audit=audit.append)
+    llm = ScriptedLLM(
+        responder=lambda m: reply("结束") if m[-1]["role"] == "tool" else call_tool("reset_password", target_user_id="bob"),
+        latency=0.001,
+    )
+    people = [ALICE, IAN, MALLORY]
+    agent = Agent(llm, TOOLS, hooks=[p])
+    results = await asyncio.gather(*(agent.run("帮 bob 重置密码", metadata=people[i % 3]) for i in range(30)))
+
+    assert llm.max_in_flight > 1  # 会话之间真的交错了
+    expected = {
+        "alice": ("reset-self-only", [["reset-self-only"]]),
+        "ian": ("已为 bob 发送重置链接", [["it-admin-all-tools"], []]),  # 能调用，但不能无人值守 → 审批通过后执行
+        "mallory": ("tenant-isolation", [["tenant-isolation"]]),
+    }
+    for i, res in enumerate(results):
+        who = people[i % 3]["user_id"]
+        marker, policy_ids = expected[who]
+        assert res.ok and marker in next(m for m in res.messages if m["role"] == "tool")["content"], who
+        assert [d["policy_ids"] for d in res.metadata["policy_decisions"]] == policy_ids, who
+        mine = [r for r in audit if r["run_id"] == res.run_id]
+        assert mine and all(r["user_id"] == who for r in mine)
+    assert sorted(approved_for) == ["ian"] * 10  # 只有 ian 的调用走到了审批
+    assert len(p.decisions) == 10 * 1 + 10 * 2 + 10 * 1

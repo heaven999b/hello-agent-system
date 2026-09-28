@@ -51,7 +51,7 @@ from .state import Checkpointer, InMemoryCheckpointer, RunState
 from .timeouts import wait_for
 from .tools import IdempotencyStore, Tool, ToolContext, ToolExecutor, ToolRegistry, ToolResult, maybe_await
 from .tracing import Span, Tracer
-from .types import LLMResponse, Message, ToolCall, calls_in, system, tool_message, user
+from .types import LLMResponse, Message, ToolCall, Usage, calls_in, system, tool_message, user
 
 logger = logging.getLogger("agentkit")
 

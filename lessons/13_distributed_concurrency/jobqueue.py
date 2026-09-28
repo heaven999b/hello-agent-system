@@ -21,14 +21,20 @@
 2. fencing token（fence 列）：每次领取 +1。heartbeat / complete / fail 都必须带上领取时拿到的 fence，
    对不上就拒绝 → 租约过期后"诈尸"的旧 worker 没法覆盖新 worker 的结果。
 3. 尝试次数上限 + 死信：一个每次都让 worker 崩溃的"毒消息"，最多害死 max_attempts 个 worker，不会无限循环。
+
+JobQueue 是**同步**的（直接调用阻塞的 sqlite3）：在没有事件循环的进程里（练习测试、demo 的会话 worker）直接用；
+在事件循环里（跑 async Agent 的 worker）要通过文件末尾的 AsyncJobQueue，理由见它的注释和 README 3.11 节。
+框架里对应的完整实现是 agentkit.distributed.SQLiteJobQueue（README 3.10 节）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -366,3 +372,62 @@ class JobQueue:
         """所有任务都进入了终态（succeeded / failed / dead）。"""
         row = self.conn.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'leased')").fetchone()
         return row[0] == 0
+
+
+# ---------------------------------------------------------------------- 在事件循环里使用
+
+
+class AsyncJobQueue:
+    """JobQueue 的 async 外壳：每个调用都放到**一个专用线程**里执行，事件循环只 await 结果。
+
+    为什么需要它（第 02 课讲过的坑：在事件循环里做阻塞调用）：JobQueue 的每个方法都是阻塞的 sqlite3 调用，
+    别的进程正在写库时，claim / heartbeat / complete 会按 busy_timeout 排队等写锁，最长 10 秒。
+    直接在事件循环里调用，这段时间里整个进程的所有协程都停了：别的任务的心跳发不出去，
+    租约一起过期，任务被别的 worker 接手 —— 一个"慢一点的数据库"就这样变成了"一批重复执行"。
+    （test_exercise.py 的 test_async_jobqueue_keeps_the_event_loop_running 实测了两种写法的差别。）
+
+    为什么是"一个"专用线程，而不用 asyncio.to_thread？sqlite3 连接默认不能跨线程使用，
+    to_thread 用的是线程池，每次调用可能落在不同的线程上。一个线程 + 一个连接，所有调用排队执行，简单且安全。
+    agentkit.distributed.SQLiteDB 用的是同一个办法。
+
+    调用方被取消时，已经开始的数据库操作仍会在线程里执行完（事务要么提交、要么回滚），不会停在一半。
+    """
+
+    def __init__(self, path: str | Path, **kwargs):
+        self._path, self._kwargs = path, kwargs
+        self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jobqueue")
+        self._q: JobQueue | None = None
+
+    async def _call(self, method: str, *args, **kwargs):
+        def run():
+            if self._q is None:  # 连接在专用线程里创建，之后也只在这个线程里使用
+                self._q = JobQueue(self._path, **self._kwargs)
+            return getattr(self._q, method)(*args, **kwargs)
+
+        return await asyncio.get_running_loop().run_in_executor(self._exec, run)
+
+    async def enqueue(self, *args, **kwargs) -> tuple[int, bool]:
+        return await self._call("enqueue", *args, **kwargs)
+
+    async def claim(self, worker_id: str, lease_seconds: float) -> Job | None:
+        return await self._call("claim", worker_id, lease_seconds)
+
+    async def heartbeat(self, job_id: int, fence: int, lease_seconds: float) -> float:
+        return await self._call("heartbeat", job_id, fence, lease_seconds)
+
+    async def complete(self, job_id: int, fence: int, result: str = "") -> None:
+        return await self._call("complete", job_id, fence, result)
+
+    async def fail(self, job_id: int, fence: int, error: str, **kwargs) -> str:
+        return await self._call("fail", job_id, fence, error, **kwargs)
+
+    async def get(self, job_id: int) -> Job | None:
+        return await self._call("get", job_id)
+
+    async def all_done(self) -> bool:
+        return await self._call("all_done")
+
+    async def close(self) -> None:
+        if self._q is not None:
+            await self._call("close")
+        self._exec.shutdown(wait=False)

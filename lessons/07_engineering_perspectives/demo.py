@@ -16,11 +16,14 @@
   3. 排序   prioritize：P0 → P1 → P2，同级按场景权重
   4. 对比   同一套规则放到 9 个典型场景上，清单差多少
   5. 查漏   coverage_report：一份设计初稿漏了哪些维度？capstone/DESIGN.md 呢？
+
+只有第 1 步的真实模式调用模型（await complete_json，入口 asyncio.run(main())）；规则引擎和其余几步都是纯计算。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 import unicodedata
 from collections import Counter
@@ -266,7 +269,7 @@ def show_profile(profile: dict, lang: str, t: dict) -> None:
     info(t["derived"].format(v=fmt(P.derive_facts(profile)["peak_llm_rpm"])))
 
 
-def extract_profile(requirement: str, lang: str) -> tuple[dict, list[str]]:
+async def extract_profile(requirement: str, lang: str) -> tuple[dict, list[str]]:
     """真实模式：让模型把需求原文抽取成画像。一次模型调用；JSON 校验失败时最多修复 2 次。"""
     from pydantic import Field, create_model
 
@@ -306,7 +309,11 @@ def extract_profile(requirement: str, lang: str) -> tuple[dict, list[str]]:
             "irreversible_actions includes messages that cannot be unsent.\n\n"
             f"Requirement:\n{requirement}"
         )
-    result = complete_json(default_llm(), prompt, Model, system=system)
+    llm = default_llm()
+    try:
+        result = await complete_json(llm, prompt, Model, system=system)
+    finally:
+        await llm.aclose()
     data = result.model_dump()
     assumptions = data.pop("assumptions")
     for f in P.FACTS:  # 数字统一成 int（如果是整数），方便展示和比较
@@ -393,7 +400,7 @@ def show_coverage(impl, text: str, lang: str, t: dict, show_evidence: bool) -> N
 # ---------------------------------------------------------------- main
 
 
-def main() -> int:
+async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--offline", action="store_true", help="不调用模型，使用人工标注的画像")
     ap.add_argument("--lang", choices=["zh", "en"], default="zh")
@@ -432,7 +439,7 @@ def main() -> int:
             info(f"  │ {line}")
         info(t["calling"])
         try:
-            profile, assumptions = extract_profile(requirement, lang)
+            profile, assumptions = await extract_profile(requirement, lang)
         except Exception as e:  # noqa: BLE001  演示程序：把错误讲清楚后退出
             info(t["llm_failed"].format(err=e))
             return 1
@@ -509,4 +516,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(asyncio.run(main()))

@@ -36,7 +36,8 @@ class CostEstimate:
 
 
 def accumulate_tool_call_deltas(chunks: Sequence[dict]) -> list[ToolCall]:
-    """把 OpenAI Chat Completions 流式返回的 chunk 拼成完整的工具调用列表。"""
+    """把 OpenAI Chat Completions 流式返回的 chunk 拼成完整的工具调用列表。
+    生产版：agentkit.llm.ToolCallAccumulator（处理 SDK 分片对象；缺 id 时补本地 id 而不是报错）。"""
     parts: dict[int, dict] = {}
     for chunk in chunks:
         choices = chunk.get("choices") or []

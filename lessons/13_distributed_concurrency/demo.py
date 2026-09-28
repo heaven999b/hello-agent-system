@@ -1,44 +1,56 @@
-"""第 13 课 Demo：高并发与分布式执行 —— 多个 worker 进程 + 一个共享的 SQLite。
+"""第 13 课 Demo（一）：自己动手 —— 用本课的 jobqueue / session_store，在真实的多进程里复现并解决并发问题。
 
-    python lessons/13_distributed_concurrency/demo.py             # 真实模型（任务很少，模型并发 ≤ 3）
-    python lessons/13_distributed_concurrency/demo.py --offline   # 离线：ScriptedLLM + sleep 模拟模型耗时
+    python lessons/13_distributed_concurrency/demo.py                # 场景 2、3 调用真实模型
+    python lessons/13_distributed_concurrency/demo.py --offline      # 离线：ScriptedLLM（模型耗时用 asyncio.sleep）
+    python lessons/13_distributed_concurrency/demo.py --offline --only 3
 
 每个 worker 都是一个独立的操作系统进程（multiprocessing，spawn 方式启动），彼此不共享内存，
-只能通过同一个 SQLite 文件协作 —— 和"多台机器 + 一个共享数据库"的并发语义一样。
+只能通过 runs/ 下的 SQLite 文件协作。故障都是真实的操作系统信号：kill -9（SIGKILL）、SIGSTOP / SIGCONT。
+（SIGSTOP / SIGCONT 只有 macOS / Linux 才有。）
 
-四个场景：
-  1. 横向扩展：同一批 Agent 任务，1/2/4/8 个 worker 的吞吐；以及模型并发上限如何给吞吐"封顶"
-  2. worker 崩溃：kill -9 一个刚建完工单的 worker → 租约过期 → 别的 worker 接手 → 幂等键防止重复建单
-  3. 僵尸 worker：worker 卡住超过租约 → 任务被接手 → 它醒来后提交的旧结果被 fencing token 拒绝
+五个场景：
+  1. 原子领取：6 个进程同时抢 30 个任务 —— "先查再改"的错误写法 vs 你的 claim_job
+  2. worker 崩溃：kill -9 一个刚建完工单的 worker → 租约过期 → 别人接手 → 幂等键防止重复建单
+  3. 僵尸 worker：SIGSTOP 冻结一个跑到一半的 worker → 别人接手并完成 → SIGCONT 解冻后，它的写入被 fence 拒绝
+     （对比两种检查点：不认 fence 的 FileCheckpointer 被它悄悄覆盖；带 fence 的 SQLiteCheckpointer 拒绝它）
   4. 同一会话并发写：不做控制（丢失更新）vs 版本号 CAS vs 按会话串行（不调用模型，两种模式输出一致）
+  5. 共享配额：持有名额的进程被 kill -9 —— multiprocessing.Semaphore 永久少一个名额，SQLiteSemaphore 租约到期自动归还
 
-运行产物（队列库、工单库、检查点、会话库）写在 lessons/13_distributed_concurrency/runs/ 下。
+跑 Agent 的 worker 进程里是一个事件循环：Agent 是 async 的，心跳是同一个循环里的另一个协程；
+本课的 JobQueue 是同步的 sqlite3 代码，所以 worker 通过 jobqueue.AsyncJobQueue（专用线程）调用它（README 3.11 节）。
+
+框架版（agentkit.distributed：WorkerPool + AgentJobHandler + 故障注入时间线）见 demo_agents.py；
+吞吐实测（1/2/4 个进程、SQLite 单写者的上限）见 demo_scale.py。
+运行产物写在 lessons/13_distributed_concurrency/runs/ 下。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 import json
 import multiprocessing as mp
+import os
 import queue
 import random
 import re
 import shutil
+import signal
 import sqlite3
 import sys
-import threading
 import time
 import unicodedata
-import uuid
 from contextlib import closing
+from contextvars import ContextVar
 from pathlib import Path
 from types import ModuleType
 from typing import Annotated, Literal
 
 from pydantic import Field
 
-from agentkit import Agent, FileCheckpointer, ScriptedLLM, ToolContext, call_tool, default_llm, reply, tool
+from agentkit import Agent, FileCheckpointer, Hook, ScriptedLLM, ToolContext, call_tool, default_llm, reply, tool
+from agentkit.distributed import CheckpointConflict, SQLiteCheckpointer, SQLiteSemaphore
 
 HERE = Path(__file__).resolve().parent
 RUNS = HERE / "runs"
@@ -46,7 +58,7 @@ RUNS = HERE / "runs"
 
 def _load_sibling(name: str) -> ModuleType:
     """按文件路径加载同目录模块（与 exercise.py 里的同名函数一致，保证全进程只有一份）。"""
-    key = f"{HERE.name}__{name}"  # 例如 "10_distributed_concurrency__jobqueue"
+    key = f"{HERE.name}__{name}"  # 例如 "13_distributed_concurrency__jobqueue"
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, HERE / f"{name}.py")
         module = importlib.util.module_from_spec(spec)
@@ -57,6 +69,7 @@ def _load_sibling(name: str) -> ModuleType:
 
 jobqueue = _load_sibling("jobqueue")
 session_store = _load_sibling("session_store")
+race = _load_sibling("race")
 
 # 16 条真实感的 IT 报修消息：每条都是一个 Agent 任务
 MESSAGES = [
@@ -159,8 +172,8 @@ class TicketSystem:
 
     def create(self, title: str, priority: str, *, job_id: int, created_by: str,
                idempotency_key: str | None = None) -> tuple[str, bool]:
-        # 每次调用新开一个连接（相当于一次 HTTP 请求）：工具在 agentkit 的工具线程里执行，
-        # 而 sqlite3 连接不能跨线程使用
+        # 每次调用新开一个连接（相当于一次 HTTP 请求）：同步工具由 agentkit 放进线程池执行，
+        # 每次可能落在不同的线程上，而 sqlite3 连接不能跨线程使用
         with closing(jobqueue.connect(self.path)) as conn:
             try:
                 cur = conn.execute(
@@ -183,77 +196,35 @@ class TicketSystem:
 # ---------------------------------------------------------------- 模型
 
 
-class LimitedLLM:
-    """给任意 LLM 套一个"全局并发上限"：所有 worker 进程共享一个信号量，同一时刻最多 N 个模型请求在途。
+def offline_llm(worker_id: str, latency: float) -> ScriptedLLM:
+    """离线剧本：第一轮调用 create_ticket，拿到工具结果后回复工单号。
 
-    这是第 5 张卡片里的"并发信号量"方案的单机版。跨机器时要换成分布式信号量（如 Redis + 租约），
-    否则持有许可的进程一旦被 kill，许可就永远还不回来了。
+    latency 用的是 asyncio.sleep（ScriptedLLM 内置）：等"模型"的时候事件循环照常运转，心跳协程照常续约。
+    回复里带上 worker 名，场景 3 用它看出"检查点里最后的回答是谁写的"。
     """
 
-    def __init__(self, inner, sem):
-        self.inner, self.sem, self.model = inner, sem, inner.model
-
-    def chat(self, messages, tools=None, **kwargs):
-        with self.sem:
-            return self.inner.chat(messages, tools, **kwargs)
-
-
-def offline_llm(latency: float) -> ScriptedLLM:
-    """离线剧本：第一轮调用 create_ticket，拿到工具结果后回复工单号。sleep 模拟模型推理耗时。"""
-
     def policy(messages):
-        time.sleep(latency)
         last = messages[-1]
         if last["role"] == "tool":
             m = re.search(r"T-\d+", last["content"] or "")
-            return reply(f"已为你创建工单 {m.group(0) if m else '（未知）'}，IT 同事会尽快联系你。")
+            return reply(f"已为你创建工单 {m.group(0) if m else '（未知）'}，IT 同事会尽快联系你。（{worker_id} 回复）")
         text = next(msg["content"] for msg in reversed(messages) if msg["role"] == "user")
-        response = call_tool("create_ticket", title=text[:20], priority="medium")
-        # 真实模型返回的 tool_call_id 是全局唯一的随机串；这里也用随机串，
-        # 因为它会成为幂等键的一部分（agentkit 默认的 call_1、call_2 在不同进程里会重复）
-        response.tool_calls[0].id = f"call_{uuid.uuid4().hex[:12]}"
-        return response
+        # call_tool 生成的 tool_call_id 是随机串（和真实模型一样），它是幂等键的一部分：
+        # 不同进程里各自从 call_1 数起的话，崩溃恢复时幂等键会撞车
+        return call_tool("create_ticket", title=text[:20], priority="medium")
 
-    return ScriptedLLM([policy] * 6)
+    return ScriptedLLM(responder=policy, latency=latency)
 
 
-# ---------------------------------------------------------------- worker：心跳线程
+# ---------------------------------------------------------------- worker 进程（async）
+
+CURRENT_JOB: ContextVar = ContextVar("demo13_current_job", default=None)
 
 
-class Heartbeat(threading.Thread):
-    """后台续约：每 interval_s 秒把租约延长到 now + lease_s。worker 一死，心跳就停，租约自然过期。"""
+def build_agent(llm, tickets: TicketSystem, cfg: dict, log, notify_q) -> Agent:
+    """一个进程一个 Agent，所有任务共用；每个任务的检查点视图在 run / resume 时传入。"""
+    wid = cfg["worker_id"]
 
-    def __init__(self, db: str, job_id: int, fence: int, lease_s: float, interval_s: float):
-        super().__init__(daemon=True)
-        self.db, self.job_id, self.fence = db, job_id, fence
-        self.lease_s, self.interval_s = lease_s, interval_s
-        self._halt, self._paused, self.lost = threading.Event(), threading.Event(), threading.Event()
-
-    def run(self) -> None:
-        q = jobqueue.JobQueue(self.db)  # 线程要用自己的连接
-        try:
-            while not self._halt.wait(self.interval_s):
-                if self._paused.is_set():
-                    continue
-                try:
-                    q.heartbeat(self.job_id, self.fence, self.lease_s)
-                except jobqueue.LeaseLostError:
-                    self.lost.set()
-                    return
-        finally:
-            q.close()
-
-    def pause(self) -> None:  # 模拟"整个进程被冻结"：心跳线程也停了
-        self._paused.set()
-
-    def stop(self) -> None:
-        self._halt.set()
-
-
-# ---------------------------------------------------------------- worker：Agent 任务
-
-
-def build_agent(llm, tickets: TicketSystem, job, worker_id: str, cfg: dict, log, crash_q) -> Agent:
     @tool(risk="write", timeout_s=120)
     def create_ticket(
         title: Annotated[str, Field(description="一句话概括问题，不超过 30 字")],
@@ -261,88 +232,127 @@ def build_agent(llm, tickets: TicketSystem, job, worker_id: str, cfg: dict, log,
         ctx: ToolContext,
     ) -> str:
         """为用户的 IT 报修创建工单，返回工单号。每条报修只调用一次。"""
-        # 幂等键 = run_id + tool_call_id。run_id 由任务 id 决定（job-7），tool_call_id 存在检查点里，
+        job = CURRENT_JOB.get()  # agentkit 把当前的 contextvars 带进工具线程，所以这里拿得到
+        # 幂等键 = run_id + tool_call_id。run_id 由任务决定（job-7），tool_call_id 存在检查点里，
         # 所以无论哪个 worker、第几次尝试，重放这次调用时 key 都一样。
         key = ctx.idempotency_key if cfg["idempotent"] else None
-        no, created = tickets.create(title, priority, job_id=job.id, created_by=worker_id, idempotency_key=key)
+        no, created = tickets.create(title, priority, job_id=job.id, created_by=wid, idempotency_key=key)
         if created:
             log(f"🧾 建工单 {no}" + (f"（幂等键 {key}）" if key else "（没带幂等键）"))
         else:
             log(f"♻️  幂等键命中 → 返回已有工单 {no}，没有重复创建")
         if job.payload.get("chaos") == "kill_after_side_effect" and job.attempts == 1:
             log("工单建好了，但结果还没写进检查点、任务也还没提交……")
-            crash_q.put(worker_id)  # 通知调度器：可以在这个最要命的时刻 kill 我了
+            notify_q.put(("kill", wid))  # 通知调度器：可以在这个最要命的时刻 kill 我了
+            # 这是同步工具：agentkit 在线程池里执行它。这里的阻塞只占住一个工具线程，
+            # 事件循环（包括心跳协程）照常运转 —— 直到调度器发来 SIGKILL
             time.sleep(60)
         return f"已创建工单 {no}"
 
-    return Agent(llm, [create_ticket], system_prompt=SYSTEM_PROMPT, name="helpdesk", max_steps=4,
-                 checkpointer=FileCheckpointer(cfg["ckpt_dir"]))
+    class FreezePoint(Hook):
+        """场景 3：拿到工具结果、准备第二次调用模型时，通知调度器"可以冻结我了"。冻结本身是调度器发来的真实 SIGSTOP。"""
+
+        def before_llm(self, state, messages) -> None:
+            job = CURRENT_JOB.get()
+            if job and job.payload.get("chaos") == "freeze_mid_run" and job.attempts == 1 and messages[-1]["role"] == "tool":
+                log("工具已执行、检查点已写，正在第二次调用模型……")
+                notify_q.put(("freeze", wid))
+
+    return Agent(llm, [create_ticket], system_prompt=SYSTEM_PROMPT, name="helpdesk", max_steps=4, hooks=[FreezePoint()])
 
 
-def handle_agent_job(job, q, tickets: TicketSystem, base_llm, cfg: dict, log, crash_q) -> None:
-    wid = cfg["worker_id"]
+async def heartbeat(q, job, cfg: dict, log) -> None:
+    """续约协程：和 Agent 跑在同一个事件循环里。进程被 SIGKILL / SIGSTOP 时它和整个进程一起停下，租约自然过期。"""
+    while True:
+        await asyncio.sleep(cfg["heartbeat_s"])
+        try:
+            await q.heartbeat(job.id, job.fence, cfg["lease_s"])
+        except jobqueue.LeaseLostError as e:
+            log(f"💔 心跳被拒绝：{short(str(e), 70)}")
+            return
+
+
+async def handle_agent_job(job, q, agent: Agent, ckpt_for, cfg: dict, log) -> None:
     log(f"领取任务 #{job.id}（第 {job.attempts} 次尝试，fence={job.fence}）：{short(job.payload['text'], 22)}")
-    hb = Heartbeat(cfg["db"], job.id, job.fence, cfg["lease_s"], cfg["heartbeat_s"])
-    hb.start()
+    hb = asyncio.create_task(heartbeat(q, job, cfg, log))
+    token = CURRENT_JOB.set(job)
+    ckpt = ckpt_for(job)
     try:
-        llm = offline_llm(cfg["latency"]) if cfg["offline"] else base_llm
-        if cfg.get("sem") is not None:
-            llm = LimitedLLM(llm, cfg["sem"])
-        agent = build_agent(llm, tickets, job, wid, cfg, log, crash_q)
         run_id = f"job-{job.id}"  # 由任务决定，而不是随机生成：换了 worker 也能找到同一个检查点
-        if agent.checkpointer.load(run_id) is not None:
+        existing = ckpt.load(run_id)
+        existing = await existing if asyncio.iscoroutine(existing) else existing
+        if existing is not None:
             log("发现前任留下的检查点 → 从断点继续，而不是从头再来")
-            result = agent.resume(run_id)
+            result = await agent.resume(run_id, checkpointer=ckpt)
         else:
-            result = agent.run(job.payload["text"], run_id=run_id,
-                               metadata={"tenant_id": job.tenant_id, "user_id": job.payload["user"]})
-
-        if job.payload.get("chaos") == "freeze_before_complete" and job.attempts == 1:
-            hb.pause()
-            log(f"😵 Agent 跑完了，正要提交时卡住 {cfg['freeze_s']:.0f} 秒（模拟 GC 停顿 / 虚拟机被暂停：心跳也停了）")
-            time.sleep(cfg["freeze_s"])
-            log("醒了！以为自己还持有租约，继续提交结果……")
-
-        if hb.lost.is_set():
-            log("心跳发现租约已经被别人接手 → 放弃提交")
-        elif result.ok:
-            q.complete(job.id, job.fence, result.output or "")
-            log(f"✅ 完成 #{job.id}：{short(result.output, 34)}")
+            result = await agent.run(job.payload["text"], run_id=run_id, checkpointer=ckpt,
+                                     metadata={"tenant_id": job.tenant_id, "user_id": job.payload["user"]})
+        # 注意：这里没有先问"我的租约还在吗"再提交 —— 问了也没用（问完和提交之间还可能被冻结）。
+        # 挡住过期持有者的，是存储在写入那一刻对 fence 的检查。
+        if result.ok:
+            await q.complete(job.id, job.fence, result.output or "")
+            log(f"✅ 完成 #{job.id}：{short(result.output, 46)}")
         else:
-            status = q.fail(job.id, job.fence, f"{result.status}: {result.stop_reason}")
+            status = await q.fail(job.id, job.fence, f"{result.status}: {result.stop_reason}")
             log(f"⚠️  任务 #{job.id} 失败（{result.stop_reason}）→ 状态变为 {status}")
     except jobqueue.LeaseLostError as e:
-        log(f"❌ 提交被拒绝（LeaseLostError）：{e}")
+        log(f"❌ 提交被拒绝（LeaseLostError）：{short(str(e), 60)}")
+    except CheckpointConflict as e:
+        log(f"❌ 检查点写入被拒绝（CheckpointConflict）：run {e.run_id} 已被 {e.writer} 接管 → 立刻停手")
     finally:
-        hb.stop()
+        hb.cancel()
+        CURRENT_JOB.reset(token)
 
 
-def agent_worker(cfg: dict, barrier=None, sem=None, crash_q=None) -> None:
-    """一个 worker 进程的一生：循环"领取 → 处理 → 提交"，直到所有任务都结束。"""
-    cfg = {**cfg, "sem": sem}
+async def _agent_worker(cfg: dict, notify_q) -> None:
     log = make_logger(cfg["worker_id"], cfg["t0"], cfg["verbose"])
-    q = jobqueue.JobQueue(cfg["db"])
+    q = jobqueue.AsyncJobQueue(cfg["db"])  # 同步的 JobQueue 放进专用线程：等写锁时不卡住事件循环
     tickets = TicketSystem(Path(cfg["tickets_db"]))
-    base_llm = None if cfg["offline"] else default_llm()
-    if barrier is not None:
-        barrier.wait()  # 所有 worker 都准备好了再一起开始，计时才公平
-    log("上线")
-    while True:
-        job = q.claim(cfg["worker_id"], cfg["lease_s"])
-        if job is None:
-            if q.all_done():
-                break
-            time.sleep(cfg["poll_s"] * random.uniform(0.5, 1.5))  # 带抖动的轮询：别让所有 worker 同一时刻一起查
-            continue
-        handle_agent_job(job, q, tickets, base_llm, cfg, log, crash_q)
+    llm = offline_llm(cfg["worker_id"], cfg["latency"]) if cfg["offline"] else default_llm()
+    agent = build_agent(llm, tickets, cfg, log, notify_q)
+    if cfg["checkpointer"] == "file":
+        file_ckpt = FileCheckpointer(cfg["ckpt_dir"])
+
+        def ckpt_for(job):
+            return file_ckpt  # ❌ 不认 fence：谁来写都照单全收
+    else:
+        base = SQLiteCheckpointer(cfg["ckpt_db"])
+        await base.setup()
+
+        def ckpt_for(job):
+            # ✅ 每次领取用这次的 fence 创建一个视图：load 时"接管"这个 run，fence 更旧的写入一律拒绝
+            return base.fenced(job.fence, writer=cfg["worker_id"])
+    log(f"上线（pid {os.getpid()}）")
+    try:
+        while True:
+            job = await q.claim(cfg["worker_id"], cfg["lease_s"])
+            if job is None:
+                if await q.all_done():
+                    break
+                await asyncio.sleep(cfg["poll_s"] * random.uniform(0.5, 1.5))  # 带抖动的轮询
+                continue
+            await handle_agent_job(job, q, agent, ckpt_for, cfg, log)
+    finally:
+        await agent.aclose()
+        await q.close()
+        if cfg["checkpointer"] != "file":
+            await base.close()
     log("队列空了，下线")
+
+
+def agent_worker(cfg: dict, notify_q=None) -> None:
+    """worker 进程入口（spawn 启动）：一个进程 = 一个事件循环，循环"领取 → 执行 → 提交"，直到所有任务都结束。"""
+    asyncio.run(_agent_worker(cfg, notify_q))
 
 
 # ---------------------------------------------------------------- worker：会话写入（场景 4）
 
 
 def session_worker(cfg: dict, barrier) -> None:
-    """处理"用户在同一个会话里发来的消息"：读会话 → 调模型（sleep 模拟）→ 把这条消息写回会话。"""
+    """处理"用户在同一个会话里发来的消息"：读会话 → 调模型（sleep 代表模型耗时）→ 把这条消息写回会话。
+
+    这是一个**没有事件循环的同步进程**：time.sleep 和阻塞的 sqlite3 调用只挡住它自己，不影响任何别人。
+    """
     wid, sid = cfg["worker_id"], cfg["session_id"]
     q = jobqueue.JobQueue(cfg["db"])
     store = session_store.SessionStore(cfg["sessions_db"])
@@ -382,6 +392,26 @@ def session_worker(cfg: dict, barrier) -> None:
         q.complete(job.id, job.fence, json.dumps(stats))
 
 
+# ---------------------------------------------------------------- 配额持有者（场景 5）
+
+
+def quota_holder_mp(sem, ready_q) -> None:
+    sem.acquire()  # 拿走 multiprocessing 信号量的一个名额
+    ready_q.put(os.getpid())
+    time.sleep(60)
+
+
+def quota_holder_sqlite(db: str, ready_q) -> None:
+    async def main():
+        sem = SQLiteSemaphore(db, "llm-quota", limit=2, lease_seconds=1.0)
+        await sem.setup()
+        async with sem.slot():  # 持有期间每 1/3 租约自动续约一次
+            ready_q.put(os.getpid())
+            await asyncio.sleep(60)
+
+    asyncio.run(main())
+
+
 # =====================================================================
 # 调度器（父进程）
 # =====================================================================
@@ -393,18 +423,28 @@ def spawn(ctx, target, *args) -> mp.Process:
     return p
 
 
-def worker_cfg(workdir: Path, worker_id: str, args, t0: float, *, verbose: bool, idempotent: bool = True) -> dict:
+def worker_cfg(workdir: Path, worker_id: str, args, t0: float, *, verbose: bool = True, idempotent: bool = True,
+               checkpointer: str = "sqlite") -> dict:
     return {
         "worker_id": worker_id, "db": str(workdir / "queue.db"), "tickets_db": str(workdir / "tickets.db"),
-        "ckpt_dir": str(workdir / "checkpoints"), "offline": args.offline, "latency": args.latency,
-        "lease_s": args.lease, "heartbeat_s": args.lease / 4, "freeze_s": args.lease * 2.5,
+        "ckpt_dir": str(workdir / "checkpoints"), "ckpt_db": str(workdir / "checkpoints.db"), "checkpointer": checkpointer,
+        "offline": args.offline, "latency": args.latency, "lease_s": args.lease, "heartbeat_s": args.lease / 4,
         "poll_s": 0.05 if args.offline else 0.2, "idempotent": idempotent, "verbose": verbose, "t0": t0,
     }
 
 
+async def _create_checkpoint_db(path: Path) -> None:
+    base = SQLiteCheckpointer(path)
+    await base.setup()
+    await base.close()
+
+
 def enqueue_messages(workdir: Path, n: int, chaos: dict[int, str] | None = None):
+    # 所有数据库文件都由调度器先建好（包括切换到 WAL 模式），再拉起 worker：
+    # 几个进程同时新建同一个 SQLite 文件、同时切换 WAL 模式时，会有进程直接收到 "database is locked"
     q = jobqueue.JobQueue(workdir / "queue.db")
-    TicketSystem(workdir / "tickets.db")  # 先建好表，免得多个 worker 同时初始化
+    TicketSystem(workdir / "tickets.db")
+    asyncio.run(_create_checkpoint_db(workdir / "checkpoints.db"))
     for i in range(n):
         payload = {"text": MESSAGES[i % len(MESSAGES)], "user": f"u{100 + i}"}
         if chaos and i + 1 in chaos:
@@ -421,59 +461,63 @@ def join_all(procs, timeout: float) -> None:
         if p.is_alive():
             print(f"   ⚠️ worker 进程 {p.pid} 超时未退出，强制结束", flush=True)
             p.kill()
+            p.join()
 
 
-# ---------------------------------------------------------------- 场景 1：横向扩展
+def wait_until(cond, timeout: float, interval: float = 0.05) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if cond():
+            return True
+        time.sleep(interval)
+    return False
 
 
-def run_batch(ctx, args, workers: int, limit: int | None, n_jobs: int) -> dict:
-    workdir = fresh_dir(f"scaling_{workers}w_{limit or 'nolimit'}")
-    q = enqueue_messages(workdir, n_jobs)
-    sem = ctx.BoundedSemaphore(limit) if limit else None
-    barrier = ctx.Barrier(workers + 1)
-    procs = [
-        spawn(ctx, agent_worker, worker_cfg(workdir, f"worker-{i + 1}", args, time.time(), verbose=False), barrier, sem)
-        for i in range(workers)
-    ]
-    barrier.wait(timeout=120)  # 所有进程都启动好了（导入库、连上数据库、建好模型客户端）
-    t0 = time.time()
-    join_all(procs, timeout=600)
-    jobs = q.list_jobs()
-    done = [j for j in jobs if j.status == "succeeded"]
-    elapsed = max((j.updated_at for j in done), default=t0) - t0
-    per_worker: dict[str, int] = {}
-    for j in done:
-        per_worker[j.worker_id] = per_worker.get(j.worker_id, 0) + 1
-    return {"elapsed": elapsed, "done": len(done), "total": len(jobs), "per_worker": per_worker}
+def pick_impl(probe) -> tuple[str, str]:
+    """exercise.py 写完了就用你的实现；还没写完（或探测失败）就用参考答案。返回 (文件路径, 说明)。"""
+    try:
+        if probe(_load_sibling("exercise")):
+            return str(HERE / "exercise.py"), "exercise.py，你的实现 👍"
+    except Exception:  # noqa: BLE001 —— NotImplementedError 或者实现有 bug，都退回参考答案
+        pass
+    return str(HERE / "solution.py"), "solution.py，exercise.py 还没写完，先用参考答案"
 
 
-def scenario_scaling(ctx, args) -> None:
-    banner("场景 1：横向扩展 —— 加 worker 能快多少？瓶颈会跑到哪里去？")
-    if args.offline:
-        n_jobs, configs = 16, [(1, None), (2, None), (4, None), (8, None), (8, 3)]
-        info(f"{n_jobs} 条报修 → {n_jobs} 个 Agent 任务。每个任务调用 2 次模型（建工单 + 回复），离线模式每次 sleep {args.latency}s。")
-    else:
-        n_jobs, configs = 3, [(1, 3), (3, 3)]
-        info(f"真实模型：{n_jobs} 个 Agent 任务，每个调用 2 次模型。所有 worker 共享一个信号量，模型并发 ≤ 3。")
-    info("Agent 的时间几乎全花在'等模型'上（I/O 密集），所以加 worker（加进程）能近似线性地提速 —— 直到撞上下一个瓶颈。")
+# ---------------------------------------------------------------- 场景 1：原子领取
 
-    rows, base = [], None
-    for workers, limit in configs:
-        r = run_batch(ctx, args, workers, limit, n_jobs)
-        throughput = r["done"] / r["elapsed"] if r["elapsed"] > 0 else 0.0
-        base = base or r["elapsed"]
-        spread = "/".join(str(v) for _, v in sorted(r["per_worker"].items()))
-        rows.append([str(workers), f"≤{limit}" if limit else "不限", f"{r['done']}/{r['total']}",
-                     f"{r['elapsed']:.2f}s", f"{throughput:.1f}", f"{base / r['elapsed']:.1f}x", spread])
+
+def _probe_claim(ex) -> bool:
+    probe = fresh_dir("probe_claim") / "q.db"
+    jobqueue.JobQueue(probe).enqueue("t", {}, "k")
+    with closing(jobqueue.connect(probe)) as conn:
+        job = ex.claim_job(conn, "probe", 30)
+        return job is not None and job.fence == 1 and ex.claim_job(conn, "probe", 30) is None
+
+
+def scenario_claim_race(ctx, args) -> None:
+    banner("场景 1：原子领取 —— 6 个进程同时抢 30 个任务，会不会有任务被领两次？")
+    impl_path, impl_label = pick_impl(_probe_claim)
+    info("6 个真实的 python 进程，各用各的 sqlite3 连接，站在同一条起跑线上一起开抢（race.py）。")
+    info("每条 SQL 执行前停 1 毫秒，把本来就存在的竞态窗口放大，让错误写法稳定地暴露出来。")
+    info(f"正确写法用的 claim_job 来自：{impl_label}")
+    rows = []
+    for label, impl in [("❌ 先 SELECT 再无条件 UPDATE", "naive"), (f"✅ claim_job（{Path(impl_path).name}）", impl_path)]:
+        workdir = fresh_dir(f"claim_{'naive' if impl == 'naive' else 'correct'}")
+        q = jobqueue.JobQueue(workdir / "queue.db")
+        for i in range(30):
+            q.enqueue("acme", {"n": i}, f"job-{i}")
+        q.close()
+        t = time.time()
+        results = race.run_race(6, "claim", db=workdir / "queue.db", impl=impl, lease=30, widen=True)
+        elapsed = time.time() - t
+        claims = [c["id"] for r in results for c in r["claims"]]
+        dup = len(claims) - len(set(claims))
+        per = "/".join(str(len(r["claims"])) for r in results)
+        rows.append([label, str(len(claims)), f"{dup}" + (" ❌" if dup else " ✅"), per, f"{elapsed:.2f}s"])
     print()
-    table(["worker 数", "模型并发", "完成", "耗时", "吞吐(个/秒)", "加速比", "各 worker 处理数"],
-          rows, [11, 10, 8, 9, 13, 9, 18])
-    if args.offline:
-        takeaway("1→8 个 worker 吞吐接近线性增长；但给模型加上'最多 3 个并发'之后，8 个 worker 也只剩约 3 倍 ——\n"
-                 "      瓶颈从'worker 不够'转移到了'模型配额不够'。这时再加 worker 只会让更多任务堆在信号量前排队。")
-    else:
-        takeaway("真实模型每次 3-5 秒、波动大，数字不必精确，看趋势：3 个 worker 明显快于 1 个。\n"
-                 "      继续加 worker 的话，模型并发上限（这里是 3）就成了天花板 —— 离线模式的最后一行专门演示了这一点。")
+    table(["写法", "领取次数", "重复领取", "每个进程领到", "耗时（含起进程）"], rows, [32, 10, 10, 20, 16])
+    takeaway("错误写法在单进程测试里完全正常，一到多进程就把同一个任务发给好几个 worker。\n"
+             "      正确写法把\"检查\"放进写入本身：BEGIN IMMEDIATE，或者带条件的 UPDATE + 检查影响行数（练习 (a)）。")
 
 
 # ---------------------------------------------------------------- 场景 2：worker 崩溃 + 幂等
@@ -485,41 +529,31 @@ def run_crash_case(ctx, args, idempotent: bool) -> dict:
     q = enqueue_messages(workdir, n_jobs, chaos={1: "kill_after_side_effect"})
     t0 = time.time()
     log = make_logger("调度器", t0)
-    sem = ctx.BoundedSemaphore(3)
-    crash_q = ctx.Queue()
-    procs = {
-        wid: spawn(ctx, agent_worker, worker_cfg(workdir, wid, args, t0, verbose=True, idempotent=idempotent), None, sem, crash_q)
-        for wid in ("worker-1", "worker-2")
-    }
+    notify_q = ctx.Queue()
+    procs = {wid: spawn(ctx, agent_worker, worker_cfg(workdir, wid, args, t0, idempotent=idempotent), notify_q)
+             for wid in ("worker-1", "worker-2")}
     try:
-        victim = crash_q.get(timeout=30 if args.offline else 150)
-        procs[victim].kill()
+        _, victim = notify_q.get(timeout=60 if args.offline else 150)
+        procs[victim].kill()  # SIGKILL
         procs[victim].join()
-        log(f"💥 kill -9 {victim}：进程瞬间消失 —— 不释放租约、不写检查点、不留遗言")
-        log(f"   任务 #1 的租约还剩最多 {args.lease:.0f} 秒，到期前没人能接手；拉起替补 worker-3（相当于 K8s 重建 Pod）")
-        procs["worker-3"] = spawn(ctx, agent_worker,
-                                  worker_cfg(workdir, "worker-3", args, t0, verbose=True, idempotent=idempotent), None, sem, crash_q)
+        log(f"💥 kill -9 {victim}（退出码 {procs[victim].exitcode}）：进程瞬间消失 —— 不释放租约、不写检查点、不留遗言")
+        log(f"   任务 #1 的租约最多还剩 {args.lease:.1f} 秒，到期前没人能接手；拉起替补 worker-3（相当于 K8s 重建 Pod）")
+        procs["worker-3"] = spawn(ctx, agent_worker, worker_cfg(workdir, "worker-3", args, t0, idempotent=idempotent), notify_q)
     except queue.Empty:
         log("⚠️ 没等到崩溃信号（模型没有调用 create_ticket？），跳过 kill")
     join_all([p for p in procs.values() if p.is_alive()], timeout=600)
-    job1 = q.get(1)
-    return {
-        "stats": q.stats(),
-        "tickets": TicketSystem(workdir / "tickets.db").per_job(),
-        "job1": job1,
-        "n_jobs": n_jobs,
-    }
+    return {"stats": q.stats(), "tickets": TicketSystem(workdir / "tickets.db").per_job(), "job1": q.get(1), "n_jobs": n_jobs}
 
 
 def scenario_crash(ctx, args) -> None:
     banner("场景 2：worker 崩溃 —— 租约过期、别人接手，会不会重复建工单？")
-    info("3 条报修，2 个 worker。处理任务 #1 的 worker 刚在工单系统里建完工单，就被 kill -9 了。")
-    info(f"租约 {args.lease:.0f} 秒、每 {args.lease / 4:.1f} 秒心跳一次（生产中一般是 30 秒到几分钟，这里调短是为了演示快）。")
-    info("接手的 worker 会从检查点恢复：检查点里有'模型决定调用 create_ticket'，但没有结果 → 这次调用会被重放。")
+    info("3 条报修，2 个 worker 进程。处理任务 #1 的 worker 刚在工单系统里建完工单，就被 kill -9 了。")
+    info(f"租约 {args.lease:.1f} 秒、每 {args.lease / 4:.2f} 秒心跳一次（生产中一般 30 秒到几分钟，这里调短是为了演示快）。")
+    info("接手的 worker 从检查点恢复：检查点里有'模型决定调用 create_ticket'，但没有结果 → 这次调用会被重放。")
 
     results = {}
     for idempotent in (False, True):
-        step(("第一轮：工具调用下游时【不带】幂等键" if not idempotent else "第二轮：工具调用下游时【带上】幂等键（run_id + tool_call_id）"))
+        step("第一轮：工具调用下游时【不带】幂等键" if not idempotent else "第二轮：工具调用下游时【带上】幂等键（run_id + tool_call_id）")
         results[idempotent] = run_crash_case(ctx, args, idempotent)
 
     def describe(r: dict) -> list[str]:
@@ -538,50 +572,94 @@ def scenario_crash(ctx, args) -> None:
     table(["", "任务完成", "工单总数（应为 3）", "任务 #1 的工单", "任务 #1 领取次数"], rows, [12, 10, 22, 20, 20])
     takeaway("租约保证了'不丢'：worker 死了，任务过期后自动被别人接手（at-least-once）。\n"
              "      但'不丢'的代价是'可能做两次' —— 只有幂等键才能保证'做两次 = 做一次'（effectively-once）。\n"
-             "      注意幂等键必须传给【下游】，由下游在同一个事务里'执行 + 记录 key'：\n"
-             "      进程内存里的 IdempotencyStore 会随进程一起死掉，在分布式场景下毫无作用。")
+             "      幂等键要传给【下游】，由下游在同一个事务里'执行 + 记录 key'。进程内存里的 IdempotencyStore\n"
+             "      会随进程一起死掉；跨进程的 SQLiteIdempotencyStore（demo_agents.py）只记'成功之后'的结果，\n"
+             "      崩溃恰好落在'下游已执行、还没记下'之间时同样拦不住 —— 最后一道防线永远是下游自己认 key。")
 
 
-# ---------------------------------------------------------------- 场景 3：僵尸 worker + fencing token
+# ---------------------------------------------------------------- 场景 3：僵尸 worker（真实的 SIGSTOP）
+
+
+def final_checkpoint(workdir: Path, kind: str) -> tuple[str | None, str | None]:
+    """父进程直接读检查点：(最终回答, 最后写入者)。FileCheckpointer 不记写入者。"""
+    if kind == "file":
+        path = workdir / "checkpoints" / "job-1.json"
+        return (json.loads(path.read_text(encoding="utf-8")).get("output"), None) if path.exists() else (None, None)
+    with closing(sqlite3.connect(workdir / "checkpoints.db")) as conn:
+        row = conn.execute("SELECT state, writer FROM agent_runs WHERE run_id = 'job-1'").fetchone()
+    return (json.loads(row[0]).get("output"), row[1]) if row else (None, None)
+
+
+def run_zombie_case(ctx, args, kind: str) -> dict:
+    workdir = fresh_dir(f"zombie_{kind}")
+    q = enqueue_messages(workdir, 1, chaos={1: "freeze_mid_run"})
+    t0 = time.time()
+    log = make_logger("调度器", t0)
+    notify_q = ctx.Queue()
+    first = spawn(ctx, agent_worker, worker_cfg(workdir, "worker-1", args, t0, checkpointer=kind), notify_q)
+    wait_until(lambda: (q.get(1).status != "queued") or not first.is_alive(), 60)  # 等 worker-1 先领走任务
+    second = spawn(ctx, agent_worker, worker_cfg(workdir, "worker-2", args, t0, checkpointer=kind), notify_q)
+    froze = False
+    try:
+        notify_q.get(timeout=60 if args.offline else 150)
+        os.kill(first.pid, signal.SIGSTOP)
+        froze = True
+        log(f"🧊 SIGSTOP worker-1（pid {first.pid}）：进程被操作系统冻结 —— 它的心跳协程也停了，但它自己毫不知情")
+        taken = wait_until(lambda: q.get(1).status == "succeeded", 60 if args.offline else 180)
+        log("接手者已经完成任务 #1" if taken else "⚠️ 等了很久也没人接手完成")
+    except queue.Empty:
+        log("⚠️ 没等到冻结信号（模型没有调用 create_ticket？），跳过冻结")
+    finally:
+        if froze:
+            os.kill(first.pid, signal.SIGCONT)
+            log(f"▶️  SIGCONT worker-1：解冻。它从被冻结的那一行继续执行，手里还攥着 fence=1 的旧租约")
+    join_all([first, second], timeout=600)
+    job = q.get(1)
+    output, writer = final_checkpoint(workdir, kind)
+    return {"job": job, "ckpt_output": output, "ckpt_writer": writer,
+            "tickets": sum(len(v) for v in TicketSystem(workdir / "tickets.db").per_job().values())}
 
 
 def scenario_zombie(ctx, args) -> None:
-    banner("场景 3：僵尸 worker —— 卡住的 worker 醒来后，还能提交结果吗？")
-    info(f"worker-1 跑完 Agent、正要提交时'卡住'了 {args.lease * 2.5:.0f} 秒（租约只有 {args.lease:.0f} 秒）。")
-    info("真实世界里这叫 stop-the-world：GC 停顿、虚拟机被迁移、容器被 CPU 限流、网络分区……进程没死，但时间停了。")
-    workdir = fresh_dir("zombie")
-    q = enqueue_messages(workdir, 1, chaos={1: "freeze_before_complete"})
-    t0 = time.time()
-    first = spawn(ctx, agent_worker, worker_cfg(workdir, "worker-1", args, t0, verbose=True))
-    while (job := q.get(1)) is not None and job.status == "queued" and first.is_alive():
-        time.sleep(0.05)  # 等 worker-1 先领走任务，再启动 worker-2
-    second = spawn(ctx, agent_worker, worker_cfg(workdir, "worker-2", args, t0, verbose=True))
-    join_all([first, second], timeout=600)
+    banner("场景 3：僵尸 worker —— 被冻结的 worker 醒来后，还能写进去吗？")
+    info("worker-1 跑到一半（工具已执行、正在第二次调用模型）时，调度器对它发 SIGSTOP：进程没死，但时间停了。")
+    info("真实世界里这叫 stop-the-world：GC 停顿、虚拟机被迁移、容器被 CPU 限流……")
+    info(f"租约 {args.lease:.1f} 秒后过期，worker-2 接手、从检查点继续并完成；然后调度器 SIGCONT 解冻 worker-1。")
+    info("跑两遍，只换检查点：FileCheckpointer（不认 fence）vs SQLiteCheckpointer.fenced（带 fence，agentkit.distributed）。")
+    results = {}
+    for kind, label in (("file", "FileCheckpointer（不认 fence）"), ("sqlite", "SQLiteCheckpointer.fenced（带 fence）")):
+        step(f"检查点：{label}")
+        results[kind] = run_zombie_case(ctx, args, kind)
 
-    job = q.get(1)
-    tickets = TicketSystem(workdir / "tickets.db").per_job()
+    def author(text: str | None) -> str:
+        m = re.search(r"（(worker-\d+) 回复）", text or "")
+        return m.group(1) if m else "（真实模型，见上方日志）"
+
     print()
-    info(f"任务 #1 最终状态：{job.status}，由 {job.worker_id} 提交，fence={job.fence}，共被领取 {job.attempts} 次")
-    info(f"保存的结果：{short(job.result, 40)}")
-    info(f"工单数：{sum(len(v) for v in tickets.values())}（接手的 worker 从检查点发现 Agent 已经跑完，直接提交，没有重跑）")
+    rows = []
+    for kind, label in (("file", "FileCheckpointer"), ("sqlite", "SQLiteCheckpointer.fenced")):
+        r = results[kind]
+        job = r["job"]
+        consistent = r["ckpt_output"] == job.result
+        who = author(r["ckpt_output"]) + (f"（writer={r['ckpt_writer']}）" if r["ckpt_writer"] else "")
+        rows.append([label, f"{job.status} / {job.worker_id} / fence={job.fence}", who,
+                     "✅ 一致" if consistent else "❌ 不一致（被僵尸覆盖）"])
+    table(["检查点", "队列：状态 / 提交者 / fence", "检查点里最终回答的作者", "检查点 = 提交的结果？"], rows, [28, 32, 30, 22])
     takeaway("worker-1 醒来时并不知道自己的租约早就过期了 —— 它'以为'自己还是主人。\n"
-             "      挡住它的不是它自己的检查，而是存储端的 fencing token：fence=1 < 当前的 2，一律拒绝。\n"
-             "      这就是为什么'分布式锁/租约必须配 fencing token'：持有者无法可靠地知道自己已经失去了锁。")
+             "      队列的提交有 fence 挡着（练习 (b)）；但检查点也是'受租约保护的写入'：\n"
+             "      FileCheckpointer 不认 fence，僵尸的最后一步悄悄覆盖了接手者的结果，而且没有任何报错；\n"
+             "      SQLiteCheckpointer.fenced 在接手时把表里的 fence 改成新的，僵尸再写就是 CheckpointConflict。\n"
+             "      凡是受租约保护的写入，都要由存储在写入那一刻检查 fence。")
 
 
 # ---------------------------------------------------------------- 场景 4：同一会话并发写
 
 
-def pick_session_impl() -> str:
-    """exercise.py 写完了就用你的实现；还没写完就用参考答案。"""
-    probe = fresh_dir("probe") / "probe.db"
-    try:
-        ex = _load_sibling("exercise")
-        store = session_store.SessionStore(probe)
-        out = ex.update_session_with_retry(store, "probe", lambda d: {**d, "ok": True}, backoff_s=0)
-        return "exercise" if out.data.get("ok") and store.get("probe").data.get("ok") else "solution"
-    except Exception:  # noqa: BLE001 —— NotImplementedError 或者实现有 bug，都退回参考答案
-        return "solution"
+def _probe_session(ex) -> bool:
+    probe = fresh_dir("probe_session") / "probe.db"
+    store = session_store.SessionStore(probe)
+    out = ex.update_session_with_retry(store, "probe", lambda d: {**d, "ok": True}, backoff_s=0)
+    return bool(out.data.get("ok") and store.get("probe").data.get("ok"))
 
 
 def run_session_case(ctx, args, mode: str, grouped: bool, impl: str, n_msgs: int, n_workers: int) -> dict:
@@ -611,11 +689,11 @@ def run_session_case(ctx, args, mode: str, grouped: bool, impl: str, n_msgs: int
 def scenario_session(ctx, args) -> None:
     banner("场景 4：同一会话并发写 —— 丢失更新 vs 版本号 CAS vs 按会话串行")
     n_msgs, n_workers = 16, 4
-    impl = pick_session_impl()
-    info(f"用户在同一个会话里连发 {n_msgs} 条消息，{n_workers} 个 worker 同时处理。每条消息：读会话 → 调模型（sleep {args.think}s）→ 写回。")
-    info("本节不调用真实模型（用 sleep 模拟），离线和在线模式的行为一致。")
-    info(f"B、C 使用的 update_session_with_retry 来自：{impl}.py"
-         + ("（你的实现 👍）" if impl == "exercise" else "（exercise.py 还没写完，先用参考答案）"))
+    impl_path, impl_label = pick_impl(_probe_session)
+    impl = Path(impl_path).stem
+    info(f"用户在同一个会话里连发 {n_msgs} 条消息，{n_workers} 个 worker 进程同时处理。每条消息：读会话 → 调模型 → 写回。")
+    info(f"本节不调用真实模型：会话 worker 是没有事件循环的同步进程，用 sleep {args.think}s 代表模型耗时；离线和在线模式行为一致。")
+    info(f"B、C 使用的 update_session_with_retry 来自：{impl_label}")
 
     cases = [
         ("A. 不做并发控制（最后写入者胜）", "unsafe", False),
@@ -642,40 +720,88 @@ def scenario_session(ctx, args) -> None:
              "      对话类 Agent 通常选 C 作为主方案，再保留 B（CAS）作为兜底的安全网。")
 
 
+# ---------------------------------------------------------------- 场景 5：共享配额 + kill -9
+
+
+async def _sqlite_quota_after_kill(db: str) -> tuple[int, float]:
+    sem = SQLiteSemaphore(db, "llm-quota", limit=2, lease_seconds=1.0)
+    await sem.setup()
+    in_use = await sem.in_use()
+    t0 = time.monotonic()
+    async with sem.slot(timeout=10):  # 两个名额同时拿到，说明死者的名额已经回来了
+        async with sem.slot(timeout=10):
+            waited = time.monotonic() - t0
+    await sem.close()
+    return in_use, waited
+
+
+def scenario_quota(ctx, args) -> None:
+    banner("场景 5：共享配额 —— 持有名额的进程被 kill -9，名额还回得来吗？")
+    info("模型网关只给了 2 个并发名额，所有 worker 进程共用。一个进程拿着名额时被 kill -9。")
+    rows = []
+
+    sem = ctx.BoundedSemaphore(2)
+    ready = ctx.Queue()
+    holder = spawn(ctx, quota_holder_mp, sem, ready)
+    ready.get(timeout=60)
+    holder.kill()
+    holder.join()
+    got = [sem.acquire(timeout=0.5), sem.acquire(timeout=2.0)]
+    rows.append(["multiprocessing.BoundedSemaphore(2)", f"{sum(got)} 个",
+                 "❌ 永久少了 1 个（没人会替死者 release）" if sum(got) < 2 else "✅"])
+
+    db = str(fresh_dir("quota") / "quota.db")
+    holder = spawn(ctx, quota_holder_sqlite, db, ready)
+    ready.get(timeout=60)
+    holder.kill()
+    holder.join()
+    in_use, waited = asyncio.run(_sqlite_quota_after_kill(db))
+    rows.append(["SQLiteSemaphore(limit=2, 租约 1 秒)", "2 个",
+                 f"✅ kill 后还占着 {in_use} 个，{waited:.2f} 秒后租约到期自动归还"])
+    print()
+    table(["实现", "之后能拿到", "结果"], rows, [38, 12, 50])
+    takeaway("multiprocessing.Semaphore 只是操作系统里的一个计数器：谁 acquire 了、谁死了，它一概不知，\n"
+             "      持有者被 kill -9 之后那个名额永远还不回来（跨机器时连这个计数器都没有）。\n"
+             "      SQLiteSemaphore 的每个名额都是带租约的一行记录：持有期间自动续约，持有者一死，续约停止，\n"
+             "      租约到期后名额自动释放 —— 这就是问题 5 卡片里'分布式信号量的许可必须带租约'。")
+
+
 # =====================================================================
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="第 13 课 Demo：高并发与分布式执行")
+    parser = argparse.ArgumentParser(description="第 13 课 Demo（一）：自己动手的多进程并发")
     parser.add_argument("--offline", action="store_true", help="使用离线剧本（ScriptedLLM），不调用真实模型")
-    parser.add_argument("--lease", type=float, default=None, help="租约秒数（默认：离线 2 秒，真实模型 3 秒）")
-    parser.add_argument("--only", default="1,2,3,4", help="只运行指定场景，如 --only 2,3")
+    parser.add_argument("--lease", type=float, default=None, help="租约秒数（默认：离线 1.5 秒，真实模型 3 秒）")
+    parser.add_argument("--only", default="1,2,3,4,5", help="只运行指定场景，如 --only 2,3")
     args = parser.parse_args()
-    args.lease = args.lease or (2.0 if args.offline else 3.0)
-    args.latency = 0.15  # 离线模式下每次"模型调用"的耗时
+    args.lease = args.lease or (1.5 if args.offline else 3.0)
+    args.latency = 0.3  # 离线模式下每次"模型调用"的耗时（asyncio.sleep）
     args.think = 0.05  # 场景 4 里每次"模型调用"的耗时
 
     if args.offline:
-        print("🔌 离线模式：ScriptedLLM + sleep 模拟模型延迟")
+        print("🔌 离线模式：ScriptedLLM（每次调用 asyncio.sleep 0.3 秒）")
     else:
         try:
             model = default_llm().model
         except RuntimeError as e:
             sys.exit(f"❌ {e}\n   没有 API key 也没关系：加上 --offline 参数运行离线版本。")
-        print(f"🌐 真实模型：{model}（所有 worker 共享一个信号量，模型并发 ≤ 3；场景 4 不调用模型）")
+        print(f"🌐 真实模型：{model}（场景 2、3 调用模型，其余场景不调用）")
     print(f"   worker 是真正的独立进程（spawn），共享的只有 {RUNS.relative_to(HERE.parents[1])}/ 下的 SQLite 文件。")
 
     ctx = mp.get_context("spawn")  # macOS / Windows 默认就是 spawn；Linux 上显式指定，行为一致
     started = time.time()
-    scenarios = {"1": scenario_scaling, "2": scenario_crash, "3": scenario_zombie, "4": scenario_session}
+    scenarios = {"1": scenario_claim_race, "2": scenario_crash, "3": scenario_zombie, "4": scenario_session,
+                 "5": scenario_quota}
     for key in args.only.replace(" ", "").split(","):
         scenarios[key](ctx, args)
 
     banner("小结")
-    info("1. 横向扩展：worker 无状态 + 状态放共享存储，加进程就能提速，直到撞上模型配额 → 要限流、要排队。")
+    info("1. 原子领取：检查必须放进写入本身（写锁 / 条件 UPDATE），多进程下'先查再改'一定会重复。")
     info("2. 投递语义：租约让任务'不丢'（at-least-once），幂等键让'重复执行'无害 → 效果上恰好一次。")
-    info("3. fencing token：租约过期后的旧持有者（僵尸）必须被存储端拒绝，只靠它自觉是不可靠的。")
+    info("3. fencing token：过期的持有者（僵尸）必须被存储端拒绝 —— 队列提交如此，检查点写入也如此。")
     info("4. 会话并发写：不控制就会静悄悄丢数据；CAS 能兜底，按会话串行是对话类 Agent 的首选。")
+    info("5. 跨进程的配额：名额必须带租约，否则一次 kill -9 就永久少一个。")
     info(f"总耗时 {time.time() - started:.0f} 秒。运行产物在 {RUNS.relative_to(HERE.parents[1])}/")
 
 

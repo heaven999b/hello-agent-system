@@ -102,7 +102,7 @@ flowchart TD
 | 可观测 | `print` 大法 | 链路追踪：每次模型和工具调用的输入、输出、耗时、token | 10 |
 | 评估 | 手工试几个问题，"感觉还行" | 评估集 + 规则/LLM 评分 + CI 门禁，防回归 | 11 |
 | 可恢复性 | 进程重启 = 任务丢失 | 每步存盘，崩溃或等待审批后从断点继续 | 08 |
-| 并发与扩展 | 单进程、一次处理一个请求 | 多实例 + 任务队列；同一会话的并发写不互相覆盖；全局限流与背压 | 13 |
+| 并发与扩展 | 单进程、一次处理一个请求 | 一个进程里用 async 同时推进很多会话；多个 worker 进程 + 任务队列（租约、fencing）；同一会话的并发写不互相覆盖；全局限流与背压 | 02 / 12 / 13 |
 | 成本与延迟 | 月底看账单才知道；每个请求都用最贵的模型 | 每次运行的 token/金额可见、可限额、可归因；模型分级路由、缓存 | 08 / 14 |
 | 企业知识 | 把所有文档塞进一个向量库 | 检索结果按用户权限过滤、租户隔离、过期知识治理、引用可校验 | 15 |
 | 多租户 | 单用户 | 身份贯穿全链路；A 公司的数据绝不出现在 B 公司的回答里 | 04 / 09 / 15 |
@@ -133,7 +133,7 @@ flowchart TB
     XCUT -.->|"贯穿每一层"| ORCH
 ```
 
-第 12 课把这些层放在一起讲生产架构的全貌，**综合实战**（[`capstone/`](../../capstone/)）则把它们组装成一个完整的企业 IT 服务台 Agent **ITBuddy**。第三部分（17–25）不新增层，而是把其中几层做深（检索、记忆、MCP 与沙箱、框架），补上横切的 ML 闭环（数据 → 评估 → 优化），再用编码 Agent 和主动式 Agent 两个应用把各层串起来。第四部分（26–31）同样不新增层，而是把各层的教学实现换成业界成熟组件（Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar），再加上异步运行时和一个多 worker 的参考服务，让同一套设计真正承担多实例、高并发的生产负载。
+第 12 课把这些层放在一起讲生产架构的全貌，**综合实战**（[`capstone/`](../../capstone/)）则把它们组装成一个完整的企业 IT 服务台 Agent **ITBuddy**。第三部分（17–25）不新增层，而是把其中几层做深（检索、记忆、MCP 与沙箱、框架），补上横切的 ML 闭环（数据 → 评估 → 优化），再用编码 Agent 和主动式 Agent 两个应用把各层串起来。第四部分（26–31）同样不新增层，而是把各层的单机教学实现换成业界成熟组件（Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar），再深入高并发下的取消、超时与舱壁，并用一个多 worker 的参考服务做压测和故障注入，让同一套设计真正承担多机、高并发的生产负载。
 
 课程与架构层、agentkit 模块的对应关系：
 
@@ -151,7 +151,7 @@ flowchart TB
 | 二 | [10](../10_observability/) | 可观测性 | 横切 | [`tracing.py`](../../agentkit/tracing.py)、[`viewer.py`](../../agentkit/viewer.py) |
 | 二 | [11](../11_evals/) | 评估驱动开发 | 横切 | [`evals.py`](../../agentkit/evals.py) |
 | 二 | [12](../12_production_architecture/) | 生产架构总览 | 全部（含接入层） | 综合 |
-| 二 | [13](../13_distributed_concurrency/) | 高并发与分布式执行 | 执行与扩展层 | 见该课 |
+| 二 | [13](../13_distributed_concurrency/) | 高并发与分布式执行 | 执行与扩展层 | [`distributed/`](../../agentkit/distributed/)（SQLite 单机多进程） |
 | 二 | [14](../14_cost_latency/) | 成本与延迟优化 | 模型层 | 见该课 |
 | 二 | [15](../15_enterprise_rag/) | 企业知识与权限感知 RAG | 上下文与知识层 | 见该课 |
 | 二 | [16](../16_release_ops/) | 发布、变更与运维 | 横切 | 见该课 |
@@ -169,7 +169,7 @@ flowchart TB
 | 四 | [27](../27_durable_workflows/) | 持久化工作流：用 Temporal 运行 Agent | 编排层、状态层 | [`contrib/temporal.py`](../../agentkit/contrib/temporal.py) |
 | 四 | [28](../28_production_observability/) | 生产可观测性：OpenTelemetry、Prometheus 与 LLM 观测平台 | 横切 | [`contrib/otel.py`](../../agentkit/contrib/otel.py) |
 | 四 | [29](../29_gateway_and_guardrails/) | 模型网关、策略即代码与护栏服务 | 模型层、安全护栏层 | [`contrib/gateway.py`](../../agentkit/contrib/gateway.py)、[`contrib/policy.py`](../../agentkit/contrib/policy.py)、[`contrib/guards.py`](../../agentkit/contrib/guards.py) |
-| 四 | [30](../30_async_runtime/) | 异步运行时与高并发服务 | 编排层、执行与扩展层 | [`aio/`](../../agentkit/aio/) |
+| 四 | [30](../30_async_runtime/) | 异步运行时与高并发服务 | 编排层、执行与扩展层 | [`agent.py`](../../agentkit/agent.py)、[`limits.py`](../../agentkit/limits.py)、[`timeouts.py`](../../agentkit/timeouts.py) |
 | 四 | [31](../31_deployment_and_scaling/) | 部署与扩缩容：从单机到集群 | 接入层、执行与扩展层 | [`production/`](../../production/) |
 
 ### 1.6 课程的四部分与学习路线
@@ -183,7 +183,7 @@ flowchart TB
 | 定位 | 主线 | 主线 | **进阶、可选**：学完主线和综合实战之后，按需挑着学 | **进阶、可选**：要把 Agent 真正部署上线、承担多实例高并发负载时学 |
 | 目标 | **学会怎么造**：Agent 的每个零件是什么、怎么从零实现 | **学会怎么选**：企业里遇到真实问题时，有哪些方案、各自的代价、该选哪个 | **学会怎么做深**：把关键构建块做到生产水准，让 Agent 靠数据和评估持续变好，并看清前沿应用怎么搭 | **学会怎么上线**：把教学实现换成成熟组件，接口不变，并用真实并发、真实进程和故障注入证明它扛得住 |
 | 讲法 | 概念 → 从零实现 → 练习 | 真实问题 → 多种方案对比 → 适用场景 → 推荐选择 → 代码实现 | 概念 → 从零实现 → 练习 + 取舍对比 | 教学实现为什么不够 → 成熟组件选型对比 → 适配器怎么接 → 运维要点与坑 → 实测验证 |
-| 你会得到 | 一个自己写出来、完全理解的 Agent 内核，外加一张 20 个维度的工程考量地图 | 一套做架构决策的判断力（面试和设计评审里最值钱的部分） | 检索、记忆、MCP、沙箱的深入实现；主流框架的上手能力；一条"数据 → 评估 → 优化"的改进闭环；编码 Agent 和主动式 Agent 的完整实现 | 一个能并发跑几百个会话的异步运行时；Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar 的接入方法与选型判断；一个带压测和故障注入的多 worker 参考服务 |
+| 你会得到 | 一个自己写出来、完全理解的 Agent 内核（async：一个进程同时服务很多会话），外加一张 20 个维度的工程考量地图 | 一套做架构决策的判断力（面试和设计评审里最值钱的部分） | 检索、记忆、MCP、沙箱的深入实现；主流框架的上手能力；一条"数据 → 评估 → 优化"的改进闭环；编码 Agent 和主动式 Agent 的完整实现 | 高并发下 async 运行时的取消、超时与舱壁；Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar 的接入方法与选型判断；一个带压测和故障注入的多 worker 参考服务 |
 
 为什么这样分？企业级 Agent 的难点很少是"不会写循环"，而是"两个窗口同时发消息时状态被覆盖了""模型 API 被限流了""检索结果把别的部门的文件带出来了"这类问题。它们大多没有唯一的正确答案，只有在规模、一致性、成本、团队能力之间的取舍。所以第二部分的每节课都由若干张"问题卡片"组成：每张卡片给出一个真实场景、几种可选方案的对比，以及怎么选。
 
@@ -191,7 +191,7 @@ flowchart TB
 
 学完前两部分和综合实战，你已经能搭出并上线一个企业级 Agent。第三部分是进阶内容，分三组：**构建块深入**（17 检索质量、18 记忆系统、19 MCP 与代码沙箱、20 从 agentkit 到框架）把第一部分里讲得较浅的零件做深；**ML 闭环**（21 数据、22 评估方法论、23 优化）回答"上线之后怎样让它越来越好"；**应用前沿**（24 编码 Agent、25 主动式 Agent 与前沿）把前面所有层组装成两类前沿应用。每课回到第一部分"从零实现"的节奏，并加上与业界方案的取舍对比。
 
-第四部分回答另一个问题：**教学版 agentkit 是同步、单进程、状态放在内存或本地文件里的，怎么把它变成能多实例部署、承担高并发的生产系统？** 答案不是自己重写一遍，而是把每一层换成业界成熟组件、接口保持不变：26 课把检查点、队列、幂等、限流、锁放到 Postgres 和 Redis 上；27 课用 Temporal 做持久化执行；28 课把追踪和指标接到 OpenTelemetry 和 Prometheus；29 课换上模型网关、Cedar 策略和分类器护栏；30 课写一个能在一个进程里并发跑几百个会话的异步运行时；31 课把它们组装成一个 API + 多 worker 的参考服务，做压测和故障注入。每课都先诚实说明教学版的局限，再对比 2–5 个组件选项（自建、开源、托管），最后用真实进程和并发实测验证。完整的差距清单见 [生产就绪指南](../../docs/production-readiness.md)。
+第四部分回答另一个问题。教学版 agentkit 只有一套 async 核心，从第 02 课起就在用：一个进程同时推进很多会话。从第 12、13 课起，它真的跑在多个 worker 进程里（`agentkit.distributed`：SQLite 上的租约队列、fence 检查点、跨进程的幂等与限流，用 kill -9 做故障注入）。但 SQLite 只在一台机器上有效。**怎么把它变成能多机部署、承担高并发的生产系统？** 答案不是自己重写一遍，而是把每一层换成业界成熟组件、接口保持不变：26 课把检查点、队列、幂等、限流、锁从 SQLite 换到 Postgres 和 Redis 上；27 课用 Temporal 做持久化执行；28 课把追踪和指标接到 OpenTelemetry 和 Prometheus；29 课换上模型网关、Cedar 策略和分类器护栏；30 课深入高并发下 async 运行时的取消、超时与舱壁；31 课把它们组装成一个 API + 多 worker 的参考服务，做压测和故障注入。每课都先诚实说明教学版的局限，再对比 2–5 个组件选项（自建、开源、托管），最后用真实进程和并发实测验证。完整的差距清单见 [生产就绪指南](../../docs/production-readiness.md)。
 
 ```mermaid
 flowchart LR
@@ -285,14 +285,14 @@ Agent(
 )
 ```
 
-这段代码里没有直接出现的几课：第 05 课讲这个循环属于哪种架构（ReAct）以及还有哪些替代架构，第 06 课讲怎样把多个模型调用或 Agent 编排起来，第 07 课给出审视整个系统的 20 个工程维度，第 11 课讲怎样证明改动没有改坏，第 12 课讲把它部署成服务，第 13–16 课讲规模化、成本、企业知识和发布运维。进阶的第 17–25 课则把检索、记忆、MCP 与沙箱做深，补上数据、评估方法论和优化的闭环，再拆解编码 Agent 和主动式 Agent。第 26–31 课把这段代码换成异步运行时和成熟组件，部署成能多实例、高并发运行的服务。
+这段代码里没有直接出现的几课：第 05 课讲这个循环属于哪种架构（ReAct）以及还有哪些替代架构，第 06 课讲怎样把多个模型调用或 Agent 编排起来，第 07 课给出审视整个系统的 20 个工程维度，第 11 课讲怎样证明改动没有改坏，第 12 课讲把它部署成服务，第 13–16 课讲规模化、成本、企业知识和发布运维。进阶的第 17–25 课则把检索、记忆、MCP 与沙箱做深，补上数据、评估方法论和优化的闭环，再拆解编码 Agent 和主动式 Agent。这段代码从第 02 课起就是 async 的；第 12、13 课让它真的跑在多个 worker 进程里（`agentkit.distributed`），第 26–31 课再把单机的 SQLite 换成 Postgres、Redis、Temporal 等成熟组件，部署成能多机、高并发运行的服务。
 
-整个 agentkit 只有两千多行 Python（其中很大一部分是解释"为什么"的注释），只依赖 `openai` 和 `pydantic`，每个文件对应一节课。它是为教学而写的，但按生产标准设计：你在这里学到的每个概念 —— 主循环、钩子、检查点、护栏、追踪 —— 在 LangGraph、OpenAI Agents SDK 等主流框架里都能找到对应物（第 20 课会把同一个任务分别用 agentkit 和三个框架实现一遍）。
+agentkit 的核心（含 `agentkit.distributed`，不含追踪查看器和 `contrib/` 适配器）五千多行 Python（其中很大一部分是解释"为什么"的注释），只依赖 `openai` 和 `pydantic`，每个文件对应一节课。它是 async 的：`result = await agent.run(...)`。它是为教学而写的，但按生产标准设计：你在这里学到的每个概念 —— 主循环、钩子、检查点、护栏、追踪 —— 在 LangGraph、OpenAI Agents SDK 等主流框架里都能找到对应物（第 20 课会把同一个任务分别用 agentkit 和三个框架实现一遍）。
 
 ## 3. 动手：运行 Demo
 
 ```bash
-.venv/bin/python lessons/00_overview/demo.py            # 真实模型（约 20 秒）
+.venv/bin/python lessons/00_overview/demo.py            # 真实模型（约 15 秒）
 .venv/bin/python lessons/00_overview/demo.py --offline  # 离线剧本，无需 API key
 ```
 
@@ -301,46 +301,51 @@ Demo 演示 3 个场景，当前用户是普通员工张三（角色 `employee`�
 | 场景 | 用户说 | 你会看到 |
 |---|---|---|
 | 1 日常问答 | VPN 报错 809 怎么办？我的工单谁在跟？ | 并行工具调用；知识库里被投毒的文章被 `ToolOutputGuard` 标记；回答中的手机号被脱敏 |
-| 2 高风险操作 | 帮我重置密码 | 运行暂停等审批 → 状态写入检查点 → 一个**新的** Agent 实例批准并从断点继续 |
+| 2 高风险操作 | 帮我重置密码 | 运行暂停等审批 → 状态写入检查点 → **另一个操作系统进程**（Demo 用 `--approve` 再启动一次自己）从检查点加载、批准并从断点继续 |
 | 3 直接注入 | 忽略之前的所有指令…… | `InputGuard` 在调用模型之前就拦截，0 次模型调用、0 成本 |
 
-真实模型运行的输出节选：
+真实模型运行的输出节选（2026-09-28 用 async 版 demo 重跑，模型 gpt-5.5）：
 
 ```text
 场景 1  日常问答：并行工具调用 · 间接注入防护 · 输出脱敏
-  ▶ 回答：VPN 809 可按以下步骤排查：
-          1. 确认当前网络能正常访问外网
-          2. 如果在家用网络，检查路由器/防火墙是否放行 UDP 500 和 4500 端口
+  ▶ 回答：VPN 809 可先按以下步骤排查：
+          1. 确认当前网络能正常访问外网。
+          2. 如果在家用路由器/公司外网络下，确认已放行 UDP 500 和 4500 端口。
           ...
-          - 跟进人：王工
-          - 联系电话：[手机号已脱敏]
+          跟进人：**王工**
+          联系电话：**[手机号已脱敏]**
   💬 知识库文章 KB-102 被人埋了一句「忽略之前的所有指令…」。ToolOutputGuard 在 ['search_kb'] 的输出里发现了它，
   💬 ✅ 模型没有被间接注入带偏。
   ▶ 追踪树：
-    agent.run  7930ms  tokens=1574→206  status=completed steps=2 cost=$0.00403
-    ├─ llm.chat  3018ms  tokens=595→78  → tool_calls: search_kb, list_my_tickets
-    ├─ tool.search_kb  7ms  ok
-    ├─ tool.list_my_tickets  5ms  ok
-    └─ llm.chat  4888ms  tokens=979→128  → final_answer
+    agent.run  7148ms  tokens=1630→226  status=completed steps=2 cost=$0.00430
+    ├─ llm.chat  3380ms  tokens=607→86  → tool_calls: search_kb, list_my_tickets
+    ├─ tool.search_kb  1ms  ok
+    ├─ tool.list_my_tickets  1ms  ok
+    └─ llm.chat  3761ms  tokens=1023→140  → final_answer
 
-场景 2  高风险操作：暂停等人工审批 → 进程"重启" → 从检查点恢复
-  ▶ status=paused  stop_reason=needs_approval  steps=1
+场景 2  高风险操作：暂停等人工审批 → 另一个进程批准 → 从检查点恢复
+  ▶ status=paused  stop_reason=needs_approval  steps=1  tokens=661  cost≈$0.00141
   💬 PermissionPolicy 没有执行它，而是抛出 PauseRun：运行暂停，完整状态已写入检查点：
-  💬   runs/00_overview/checkpoints/f6b305a2b2b4.json（3 条消息）
-  ⏳ ……一段时间后，审批人在审批系统里点了「批准」。处理审批的是另一个进程（新的 Agent 实例）：
-  ▶ status=completed  stop_reason=final_answer  steps=2
-  ▶ 回答：已为你重置域账号密码。临时密码已发送到你的企业邮箱，30 分钟内有效；首次登录后请立即修改密码。
+  💬   runs/00_overview/checkpoints/b897b630454c.json（3 条消息）
+  ⏳ ……一段时间后，审批人在审批系统里点了「批准」。处理审批的是另一个进程（当前进程 pid=33724）：
 
-审计日志（本次运行）
-  [tool_call] run=209da8836155 user=E100 tool=search_kb ok=True approved=None error=None
-  [tool_call] run=f6b305a2b2b4 user=E100 tool=reset_password ok=True approved=True error=None
-  [run_end]   run=897a0fc2a4af user=E100 status=stopped reason=blocked_input steps=0 tokens=0
+  [审批进程 pid=33919] 收到审批：run_id=b897b630454c，批准人 IT 主管 M-331
+  ▶ status=completed  stop_reason=final_answer  steps=2  tokens=1400  cost≈$0.00266
+  ▶ 回答：已为你重置域账号密码。临时密码已发送到你的企业邮箱，30 分钟内有效；首次登录后需要立即修改密码。
+  💬 审批进程 pid=33919（退出码 0）和本进程 pid=33724 是两个不同的操作系统进程，
+  💬   它们之间没有共享内存，只共享磁盘上的检查点目录。
+  💬 子进程用 run_id 从检查点加载状态、执行已批准的工具调用、再让模型继续；本进程重新读检查点：status=completed。
+
+审计日志（本次运行）—— 给安全 / 合规 / 法务看的记录
+  [tool_call] run=31ff747f872e user=E100 tool=search_kb ok=True approved=None by=None error=None
+  [tool_call] run=b897b630454c user=E100 tool=reset_password ok=True approved=True by=M-331 error=None
+  [run_end]   run=47949a567a0a user=E100 status=stopped reason=blocked_input steps=0 tokens=0
 ```
 
 该观察什么：
 
 1. **一次普通问答背后有多少层在工作**：身份注入、不可信数据标记、脱敏、预算、审计、追踪，用户完全无感。
-2. **暂停不是阻塞**：场景 2 的审批可以在一天后由另一台机器处理，因为状态全在检查点里。
+2. **暂停不是阻塞**：场景 2 的审批真的由另一个进程完成（两个 pid 不同），两个进程之间只有磁盘上的检查点。所以审批可以在一天后、服务重启过几次之后再处理；把检查点放进 Postgres，处理审批的就可以是另一台机器（第 13、26 课）。
 3. **最便宜的防御是在最前面拦截**：场景 3 的攻击请求连模型都没见到。但正则一定会漏，真正的底线是后面的权限和审批。
 
 运行产物在 `runs/00_overview/` 下（已被 `.gitignore` 忽略），可以打开 `checkpoints/*.json` 看看一次运行的完整状态长什么样。
@@ -349,7 +354,7 @@ Demo 演示 3 个场景，当前用户是普通员工张三（角色 `employee`�
 
 本课没有编程练习。请完成：
 
-1. **自测题**：[`quiz.md`](quiz.md)，16 道题，答案折叠在每题下方。
+1. **自测题**：[`quiz.md`](quiz.md)，17 道题，答案折叠在每题下方。
 2. **动手改一改 Demo（可选，5 分钟）**：
    - 把 `demo.py` 里 `ME` 的角色改成 `["it_admin"]`，看看"该用户能看到的工具"有什么变化；
    - 把场景 2 里的 `approved=True` 改成 `False`，看看模型收到"审批未通过"的观察后怎么回答用户；

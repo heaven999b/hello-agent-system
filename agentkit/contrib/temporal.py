@@ -27,6 +27,8 @@ Workflow，让持久化执行引擎替你记住"执行到哪一步"。
     summarize_history(history) / activity_attempts(history) / format_history(lines)   事件历史摘要
 
 哪些 agentkit Hook 可以直接放进 workflow（纯逻辑），哪些必须移到 activity（有 IO / 非确定性）：
+（Hook 方法写成普通方法或 async def 都可以，workflow 里会 await 后者 —— 但 async 不等于"可以做 IO"：
+在 workflow 里 await 的只能是纯逻辑，真正的 IO 只能出现在 activity 里。）
 
     可以（纯逻辑，给定相同输入永远得出相同结果）：
         PermissionPolicy（approver=None 时）  RBAC、deny_tools、按风险审批；它抛的 PauseRun 在这里变成 wait_condition
@@ -54,12 +56,13 @@ Workflow，让持久化执行引擎替你记住"执行到哪一步"。
   串行 7.9 秒 → 并发 1.15 秒）。
 - 阻塞 IO 的后果：async activity 跑在 worker 的事件循环上，一个同步的 requests / time.sleep / 同步数据库驱动
   会卡住这个 worker 上所有 activity、心跳和 workflow 任务的收发，并发退化成 1；心跳发不出去还会被判超时重试。
-  同步工具交给 agentkit.aio.AsyncToolExecutor（有上限的线程池）；模型客户端在 worker 启动时创建，不在 activity 里懒加载。
+  同步工具交给 agentkit.tools.ToolExecutor（有上限的线程池，和 Agent 执行工具是同一套）；
+  模型客户端在 worker 启动时创建，不在 activity 里懒加载。
   （Temporal 也支持同步 activity，但要求 Worker 配置 activity_executor，官方推荐 ThreadPoolExecutor。）
 - 取消的传递：workflow 被取消（handle.cancel()）或 activity 心跳超时 → 服务端在心跳响应里通知 worker →
   SDK 取消这个 activity 的 asyncio 任务 → `await llm.chat(...)` 抛出 CancelledError，异步 HTTP 客户端中断请求。
-  前提是 activity 在发心跳（_heartbeating，每 heartbeat_timeout / 2 一次）、模型客户端是异步的；
-  同步客户端放在线程里时，取消只能"不再等它"，请求会在后台跑完并照样计费。
+  前提是 activity 在发心跳（_heartbeating，每 heartbeat_timeout / 2 一次）。agentkit 的 LLM 都是 async 的；
+  自己包装的模型客户端如果在线程里调同步 SDK，取消只能"不再等它"，请求会在后台跑完并照样计费。
 
 依赖：pip install -e ".[temporal]"
 """
@@ -68,7 +71,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 import json
 import threading
 import uuid
@@ -88,13 +90,12 @@ with workflow.unsafe.imports_passed_through():
     # agentkit 在沙箱里只能以 passthrough 方式导入：agentkit/config.py 在导入时调用了 Path.resolve()，
     # 沙箱重新导入它会直接报 "__call__ on pathlib.Path.resolve restricted"（本课实测）。
     from agentkit.agent import DEFAULT_SYSTEM_PROMPT
-    from agentkit.aio import AsyncLLM, AsyncToolExecutor
     from agentkit.hooks import Hook, PauseRun, StopRun
     from agentkit.llm import LLM, LLMError
     from agentkit.permissions import PermissionPolicy
     from agentkit.pricing import estimate_cost
     from agentkit.state import RunState
-    from agentkit.tools import IdempotencyStore, Tool, ToolContext, ToolRegistry, ToolResult
+    from agentkit.tools import IdempotencyStore, Tool, ToolContext, ToolExecutor, ToolRegistry, ToolResult, maybe_await
     from agentkit.types import LLMResponse, ToolCall, Usage, calls_in, system, tool_message, user
 
 DEFAULT_TASK_QUEUE = "agentkit-agents"
@@ -273,10 +274,12 @@ async def _heartbeating():
 class AgentActivities:
     """LLM 与工具 Activity，全部是 async def。
 
-    - llm_factory 在 make_worker 启动 worker 时调用一次，应返回 agentkit.aio.AsyncLLM（如 AsyncOpenAICompatLLM）。
-      也兼容同步 LLM（放进线程池执行），但那样取消只能"停止等待"，HTTP 请求会在后台跑完、照样计费。
-    - 工具经 agentkit.aio.AsyncToolExecutor 执行 —— 和 AsyncAgent（第 30 课）是同一套执行语义：
+    - llm_factory 在 make_worker 启动 worker 时调用一次，应返回一个 agentkit LLM（如 OpenAICompatLLM、
+      LiteLLMRouterLLM）：`await llm.chat(...)` 可以被取消，取消时 HTTP 请求随之中断。
+    - 工具经 agentkit.tools.ToolExecutor 执行 —— 和 Agent 执行工具是同一套语义：
       async 工具真正可取消；同步工具进有上限的线程池；isolated(tool) 标记的工具在子进程里执行、超时直接 kill。
+    - tool_hooks：有 IO 的 after_tool 钩子（审计、包裹不可信数据、LLM 分类器）在这里执行。钩子方法是 async 的
+      就直接 await；是普通方法的（通常是同步写文件、写库）放进线程执行，不卡住事件循环。
     - 创建的 LLM 应该**关掉自己的重试**：重试交给 Temporal 的 RetryPolicy。两层都重试会让尝试次数相乘
       （ResilientLLM 3 次 × RetryPolicy 5 次 = 15 次），而且外层完全看不见。
     - ⚠️ async activity 里绝不能有阻塞调用（requests、time.sleep、同步数据库驱动……）：它们跑在 worker 的事件循环上，
@@ -285,7 +288,7 @@ class AgentActivities:
 
     def __init__(
         self,
-        llm_factory: Callable[[], "AsyncLLM | LLM"],
+        llm_factory: Callable[[], LLM],
         tools: Iterable[Tool] | ToolRegistry,
         *,
         tool_hooks: Sequence[Hook] = (),
@@ -301,7 +304,7 @@ class AgentActivities:
             self.registry.idempotency_store = idempotency_store
         self.tool_hooks = list(tool_hooks)
         self.idempotent_tools = set(idempotent_tools)
-        self.executor = AsyncToolExecutor(self.registry, max_threads=sync_tool_threads)
+        self.executor = ToolExecutor(self.registry, max_threads=sync_tool_threads)
 
     def llm(self):
         """创建（一次）并返回 LLM。make_worker 会在启动时就调用它，而不是等到第一个 llm_step。
@@ -343,9 +346,7 @@ class AgentActivities:
         llm = self._llm if self._llm is not None else await asyncio.to_thread(self.llm)  # 兜底：别在事件循环里建客户端
         async with _heartbeating():
             try:
-                if inspect.iscoroutinefunction(llm.chat):
-                    return await llm.chat(inp.messages, tools=inp.tools or None)
-                return await asyncio.to_thread(llm.chat, inp.messages, inp.tools or None)
+                return await llm.chat(inp.messages, tools=inp.tools or None)
             except LLMError as e:
                 delay = timedelta(seconds=e.retry_after) if e.retry_after else None  # 服务端的 Retry-After 优先
                 raise ApplicationError(
@@ -363,7 +364,7 @@ class AgentActivities:
 
     @activity.defn(name="execute_tool")
     async def execute_tool(self, inp: ToolStepInput) -> ToolResult:
-        """经 AsyncToolExecutor 执行一次工具调用（参数校验、超时、幂等、输出截断与 ToolRegistry.execute 一致）。
+        """经 ToolExecutor 执行一次工具调用（参数校验、超时、幂等、输出截断与 Agent 执行工具时一致）。
 
         工具把所有异常都变成了 ToolResult（"错误即观察"）。这里再做一次分流：
         内部异常 / 超时 → 抛 ApplicationError，让 RetryPolicy 决定是否重试；
@@ -388,8 +389,11 @@ class AgentActivities:
                 state.approvals[inp.call.id] = bool(inp.approval.get("approved"))
                 state.approval_log.append(inp.approval)
             for h in self.tool_hooks:
-                # 这些钩子会写文件、写审计库（同步 IO）：放进线程执行，不能卡住事件循环
-                new = await asyncio.to_thread(h.after_tool, state, inp.call, result)
+                if asyncio.iscoroutinefunction(h.after_tool):
+                    new = await h.after_tool(state, inp.call, result)  # async 钩子（如 ClassifierGuard）：直接 await
+                else:
+                    # 普通方法的钩子会写文件、写审计库（同步 IO）：放进线程执行，不能卡住事件循环
+                    new = await asyncio.to_thread(h.after_tool, state, inp.call, result)
                 if new is not None:
                     result = new
         return result
@@ -542,7 +546,7 @@ class AgentWorkflow:
                 ]
                 text = inp.user_input
                 for h in self._hooks:
-                    new = h.on_run_start(state, text)  # 可能抛 StopRun（如注入检测）
+                    new = await maybe_await(h.on_run_start(state, text))  # 可能抛 StopRun（如注入检测）
                     if new is not None:
                         text = new
                 state.messages.append(user(text))
@@ -571,7 +575,7 @@ class AgentWorkflow:
         state.active_seconds += workflow.time() - state.segment_started_at
         self._phase = state.status
         for h in self._hooks:
-            h.on_run_end(state)
+            await maybe_await(h.on_run_end(state))
         return AgentResult(
             output=state.output,
             status=state.status,
@@ -599,7 +603,7 @@ class AgentWorkflow:
             if not response.tool_calls:
                 output = response.content or ""
                 for h in self._hooks:
-                    new = h.on_final(state, output)
+                    new = await maybe_await(h.on_final(state, output))
                     if new is not None:
                         output = new
                 state.messages[-1]["content"] = output
@@ -621,10 +625,10 @@ class AgentWorkflow:
     async def _call_llm(self) -> LLMResponse:
         state, inp = self._state, self._inp
         for h in self._hooks:
-            h.before_llm(state, state.messages)
+            await maybe_await(h.before_llm(state, state.messages))
         visible = list(self._specs)
         for h in self._hooks:
-            visible = h.visible_tools(state, visible)
+            visible = await maybe_await(h.visible_tools(state, visible))
         schemas = [self._specs[n].schema for n in visible if n in self._specs] or None
         try:
             response = await workflow.execute_activity_method(
@@ -649,7 +653,7 @@ class AgentWorkflow:
         state.usage = state.usage + response.usage
         state.cost_usd += estimate_cost(response.usage, response.model or "default")
         for h in self._hooks:
-            h.after_llm(state, response)
+            await maybe_await(h.after_llm(state, response))
         return response
 
     async def _run_pending_tools(self) -> None:
@@ -668,7 +672,7 @@ class AgentWorkflow:
         i = 0
         while i < len(self._hooks):
             try:
-                denial = self._hooks[i].before_tool(state, call, view)
+                denial = await maybe_await(self._hooks[i].before_tool(state, call, view))
             except PauseRun:
                 await self._wait_for_approval(call)  # 等到决定后，从同一个钩子重新判断
                 continue
@@ -681,7 +685,7 @@ class AgentWorkflow:
             result = await self._execute_tool(call, spec)
             state.tool_calls_count += 1
         for h in self._hooks:
-            new = h.after_tool(state, call, result)
+            new = await maybe_await(h.after_tool(state, call, result))
             if new is not None:
                 result = new
         return result
@@ -808,7 +812,7 @@ def sandbox_runner():
 def make_worker(
     client,
     task_queue: str,
-    llm_factory: Callable[[], "AsyncLLM | LLM"],
+    llm_factory: Callable[[], LLM],
     tools: Iterable[Tool] | ToolRegistry,
     *,
     tool_hooks: Sequence[Hook] = (),
@@ -833,9 +837,9 @@ def make_worker(
       但 worker 刚启动、要为大量 workflow 重放历史时它会成为瓶颈。
     - sync_tool_threads：同步工具的线程池大小（async 工具不占线程）。
 
-    idempotency_store：跨 worker 共享的幂等存储，用异步版（如第 26 课的 AsyncRedisIdempotencyStore；同步版的每次 get/put
-    都会阻塞事件循环）。配置后 write/dangerous
-    工具按"幂等"对待，允许重试 3 次；进程内的 IdempotencyStore 不能跨 worker 去重，不要在这里用它。
+    idempotency_store：跨 worker 共享的幂等存储（如第 26 课的 RedisIdempotencyStore，get / put 是 async 的，
+    不阻塞事件循环）。配置后 write/dangerous 工具按"幂等"对待，允许重试 3 次；
+    进程内的 IdempotencyStore 不能跨 worker 去重，不要在这里用它。
 
     activity 全部是 async def，所以不需要 activity_executor（SDK 只对同步 activity 要求它，官方推荐 ThreadPoolExecutor）。
     """

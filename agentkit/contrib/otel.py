@@ -9,13 +9,15 @@
                         属性映射到 OpenTelemetry GenAI 语义约定（invoke_agent / chat / execute_tool）。
                         它同时是一个可选 Hook：放进 hooks 可以补上核心 span 里没有的
                         gen_ai.tool.call.id / gen_ai.conversation.id / 停止原因，以及（显式开启时的）消息内容。
-                        同步 Agent 与 AsyncAgent 都适用（多线程、asyncio 并发与并行工具下父子关系均经测试验证）。
+                        并发的运行、同一轮里并行执行的工具（async 工具各在自己的 task 里，同步工具在线程池里）
+                        之下，父子关系均经测试验证。
     setup_tracing       一行配好生产用的 TracerProvider：资源、父级优先的比例采样、OTLP/HTTP 批量导出。
     inject_context / extract_context / continue_trace
                         W3C traceparent 跨队列、跨进程传播：生产者把它放进任务 payload，
                         worker 取出后接着同一条 trace 继续（第 30 课的 worker 直接用）。
     PrometheusHook      一个 agentkit Hook：运行数、耗时直方图、token、成本、工具调用、待审批数、在途运行数。
-                        回调都是同步的内存计数，可直接用于 AsyncAgent（但任何同步 Hook 里都不能做阻塞 IO）。
+                        回调都是普通方法、只做内存计数（纯计算的 Hook 不必写成 async；但普通方法在事件循环线程里
+                        执行，里面绝不能做阻塞 IO）。
     start_metrics_server  暴露 /metrics；多进程（gunicorn / 多 worker）时自动切换到 prometheus_client 的多进程模式。
 
 语义约定版本：GenAI 约定仍是 **Development** 状态，已迁到独立仓库
@@ -234,9 +236,9 @@ class OTelTracer(Tracer, Hook):
       （取自 metadata["conversation_id"]），开启内容采集时记录用户输入和最终回答。
     - 线程与 asyncio：agentkit 的 span 栈和 OTel 的当前 span 都存在 contextvars 里，并且在同一个 with 块里
       一起 set、一起 reset。每个线程、每个 asyncio task 都有自己的 context 副本（task 在创建时复制父 context），
-      所以多个并发运行交错执行、同一轮里并行执行的工具 task，父子关系都各归各的；tests/contrib/test_otel.py
-      用 50 个并发 async run（每个带并行工具）验证了这一点。唯一的要求是：span 在哪个 task 里进入，就在哪个
-      task 里退出（普通的 with / async 函数写法天然满足）。
+      所以多个并发运行交错执行、同一轮里并行执行的工具 task（以及复制了 context 的同步工具线程），父子关系都各归各的；
+      tests/contrib/test_otel.py 用 50 个并发运行（每个带 3 个并行工具）验证了这一点。唯一的要求是：span 在哪个 task
+      里进入，就在哪个 task 里退出（普通的 with / async 函数写法天然满足）。
     """
 
     def __init__(
@@ -491,14 +493,10 @@ def extract_context(carrier: Mapping[str, str] | None) -> Any:
 class continue_trace:  # noqa: N801 —— 用法上是一个上下文管理器函数，保持小写
     """在 with / async with 块里"接着"carrier 所代表的 trace 继续：块内新建的 span 以生产者的 span 为父。
 
-    同步 worker：
-        with continue_trace(job["trace"]):
-            agent.run(job["input"])             # invoke_agent span 与生产者在同一条 trace 里
-
     asyncio worker（每个任务一个 task，并发处理互不串线）：
         async def handle(job):
-            async with continue_trace(job["trace"]):
-                await async_agent.run(job["input"])
+            async with continue_trace(job["trace"]):   # 写成普通的 with 也可以：进入 / 退出都只是内存操作
+                await agent.run(job["input"])       # invoke_agent span 与生产者在同一条 trace 里
 
         async def worker(q: asyncio.Queue):
             while True:
@@ -645,8 +643,8 @@ class PrometheusHook(Hook):
     标签基数：只有租户数量有上限时才开 tenant_label（超过 max_tenants 或不在 allowed_tenants 里的归入
     "__other__"）；user_id、run_id、trace_id 绝不能当标签 —— 它们属于 trace 和日志。
 
-    线程与 asyncio：所有回调都是同步方法，只做内存里的计数（prometheus_client 自带锁），可以直接用于
-    AsyncAgent。**不要**在这个 Hook（或任何同步 Hook）里做阻塞 IO —— 同步 Hook 在事件循环线程里执行，
+    线程与 asyncio：所有回调都是普通方法，只做内存里的计数（prometheus_client 自带锁），Agent 直接调用。
+    **不要**在这个 Hook（或任何写成普通方法的 Hook）里做阻塞 IO —— 它在事件循环线程里执行，
     一次 50ms 的阻塞调用会让同一进程里所有并发运行一起停 50ms。需要查数据库的指标（如待审批数、
     队列深度）放到独立的定时任务里，用 set_pending_approvals / set_queue_stats 写入。
     """
@@ -692,7 +690,7 @@ class PrometheusHook(Hook):
                 self._pending.discard(state.run_id)
                 self._m["approvals"].dec()
 
-    # ------------------------------------------------------------------ Hook 回调（全部是同步的内存操作）
+    # ------------------------------------------------------------------ Hook 回调（全部是普通方法，只做内存操作）
 
     def on_run_start(self, state: "RunState", user_input: str) -> str | None:
         self._touch(state)

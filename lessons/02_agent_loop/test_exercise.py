@@ -1,16 +1,21 @@
 """第 02 课练习测试。离线、确定性：用 ScriptedLLM 按剧本扮演模型。
 
+练习函数是 async 的，所以测试也是 `async def test_...`（pytest-asyncio 的 auto 模式，不用加装饰器），
+里面用 await 调用它们。
+
 运行：make lesson N=02
 用参考答案验证测试本身：AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/02_agent_loop
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
 import pytest
 
-from agentkit import ScriptedLLM, call_tool, call_tools, reply
+from agentkit import ScriptedLLM, call_tool, call_tools, reply, wait_for
 from agentkit.testing import load_exercise
 from agentkit.types import LLMResponse, ToolCall
 
@@ -43,7 +48,15 @@ def now() -> str:
     return "12:00"
 
 
-TOOLS = {"add": add, "get_weather": get_weather, "boom": boom, "now": now}
+async def lookup_stock(sku: str) -> dict:
+    """查询库存（async 工具：真实系统里它会 await 一个 HTTP / 数据库客户端）"""
+    await asyncio.sleep(0.01)  # 模拟网络等待：这段时间事件循环可以去推进别的会话
+    if sku == "missing":
+        raise LookupError(f"库存系统里没有 {sku}")
+    return {"sku": sku, "stock": 7}
+
+
+TOOLS = {"add": add, "get_weather": get_weather, "boom": boom, "now": now, "lookup_stock": lookup_stock}
 
 
 # ------------------------------------------------------------------ 辅助断言
@@ -76,49 +89,50 @@ def assert_protocol_ok(messages: list[dict]) -> None:
 # ------------------------------------------------------------------ execute_tool_call
 
 
-def test_execute_success_returns_string():
-    assert ex.execute_tool_call(TOOLS, ToolCall("c1", "add", '{"a": 2, "b": 3}')) == "5"
-    out = ex.execute_tool_call(TOOLS, ToolCall("c2", "get_weather", '{"city": "北京"}'))
+async def test_execute_success_returns_string():
+    assert await ex.execute_tool_call(TOOLS, ToolCall("c1", "add", '{"a": 2, "b": 3}')) == "5"
+    out = await ex.execute_tool_call(TOOLS, ToolCall("c2", "get_weather", '{"city": "北京"}'))
     assert json.loads(out) == {"city": "北京", "temp_c": 31}
     assert "北京" in out, "非字符串结果要用 json.dumps(..., ensure_ascii=False)，中文不能被转义"
 
 
-def test_execute_empty_arguments_means_no_args():
-    assert ex.execute_tool_call(TOOLS, ToolCall("c1", "now", "")) == "12:00"
+async def test_execute_empty_arguments_means_no_args():
+    assert await ex.execute_tool_call(TOOLS, ToolCall("c1", "now", "")) == "12:00"
 
 
-def test_execute_unknown_tool_lists_available_tools():
-    out = ex.execute_tool_call(TOOLS, ToolCall("c1", "delete_everything", "{}"))
+async def test_execute_unknown_tool_lists_available_tools():
+    out = await ex.execute_tool_call(TOOLS, ToolCall("c1", "delete_everything", "{}"))
     assert out.startswith(("错误", "Error"))
     assert "delete_everything" in out
     assert "add" in out and "get_weather" in out, "要告诉模型有哪些工具可用，它才能自我纠正"
 
 
-def test_execute_invalid_json():
-    out = ex.execute_tool_call(TOOLS, ToolCall("c1", "add", "{a: 1, b: 2"))
+async def test_execute_invalid_json():
+    out = await ex.execute_tool_call(TOOLS, ToolCall("c1", "add", "{a: 1, b: 2"))
     assert out.startswith(("错误", "Error")) and "JSON" in out
 
 
-def test_execute_arguments_must_be_object():
-    assert ex.execute_tool_call(TOOLS, ToolCall("c1", "add", "[1, 2]")).startswith(("错误", "Error"))
+async def test_execute_arguments_must_be_object():
+    out = await ex.execute_tool_call(TOOLS, ToolCall("c1", "add", "[1, 2]"))
+    assert out.startswith(("错误", "Error"))
 
 
-def test_execute_exception_becomes_observation():
-    out = ex.execute_tool_call(TOOLS, ToolCall("c1", "boom", "{}"))
+async def test_execute_exception_becomes_observation():
+    out = await ex.execute_tool_call(TOOLS, ToolCall("c1", "boom", "{}"))
     assert out.startswith(("错误", "Error")) and "RuntimeError" in out and "数据库连接超时" in out
 
 
-def test_execute_wrong_argument_names():
-    out = ex.execute_tool_call(TOOLS, ToolCall("c1", "add", '{"x": 1, "y": 2}'))
+async def test_execute_wrong_argument_names():
+    out = await ex.execute_tool_call(TOOLS, ToolCall("c1", "add", '{"x": 1, "y": 2}'))
     assert out.startswith(("错误", "Error")) and "TypeError" in out
 
 
 # ------------------------------------------------------------------ run_agent_loop：正常路径
 
 
-def test_direct_answer_without_tool_calls():
+async def test_direct_answer_without_tool_calls():
     llm = ScriptedLLM([reply("你好！")])
-    r = ex.run_agent_loop(llm, TOOLS, "hi")
+    r = await ex.run_agent_loop(llm, TOOLS, "hi")
     assert r["output"] == "你好！"
     assert r["stop_reason"] == "final_answer" and r["steps"] == 1
     assert [m["role"] for m in r["messages"]] == ["system", "user", "assistant"]
@@ -127,19 +141,19 @@ def test_direct_answer_without_tool_calls():
     assert len(llm.calls) == 1
 
 
-def test_tool_schemas_are_sent_and_empty_tools_become_none():
+async def test_tool_schemas_are_sent_and_empty_tools_become_none():
     llm = ScriptedLLM([reply("ok")])
-    ex.run_agent_loop(llm, TOOLS, "hi")
+    await ex.run_agent_loop(llm, TOOLS, "hi")
     assert [t["function"]["name"] for t in llm.calls[0]["tools"]] == list(TOOLS)
 
     llm = ScriptedLLM([reply("ok")])
-    ex.run_agent_loop(llm, {}, "hi")
+    await ex.run_agent_loop(llm, {}, "hi")
     assert llm.calls[0]["tools"] is None, "没有工具时应传 tools=None，而不是空列表"
 
 
-def test_single_tool_call_round_trip():
+async def test_single_tool_call_round_trip():
     llm = ScriptedLLM([call_tool("add", a=2, b=3), reply("结果是 5")])
-    r = ex.run_agent_loop(llm, TOOLS, "2+3=?")
+    r = await ex.run_agent_loop(llm, TOOLS, "2+3=?")
     msgs = r["messages"]
     assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool", "assistant"]
     assert msgs[2]["tool_calls"][0]["function"]["name"] == "add"
@@ -151,9 +165,9 @@ def test_single_tool_call_round_trip():
     assert_protocol_ok(msgs)
 
 
-def test_multiple_sequential_steps():
+async def test_multiple_sequential_steps():
     llm = ScriptedLLM([call_tool("get_weather", city="北京"), call_tool("add", a=31, b=1), reply("32")])
-    r = ex.run_agent_loop(llm, TOOLS, "北京气温加 1")
+    r = await ex.run_agent_loop(llm, TOOLS, "北京气温加 1")
     assert r["steps"] == 3 and r["output"] == "32"
     contents = [m["content"] for m in tool_msgs(r["messages"])]
     assert json.loads(contents[0]) == {"city": "北京", "temp_c": 31}
@@ -161,12 +175,12 @@ def test_multiple_sequential_steps():
     assert_protocol_ok(r["messages"])
 
 
-def test_parallel_tool_calls_all_answered_in_order():
+async def test_parallel_tool_calls_all_answered_in_order():
     llm = ScriptedLLM([
         call_tools(("get_weather", {"city": "北京"}), ("get_weather", {"city": "上海"})),
         reply("北京更热"),
     ])
-    r = ex.run_agent_loop(llm, TOOLS, "北京和上海哪个热？")
+    r = await ex.run_agent_loop(llm, TOOLS, "北京和上海哪个热？")
     assistant = r["messages"][2]
     tms = tool_msgs(r["messages"])
     assert len(assistant["tool_calls"]) == 2 and len(tms) == 2, "一次并行发起的多个调用都要执行"
@@ -176,41 +190,41 @@ def test_parallel_tool_calls_all_answered_in_order():
     assert_protocol_ok(r["messages"])
 
 
-def test_content_with_tool_calls_is_not_final():
+async def test_content_with_tool_calls_is_not_final():
     thinking_aloud = LLMResponse(content="我先算一下", tool_calls=[ToolCall("c9", "add", '{"a": 1, "b": 1}')])
     llm = ScriptedLLM([thinking_aloud, reply("等于 2")])
-    r = ex.run_agent_loop(llm, TOOLS, "1+1")
+    r = await ex.run_agent_loop(llm, TOOLS, "1+1")
     assert r["output"] == "等于 2" and r["steps"] == 2, "有 tool_calls 就不是最终答案，即使 content 不为空"
 
 
-def test_none_content_final_answer_becomes_empty_string():
-    r = ex.run_agent_loop(ScriptedLLM([LLMResponse(content=None)]), TOOLS, "hi")
+async def test_none_content_final_answer_becomes_empty_string():
+    r = await ex.run_agent_loop(ScriptedLLM([LLMResponse(content=None)]), TOOLS, "hi")
     assert r["output"] == "" and r["stop_reason"] == "final_answer"
 
 
 # ------------------------------------------------------------------ run_agent_loop：错误即观察
 
 
-def test_unknown_tool_does_not_crash_loop():
+async def test_unknown_tool_does_not_crash_loop():
     llm = ScriptedLLM([call_tool("delete_everything"), reply("抱歉，我没有这个能力")])
-    r = ex.run_agent_loop(llm, TOOLS, "删掉一切")
+    r = await ex.run_agent_loop(llm, TOOLS, "删掉一切")
     assert tool_msgs(r["messages"])[0]["content"].startswith(("错误", "Error"))
     assert r["output"] == "抱歉，我没有这个能力"
     assert_protocol_ok(r["messages"])
 
 
-def test_tool_exception_does_not_crash_loop():
+async def test_tool_exception_does_not_crash_loop():
     llm = ScriptedLLM([call_tool("boom"), reply("工具出错了")])
-    r = ex.run_agent_loop(llm, TOOLS, "x")
+    r = await ex.run_agent_loop(llm, TOOLS, "x")
     obs = tool_msgs(r["messages"])[0]["content"]
     assert obs.startswith(("错误", "Error")) and "数据库连接超时" in obs
     assert r["stop_reason"] == "final_answer"
 
 
-def test_model_self_corrects_after_invalid_json():
+async def test_model_self_corrects_after_invalid_json():
     bad = LLMResponse(tool_calls=[ToolCall("c1", "add", "{a: 1, b: 2")])
     llm = ScriptedLLM([bad, call_tool("add", a=1, b=2), reply("3")])
-    r = ex.run_agent_loop(llm, TOOLS, "1+2")
+    r = await ex.run_agent_loop(llm, TOOLS, "1+2")
     contents = [m["content"] for m in tool_msgs(r["messages"])]
     assert contents[0].startswith(("错误", "Error")) and contents[1] == "3"
     assert r["output"] == "3" and r["steps"] == 3
@@ -221,21 +235,81 @@ def test_model_self_corrects_after_invalid_json():
 # ------------------------------------------------------------------ run_agent_loop：步数上限
 
 
-def test_max_steps_stops_runaway_loop():
+async def test_max_steps_stops_runaway_loop():
     llm = ScriptedLLM([call_tool("add", a=1, b=1) for _ in range(3)])
-    r = ex.run_agent_loop(llm, TOOLS, "一直算", max_steps=3)
+    r = await ex.run_agent_loop(llm, TOOLS, "一直算", max_steps=3)
     assert r["stop_reason"] == "max_steps" and r["output"] is None and r["steps"] == 3
     assert len(llm.calls) == 3, "达到上限后不能再调用模型"
     assert r["messages"][-1]["role"] == "tool", "最后一步的工具也要执行完，保证历史配对完整"
     assert_protocol_ok(r["messages"])
 
 
-def test_default_max_steps_is_5():
+async def test_default_max_steps_is_5():
     llm = ScriptedLLM([call_tool("now") for _ in range(5)])
-    r = ex.run_agent_loop(llm, TOOLS, "x")
+    r = await ex.run_agent_loop(llm, TOOLS, "x")
     assert r["steps"] == 5 and r["stop_reason"] == "max_steps"
 
 
-def test_invalid_max_steps_raises():
+async def test_invalid_max_steps_raises():
     with pytest.raises(ValueError):
-        ex.run_agent_loop(ScriptedLLM([]), TOOLS, "x", max_steps=0)
+        await ex.run_agent_loop(ScriptedLLM([]), TOOLS, "x", max_steps=0)
+
+
+# ------------------------------------------------------------------ async：工具、并发、取消
+
+
+async def test_async_tool_is_awaited():
+    out = await ex.execute_tool_call(TOOLS, ToolCall("c1", "lookup_stock", '{"sku": "A-1"}'))
+    assert "coroutine" not in out, "async 工具返回的是协程，要 await 它才能拿到结果（忘了 await 是最常见的 async bug）"
+    assert json.loads(out) == {"sku": "A-1", "stock": 7}
+
+
+async def test_async_tool_exception_becomes_observation():
+    out = await ex.execute_tool_call(TOOLS, ToolCall("c1", "lookup_stock", '{"sku": "missing"}'))
+    assert out.startswith(("错误", "Error")) and "LookupError" in out, "async 工具的异常在 await 时才抛出，await 也要放进 try"
+
+
+async def test_async_tool_inside_loop():
+    llm = ScriptedLLM([call_tool("lookup_stock", sku="A-1"), reply("还有 7 件")])
+    r = await ex.run_agent_loop(llm, TOOLS, "A-1 还有货吗？")
+    assert json.loads(tool_msgs(r["messages"])[0]["content"]) == {"sku": "A-1", "stock": 7}
+    assert r["output"] == "还有 7 件"
+    assert_protocol_ok(r["messages"])
+
+
+async def test_many_sessions_share_one_event_loop():
+    """20 个会话同时跑：如果循环真的在 await 模型时让出了事件循环，20 个模型调用会同时在途。"""
+
+    def responder(messages):  # 每个会话：先调一次工具，看到工具结果后回答
+        return reply("3") if messages[-1]["role"] == "tool" else call_tool("add", a=1, b=2)
+
+    llm = ScriptedLLM(responder=responder, latency=0.2)
+    n = 20
+    t0 = time.perf_counter()
+    results = await asyncio.gather(*(ex.run_agent_loop(llm, TOOLS, f"会话 {i}：1+2=?") for i in range(n)))
+    elapsed = time.perf_counter() - t0
+    assert [r["output"] for r in results] == ["3"] * n
+    assert llm.call_count == 2 * n
+    # 确定性的证据：同一时刻在途的模型调用数。一个接一个地跑，这里会是 1
+    assert llm.max_in_flight == n, f"同时在途的模型调用只有 {llm.max_in_flight} 个：是不是在哪里阻塞了事件循环？"
+    # 时间只作宽松兜底：串行要 20 × 2 × 0.2 = 8 秒，并发约 0.4 秒（机器负载高时也远小于 4 秒）
+    assert elapsed < 4, f"20 个会话用了 {elapsed:.1f}s，没有真正并发"
+
+
+async def test_cancellation_propagates():
+    """调用方取消（例如用户关掉了页面）：CancelledError 要从循环里原样抛出，不能被当成工具错误吞掉。"""
+    started = asyncio.Event()
+
+    async def slow_report() -> str:
+        """生成一份很慢的报表"""
+        started.set()
+        await asyncio.sleep(30)
+        return "报表"
+
+    llm = ScriptedLLM([call_tool("slow_report"), reply("不应该走到这里")])
+    task = asyncio.ensure_future(ex.run_agent_loop(llm, {"slow_report": slow_report}, "出报表"))
+    await wait_for(started.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert llm.call_count == 1, "取消之后不能再调用模型（继续花钱）"

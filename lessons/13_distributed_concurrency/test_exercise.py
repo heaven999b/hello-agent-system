@@ -1,64 +1,43 @@
-"""第 13 课练习测试：离线、确定（假时间 + 断言不变量），并用多线程制造真实竞争。
+"""第 13 课练习测试：离线、确定（断言不变量）。
 
 运行：make lesson N=13    或    .venv/bin/python -m pytest lessons/13_distributed_concurrency -v
 
-为什么多线程能测出并发 bug？每个线程用自己的 sqlite3 连接，sqlite3 在执行 SQL 时会释放 GIL，
-所以多个线程的 SQL 是真正交错执行的。为了让"有竞态的实现"稳定地暴露出来，
-并发测试会给每个连接装一个 trace 回调，在每条 SQL 执行前停 1 毫秒，把竞态窗口放大。
+两类测试：
+- 算法测试：一个连接、注入的假时间 T0，结果与真实时钟无关（例如"租约没过期之前不许接手"）；
+- 并发测试：用 race.py 同时拉起 6~10 个**真实的 python 进程**，每个进程用自己的 sqlite3 连接调用你的函数，
+  所有进程在同一条起跑线上一起开抢，用的是真实时钟。进程之间不共享任何内存，只能通过数据库协作 ——
+  和多台机器上的 worker 一样。为了让有竞态的实现稳定地暴露出来，claim 的并发测试会在每条 SQL 执行前停 1 毫秒
+  （sqlite3 的 trace 回调），把本来就存在的竞态窗口放大。
+断言的都是确定性的量：每个任务被领取几次、每个 fence 发出去几次、计数器最后是多少；时间只用作宽松的超时上限。
 """
 
 from __future__ import annotations
 
-import threading
+import asyncio
+import sys
 import time
+from collections import defaultdict
 
 import pytest
 
-from agentkit.testing import load_exercise
+from agentkit.testing import load_exercise, load_sibling
 
 ex = load_exercise(__file__)
 jq = ex.jobqueue
 ss = ex.session_store
+race = load_sibling(__file__, "race")
+IMPL = ex.__file__  # 子进程加载同一个实现：默认 exercise.py，AGENTKIT_SOLUTION=1 时是 solution.py
 
-T0 = 1_000_000.0  # 假时间起点：所有涉及时间的断言都用它，结果与真实时钟无关
-
-
-def _widen_race(_sql: str) -> None:
-    time.sleep(0.001)
+T0 = 1_000_000.0  # 假时间起点：算法测试里所有涉及时间的断言都用它，结果与真实时钟无关
 
 
-def _queue(tmp_path, n: int = 1, **enqueue_kwargs):
+def _queue(tmp_path, n: int = 1, *, clock=lambda: T0, **enqueue_kwargs):
     """建库并入队 n 个任务，返回 (db 路径, 一个连接, job_ids)。"""
     db = tmp_path / "jobs.db"
-    q = jq.JobQueue(db, clock=lambda: T0)
+    q = jq.JobQueue(db, clock=clock)
     ids = [q.enqueue("acme", {"n": i}, f"key-{i}", **enqueue_kwargs)[0] for i in range(n)]
     q.close()
     return db, jq.connect(db), ids
-
-
-def _run_threads(n: int, target) -> None:
-    """启动 n 个线程同时执行 target(i)；任何线程里的异常都在主线程重新抛出（包括 NotImplementedError）。"""
-    errors: list[BaseException] = []
-    barrier = threading.Barrier(n)
-
-    def wrapper(i: int) -> None:
-        try:
-            barrier.wait(timeout=10)
-            target(i)
-        except BaseException as e:  # noqa: BLE001
-            errors.append(e)
-            barrier.abort()
-
-    threads = [threading.Thread(target=wrapper, args=(i,)) for i in range(n)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=60)
-    real = [e for e in errors if not isinstance(e, threading.BrokenBarrierError)]
-    if real:
-        raise real[0]
-    assert not errors, errors
-    assert not any(t.is_alive() for t in threads), "有线程卡住了（死循环或死锁？）"
 
 
 # =====================================================================
@@ -103,27 +82,44 @@ def test_claim_stops_handing_out_a_job_after_max_attempts(tmp_path):
 
 
 def test_concurrent_claims_never_hand_out_a_job_twice(tmp_path):
-    db, conn, ids = _queue(tmp_path, 40)
-    claimed: list[tuple[str, int, int]] = []
-    lock = threading.Lock()
-
-    def worker(i: int) -> None:
-        my_conn = jq.connect(db)  # 每个线程自己的连接
-        my_conn.set_trace_callback(_widen_race)
-        try:
-            while (job := ex.claim_job(my_conn, f"worker-{i}", 30, now=T0)) is not None:
-                with lock:
-                    claimed.append((job.worker_id, job.id, job.fence))
-        finally:
-            my_conn.close()
-
-    _run_threads(8, worker)
+    """8 个真实进程同时抢 40 个任务（每条 SQL 前停 1 毫秒放大竞态窗口）。"""
+    db, conn, ids = _queue(tmp_path, 40, clock=time.time)
+    results = race.run_race(8, "claim", db=db, impl=IMPL, lease=30, widen=True)
+    claimed = [(r["worker"], c["id"], c["fence"]) for r in results for c in r["claims"]]
     claimed_ids = [job_id for _, job_id, _ in claimed]
-    assert sorted(claimed_ids) == sorted(ids), "有任务被领取了两次，或者有任务没被领取"
+    assert sorted(claimed_ids) == sorted(ids), (
+        f"有任务被领取了两次，或者有任务没被领取：{len(claimed_ids)} 次领取，{len(set(claimed_ids))} 个不同的任务"
+    )
     assert all(fence == 1 for _, _, fence in claimed)
-    for worker_id, job_id, _ in claimed:  # 数据库里记录的持有者，必须就是拿到它的那个 worker
+    assert sum(1 for r in results if r["claims"]) >= 2, "竞争没有真正发生：只有一个进程领到了任务"
+    for worker, job_id, _ in claimed:  # 数据库里记录的持有者，必须就是拿到它的那个进程
         stored = jq.get_job(conn, job_id)
-        assert (stored.worker_id, stored.attempts, stored.fence) == (worker_id, 1, 1)
+        assert (stored.worker_id, stored.attempts, stored.fence) == (worker, 1, 1)
+
+
+def test_fences_are_handed_out_once_each_under_lease_churn(tmp_path):
+    """6 个进程反复抢 3 个任务：租约只有 20 毫秒、领了就不管（模拟 worker 一个接一个地卡死），跑 1 秒。
+
+    对每个任务：fence 从 1 开始连续递增、每个值只发出去一次；每次接手都发生在上一个租约过期之后。
+    有竞态的领取会把同一个 fence 发给两个进程 —— 那样 fencing 就失效了（两个"最新持有者"）。
+    """
+    db, conn, ids = _queue(tmp_path, 3, clock=time.time, max_attempts=1_000_000)
+    results = race.run_race(6, "claim", db=db, impl=IMPL, lease=0.02, duration=1.0)
+    by_job: dict[int, list[dict]] = defaultdict(list)
+    for r in results:
+        for c in r["claims"]:
+            by_job[c["id"]].append({**c, "worker": r["worker"]})
+    assert set(by_job) == set(ids)
+    for job_id, claims in by_job.items():
+        claims.sort(key=lambda c: c["fence"])
+        fences = [c["fence"] for c in claims]
+        assert fences == list(range(1, len(fences) + 1)), f"任务 #{job_id} 的 fence 有重复或跳号：{fences[:20]}…"
+        assert all(c["attempts"] == c["fence"] for c in claims)  # 每次领取 attempts 和 fence 各 +1
+        for prev, nxt in zip(claims, claims[1:]):
+            assert nxt["now"] > prev["lease_until"], "上一个租约还没过期就被别人接手了"
+        assert jq.get_job(conn, job_id).fence == fences[-1]
+    takeovers = {c["worker"] for claims in by_job.values() for c in claims[1:]}
+    assert len(takeovers) >= 2, "竞争没有真正发生：接手的总是同一个进程"
 
 
 # =====================================================================
@@ -250,23 +246,78 @@ def test_backoff_between_retries_but_not_after_giving_up(tmp_path):
 
 
 def test_100_concurrent_increments_lose_nothing(tmp_path):
+    """10 个真实进程，各对同一个会话做 10 次"读 → 处理 1 毫秒 → 写回 +1"。"""
     db = tmp_path / "sessions.db"
-    ss.SessionStore(db).close()  # 先建好库，再让 10 个线程同时连上来
-
-    def increment(data: dict) -> dict:
-        time.sleep(0.001)  # 模拟"读完之后要处理一会儿"，让读和写之间真的有别人插进来
-        data["count"] = data.get("count", 0) + 1
-        return data
-
-    def worker(_i: int) -> None:
-        store = ss.SessionStore(db)
-        try:
-            for _ in range(10):
-                ex.update_session_with_retry(store, "counter", increment, max_attempts=200, backoff_s=0.001)
-        finally:
-            store.close()
-
-    _run_threads(10, worker)
+    ss.SessionStore(db).close()  # 先建好库，再让 10 个进程同时连上来
+    results = race.run_race(10, "increment", db=db, impl=IMPL, times=10, think=0.001, max_attempts=200, backoff=0.001)
     final = ss.SessionStore(db).get("counter")
     assert final.data["count"] == 100, f"丢失了 {100 - final.data['count']} 次更新"
     assert final.version == 100  # 每次成功写入恰好 +1：没有多写，也没有少写
+    assert sum(r["conflicts"] for r in results) > 0, "竞争没有真正发生：一次 CAS 冲突都没有"
+
+
+# =====================================================================
+# 事件循环里的阻塞调用（不是练习：jobqueue.AsyncJobQueue 已经写好）
+# =====================================================================
+
+
+async def _hold_write_lock(db, seconds: float):
+    """另一个真实进程拿到写锁（BEGIN IMMEDIATE）后握住 seconds 秒。返回时锁已经被它拿到了。"""
+    script = (
+        "import sqlite3, sys, time\n"
+        "c = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
+        "c.execute('BEGIN IMMEDIATE')\n"
+        "print('locked', flush=True)\n"
+        f"time.sleep({seconds})\n"
+        "c.execute('COMMIT')\n"
+    )
+    proc = await asyncio.create_subprocess_exec(sys.executable, "-c", script, str(db), stdout=asyncio.subprocess.PIPE)
+    assert (await proc.stdout.readline()).strip() == b"locked"
+    return proc
+
+
+async def _ticks_while(db, call) -> tuple[int, object]:
+    """另一个进程握着写锁时执行 call()，数一数这段时间里一个每 10 毫秒醒一次的协程跑了几次。"""
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    task = asyncio.create_task(ticker())
+    holder = await _hold_write_lock(db, 0.8)
+    ticks = 0
+    job = await call()
+    seen = ticks  # call() 返回后立刻读数，中间没有 await
+    task.cancel()
+    await holder.wait()
+    return seen, job
+
+
+async def test_async_jobqueue_keeps_the_event_loop_running(tmp_path):
+    """同步的 JobQueue.claim 直接在事件循环里调用：等写锁的 0.8 秒里，别的协程（比如心跳）一次都跑不了。
+    经过 AsyncJobQueue（专用线程）：事件循环照常运转。这就是 README 3.11 节的决定依据。"""
+    db, conn, _ = _queue(tmp_path, 2, clock=time.time)
+    conn.close()
+
+    q = jq.JobQueue(db)
+
+    async def blocking():
+        return q.claim("w-blocking", 30)  # ❌ 阻塞的 sqlite3 调用跑在事件循环线程里
+
+    blocked_ticks, job1 = await _ticks_while(db, blocking)
+    q.close()
+
+    aq = jq.AsyncJobQueue(db)
+
+    async def offloaded():
+        return await aq.claim("w-async", 30)  # ✅ 在专用线程里等锁，事件循环不受影响
+
+    free_ticks, job2 = await _ticks_while(db, offloaded)
+    await aq.close()
+
+    assert job1 is not None and job2 is not None and job1.id != job2.id
+    assert blocked_ticks == 0, "阻塞调用期间事件循环本该一动不动"
+    assert free_ticks >= 20, f"专用线程等锁时事件循环应该照常运转，只跑了 {free_ticks} 次"

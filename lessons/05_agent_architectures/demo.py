@@ -3,19 +3,23 @@
     .venv/bin/python lessons/05_agent_architectures/demo.py            # 真实模型（读取 .env）
     .venv/bin/python lessons/05_agent_architectures/demo.py --offline  # 离线剧本，无需 API key
 
-任务：查三个城市在出差当天的天气，给出出差建议。工具是假的（数据写死在本文件里），
-而且"广州"的主接口被故意设成维护中 —— 看三种架构各自怎么应对这个意外。
+任务：查三个城市在出差当天的天气，给出出差建议。工具是假的（数据写死在本文件里，每次查询用 asyncio.sleep
+模拟 0.3 秒的网络延迟），而且"广州"的主接口被故意设成维护中 —— 看三种架构各自怎么应对这个意外。
 
   1. ReAct            agentkit.Agent：模型边想边做，每拿到一个观察结果，就重新决定下一步
-  2. Plan-and-Execute 规划器一次写出完整计划 → 代码逐步执行（不经过模型）→ 某一步失败才重规划 → 汇总
+  2. Plan-and-Execute 规划器一次写出完整计划 → 代码执行（不经过模型；互不依赖的只读步骤整批并发）
+                      → 某一步失败才重规划 → 汇总
   3. Reflection       ReAct 先写初稿 → 批评者对照工具数据挑错（先代码检查、再模型检查）→ 按意见修改
+  附：有写操作的计划为什么不能整批并发（纯代码演示，不调用模型）
 
-最后打印对比表：模型调用、工具调用、token、耗时，以及一个用代码做的"质量检查"。
+最后打印对比表：模型调用、工具调用、工具同时在途的峰值、token、耗时，以及一个用代码做的"质量检查"。
+整个 Demo 是 async 的：模型调用和工具调用都在一个事件循环里 await，入口是 asyncio.run(main())。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 import time
@@ -28,7 +32,7 @@ from pydantic import BaseModel, Field
 from agentkit import Agent, ScriptedLLM, ToolError, ToolRegistry, Usage, call_tool, call_tools, default_llm, reply, tool
 from agentkit.context import estimate_tokens
 from agentkit.types import ToolCall, calls_in
-from agentkit.workflows import Review, complete, complete_json, evaluator_optimizer
+from agentkit.workflows import Review, complete, complete_json, evaluator_optimizer, parallel
 
 # ====================================================================== 任务与假工具
 
@@ -52,6 +56,21 @@ WEATHER = {
 AIRPORTS = {"PEK": "北京", "PKX": "北京", "SHA": "上海", "PVG": "上海", "CAN": "广州"}
 UNDER_MAINTENANCE = {"广州"}  # 主接口"维护中"的城市：制造一个计划之外的失败
 TOOL_LOG: list[str] = []  # 记录每次真正执行的工具调用，用来统计"工具调用次数"
+TOOL_LATENCY = 0.3  # 每次查询模拟的网络延迟（秒）
+# 同时在途的工具调用数：peak 给对比表用（每个架构开始时清零），batch_peak 给 Plan-and-Execute 的每一批用。
+# 不需要锁：只有一个事件循环，下面 += / -= 这几行之间没有 await，不会被别的协程打断（第 06 课 §2.3 细讲）
+TOOL_STATS = {"in_flight": 0, "peak": 0, "batch_peak": 0}
+
+
+async def _call_weather_service() -> None:
+    """模拟一次网络请求：在途计数 +1，等 TOOL_LATENCY 秒，计数 -1。"""
+    TOOL_STATS["in_flight"] += 1
+    TOOL_STATS["peak"] = max(TOOL_STATS["peak"], TOOL_STATS["in_flight"])
+    TOOL_STATS["batch_peak"] = max(TOOL_STATS["batch_peak"], TOOL_STATS["in_flight"])
+    try:
+        await asyncio.sleep(TOOL_LATENCY)
+    finally:
+        TOOL_STATS["in_flight"] -= 1
 
 
 def _forecast(city: str, date: str) -> dict:
@@ -63,31 +82,33 @@ def _forecast(city: str, date: str) -> dict:
 
 
 @tool
-def get_weather(
+async def get_weather(
     city: Annotated[str, Field(description="城市中文名，如 北京")],
     date: Annotated[str, Field(description="日期，格式 MM-DD，如 10-15")],
 ) -> dict:
     """按城市查询某一天的天气预报：天气、气温、降水概率，以及气象预警（如果有）。"""
     TOOL_LOG.append(f"get_weather({city},{date})")
+    await _call_weather_service()
     if city in UNDER_MAINTENANCE:
         raise ToolError(f"{city}气象站接口维护中（503）。可以改用 get_weather_by_airport 按机场三字码查询，例如广州白云机场是 CAN。")
     return _forecast(city, date)
 
 
 @tool
-def get_weather_by_airport(
+async def get_weather_by_airport(
     airport_code: Annotated[str, Field(description="机场三字码，如 PEK、SHA、CAN")],
     date: Annotated[str, Field(description="日期，格式 MM-DD，如 10-15")],
 ) -> dict:
     """备用接口：按机场三字码查询机场所在城市某一天的天气预报（字段同 get_weather）。"""
     TOOL_LOG.append(f"get_weather_by_airport({airport_code},{date})")
+    await _call_weather_service()
     city = AIRPORTS.get(airport_code.strip().upper())
     if city is None:
         raise ToolError(f"不认识机场三字码 {airport_code}。支持：{', '.join(AIRPORTS)}")
     return {"机场": airport_code.upper(), **_forecast(city, date)}
 
 
-TOOLS = [get_weather, get_weather_by_airport]
+TOOLS = [get_weather, get_weather_by_airport]  # 两个都是只读工具（默认 risk="read"）
 
 
 # ====================================================================== 计量与打印
@@ -105,9 +126,9 @@ class Metered:
     def __init__(self, llm, meter: Meter):
         self.llm, self.meter, self.model = llm, meter, llm.model
 
-    def chat(self, messages, tools=None, **kwargs):
-        response = self.llm.chat(messages, tools, **kwargs)
-        self.meter.calls += 1
+    async def chat(self, messages, tools=None, **kwargs):
+        response = await self.llm.chat(messages, tools, **kwargs)
+        self.meter.calls += 1  # 这两行之间没有 await：单个事件循环里不会被别的协程打断，不需要锁
         self.meter.usage = self.meter.usage + response.usage
         return response
 
@@ -118,8 +139,8 @@ class Estimated:
     def __init__(self, llm):
         self.llm, self.model = llm, llm.model
 
-    def chat(self, messages, tools=None, **kwargs):
-        response = self.llm.chat(messages, tools, **kwargs)
+    async def chat(self, messages, tools=None, **kwargs):
+        response = await self.llm.chat(messages, tools, **kwargs)
         tool_tokens = estimate_tokens([{"content": json.dumps(tools, ensure_ascii=False)}]) if tools else 0
         response.usage = Usage(estimate_tokens(messages) + tool_tokens, estimate_tokens([response.to_message()]))
         return response
@@ -131,19 +152,24 @@ SUMMARY: list[dict] = []
 
 @contextmanager
 def measure(name: str, who_thinks: str, outputs: dict):
-    calls0, tokens0, tools0, t0 = METER.calls, METER.usage.total, len(TOOL_LOG), time.time()
+    calls0, tokens0, tools0, t0 = METER.calls, METER.usage.total, len(TOOL_LOG), time.perf_counter()
+    TOOL_STATS["peak"] = 0
     yield
     row = {
         "name": name,
         "who": who_thinks,
-        "seconds": time.time() - t0,
+        "seconds": time.perf_counter() - t0,
         "llm_calls": METER.calls - calls0,
         "tool_calls": len(TOOL_LOG) - tools0,
+        "tool_peak": TOOL_STATS["peak"],
         "tokens": METER.usage.total - tokens0,
         "output": outputs.get("text", ""),
     }
     SUMMARY.append(row)
-    print(f"\n  ⏱ 耗时 {row['seconds']:.1f}s ｜ 模型调用 {row['llm_calls']} 次 ｜ 工具调用 {row['tool_calls']} 次 ｜ tokens {row['tokens']}")
+    print(
+        f"\n  ⏱ 耗时 {row['seconds']:.1f}s ｜ 模型调用 {row['llm_calls']} 次 ｜ 工具调用 {row['tool_calls']} 次"
+        f"（同时在途峰值 {row['tool_peak']}）｜ tokens {row['tokens']}"
+    )
 
 
 def section(title: str) -> None:
@@ -224,13 +250,14 @@ REACT_PROMPT = (
 )
 
 
-def run_react(llm) -> None:
+async def run_react(llm) -> None:
     section("架构 1：ReAct —— 边想边做（agentkit.Agent 本身就是 ReAct）")
     note("每一步都回到模型：模型看到上一步的观察结果，再决定下一步。遇到意外（广州接口维护）时，下一步自然会绕过去。")
+    note("模型在同一步里请求多个只读工具时，Agent 会并发执行它们（同一轮全是只读工具才并发，有写操作就按顺序）。")
     outputs: dict = {}
     with measure("ReAct", "每一步都由模型决定", outputs):
         agent = Agent(llm, TOOLS, system_prompt=REACT_PROMPT, name="react", max_steps=8)
-        result = agent.run(TASK)
+        result = await agent.run(TASK)
         print("\n  执行轨迹：")
         show_trajectory(result.messages)
         print(f"\n  🤖 输出（status={result.status}）：")
@@ -266,17 +293,16 @@ PLANNER_PROMPT = """你是规划器。请把任务拆成一组工具调用步骤
 
 任务：{task}"""
 
-REPLANNER_PROMPT = """你是重规划器。按计划执行时，有一步失败了。
+REPLANNER_PROMPT = """你是重规划器。按计划执行时，有步骤失败了。
 任务：{task}
 已成功的步骤及结果：
 {done}
-失败的步骤：{failed}
-错误信息：{error}
-原计划中还没执行的步骤：{remaining}
+失败的步骤及错误信息：
+{failed}
 可用工具：
 {tools}
 
-请给出从现在起还需要执行的新步骤（替换失败的步骤和还没执行的步骤）。不要重复已成功的步骤，新步骤的 id 不能与已成功步骤的 id 相同。"""
+请给出从现在起还需要执行的新步骤（替换失败的步骤）。不要重复已成功的步骤，新步骤的 id 不能与已成功步骤的 id 相同。"""
 
 SOLVER_PROMPT = """任务：{task}
 
@@ -290,50 +316,68 @@ def fmt_step(s: PlanStep) -> str:
     return f"{s.id}: {s.tool}({','.join(s.args.values())})"
 
 
-def run_plan_execute(llm) -> None:
+async def run_plan_execute(llm) -> None:
     section("架构 2：Plan-and-Execute —— 先规划，再执行，失败才重规划")
     note("模型只在三个时刻思考：开头规划一次、某步失败时重规划、最后汇总一次。中间的执行全由代码完成，不经过模型。")
+    note("这份计划里的步骤互不依赖（参数都是字面值，没有引用别的步骤结果的写法），而且都是只读查询 → 整批并发执行。")
     outputs: dict = {}
     with measure("Plan-and-Execute", "开头规划 + 失败重规划 + 最后汇总", outputs):
         registry = ToolRegistry(TOOLS)
-        plan = complete_json(llm, PLANNER_PROMPT.format(tools=tools_doc(), task=TASK), Plan).steps
+        plan = (await complete_json(llm, PLANNER_PROMPT.format(tools=tools_doc(), task=TASK), Plan)).steps
         print("\n  📋 规划器给出的计划（1 次模型调用）：")
         for s in plan:
             print(f"    {fmt_step(s)}")
 
+        async def execute(step: PlanStep):
+            call = ToolCall(id=step.id, name=step.tool, arguments=json.dumps(step.args, ensure_ascii=False))
+            return await registry.execute(call)
+
         results: dict[str, str] = {}
-        remaining, replans = list(plan), 0
-        print("\n  ⚙️  执行（由代码逐步调用工具，不经过模型）：")
-        while remaining:
-            step = remaining.pop(0)
-            r = registry.execute(ToolCall(id=step.id, name=step.tool, arguments=json.dumps(step.args, ensure_ascii=False)))
-            if r.ok:
-                results[step.id] = r.content
-                print(f"    ✅ {fmt_step(step)}")
-                continue
-            print(f"    ❌ {fmt_step(step)} → {r.content[:60]}")
+        batch, replans = list(plan), 0
+        print("\n  ⚙️  执行（由代码调用工具，不经过模型；一批里的步骤同时发出）：")
+        while batch:
+            # 能整批并发的前提：步骤之间互不依赖，而且没有副作用。有写操作的计划必须按顺序执行（见本 Demo 最后一节）
+            assert all(registry.get(s.tool).risk == "read" for s in batch)
+            TOOL_STATS["batch_peak"], t0 = 0, time.perf_counter()
+            # registry.execute 把工具错误变成 ToolResult(ok=False) 而不是抛异常：一个城市查不到不会取消另外两个
+            outcomes = await parallel([lambda s=s: execute(s) for s in batch], max_concurrency=4)
+            elapsed = time.perf_counter() - t0
+            failed = []
+            for step, r in zip(batch, outcomes):
+                if r.ok:
+                    results[step.id] = r.content
+                    print(f"    ✅ {fmt_step(step)}")
+                else:
+                    failed.append((step, r))
+                    print(f"    ❌ {fmt_step(step)} → {r.content[:60]}")
+            print(
+                f"       这一批 {len(batch)} 步：同时在途峰值 {TOOL_STATS['batch_peak']}，"
+                f"用时 {elapsed:.2f}s（逐个执行至少要 {len(batch) * TOOL_LATENCY:.1f}s）"
+            )
+            if not failed:
+                break
             if replans >= MAX_REPLANS:
                 print(f"    🛑 已重规划 {replans} 次，达到上限，带着已有数据去汇总")
                 break
             replans += 1
-            new_plan = complete_json(
-                llm,
-                REPLANNER_PROMPT.format(
-                    task=TASK,
-                    done="\n".join(f"- {k}: {v}" for k, v in results.items()) or "（无）",
-                    failed=fmt_step(step),
-                    error=r.content,
-                    remaining="；".join(fmt_step(s) for s in remaining) or "（无）",
-                    tools=tools_doc(),
-                ),
-                Plan,
+            new_plan = (
+                await complete_json(
+                    llm,
+                    REPLANNER_PROMPT.format(
+                        task=TASK,
+                        done="\n".join(f"- {k}: {v}" for k, v in results.items()) or "（无）",
+                        failed="\n".join(f"- {fmt_step(s)} → {r.content}" for s, r in failed),
+                        tools=tools_doc(),
+                    ),
+                    Plan,
+                )
             ).steps
             # 简化处理：跳过与已成功步骤重名的步骤（练习 1 里你会把它当作非法计划，更严格）
-            remaining = [s for s in new_plan if s.id not in results]
-            print(f"    🔁 重规划（第 {replans} 次，1 次模型调用）→ " + "；".join(fmt_step(s) for s in remaining))
+            batch = [s for s in new_plan if s.id not in results]
+            print(f"    🔁 重规划（第 {replans} 次，1 次模型调用）→ " + "；".join(fmt_step(s) for s in batch))
 
         evidence = "\n".join(f"- {v}" for v in results.values())
-        answer = complete(llm, SOLVER_PROMPT.format(task=TASK, evidence=evidence))
+        answer = await complete(llm, SOLVER_PROMPT.format(task=TASK, evidence=evidence))
         print("\n  🤖 汇总输出（1 次模型调用）：")
         show_block(answer)
         outputs["text"] = answer
@@ -356,7 +400,7 @@ CRITIC_PROMPT = """你是严格的差旅审稿人。请对照工具返回的数�
 REVISE_PROMPT = "审稿意见：{feedback}\n请据此修改你上一版的出差建议。仍然遵守原来的格式要求，只输出修改后的完整建议。"
 
 
-def run_reflection(llm) -> None:
+async def run_reflection(llm) -> None:
     section("架构 3：Reflection —— 先写初稿，再挑错，再修改")
     note("生成者是一个 ReAct Agent；批评者手里有工具数据（外部依据），先用代码检查，代码查不出的再交给模型。")
     outputs: dict = {}
@@ -365,14 +409,14 @@ def run_reflection(llm) -> None:
         last: dict = {}
         log: list[str] = []
 
-        def generate(task: str, feedback: str | None) -> str:
+        async def generate(task: str, feedback: str | None) -> str:
             if feedback is None:
-                last["result"] = writer.run(task)
+                last["result"] = await writer.run(task)
             else:  # 带着完整历史继续对话：修改时仍然看得到之前的工具数据，也可以再调工具
-                last["result"] = writer.run(REVISE_PROMPT.format(feedback=feedback), history=last["result"].history)
+                last["result"] = await writer.run(REVISE_PROMPT.format(feedback=feedback), history=last["result"].history)
             return last["result"].output or ""
 
-        def evaluate(draft: str) -> Review:
+        async def evaluate(draft: str) -> Review:
             evidence = tool_evidence(last["result"].messages)
             lines = [ln for ln in draft.splitlines() if ln.strip()]
             problems = []  # 1) 代码检查：确定、免费，不会被说服
@@ -388,9 +432,9 @@ def run_reflection(llm) -> None:
                 return Review(passed=False, feedback="；".join(problems) + "。")
             log.append("模型检查")  # 2) 模型检查：对照数据核对事实和可执行性
             prompt = CRITIC_PROMPT.format(task=TASK, evidence="\n".join(f"- {e}" for e in evidence), draft=draft)
-            return complete_json(llm, prompt, Review)
+            return await complete_json(llm, prompt, Review)
 
-        final, reviews = evaluator_optimizer(generate, evaluate, TASK, max_rounds=3)
+        final, reviews = await evaluator_optimizer(generate, evaluate, TASK, max_rounds=3)
         verdicts = [
             f"    🔍 第 {i} 轮评审 · {who} → " + ("✅ 通过" if r.passed else f"❌ 退回：{r.feedback}")
             for i, (r, who) in enumerate(zip(reviews, log), 1)
@@ -402,6 +446,78 @@ def run_reflection(llm) -> None:
         show_block(final)
         outputs["text"] = final
     note("agentkit 的 evaluator_optimizer 不会发现\"同一条意见反复出现\"—— 那种情况继续改只会烧钱。练习 2 的 reflect_loop 会补上这一点。")
+
+
+# ====================================================================== 附：有写操作的计划为什么不能整批并发
+
+
+class Account:
+    """一个假的"订票 + 支付"系统，只用来记录副作用发生了没有。"""
+
+    def __init__(self):
+        self.bookings = {"B-OLD": "10-17 CZ3101 北京→广州"}
+        self.log: list[str] = []
+
+
+async def book_flight(acct: Account, flight: str) -> str:
+    """写操作：订新航班。慢（0.3s 后才返回），而且这一次会失败：航班售罄。"""
+    await asyncio.sleep(0.3)
+    raise RuntimeError(f"{flight} 已售罄")
+
+
+async def cancel_booking(acct: Account, booking: str) -> str:
+    """写操作：退掉旧航班。快（0.05s 就完成），退了就回不来。"""
+    await asyncio.sleep(0.05)
+    acct.log.append(f"已退订 {acct.bookings.pop(booking)}")
+    return "ok"
+
+
+async def refund(acct: Account, order: str) -> str:
+    """写操作：退款。请求先发出去，再等支付网关确认（0.3s）。"""
+    acct.log.append(f"退款请求已发给支付网关（订单 {order}）")
+    await asyncio.sleep(0.3)
+    acct.log.append("收到网关确认：已退款")
+    return "ok"
+
+
+async def send_sms(acct: Account, text: str) -> str:
+    """写操作：发短信。这一次短信服务 0.05s 后返回 500。"""
+    await asyncio.sleep(0.05)
+    raise RuntimeError("短信服务 500")
+
+
+async def run_side_effects_demo() -> None:
+    section("附：计划里有写操作时，为什么不能整批并发（纯代码演示，不调用模型）")
+    note("上面三个城市的查询互不依赖、没有副作用，所以可以同时发出。换成写操作，同样的并发会出事：")
+
+    print("\n  场景 1：改签 —— 计划是 s1 订新航班（book_flight），s2 退旧航班（cancel_booking）")
+    seq = Account()
+    try:
+        for step in (lambda: book_flight(seq, "CZ3105"), lambda: cancel_booking(seq, "B-OLD")):
+            await step()  # 按计划顺序：第一步失败就停下，第二步根本不会发生
+    except RuntimeError as e:
+        print(f"    按顺序执行：s1 失败（{e}）→ 停下。剩余订单：{list(seq.bookings) or '无'}")
+    par = Account()
+    try:
+        await parallel([lambda: book_flight(par, "CZ3105"), lambda: cancel_booking(par, "B-OLD")])
+    except RuntimeError as e:
+        print(f"    整批并发：s1 失败（{e}）时，s2 早已完成 → {par.log[0]}。剩余订单：{list(par.bookings) or '无'} ❌")
+    note("并发执行时，\"先订新的、成功了再退旧的\"这层顺序没了：用户现在一张票都没有。")
+
+    print("\n  场景 2：计划是 s1 退款（refund），s2 发短信通知（send_sms），两步并发执行")
+    acct = Account()
+    try:
+        await parallel([lambda: refund(acct, "A1001"), lambda: send_sms(acct, "退款已受理")])
+    except RuntimeError as e:
+        print(f"    s2 失败（{e}）→ parallel 立刻取消还在等响应的 s1")
+    for line in acct.log:
+        print(f"    · {line}")
+    print("    退款到底成功了没有？请求已经发出去了，确认没等到 —— 状态未知，只能靠幂等键 + 对账收拾 ❌")
+    note(
+        """"一个失败、其余立刻取消"对只读查询是好事（不在后台白花钱），对写操作是灾难：取消会落在半路。
+        规则和 Agent 主循环一样：全是只读步骤才并发；有写操作就按计划顺序逐个执行，写工具还要幂等（第 08 课）。
+        练习文件里已提供的 run_independent_steps 就是按这条规则写的：批里有写操作，一步都不执行，直接报错。"""
+    )
 
 
 # ====================================================================== 离线剧本
@@ -455,47 +571,61 @@ def offline_scripts() -> dict[str, list]:
 # ====================================================================== main
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--offline", action="store_true", help="使用 ScriptedLLM 剧本，不调用真实模型")
     args = parser.parse_args()
 
+    real = None
     if args.offline:
-        print("🧪 离线模式：ScriptedLLM 剧本（输出是预先写好的；调用次数和数据流与真实运行一致；token 按文本长度估算；耗时无参考意义）")
+        print(
+            "🧪 离线模式：ScriptedLLM 剧本（输出是预先写好的；调用次数和数据流与真实运行一致；token 按文本长度估算；"
+            f"模型调用不耗时，耗时只来自工具的模拟延迟 {TOOL_LATENCY}s）"
+        )
         scripts = offline_scripts()
         llms = {name: Metered(Estimated(ScriptedLLM(items)), METER) for name, items in scripts.items()}
     else:
-        real = Metered(default_llm(), METER)
+        real = default_llm()
         print(f"🌐 真实模型模式：{real.model}（如需离线运行，加 --offline）")
-        llms = dict.fromkeys(["react", "plan_execute", "reflection"], real)
+        llms = dict.fromkeys(["react", "plan_execute", "reflection"], Metered(real, METER))
 
-    print(f"\n📝 任务：{TASK}")
-    run_react(llms["react"])
-    run_plan_execute(llms["plan_execute"])
-    run_reflection(llms["reflection"])
+    try:
+        print(f"\n📝 任务：{TASK}")
+        await run_react(llms["react"])
+        await run_plan_execute(llms["plan_execute"])
+        await run_reflection(llms["reflection"])
+    finally:
+        if real is not None:
+            await real.aclose()
 
     section("对比：同一个任务，三种架构的价格和结果")
-    header = f"  {pad('架构', 18)}{pad('模型调用', 10)}{pad('工具调用', 10)}{pad('tokens', 9)}{pad('耗时', 8)}{pad('质量检查', 28)}模型在哪里思考"
+    header = (
+        f"  {pad('架构', 18)}{pad('模型调用', 10)}{pad('工具调用', 10)}{pad('工具峰值', 10)}{pad('tokens', 9)}"
+        f"{pad('耗时', 8)}{pad('质量检查', 28)}模型在哪里思考"
+    )
     print(header)
     for row in SUMMARY:
         check, _ = quality(row["output"])
         seconds = f"{row['seconds']:.1f}s"
         print(
             f"  {pad(row['name'], 18)}{pad(str(row['llm_calls']), 10)}{pad(str(row['tool_calls']), 10)}"
-            f"{pad(str(row['tokens']), 9)}{pad(seconds, 8)}{pad(check, 28)}{row['who']}"
+            f"{pad(str(row['tool_peak']), 10)}{pad(str(row['tokens']), 9)}{pad(seconds, 8)}{pad(check, 28)}{row['who']}"
         )
     note(
         """ReAct 最灵活：意外发生时，下一步自然就绕过去了；代价是每一步都要把越来越长的历史重新发给模型。
-        Plan-and-Execute 的执行阶段不经过模型：计划对了就又快又省，计划错了要靠重规划兜底（练习 1）。
+        Plan-and-Execute 的执行阶段不经过模型：计划对了就又快又省，互不依赖的只读步骤还能整批并发；计划错了要靠重规划兜底（练习 1）。
         Reflection 在任何架构之上再加一层"挑错 + 修改"：批评者手里有外部依据（工具数据、代码检查）时才真正有用（练习 2）。
+        工具峰值一栏是"同一时刻有几个工具调用在途"：3 说明三个城市的查询确实是同时发出的，不是一个接一个。
         质量检查一栏是用几行代码做的最小评估 —— 架构选型要靠这类数据说话，而不是靠感觉（第 11 课）。"""
     )
+
+    await run_side_effects_demo()
     print("\n  下一步：完成 exercise.py，然后运行 make lesson N=05")
 
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except RuntimeError as e:
         if "LLM_API_KEY" not in str(e):
             raise

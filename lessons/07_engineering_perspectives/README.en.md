@@ -1057,25 +1057,27 @@ Offline output, steps 2 and 3 (excerpt):
            ↳ trigger: can_send_external = True
 ```
 
-Live output (gpt-5.5, September 2026; the model's output can vary from run to run). With the English requirement, the model leaned cautious:
+Live output (gpt-5.5, measured 2026-09-28; the model's output varies from run to run — the previous run agreed on 29/32). With the English requirement, the model leaned cautious:
 
 ```text
-   Model and human labels agree on 29/32 facts.
+   Model and human labels agree on 28/32 facts.
    Disagreements (model → human):
      ✘ minors                  True → False
      ✘ sensitive_data          True → False
      ✘ third_party_tools       True → False
-   Because of these differences the checklist gains 9 and loses 0 items, e.g.:
+     ✘ long_term_memory        True → False
+   Because of these differences the checklist gains 11 and loses 0 items, e.g.:
      + access.scoped_tokens  Short-lived, narrowly scoped tokens downstream
+     + access.sensitive_access_log  Log every access to sensitive data
+     + context.memory_governance  Govern long-term memory writes, expiry and deletion
      + privacy.minors_data  Children's personal data
-     + privacy.sensitive_pi  Sensitive personal data: separate consent and impact assessment
 ```
 
-With the Chinese requirement (`--lang zh`), it erred the other way in our run: 31/32 facts agreed, but it judged `uses_rag` as False, and the checklist **lost** 6 items, including a P0 (pre-filtering retrieval by permission).
+With the Chinese requirement (`--lang zh`), the same day's run erred in both directions: 30/32 facts agreed; it judged `minors` as True (the cautious side) but `uses_rag` as False, so the checklist gained 2 items and **lost** 6, including a P0 (pre-filtering retrieval by permission).
 
 **What to look for:**
 
-1. **One fact, a whole group of checks.** One wrong fact removed six checks, one of them a P0; three over-cautious facts added nine. The "when unsure, pick the side with more checks" rule tilts mistakes toward the cheaper direction (extra work rather than missed risks), but it doesn't remove them — so a person must confirm the profile, and the rule engine must **raise** on a missing fact rather than treat it as False.
+1. **One fact, a whole group of checks.** Getting `uses_rag` wrong removed six checks, one of them a P0; four over-cautious facts added eleven. The "when unsure, pick the side with more checks" rule tilts most mistakes toward the cheaper direction (extra work rather than missed risks), but it doesn't remove them — `uses_rag` still went the costly way — so a person must confirm the profile, and the rule engine must **raise** on a missing fact rather than treat it as False.
 2. **What the ordering means.** Within P0, security comes first because it carries the highest weight for this project (outside users + lethal trifecta + untrusted content + outbound sending = 6).
 3. **The comparison table in step 4.** General checks are the same for every scenario; the differences come entirely from situational ones.
 4. **The gap check in step 5.** The first draft covers 7 of 20 dimensions, `capstone/DESIGN.md` covers 20 of 20 — but open the evidence: its hit for "Responsible AI & content safety" is the phrase "needs content review" in the threat-model table (about reviewing knowledge-base articles), not an actual output content policy. **The tool finds what isn't mentioned at all; judging the rest is a human's job.**

@@ -53,9 +53,9 @@ def _client(client_or_url: Any):
 class _Scripts:
     """注册 Lua 脚本，并在第一次使用时 SCRIPT LOAD 预热脚本缓存（构造函数里不能 await；加锁，只做一次）。
 
-    预热之后第一次调用就是 EVALSHA 命中，少一次往返。（实测 fakeredis 在很多连接同时走"EVALSHA 未命中 →
-    SCRIPT LOAD"路径时会断开连接，预热也顺便绕开了它。Redis 重启 / 主从切换后缓存会清空，那时 redis-py
-    会自动回退到 SCRIPT LOAD。）
+    预热之后第一次调用就是 EVALSHA 命中，少一次往返。（实测 fakeredis 2.38 + redis.asyncio：EVALSHA 未命中、
+    返回 NOSCRIPT 之后，服务端会断开这条连接，redis-py "先 SCRIPT LOAD 再重试"的自动回退走不通；预热也顺便绕开了它。
+    真 Redis 没有这个问题：重启 / 主从切换后脚本缓存清空时，redis-py 会自动回退到 SCRIPT LOAD。）
     """
 
     def __init__(self, client, *luas: str):

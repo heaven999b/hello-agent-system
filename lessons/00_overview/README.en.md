@@ -102,7 +102,7 @@ Some common cases where you shouldn't use one:
 | Observability | `print` debugging | Tracing: the inputs, outputs, latency, and tokens of every model and tool call | 10 |
 | Evaluation | Try a few questions by hand; "seems fine" | Eval set + rule-based/LLM grading + CI gates to prevent regressions | 11 |
 | Recoverability | Process restart = lost task | State saved at every step; resume from where it stopped after a crash or an approval wait | 08 |
-| Concurrency & scale | Single process, one request at a time | Multiple instances + task queue; concurrent writes to the same session don't overwrite each other; global rate limiting and backpressure | 13 |
+| Concurrency & scale | Single process, one request at a time | One process drives many sessions at once with async; multiple worker processes + a task queue (leases, fencing); concurrent writes to the same session don't overwrite each other; global rate limiting and backpressure | 02 / 12 / 13 |
 | Cost & latency | You find out from the bill at month's end; every request uses the most expensive model | Per-run tokens and spend are visible, cappable, and attributable; tiered model routing, caching | 08 / 14 |
 | Enterprise knowledge | Dump every document into one vector store | Retrieval filtered by user permissions, tenant isolation, stale-knowledge governance, verifiable citations | 15 |
 | Multi-tenancy | Single user | Identity propagated end to end; Company A's data never shows up in Company B's answers | 04 / 09 / 15 |
@@ -133,7 +133,7 @@ flowchart TB
     XCUT -.->|"spans every layer"| ORCH
 ```
 
-Lesson 12 puts these layers together into the full production architecture, and the **capstone** ([`capstone/`](../../capstone/README.en.md)) assembles them into a complete enterprise IT help-desk agent, **ITBuddy**. Part 3 (17–25) adds no new layers. Instead, it goes deeper on several of them (retrieval, memory, MCP and sandboxes, frameworks), adds the cross-cutting ML loop (data → evaluation → optimization), and ties the layers together in two applications: coding agents and proactive agents. Part 4 (26–31) doesn't add layers either. It swaps each layer's teaching implementation for mature industry components (Postgres, Redis, Temporal, OpenTelemetry, LiteLLM, Cedar), then adds an async runtime and a multi-worker reference service, so the same design can carry real multi-instance, high-concurrency production load.
+Lesson 12 puts these layers together into the full production architecture, and the **capstone** ([`capstone/`](../../capstone/README.en.md)) assembles them into a complete enterprise IT help-desk agent, **ITBuddy**. Part 3 (17–25) adds no new layers. Instead, it goes deeper on several of them (retrieval, memory, MCP and sandboxes, frameworks), adds the cross-cutting ML loop (data → evaluation → optimization), and ties the layers together in two applications: coding agents and proactive agents. Part 4 (26–31) doesn't add layers either. It swaps each layer's single-machine teaching implementation for mature industry components (Postgres, Redis, Temporal, OpenTelemetry, LiteLLM, Cedar), digs into cancellation, timeouts, and bulkheads under high concurrency, and load-tests and fault-injects a multi-worker reference service, so the same design can carry real multi-machine, high-concurrency production load.
 
 How the lessons map to architecture layers and agentkit modules:
 
@@ -151,7 +151,7 @@ How the lessons map to architecture layers and agentkit modules:
 | 2 | [10](../10_observability/README.en.md) | Observability | Cross-cutting | [`tracing.py`](../../agentkit/tracing.py), [`viewer.py`](../../agentkit/viewer.py) |
 | 2 | [11](../11_evals/README.en.md) | Eval-driven development | Cross-cutting | [`evals.py`](../../agentkit/evals.py) |
 | 2 | [12](../12_production_architecture/README.en.md) | Production architecture overview | All (including access) | Everything combined |
-| 2 | [13](../13_distributed_concurrency/README.en.md) | High concurrency and distributed execution | Execution and scaling | See the lesson |
+| 2 | [13](../13_distributed_concurrency/README.en.md) | High concurrency and distributed execution | Execution and scaling | [`distributed/`](../../agentkit/distributed/) (SQLite, multiple processes on one machine) |
 | 2 | [14](../14_cost_latency/README.en.md) | Cost and latency optimization | Model | See the lesson |
 | 2 | [15](../15_enterprise_rag/README.en.md) | Enterprise knowledge and permission-aware RAG | Context and knowledge | See the lesson |
 | 2 | [16](../16_release_ops/README.en.md) | Release, change, and operations | Cross-cutting | See the lesson |
@@ -169,7 +169,7 @@ How the lessons map to architecture layers and agentkit modules:
 | 4 | [27](../27_durable_workflows/README.en.md) | Durable workflows: running agents on Temporal | Orchestration, state | [`contrib/temporal.py`](../../agentkit/contrib/temporal.py) |
 | 4 | [28](../28_production_observability/README.en.md) | Production observability: OpenTelemetry, Prometheus, and LLM observability platforms | Cross-cutting | [`contrib/otel.py`](../../agentkit/contrib/otel.py) |
 | 4 | [29](../29_gateway_and_guardrails/README.en.md) | Model gateways, policy as code, and guardrail services | Model, guardrails | [`contrib/gateway.py`](../../agentkit/contrib/gateway.py), [`contrib/policy.py`](../../agentkit/contrib/policy.py), [`contrib/guards.py`](../../agentkit/contrib/guards.py) |
-| 4 | [30](../30_async_runtime/README.en.md) | Async runtime and high-concurrency serving | Orchestration, execution and scaling | [`aio/`](../../agentkit/aio/) |
+| 4 | [30](../30_async_runtime/README.en.md) | Async runtime and high-concurrency serving | Orchestration, execution and scaling | [`agent.py`](../../agentkit/agent.py), [`limits.py`](../../agentkit/limits.py), [`timeouts.py`](../../agentkit/timeouts.py) |
 | 4 | [31](../31_deployment_and_scaling/README.en.md) | Deployment and scaling: from one machine to a cluster | Access, execution and scaling | [`production/`](../../production/) |
 
 ### 1.6 The four parts of the course and the learning path
@@ -183,7 +183,7 @@ The course has four parts, and you study them differently:
 | Role | Core path | Core path | **Advanced, optional**: pick lessons as you need them after the core path and the capstone | **Advanced, optional**: study it when you need to actually deploy an agent and carry multi-instance, high-concurrency load |
 | Goal | **Learn how to build**: what each part of an agent is and how to implement it from scratch | **Learn how to choose**: when a real problem hits in an enterprise, what the options are, what each one costs, and which to pick | **Learn how to go deep**: bring key building blocks up to production grade, make the agent keep improving through data and evals, and see how frontier applications are put together | **Learn how to ship**: swap the teaching implementations for mature components behind the same interfaces, and prove they hold up with real concurrency, real processes, and failure injection |
 | Approach | Concept → build from scratch → exercise | Real problem → compare several solutions → where each fits → recommendation → code | Concept → build from scratch → exercise + trade-off comparison | Why the teaching version falls short → compare component options → how the adapter plugs in → operations and pitfalls → verify by measurement |
-| What you get | An agent core you wrote yourself and fully understand, plus a 20-dimension map of engineering perspectives | Judgment for architecture decisions (the most valuable thing in interviews and design reviews) | In-depth implementations of retrieval, memory, MCP, and sandboxes; hands-on skill with mainstream frameworks; a "data → evaluation → optimization" improvement loop; complete coding and proactive agents | An async runtime that runs hundreds of concurrent sessions; how to adopt and choose between Postgres, Redis, Temporal, OpenTelemetry, LiteLLM, and Cedar; a multi-worker reference service with load and failure-injection tests |
+| What you get | An agent core you wrote yourself and fully understand (async: one process serves many sessions at once), plus a 20-dimension map of engineering perspectives | Judgment for architecture decisions (the most valuable thing in interviews and design reviews) | In-depth implementations of retrieval, memory, MCP, and sandboxes; hands-on skill with mainstream frameworks; a "data → evaluation → optimization" improvement loop; complete coding and proactive agents | Cancellation, timeouts, and bulkheads in the async runtime under high concurrency; how to adopt and choose between Postgres, Redis, Temporal, OpenTelemetry, LiteLLM, and Cedar; a multi-worker reference service with load and failure-injection tests |
 
 Why split it this way? The hard part of enterprise agents is rarely "I don't know how to write the loop." It's problems like "state got overwritten when two windows sent messages at the same time," "the model API is rate-limiting us," or "retrieval surfaced another department's files." Most of these have no single right answer, only trade-offs among scale, consistency, cost, and team capability. That's why every Part 2 lesson is built from a set of "problem cards": each card presents a real scenario, compares several candidate solutions, and explains how to choose.
 
@@ -191,7 +191,7 @@ Lesson 07, "Engineering perspectives," closes Part 1 and is the bridge into Part
 
 Once you've finished the first two parts and the capstone, you can build and ship an enterprise agent. Part 3 is advanced material in three groups. **Building blocks in depth** (17 retrieval quality, 18 memory systems, 19 MCP and code sandboxes, 20 from agentkit to frameworks) goes deeper on parts that Part 1 covered lightly. **The ML loop** (21 data, 22 eval methodology, 23 optimization) answers "how do we keep making it better after launch?" **The application frontier** (24 coding agents, 25 proactive agents and the frontier) assembles every earlier layer into two kinds of frontier applications. Each lesson returns to Part 1's build-from-scratch rhythm and adds a comparison of the trade-offs in industry solutions.
 
-Part 4 answers a different question: **the teaching agentkit is synchronous, single-process, and keeps state in memory or local files — how do you turn it into a production system that runs as many instances and carries high concurrency?** The answer isn't to rewrite it yourself. You swap each layer for a mature component and keep the interfaces: Lesson 26 moves checkpoints, the job queue, idempotency, rate limits, and locks onto Postgres and Redis; 27 uses Temporal for durable execution; 28 wires tracing and metrics into OpenTelemetry and Prometheus; 29 brings in a model gateway, Cedar policies, and classifier guardrails; 30 builds an async runtime that runs hundreds of sessions concurrently in one process; and 31 assembles everything into an API + multi-worker reference service with load and failure-injection tests. Each lesson starts by stating the teaching version's limits honestly, compares 2–5 component options (build, open source, managed), and verifies the result with real processes and real concurrency. For the full gap list, see the [production readiness guide](../../docs/production-readiness.en.md).
+Part 4 answers a different question. The teaching agentkit has a single async core, in use from Lesson 02 on: one process drives many sessions at once. From Lessons 12 and 13 on, it really runs in multiple worker processes (`agentkit.distributed`: a leased job queue, fenced checkpoints, and cross-process idempotency and rate limiting on SQLite, with kill -9 for fault injection). But SQLite only works on one machine. **How do you turn it into a production system that runs on many machines and carries high concurrency?** The answer isn't to rewrite it yourself. You swap each layer for a mature component and keep the interfaces: Lesson 26 moves checkpoints, the job queue, idempotency, rate limits, and locks from SQLite onto Postgres and Redis; 27 uses Temporal for durable execution; 28 wires tracing and metrics into OpenTelemetry and Prometheus; 29 brings in a model gateway, Cedar policies, and classifier guardrails; 30 digs into cancellation, timeouts, and bulkheads in the async runtime under high concurrency; and 31 assembles everything into an API + multi-worker reference service with load and failure-injection tests. Each lesson starts by stating the teaching version's limits honestly, compares 2–5 component options (build, open source, managed), and verifies the result with real processes and real concurrency. For the full gap list, see the [production readiness guide](../../docs/production-readiness.en.md).
 
 ```mermaid
 flowchart LR
@@ -285,14 +285,14 @@ Agent(
 )
 ```
 
-The lessons that don't show up directly in this code: Lesson 05 explains which architecture this loop is (ReAct) and what the alternatives are; Lesson 06 covers orchestrating several model calls or agents together; Lesson 07 gives you 20 engineering dimensions for reviewing the whole system; Lesson 11 shows how to prove a change didn't break anything; Lesson 12 turns it into a deployed service; and Lessons 13–16 cover scale, cost, enterprise knowledge, and release and operations. The advanced Lessons 17–25 go deeper on retrieval, memory, MCP, and sandboxes, add the data, eval-methodology, and optimization loop, and take apart coding agents and proactive agents. Lessons 26–31 swap this code for an async runtime and mature components and deploy it as a service that runs as many instances under high concurrency.
+The lessons that don't show up directly in this code: Lesson 05 explains which architecture this loop is (ReAct) and what the alternatives are; Lesson 06 covers orchestrating several model calls or agents together; Lesson 07 gives you 20 engineering dimensions for reviewing the whole system; Lesson 11 shows how to prove a change didn't break anything; Lesson 12 turns it into a deployed service; and Lessons 13–16 cover scale, cost, enterprise knowledge, and release and operations. The advanced Lessons 17–25 go deeper on retrieval, memory, MCP, and sandboxes, add the data, eval-methodology, and optimization loop, and take apart coding agents and proactive agents. This code has been async since Lesson 02; Lessons 12 and 13 run it in multiple worker processes for real (`agentkit.distributed`), and Lessons 26–31 then swap the single-machine SQLite for mature components such as Postgres, Redis, and Temporal and deploy it as a service that runs on many machines under high concurrency.
 
-All of agentkit is just over 2,000 lines of Python (a large share of which are comments explaining the "why"). It depends only on `openai` and `pydantic`, and each file maps to one lesson. It's written for teaching but designed to production standards: every concept you learn here — the loop, hooks, checkpoints, guardrails, tracing — has a counterpart in mainstream frameworks such as LangGraph and the OpenAI Agents SDK (Lesson 20 implements the same task in agentkit and in three frameworks).
+agentkit's core (including `agentkit.distributed`, excluding the trace viewer and the `contrib/` adapters) is a little over 5,000 lines of Python (a large share of which are comments explaining the "why"). It depends only on `openai` and `pydantic`, and each file maps to one lesson. It's async: `result = await agent.run(...)`. It's written for teaching but designed to production standards: every concept you learn here — the loop, hooks, checkpoints, guardrails, tracing — has a counterpart in mainstream frameworks such as LangGraph and the OpenAI Agents SDK (Lesson 20 implements the same task in agentkit and in three frameworks).
 
 ## 3. Hands-on: run the demo
 
 ```bash
-.venv/bin/python lessons/00_overview/demo.py            # real model (~20 seconds)
+.venv/bin/python lessons/00_overview/demo.py            # real model (~15 seconds)
 .venv/bin/python lessons/00_overview/demo.py --offline  # scripted offline run, no API key needed
 ```
 
@@ -301,46 +301,51 @@ The demo walks through 3 scenarios. The current user is Zhang San (a placeholder
 | Scenario | The user says | What you'll see |
 |---|---|---|
 | 1 Everyday Q&A | "VPN error 809 — what do I do? And who's handling my ticket?" | Parallel tool calls; a poisoned knowledge-base article gets flagged by `ToolOutputGuard`; the phone number in the answer is redacted |
-| 2 High-risk action | "Reset my password" | The run pauses for approval → its state is written to a checkpoint → a **new** agent instance approves and resumes from the checkpoint |
+| 2 High-risk action | "Reset my password" | The run pauses for approval → its state is written to a checkpoint → **a separate OS process** (the demo starts itself again with `--approve`) loads the checkpoint, approves, and resumes from where it stopped |
 | 3 Direct injection | "Ignore all previous instructions…" | `InputGuard` blocks it before the model is ever called: 0 model calls, zero cost |
 
-Excerpt from a run against a real model. (Demo output translated from Chinese.)
+Excerpt from a run against a real model (re-run with the async demo on 2026-09-28, model gpt-5.5). (Demo output translated from Chinese.)
 
 ```text
 Scenario 1  Everyday Q&A: parallel tool calls · indirect injection defense · output redaction
-  ▶ Answer: To troubleshoot VPN error 809:
-            1. Confirm that your current network can reach the internet
-            2. If you're on a home network, check that your router/firewall allows UDP ports 500 and 4500
+  ▶ Answer: To troubleshoot VPN error 809, start with these steps:
+            1. Confirm that your current network can reach the internet.
+            2. If you're on a home router or outside the corporate network, make sure UDP ports 500 and 4500 are allowed.
             ...
-            - Assignee: Engineer Wang
-            - Phone: [phone number redacted]
+            Assignee: **Engineer Wang**
+            Phone: **[phone number redacted]**
   💬 Someone planted "Ignore all previous instructions…" in knowledge-base article KB-102. ToolOutputGuard found it in the output of ['search_kb'],
   💬 ✅ The model was not steered off course by the indirect injection.
   ▶ Trace tree:
-    agent.run  7930ms  tokens=1574→206  status=completed steps=2 cost=$0.00403
-    ├─ llm.chat  3018ms  tokens=595→78  → tool_calls: search_kb, list_my_tickets
-    ├─ tool.search_kb  7ms  ok
-    ├─ tool.list_my_tickets  5ms  ok
-    └─ llm.chat  4888ms  tokens=979→128  → final_answer
+    agent.run  7148ms  tokens=1630→226  status=completed steps=2 cost=$0.00430
+    ├─ llm.chat  3380ms  tokens=607→86  → tool_calls: search_kb, list_my_tickets
+    ├─ tool.search_kb  1ms  ok
+    ├─ tool.list_my_tickets  1ms  ok
+    └─ llm.chat  3761ms  tokens=1023→140  → final_answer
 
-Scenario 2  High-risk action: pause for human approval → process "restarts" → resume from checkpoint
-  ▶ status=paused  stop_reason=needs_approval  steps=1
+Scenario 2  High-risk action: pause for human approval → another process approves → resume from checkpoint
+  ▶ status=paused  stop_reason=needs_approval  steps=1  tokens=661  cost≈$0.00141
   💬 PermissionPolicy didn't execute it; it raised PauseRun instead. The run is paused and its full state has been written to a checkpoint:
-  💬   runs/00_overview/checkpoints/f6b305a2b2b4.json (3 messages)
-  ⏳ …Some time later, an approver clicks "Approve" in the approval system. The approval is handled by a different process (a new Agent instance):
-  ▶ status=completed  stop_reason=final_answer  steps=2
-  ▶ Answer: I've reset your domain account password. A temporary password has been sent to your work email and is valid for 30 minutes. Please change it right after you first sign in.
+  💬   runs/00_overview/checkpoints/b897b630454c.json (3 messages)
+  ⏳ …Some time later, an approver clicks "Approve" in the approval system. The approval is handled by a different process (current process pid=33724):
 
-Audit log (this run)
-  [tool_call] run=209da8836155 user=E100 tool=search_kb ok=True approved=None error=None
-  [tool_call] run=f6b305a2b2b4 user=E100 tool=reset_password ok=True approved=True error=None
-  [run_end]   run=897a0fc2a4af user=E100 status=stopped reason=blocked_input steps=0 tokens=0
+  [approval process pid=33919] Received approval: run_id=b897b630454c, approver IT lead M-331
+  ▶ status=completed  stop_reason=final_answer  steps=2  tokens=1400  cost≈$0.00266
+  ▶ Answer: I've reset your domain account password. A temporary password has been sent to your work email and is valid for 30 minutes; you must change it right after you first sign in.
+  💬 Approval process pid=33919 (exit code 0) and this process pid=33724 are two different OS processes;
+  💬   they share no memory, only the checkpoint directory on disk.
+  💬 The child loaded the state from the checkpoint by run_id, ran the approved tool call, and let the model continue; this process re-read the checkpoint: status=completed.
+
+Audit log (this run) — the record for security, compliance, and legal
+  [tool_call] run=31ff747f872e user=E100 tool=search_kb ok=True approved=None by=None error=None
+  [tool_call] run=b897b630454c user=E100 tool=reset_password ok=True approved=True by=M-331 error=None
+  [run_end]   run=47949a567a0a user=E100 status=stopped reason=blocked_input steps=0 tokens=0
 ```
 
 What to notice:
 
 1. **How many layers are at work behind one ordinary Q&A**: identity injection, untrusted-data tagging, redaction, budgets, auditing, tracing — all invisible to the user.
-2. **Pausing isn't blocking**: in scenario 2, the approval could be handled a day later on a different machine, because all the state lives in the checkpoint.
+2. **Pausing isn't blocking**: in scenario 2, the approval really is completed by another process (the two pids differ), and the only thing the two processes share is the checkpoint on disk. That's why the approval can happen a day later, after the service has restarted a few times; put the checkpoints in Postgres and the approval can be handled on a different machine (Lessons 13, 26).
 3. **The cheapest defense is the one at the front door**: the attack in scenario 3 never even reached the model. But regexes will always miss something; the real backstop is the permissions and approvals further down the stack.
 
 Run artifacts go to `runs/00_overview/` (ignored via `.gitignore`). Open `checkpoints/*.json` to see what the full state of a run looks like.
@@ -349,7 +354,7 @@ Run artifacts go to `runs/00_overview/` (ignored via `.gitignore`). Open `checkp
 
 This lesson has no coding exercise. Instead:
 
-1. **Quiz**: [`quiz.en.md`](quiz.en.md), 16 questions, with the answers collapsed under each one.
+1. **Quiz**: [`quiz.en.md`](quiz.en.md), 17 questions, with the answers collapsed under each one.
 2. **Tinker with the demo (optional, 5 minutes)**:
    - In `demo.py`, change `ME`'s roles to `["it_admin"]` and see how the "tools this user can see" change;
    - In scenario 2, change `approved=True` to `False` and see how the model answers the user once it receives an "approval denied" observation;

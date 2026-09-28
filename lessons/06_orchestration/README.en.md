@@ -29,13 +29,15 @@ That's exactly what Anthropic stresses again and again in *Building Effective Ag
 
 This lesson's demo runs each of the 5 patterns against a real model and measures its "price":
 
-| Pattern | Time | Model calls | Tokens | Who decides the flow |
-|---|---|---|---|---|
-| route (3 tickets) | 7.4s | 3 | 1,566 | Code (the model only classifies) |
-| parallel voting | 3.2s | 3 | 1,722 | Code |
-| orchestrator_workers | 19.1s | 5 | 2,859 | The model plans + code executes |
-| evaluator_optimizer | 8.5s | 3 | 1,417 | A code loop + the model generates / reviews |
-| agent_as_tool multi-agent | 26.6s | 7 | 5,082 | The model (the supervisor decides whom to delegate to) |
+| Pattern | Time | Model calls | Peak in flight | Tokens | Who decides the flow |
+|---|---|---|---|---|---|
+| route (3 tickets) | 6.2s | 3 | 1 | 1,566 | Code (the model only classifies) |
+| parallel voting | 3.4s | 3 | 3 | 1,706 | Code |
+| orchestrator_workers | 14.3s | 5 | 3 | 2,871 | The model plans + code executes |
+| evaluator_optimizer | 7.5s | 3 | 1 | 1,372 | A code loop + the model generates / reviews |
+| agent_as_tool multi-agent | 28.4s | 7 | 1 | 5,345 | The model (the supervisor decides whom to delegate to) |
+
+(Measured 2026-09-28 on a macOS laptop, calling gpt-5.5 through a local OpenAI-compatible gateway, single run; model latency swings by several seconds from run to run. "Peak in flight" is counted by the demo's meter: how many model calls were waiting for a reply at the same moment.)
 
 ## 1. Core concepts
 
@@ -82,11 +84,11 @@ HANDLERS[label]                             # KeyError!
 That's why nearly every step in an orchestration asks the model for **a data structure that code can validate**. agentkit's `complete_json` ([agentkit/workflows.py](../../agentkit/workflows.py)) is the foundation of every orchestration pattern:
 
 ```python
-def complete_json(llm, prompt, model_cls, system=None, max_repairs=2):
+async def complete_json(llm, prompt, model_cls, system=None, max_repairs=2):
     schema = json.dumps(model_cls.model_json_schema(), ensure_ascii=False)
     messages = [...]  # append the JSON Schema to the prompt and ask for "JSON only"
     for _ in range(max_repairs + 1):
-        text = llm.chat(messages).content or ""
+        text = (await llm.chat(messages)).content or ""  # while waiting for the model, the event loop serves other requests
         try:
             return model_cls.model_validate_json(extract_json(text))   # ① extract the JSON ② validate with Pydantic
         except (ValidationError, ValueError) as e:
@@ -127,9 +129,9 @@ flowchart LR
 ```
 
 ```python
-def chain(steps, text, gate=None):
+async def chain(steps, text, gate=None):        # each step is an async function (a model call underneath)
     for i, step in enumerate(steps):
-        text = step(text)
+        text = await step(text)
         if gate is not None and not gate(i, text):
             raise ValueError(f"The output of step {i + 1} failed the gate: {text[:200]}")
     return text
@@ -154,16 +156,16 @@ flowchart LR
 ```
 
 ```python
-def route(llm, text, routes: dict[str, str]) -> str:
+async def route(llm, text, routes: dict[str, str]) -> str:
     names = tuple(routes)
     Choice = create_model("RouteChoice", route=(Literal[names], ...), reason=(str, ""))
     options = "\n".join(f"- {k}: {v}" for k, v in routes.items())
-    result = complete_json(llm, f"Assign the request below to the best-fitting category.\n\nCategories:\n{options}\n\nRequest: {text}", Choice)
+    result = await complete_json(llm, f"Assign the request below to the best-fitting category.\n\nCategories:\n{options}\n\nRequest: {text}", Choice)
     return result.route
 ```
 
 - **Best for**: inputs that fall into clearly distinct categories that are better handled separately. Customer-support triage is the classic example. Another high-value use is **routing by difficulty to different models** — easy, common questions go to a small, cheap model, and hard ones go to a stronger model (Anthropic calls out this use specifically).
-- **Cost**: one extra classification call (7.4s in total for 3 tickets in the demo).
+- **Cost**: one extra classification call (6.2s in total for 3 tickets in the demo).
 - **The biggest risk is misrouting**: once a request lands in the wrong place, nothing downstream can save it. Enterprise practice:
   1. **Rules first**: anything keywords can settle ("refund," "invoice") is routed directly — zero cost, zero latency, explainable. Only the long tail the rules can't decide goes to the model. That's `hybrid_route` in Exercise 1;
   2. **Always have an other / fallback category**, so a model error or an unknown category degrades gracefully instead of crashing;
@@ -188,17 +190,73 @@ flowchart LR
 ```
 
 ```python
-def parallel(fns, max_workers=4):
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(lambda f: f(), fns))
+async def parallel(fns, max_concurrency=8):
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def one(fn):
+        async with sem:                                   # at most max_concurrency in flight: backpressure
+            return await fn()
+
+    tasks = [asyncio.ensure_future(one(f)) for f in fns]
+    try:
+        return list(await asyncio.gather(*tasks))         # results in input order
+    except BaseException:
+        for t in tasks:                                   # one failed (or the caller was cancelled): cancel the rest now, stop spending
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)   # wait until they've really stopped, then re-raise
+        raise
 ```
 
-- **Cost**: N × the calls, but **latency is set by the slowest branch, not the sum**. Measured in the demo: the three reviews take 8.1s sequentially and only 3.2s in parallel.
+`fns` are "functions that return a coroutine when called" (e.g. `lambda s=s: worker(s)`), not coroutines: a coroutine can only be awaited once, and this way it's created only after the semaphore is acquired. All the calls wait on the model at the same time on one event loop in one thread — no thread pool involved.
+
+- **Cost**: N × the calls, but **latency is set by the slowest branch, not the sum**. Measured in the demo: the three reviews took 1.9s, 3.0s and 3.4s; sequentially that's 8.3s, in parallel it took 3.4s, and the meter counted a peak of 3 calls in flight.
+- **Is the concurrency real? Measure it.** Real-model latency is too noisy, so the demo's "Pattern 2 appendix" fires 10 calls at a `ScriptedLLM(latency=0.2)` with controlled latency and reads ScriptedLLM's own in-flight peak, `max_in_flight`:
+
+  | `max_concurrency` | Peak in flight | Time | Theory |
+  |---|---|---|---|
+  | 1 | 1 | 2.02s | 10 waves × 0.2s |
+  | 4 | 4 | 0.61s | 3 waves × 0.2s |
+  | 10 | 10 | 0.20s | 1 wave × 0.2s |
+
+  The peak equals the cap exactly: the concurrency is real, and so is the cap. The in-flight peak is the deterministic evidence (how many calls were waiting at once); the timing is only corroboration.
+- **One fails, the rest are cancelled.** By default `asyncio.gather` just surfaces the first exception and lets the other tasks keep running — and keep spending. `parallel` catches the exception, cancels the remaining tasks, waits for them to really stop, and then re-raises. Measured in the demo: the security and performance branches each need 1.0s of model time, the third branch raises at 0.1s → `parallel` raises at 0.10s, both branches received `CancelledError`, zero calls are left in flight, and neither of the 2 calls that went out ever finished. The same cleanup happens when the caller itself is cancelled (the user disconnects).
+- **Shared state: why the meter needs no lock.** The demo counts calls and tokens in one global `Meter`, and the three reviewers update it at the same time. The old thread-based version needed a `threading.Lock`: a thread can be switched out between any two bytecodes, so a read-modify-write like `calls += 1` can be interrupted. Now every call runs on one event loop, and the event loop switches coroutines **only at an await** — so as long as there's no await between the read and the write, no other coroutine can get in:
+
+  ```python
+  async def chat(self, messages, tools=None, **kwargs):
+      m = self.meter
+      m.in_flight += 1                                   # ↓ no await between these two lines
+      m.max_in_flight = max(m.max_in_flight, m.in_flight)
+      try:
+          response = await self.llm.chat(messages, tools, **kwargs)   # the only await: other coroutines run while we wait for the model
+      finally:
+          m.in_flight -= 1
+      m.calls += 1                                       # ↓ no await here either: can't be interrupted
+      m.usage = m.usage + response.usage
+      return response
+  ```
+
+  The counterexample puts an await between the read and the write (measured in the demo's "Pattern 2 appendix", 1,000 coroutines each adding 1):
+
+  ```python
+  async def add_racy():
+      v = counter.value          # read
+      await asyncio.sleep(0)     # an await between read and write (say, awaiting an audit-log write or a Redis lookup)
+      counter.value = v + 1      # write: uses the value read before the await, overwriting everyone else's updates
+  ```
+
+  | How it's written | After 1,000 increments |
+  |---|---|
+  | No await inside the read-modify-write | 1000 |
+  | One await between the read and the write | **1** (999 updates lost) |
+  | Same await, but the whole block wrapped in `asyncio.Lock` | 1000 |
+
+  The rule: don't await inside a read-modify-write; if you must await in between (say, checking external state before writing), wrap the whole block in an `asyncio.Lock`. This holds only within one process's event loop: counters shared across worker processes need atomic database updates (Lesson 13).
 - **The aggregation rule is itself a business decision**. In the demo, the reviewers look at code with a SQL injection. In the offline script, the security perspective says REJECT and the other two say APPROVE — **so majority vote lets the vulnerability through**. Security and compliance checks should have **veto power**; Anthropic also notes that content moderation can use different vote thresholds to balance false positives and false negatives.
 - **No consensus? Admit you're not sure**: Exercise 2's `vote_with_quorum` returns an answer only when the winner's share of the votes reaches the quorum; otherwise it returns None. In the enterprise, None means escalate to a human.
 - **Production pitfalls**:
-  - **Concurrency amplifies rate limits**: one request fanning out into 5 parallel calls is more likely to hit 429s at peak; pair it with Lesson 08's rate limiting and retries;
-  - **What if one branch fails?** agentkit's `parallel` uses `pool.map`, so if any branch raises, the whole call fails. Production code usually tolerates partial failure (a failed branch counts as an abstention);
+  - **Concurrency amplifies rate limits**: one request fanning out into 5 parallel calls is more likely to hit 429s at peak; pair it with Lesson 08's rate limiting and retries; `max_concurrency` is the simplest form of backpressure;
+  - **What if one branch fails?** By default `parallel` cancels the rest when one fails (you won't get a complete result anyway). If you want to aggregate despite partial failure, have each branch do its own `try/except Exception` and return None — `parallel` never sees the exception, so it cancels nothing; None becomes an abstention for `vote_with_quorum` (the demo gets `['REJECT', 'REJECT', None]`). Catch only `Exception`: `CancelledError` must still propagate;
   - **Errors are correlated**: run the same model with the same prompt 5 times, and it tends to make the same mistake. Voting reduces random errors, not systematic bias — for truly different perspectives, vary the prompt, the model, or the information source.
 
 ### 2.4 Orchestrator-workers
@@ -218,20 +276,20 @@ flowchart LR
 ```
 
 ```python
-def orchestrator_workers(llm, task, worker, max_subtasks=5):
-    plan = complete_json(llm, f"Break the task below into at most {max_subtasks} independent subtasks that can run in parallel.\n\nTask: {task}", Plan)
+async def orchestrator_workers(llm, task, worker, max_subtasks=5):   # worker is an async function
+    plan = await complete_json(llm, f"Break the task below into at most {max_subtasks} independent subtasks that can run in parallel.\n\nTask: {task}", Plan)
     subtasks = plan.subtasks[:max_subtasks]                      # truncate again in code: don't trust the model to follow the rules
-    results = parallel([lambda s=s: worker(s) for s in subtasks])
+    results = await parallel([lambda s=s: worker(s) for s in subtasks])
     parts = "\n\n".join(f"### Subtask {i + 1}: {s}\n{r}" for i, (s, r) in enumerate(zip(subtasks, results)))
-    return complete(llm, f"Original task: {task}\n\nBelow are the results of each subtask. Combine them into one complete, coherent final answer without repetition:\n\n{parts}")
+    return await complete(llm, f"Original task: {task}\n\nBelow are the results of each subtask. Combine them into one complete, coherent final answer without repetition:\n\n{parts}")
 ```
 
 - **Best for**: complex tasks where you can't know in advance which subtasks are needed. Anthropic's examples: coding tasks that change multiple files; search tasks that gather and analyze information from multiple sources.
-- **Cost**: 1 (plan) + N (workers) + 1 (synthesis) calls; latency ≈ planning + the slowest worker + synthesis.
+- **Cost**: 1 (plan) + N (workers) + 1 (synthesis) calls; latency ≈ planning + the slowest worker + synthesis (the workers wait on the model at the same time: a peak of 3 in flight in the demo).
 - **Two limits you must set**:
   1. **Number of subtasks**: `max_subtasks` caps N, and code truncates again (`[:max_subtasks]`);
-  2. **Synthesis length**: we actually hit this one while running the demo. On the first run, the task said nothing about length, and the synthesis step wrote a "complete checklist handbook" of 255+ lines — **this one pattern took 64.3s and 5,586 tokens**. After we added "at most 8 items in the final list, one sentence each" to the task, it dropped to **19.1s and 2,859 tokens**. In a multi-step orchestration, any step without an output constraint can become a black hole for latency and cost.
-- **Plan quality is the bottleneck**: if the breakdown is wrong (overlapping subtasks, missing ones, or dependent subtasks run in parallel), flawless execution won't save it. In high-stakes scenarios, have a human review the plan before it runs.
+  2. **Synthesis length**: we actually hit this one while running the demo. When the task says nothing about length, the synthesis step writes a whole "complete checklist handbook." Re-measured on 2026-09-28: on the first run, the synthesis call alone exceeded the client's default 60-second timeout and the whole pattern failed; rerun with the timeout raised to 240 seconds, the synthesis came to 195 lines, and **this one pattern took 61.5s and 5,438 tokens**. With "at most 8 items in the final list, one sentence each" added to the task, it takes **14.3s and 2,871 tokens**. In a multi-step orchestration, any step without an output constraint can become a black hole for latency and cost — or simply time out.
+- **Plan quality is the bottleneck**: if the breakdown is wrong (overlapping subtasks, missing ones, or dependent subtasks run in parallel), flawless execution won't save it. The real run produced an example: the orchestrator's third subtask was "consolidate and deduplicate all the checklist items, compressing them to at most 8" — it depends on the first two subtasks' results, yet it ran at the same time as them as if it were independent (the worker had neither result in hand and could only make things up), and the final step then synthesized everything again. State in the planning prompt that "subtasks must be independent; the final step does the synthesis"; in high-stakes scenarios, have a human review the plan before it runs.
 
 ### 2.5 Evaluator-optimizer
 
@@ -247,11 +305,11 @@ flowchart LR
 ```
 
 ```python
-def evaluator_optimizer(generate, evaluate, task, max_rounds=3):
+async def evaluator_optimizer(generate, evaluate, task, max_rounds=3):   # generate / evaluate are async functions
     feedback, reviews, candidate = None, [], ""
     for _ in range(max_rounds):
-        candidate = generate(task, feedback)
-        review = evaluate(candidate)
+        candidate = await generate(task, feedback)
+        review = await evaluate(candidate)
         reviews.append(review)
         if review.passed:
             break
@@ -264,13 +322,13 @@ def evaluator_optimizer(generate, evaluate, task, max_rounds=3):
 - **The best evaluator is code**. In the demo, the slogan has two acceptance criteria: at most 15 characters, and it must convey the "long battery life" selling point. Code counts the characters (deterministic, free, and impossible to talk out of it); only once the length passes do we pay the model to judge the selling point. (Demo output translated from Chinese. The slogan itself stays in Chinese because the length check counts Chinese characters.)
 
   ```text
-  Round 1 · code check (17 chars) → ❌ Rejected: currently 17 chars, over the 15-char limit. Cut it to 15 chars or fewer and keep the core selling point…
-  Round 2 · model check (11 chars) → ✅ Passed
-  Final slogan: 「一充用30天，腕上更安心」 ("One charge lasts 30 days; peace of mind on your wrist")
+  Round 1 · code check (16 chars) → ❌ Rejected: currently 16 chars, over the 15-char limit. Cut it to 15 chars or fewer and keep the core selling point…
+  Round 2 · model check (9 chars) → ✅ Passed
+  Final slogan: 「一充30天，健康随行」 ("30 days on one charge, health by your side")
   ```
 
   The same goes for coding: running tests, type checkers, and linters is far more reliable than asking a model to "see if the code looks right."
-- **Feedback must be specific and actionable**: "make it better" sends the loop in circles; "17 characters now, cut it to 15 or fewer" converges.
+- **Feedback must be specific and actionable**: "make it better" sends the loop in circles; "16 characters now, cut it to 15 or fewer" converges.
 - **max_rounds is a mandatory brake**: the model may never get it right, or it may flip-flop between two versions. Hitting the limit needs a fallback, and you should track it as a metric worth watching.
 
 ### 2.6 Agents: handing the flow to the model (📖 Optional)
@@ -325,24 +383,26 @@ OpenAI's guide calls the first two the **Manager pattern** (agents as tools) and
 agentkit implements the first one ([agentkit/workflows.py](../../agentkit/workflows.py)):
 
 ```python
-def agent_as_tool(agent, name: str, description: str) -> Tool:
-    def delegate(
+def agent_as_tool(agent, name: str, description: str, timeout_s: float = 300.0) -> Tool:
+    async def delegate(
         task: Annotated[str, Field(description="The complete task for this specialist, including all necessary context")],
         ctx: ToolContext,
     ) -> str:
         meta = {"tenant_id": ctx.tenant_id, "user_id": ctx.user_id, "roles": list(ctx.roles), "parent_run": ctx.run_id}
-        result = agent.run(task, metadata=meta)
+        result = await agent.run(task, metadata=meta)
         if not result.ok:
             return f"Specialist {name} could not complete the task ({result.status}): {result.output}"
         return result.output or ""
-    return Tool(delegate, name=name, description=description)
+    # the specialist runs several model turns, so give it time; if the supervisor is cancelled, so is the specialist (async tools really can be cancelled)
+    return Tool(delegate, name=name, description=description, timeout_s=timeout_s)
 ```
 
-Three design choices worth noting:
+Four design choices worth noting:
 
 1. **The parameter description says "including all necessary context"**: the specialist never sees the user's original words — only the `task` the supervisor writes. The demo's supervisor prompt stresses this, so the supervisor wrote self-contained delegations such as "product category is earphones, delivered 2026-09-22, today is 2026-09-27, opened";
 2. **Identity propagation**: tenant_id / user_id / roles are passed to the specialist via `ctx`, and the specialist's tools (`get_order` in the demo) use them to verify who owns the order. Without propagation, either the specialist loses the user's identity or the model has to pass it — which is an open invitation to prompt injection;
 3. **Specialist failures don't raise**: they become a text observation handed back to the supervisor, which decides how to explain the failure to the user (Lesson 03's "errors as observations").
+4. **It's an async tool, so cancellation reaches inside**: the specialist's `agent.run` is awaited directly inside the supervisor's task. When the supervisor delegates to several specialists in one step (tools default to `risk="read"`), the agent runs them concurrently; when the supervisor is cancelled (the user disconnects, `run_timeout` expires), the cancellation travels all the way into the model call the specialist is waiting on. Measured in the demo's "Pattern 5 appendix": cancelling the supervisor while the specialist's model call is in flight, the supervisor's `run()` raises `CancelledError` 0.5 ms later, both checkpoints record `cancelled`, the specialist's second scripted call never happens and `get_order` never runs. `timeout_s=300` caps the whole delegation: a specialist runs several model turns, and the ordinary tool default of 30 seconds isn't enough.
 
 #### The costs of multi-agent
 
@@ -351,7 +411,7 @@ Three design choices worth noting:
 | **token × N** | Every agent has its own system prompt, tool definitions, and multi-turn loop | Anthropic's multi-agent research system: agents use about 4× the tokens of chat, and multi-agent systems about 15× |
 | **Fragmented context** | Specialists don't know the user's original words or other specialists' decisions, and make conflicting assumptions | Cognition's *Don't Build Multi-Agents*: two sub-agents built the Flappy Bird background and the bird separately, the styles didn't match, and the pieces couldn't be put together |
 | **Error propagation** | One specialist's wrong conclusion is treated as fact by the supervisor, which keeps reasoning from it | The more confident the downstream agent, the harder the error is to catch |
-| **Latency** | Dependent delegations have to run sequentially | Demo: the supervisor asks about the order first, then asks about the policy with the order facts in hand — 7 calls, 26.6s in total |
+| **Latency** | Dependent delegations have to run sequentially | Demo: the supervisor asks about the order first, then asks about the policy with the order facts in hand — 7 calls, 28.4s in total |
 | **Hard to debug** | One user request is scattered across multiple traces from multiple agents | Sub-agent traces must hang under the supervisor's trace; see §5.4 |
 
 Cognition's article distills the lesson into two principles: **share context — full agent traces, not just individual messages; and actions carry implicit decisions, so conflicting decisions lead to bad results.**
@@ -376,7 +436,7 @@ In one sentence: **multi-agent trades money for breadth. It's worth it only when
 - Traceability: every agent call for one user request should be visible in a single trace tree (in the demo, all three agents share one `Tracer`; see §5.4 and Lesson 10);
 - Cost attribution: the tokens on the supervisor's `agent.run` count only its own model calls; the full cost of the request has to add up the sub-agents' entire subtrees (the demo uses a shared meter for the total).
 
-When a multi-agent system has to serve many concurrent users and run across processes or even machines, distributed-systems problems show up: task queues, rate limiting, shared state, retrying failures. Lesson 13, [High concurrency and distributed execution](../13_distributed_concurrency/README.en.md), covers them.
+Within one process, the async agent can already drive hundreds or thousands of sessions at once (Lesson 02). Once a multi-agent system has to run across processes or even machines, distributed-systems problems show up: task queues, leases, rate limiting, shared state, retrying failures. Lesson 13, [High concurrency and distributed execution](../13_distributed_concurrency/README.en.md), covers them by really starting multiple worker processes with `agentkit.distributed` (a SQLite lease queue, fencing, and another process taking over after `kill -9`).
 
 ### 2.8 Decision tree
 
@@ -408,79 +468,113 @@ python lessons/06_orchestration/demo.py            # real model, about 1 minute
 python lessons/06_orchestration/demo.py --offline  # offline script, no API key needed
 ```
 
-Excerpt from a real-model run:
+Excerpt from a real-model run (gpt-5.5, 2026-09-28; the two "appendix" sections use ScriptedLLM and print the same thing in real and offline mode). The demo prints in Chinese; it's translated here for readability:
 
 ```text
 Pattern 2: parallel + voting — three perspectives review the same code at once
-  [security   ] REJECT  SQL injection risk   (2.0s)
-  [performance] REJECT  SELECT * with fetchall may be too expensive   (3.2s)
-  [readability] APPROVE Clear naming and structure, easy to read   (2.9s)
+  [security   ] REJECT  SQL injection risk   (1.9s)
+  [performance] REJECT  SELECT * with fetchall may use too much memory   (3.0s)
+  [readability] APPROVE Clear naming, simple and readable structure   (3.4s)
 
-  Sequential would take ~8.1s; parallel actually took 3.2s — latency is set by the slowest branch, not the sum.
+  Sequential would take ~8.3s; parallel actually took 3.4s, peak model calls in flight 3 — latency is set by the slowest branch, not the sum.
   Majority vote (majority_vote): REJECT
   Security veto (business rule): REJECT
 
+Pattern 2 appendix: did the concurrency really happen? What happens when one branch fails? (ScriptedLLM mechanism demo, no real model)
+  10 calls, max_concurrency=1  → peak in flight 1 , took 2.02s (theory: 10 waves × 0.2s = 2.0s)
+  10 calls, max_concurrency=4  → peak in flight 4 , took 0.61s (theory: 3 waves × 0.2s = 0.6s)
+  10 calls, max_concurrency=10 → peak in flight 10, took 0.20s (theory: 1 wave × 0.2s = 0.2s)
+
+  Three branches in parallel: the security and performance model calls take 1.0s each; the third branch raises at 0.1s.
+  parallel raised to the caller at 0.10s: the readability reviewer's prompt template failed to render
+    · security: cancelled (model call stopped midway; it won't keep running in the background)
+    · performance: cancelled (model call stopped midway; it won't keep running in the background)
+  Model calls in flight now: 0; 2 calls went out and none of them finished
+
+  Written differently — each branch handles its own failure, a failure = abstention None → ['REJECT', 'REJECT', None] (the other two finish normally)
+
+Pattern 2 appendix: why the meter needs no lock — and when updates get lost
+  1000 coroutines each add 1:
+    no await inside the read-modify-write → 1000
+    one await between read and write      → 1 (999 updates lost) ❌
+    same await, but with asyncio.Lock     → 1000
+
 Pattern 5: agent_as_tool multi-agent — supervisor + order specialist + policy specialist
-    → ask_order_expert(task='Look up the after-sales facts for order A1001: product category/name, delivery date, whether it has been opened or used. …')
+    → ask_order_expert(task='Look up the after-sales facts for order A1001: product category/name, delivery date, whether it has been opened. The user asks whether it can still be returned today, 2026-09-27.')
       ← - Delivery date: 2026-09-22
-      ← - Opened or used: opened
+      ← - Opened: yes
     → ask_policy_expert(task='Based on the after-sales policy, decide: product category is earphones, delivered 2026-09-22, today is 2026-09-27, opened. …')
-      ← Per the after-sales policy: if these are in-ear earphones or a similar personal-contact item and they have been opened, no-questions-asked returns are not supported.
+      ← 2. **Personal-contact items**:
+      ←    "In-ear earphones and other personal-contact items cannot be returned without a reason once opened, for hygiene reasons."
   🤖 Final answer (status=completed):
-    │ It's been 5 days since delivery, which is within the 7-day no-questions-asked return window, but in-ear earphones are personal-contact items and can't be returned without a reason once opened, for hygiene reasons.
+    │ Order A1001 is a pair of in-ear noise-cancelling earphones, delivered 2026-09-22 and opened.
+    │ Today, 2026-09-27, is still within 7 days, but in-ear earphones are personal-contact items and can't be returned without a reason once opened.
     │ If there's a performance defect, you can request a return or exchange within 15 days of delivery with an inspection report.
 
   Full trace of one request (every step of each specialist agent is nested under the supervisor's matching tool span):
-    agent.run  23701ms  tokens=2403→282  status=completed steps=3 cost=$0.00582
-    ├─ llm.chat  3095ms  tokens=578→114  → tool_calls: ask_order_expert
-    ├─ tool.ask_order_expert  4059ms  ok
-    │  └─ agent.run  4058ms  tokens=999→79  status=completed steps=2 cost=$0.00204
-    │     ├─ llm.chat  1488ms  tokens=461→21  → tool_calls: get_order
-    │     ├─ tool.get_order  1ms  ok
-    │     └─ llm.chat  2568ms  tokens=538→58  → final_answer
-    ├─ llm.chat  4136ms  tokens=714→73  → tool_calls: ask_policy_expert
-    ├─ tool.ask_policy_expert  9259ms  ok
-    │  └─ agent.run  9251ms  tokens=1044→360  status=completed steps=2 cost=$0.00490
-    │     ├─ llm.chat  1979ms  tokens=458→45  → tool_calls: search_policy
-    │     ├─ tool.search_policy  1ms  ok
-    │     └─ llm.chat  7265ms  tokens=586→315  → final_answer
-    └─ llm.chat  3145ms  tokens=1111→95  → final_answer
+    agent.run  28419ms  tokens=2393→283  status=completed steps=3 cost=$0.00582
+    ├─ llm.chat  3688ms  tokens=578→105  → tool_calls: ask_order_expert
+    ├─ tool.ask_order_expert  5454ms  ok
+    │  └─ agent.run  5453ms  tokens=991→75  status=completed steps=2 cost=$0.00199
+    │     ├─ llm.chat  1460ms  tokens=457→21  → tool_calls: get_order
+    │     ├─ tool.get_order  0ms  ok
+    │     └─ llm.chat  3991ms  tokens=534→54  → final_answer
+    ├─ llm.chat  2706ms  tokens=706→83  → tool_calls: ask_policy_expert
+    ├─ tool.ask_policy_expert  12880ms  ok
+    │  └─ agent.run  12879ms  tokens=1063→540  status=completed steps=2 cost=$0.00673
+    │     ├─ llm.chat  2324ms  tokens=468→47  → tool_calls: search_policy
+    │     ├─ tool.search_policy  0ms  ok
+    │     └─ llm.chat  10553ms  tokens=595→493  → final_answer
+    └─ llm.chat  3689ms  tokens=1109→95  → final_answer
 
-  ⏱ Time 23.7s | model calls: 7 | tokens 5167
+  ⏱ Time 28.4s | model calls: 7 (peak in flight 1) | tokens 5345
+
+Pattern 5 appendix: cancel the supervisor and the specialist stops too (ScriptedLLM mechanism demo, no real model)
+  Specialist model calls in flight: 1 → the user disconnects; cancel the supervisor's run (task.cancel())
+  0.5ms later, the supervisor's run() raises CancelledError (the cancellation propagates; nothing swallowed it)
+    · order specialist: status=cancelled, stop_reason=cancelled
+    · supervisor: status=cancelled, stop_reason=cancelled
+  Specialist model calls in flight now: 0; it was called 1 time in total — the second scripted call never happened, and get_order never ran
 ```
 
 **What to look for:**
 
-1. The comparison table at the end: from routing to multi-agent, calls and tokens climb all the way up;
-2. The sequential-vs-parallel timing in the parallel pattern. Offline mode deterministically reproduces the "majority vote lets the SQL injection through" case — compare it with the real run and think about how the voting rule should be set;
-3. Whether each evaluator-optimizer round is a "code check" or a "model check," and why round 1 was rejected without spending a cent;
-4. Multi-agent delegation is **sequential**: the supervisor needs the order facts before it can write a self-contained task for the policy specialist. The trace tree shows each specialist running 2 steps of its own; the policy specialist's final answer is 315 tokens long and is the slowest step in the whole request. Also compare: the tokens shown on the supervisor's `agent.run` (2403→282) are only its own — the whole request actually used 5167;
-5. Try changing it: delete "最终不超过 8 条" ("at most 8 items in the final list") from `ORCH_TASK` and rerun it to see what happens to the synthesis step's time and tokens.
+1. The comparison table at the end: from routing to multi-agent, calls and tokens climb all the way up. In the "peak in flight" column, only parallel and orchestrator_workers have workers waiting on the model at the same time;
+2. The sequential-vs-parallel timing in the parallel pattern, and the in-flight peak of 3. Offline mode deterministically reproduces the "majority vote lets the SQL injection through" case — compare it with the real run and think about how the voting rule should be set;
+3. The two sets of numbers in the "Pattern 2 appendix": the in-flight peak equals `max_concurrency` exactly; when one branch fails the other two are cancelled and in-flight calls drop to zero, whereas branches that handle their own failures return a complete result with an abstention;
+4. The meter needs no lock, but put one await between a read and its write and 1,000 updates shrink to 1;
+5. Whether each evaluator-optimizer round is a "code check" or a "model check," and why round 1 was rejected without spending a cent;
+6. Multi-agent delegation is **sequential**: the supervisor needs the order facts before it can write a self-contained task for the policy specialist. The trace tree shows each specialist running 2 steps of its own; the policy specialist's final answer is 493 tokens long, took 10.6s, and is the slowest step in the whole request. Also compare: the tokens shown on the supervisor's `agent.run` (2393→283) are only its own — the whole request actually used 5345;
+7. "Pattern 5 appendix": the specialist finishes first, then the supervisor — cancellation starts at the innermost pending model call and propagates outward layer by layer;
+8. Try changing it: delete "最终不超过 8 条" ("at most 8 items in the final list") from `ORCH_TASK` and rerun it to see what happens to the synthesis step's time and tokens (§2.4 has our re-measured result: the first attempt simply timed out).
 
 ## 4. Exercises
 
-Open [`exercise.py`](exercise.py) and implement the three most common pieces of orchestration "glue code." The model is abstracted as a plain function, so the tests are fully offline and deterministic:
+Open [`exercise.py`](exercise.py) and implement the three most common pieces of orchestration "glue code." The model is abstracted as an injected async function, so the tests are fully offline and deterministic. Whether a function must be `async def` depends on whether it awaits the model: `hybrid_route` and `run_with_gates` do (they call the model / async steps); `vote_with_quorum` doesn't (it only counts answers already in hand — pure computation).
 
-**Task 1: `hybrid_route(text, rules, llm_route, default="other") -> (category, source)`**
+**Task 1: `async def hybrid_route(text, rules, llm_route, default="other") -> (category, source)`**
 - Keyword rules come first (substring match, case-insensitive); if several categories match, take the first in rules order; when a rule matches, **don't call** the model;
-- Call `llm_route` only if no rule matches; strip whitespace from its output and ignore case before matching it against the known categories;
-- If the model raises, returns an unknown category, or returns a non-string → `(default, "default")`; empty keywords must be ignored.
+- `await llm_route(text)` only if no rule matches; strip whitespace from its output and ignore case before matching it against the known categories;
+- If the model raises, returns an unknown category, or returns a non-string → `(default, "default")`; empty keywords must be ignored;
+- Catch only `Exception`: the `CancelledError` raised when the caller cancels the request must propagate unchanged, never degrade to the default (there's a test for this).
 
 **Task 2: `vote_with_quorum(answers, quorum) -> str | None`**
 - Normalize (strip leading and trailing whitespace, ignore case) before counting; return the winning answer as it was written at its first occurrence;
 - None / blank answers are abstentions: they count toward the total but can't win; return None on a tie for first place or if the winner's share doesn't reach the quorum;
 - Raise `ValueError` if quorum isn't in (0, 1]; watch out for the floating-point edge case of "exactly equal."
 
-**Task 3: `run_with_gates(steps, text, gates) -> GateResult`**
+**Task 3: `async def run_with_gates(steps, text, gates) -> GateResult`**
+- Each step is an async function (`await fn(current)`); gate functions are plain functions;
 - Configuration errors (duplicate step names, a gate pointing at a step that doesn't exist) raise `ValueError` before anything runs;
-- Runtime errors (a step raises, a gate fails, a gate function itself raises) return structured failure info and never propagate; a gate function that errors counts as a failed check (fail closed).
+- Runtime errors (a step raises, a gate fails, a gate function itself raises) return structured failure info and never propagate; a gate function that errors counts as a failed check (fail closed);
+- "Never propagate" applies to `Exception` only: cancellation still propagates, and no later step runs (there's a test for this).
 
 All three tasks rest on the same enterprise principles: **determinism over the model, a fallback for every failure, escalate to a human when unsure, fail loudly on configuration errors, and return runtime errors as structured data**.
 
 Verify:
 
 ```bash
-make lesson N=06                     # done when everything passes (20 tests)
+make lesson N=06                     # done when everything passes (22 tests)
 AGENTKIT_SOLUTION=1 make lesson N=06 # run against the reference solution to confirm the tests themselves are correct
 ```
 
@@ -488,7 +582,7 @@ AGENTKIT_SOLUTION=1 make lesson N=06 # run against the reference solution to con
 
 ### 5.1 Framework or hand-rolled?
 
-Anthropic's advice is to start by using the LLM API directly: many patterns take only a few lines of code (this lesson's `workflows.py` is under 200 lines). If you do use a framework, make sure you understand what it does under the hood — framework abstractions can obscure the underlying prompts and responses, which makes debugging harder, and they make it tempting to add complexity you don't need. When orchestration gets complex (dozens of nodes, branches, loops, human steps, a need for visualization), graph orchestration frameworks such as LangGraph, which express the flow as an explicit state graph, earn their keep. The test: does the framework help you **see** the flow, or does it **hide** it?
+Anthropic's advice is to start by using the LLM API directly: many patterns take only a few lines of code (this lesson's `workflows.py` is about 200 lines). If you do use a framework, make sure you understand what it does under the hood — framework abstractions can obscure the underlying prompts and responses, which makes debugging harder, and they make it tempting to add complexity you don't need. When orchestration gets complex (dozens of nodes, branches, loops, human steps, a need for visualization), graph orchestration frameworks such as LangGraph, which express the flow as an explicit state graph, earn their keep. The test: does the framework help you **see** the flow, or does it **hide** it?
 
 ### 5.2 Long flows need durable execution
 
@@ -504,16 +598,16 @@ Say an orchestration runs for 10 minutes and waits 2 hours for human approval in
 Ideally, one user request lives in one trace tree: `supervisor agent.run → tool.ask_order_expert → specialist agent.run → llm.chat / tool.get_order` (the demo output in §3 looks exactly like this). Getting there takes two conditions, and you need both:
 
 1. **Share one Tracer**: agentkit's `Tracer` uses a `ContextVar` to track the current span, and each Tracer has its own. If the three agents each use their own Tracer, each one starts a new tree.
-2. **The current span must cross threads**: `ToolRegistry.execute` runs tools in a thread pool (to enforce timeouts), and Python's `ThreadPoolExecutor` does **not** carry the caller's contextvars into worker threads by default. agentkit wraps each submission in `contextvars.copy_context().run` (see [agentkit/tools.py](../../agentkit/tools.py)), which is how the specialist's `agent.run` finds its parent span.
+2. **The specialist must see the supervisor's current span while it runs**: the current span lives in a `ContextVar`. `agent_as_tool` produces an async tool, so the specialist's `agent.run` is awaited directly inside the supervisor's task and the ContextVar is simply visible; when the supervisor runs several tools concurrently in one step, each tool runs in its own task, and asyncio copies the current context when it creates a task, so they see it too. Synchronous tools run in a thread pool, and threads do **not** inherit the caller's contextvars by default; agentkit wraps each submission in `contextvars.copy_context().run` (see [agentkit/tools.py](../../agentkit/tools.py)).
 
-Condition 2 is a real bug we hit while writing this lesson. The first implementation had no `copy_context`, so even with a shared Tracer, each specialist's trace became a new root with a new trace_id. When investigating "why was this request slow?" in production, you'd see three unrelated traces and have to guess from timestamps how they fit together. Check for this in any code that does its work in thread pools, coroutines, or callbacks. Across processes and services (say, a specialist agent deployed as a separate service), you need to propagate the trace context explicitly in request headers, as OpenTelemetry does; Lesson 10 goes deeper.
+Condition 2 is a real bug we hit while writing this lesson. The first implementation (back when every tool ran in a thread pool) had no `copy_context`, so even with a shared Tracer, each specialist's trace became a new root with a new trace_id. When investigating "why was this request slow?" in production, you'd see three unrelated traces and have to guess from timestamps how they fit together. Check for this in any code that does its work in thread pools, new tasks, or callbacks (`asyncio.create_task` copies the context; `loop.run_in_executor` does not). Across processes and services (say, a specialist agent deployed as a separate service, or a delegation that becomes a job on a queue), contextvars can't follow, so the trace context has to travel explicitly in request headers or the job payload: Lesson 28's `agentkit.contrib.otel` provides `inject_context` / `continue_trace`, which propagate it in W3C `traceparent` format across queues and processes ([Lesson 28 §2.4](../28_production_observability/README.en.md#24-propagation-across-queues-inject_context--continue_trace)); Lesson 10 covers the concepts.
 
 ### 5.5 Partial failure in parallel
 
-`parallel` is built on `pool.map`: if any branch raises, you lose the entire result, and the money spent on the branches that succeeded is wasted. Common production approaches:
+`parallel`'s default semantics are "one fails, cancel the rest": the unfinished branches stop spending money, but you also lose the results of the branches that already finished. Common production approaches:
 
-- Wrap each branch in its own try/except and return None on failure (an abstention in a vote, which plugs straight into `vote_with_quorum`);
-- Give each branch a timeout, so one slow branch can't hold up the rest;
+- Wrap each branch in its own `try/except Exception` and return None on failure (an abstention in a vote, which plugs straight into `vote_with_quorum`) — `parallel` never sees an exception, so it cancels nothing (the third output of the demo's "Pattern 2 appendix"); catch only `Exception` so `CancelledError` still propagates;
+- Give each branch a timeout, so one slow branch can't hold up the rest. Use `agentkit.wait_for`, not `asyncio.wait_for`: before Python 3.12, the latter swallows the cancellation when "just finished" and "cancelled" happen at the same time (see [agentkit/timeouts.py](../../agentkit/timeouts.py) for why);
 - Set a minimum success count (e.g. at least 3 of 5 branches must succeed before aggregating); otherwise fail the whole thing or escalate to a human.
 
 ### 5.6 What to pass between agents: summaries or everything
@@ -572,7 +666,11 @@ His alternative is **one** strong general-purpose model with the tools merged in
 | Routing without an other / fallback category | The whole request fails when the model outputs an unknown category or errors | Rules first, model as fallback, graceful degradation on failure (Exercise 1) |
 | Using majority vote for security checks | The vulnerability gets through when most perspectives see "no problem" | Veto power for security and compliance; escalate to a human when there's no consensus (Exercise 2) |
 | Assuming voting eliminates all errors | Systematic errors from the same model and prompt remain | Vary the prompt / model / information source to get truly independent perspectives |
-| No cap on subtasks or synthesis length in orchestrator-workers | Runaway cost; the synthesis runs to hundreds of lines (64s in the demo) | `max_subtasks` + truncation in code + output length constraints |
+| No cap on subtasks or synthesis length in orchestrator-workers | Runaway cost; the synthesis runs to hundreds of lines (re-measured in the demo: 61.5s, and the first attempt timed out) | `max_subtasks` + truncation in code + output length constraints |
+| The orchestrator produces a "subtask" that depends on other subtasks | The worker lacks the results it depends on and can only make things up (the real demo run produced "consolidate and deduplicate all the checklist items") | State in the planning prompt that subtasks are independent and the final step does the synthesis; have a human review plans in high-stakes cases |
+| Fan-out without a concurrency cap | One request fans out into dozens of calls that hit the gateway at once and trigger 429s | `parallel(..., max_concurrency=N)` (demo: the in-flight peak equals the cap exactly) |
+| An await between reading and writing shared state | Lost updates (demo: 1,000 coroutines each add 1, the result is 1) | No await inside a read-modify-write; if you must await, use `asyncio.Lock`; across processes, use atomic database updates |
+| `except BaseException` / a bare `except` that swallows cancellation | The user disconnected, but the orchestration keeps running and spending in the background | Catch only `Exception`; let `CancelledError` propagate (Exercises 1 and 3 each have a cancellation test) |
 | No round limit or vague feedback in evaluator-optimizer | Infinite loops, going in circles | Specific, actionable feedback; code checks first; max_rounds as a backstop |
 | Raising immediately when a prompt chain's gate fails | A 500 error, and the completed intermediate results are lost | Return structured failure info (Exercise 3) |
 | A misspelled gate name that's silently ignored | A security check is quietly skipped | Fail loudly on configuration errors at startup |
@@ -662,6 +760,15 @@ His alternative is **one** strong general-purpose model with the tools merged in
 - At the same time, run a single-agent baseline on the same eval set. The MAST paper opens by pointing out that multi-agent gains over simple baselines are often small; if a single agent does about as well or better, switch back (Neubig's point). Multi-agent clearly pays off only in cases like permission isolation, agents acting for different people, or heavily parallel work.
 </details>
 
+<details>
+<summary>Q10: In an asyncio program, several coroutines update the same counter. Do you need a lock?</summary>
+
+- It depends on whether there's an await between the read and the write: the event loop switches coroutines only at an await. `x += 1`, or awaiting the model's result first and then updating the stats — these read-modify-writes have no await inside, can't be interrupted, and need no lock;
+- With an await between the read and the write (read the balance, await a risk check, write it back), updates get lost: another coroutine changes the value while you wait, and you write back a stale one (this lesson's demo: 1,000 updates shrink to 1). Either reorder it to "await first, then read-modify-write in one go," or wrap the whole block in an `asyncio.Lock`;
+- Threads are different: a thread can be switched out between any two bytecodes, so even `+=` isn't safe — which is why the old thread-based version needed a `threading.Lock`;
+- All of this holds only within one process: state shared across worker processes needs atomic database updates, version-checked conditional updates, or a distributed lock (Lesson 13).
+</details>
+
 ## 8. Self-check
 
 - [ ] I can explain the difference between a workflow and an agent in one sentence, and draw the complexity ladder
@@ -674,6 +781,8 @@ His alternative is **one** strong general-purpose model with the tools merged in
 - [ ] I can name at least four costs of multi-agent systems, and say when they're worth it
 - [ ] I can name MAST's three failure categories and give one detection method and one mitigation for each
 - [ ] I can use the decision tree to pick an orchestration approach for a new requirement, and answer "why isn't the previous rung enough?"
+- [ ] I can prove that parallelism really happened using the in-flight peak (not just timing), and say what `parallel` does when one branch fails and how to make it tolerate partial failure
+- [ ] I can explain why "no await inside a read-modify-write" means no lock is needed on a single event loop, and write a counterexample that loses updates
 - [ ] I've finished the exercises, and `make lesson N=06` passes
 
 ## Further reading

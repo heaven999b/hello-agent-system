@@ -55,13 +55,13 @@ flowchart TD
     J -->|"Yes"| V{"Passes schema validation?"}
     V -->|"No"| OBS
     V -->|"Yes"| C["Inject trusted ctx identity"]
-    C --> R["Execute with a timeout"]
+    C --> R["Execute with a timeout<br/>async tools awaited directly, sync tools in a thread pool"]
     R -->|"ToolError / exception / timeout"| OBS
     R -->|"Success"| T["Serialize + truncate"]
     T --> OK["Result observation fed back to the model"]
 ```
 
-Every call goes through [`ToolRegistry.execute()`](../../agentkit/tools.py), the **single chokepoint**. Validation, identity injection, timeouts, truncation, and idempotency all happen here; the tool functions themselves contain only business logic.
+Every call goes through [`await ToolRegistry.execute()`](../../agentkit/tools.py), the **single chokepoint** (the `ToolExecutor.execute()` that `Agent` uses internally is the same logic). Validation, identity injection, timeouts, truncation, and idempotency all happen here; the tool functions themselves contain only business logic. It's async: while one session waits on a tool, the other sessions in the same process keep making progress ([Lesson 02](../02_agent_loop/README.en.md) section 1.7).
 
 ## 2. From toy to production: building it layer by layer
 
@@ -146,19 +146,26 @@ A checklist for writing tool descriptions:
 The arguments a model produces **will** go wrong: invalid JSON, missing fields, wrong types, out-of-range values, invented parameters. [`ToolRegistry.execute()`](../../agentkit/tools.py) turns every one of these problems into text fed back to the model, instead of raising an exception that crashes the agent:
 
 ```python
+# Tool.parse_arguments: returns (args dict, None) or (None, an error message for the model)
 # 1) Parse the JSON — the model may produce invalid JSON
 try:
-    raw = json.loads(call.arguments or "{}")
-    ...
+    raw = json.loads(arguments or "{}")
+    if not isinstance(raw, dict):
+        raise ValueError("the arguments must be a JSON object")
 except (json.JSONDecodeError, ValueError) as e:
-    return ToolResult(False, f"Error: the arguments are not a valid JSON object ({e}). Please regenerate them.", "invalid_args")
+    return None, f"Error: the arguments are not a valid JSON object ({e}). Please regenerate them."
 
 # 2) Validate against the schema — missing fields, wrong types, out-of-range values, and extra fields are all caught here
 try:
-    args = t.args_model.model_validate(raw)
+    args = self.args_model.model_validate(raw)
 except ValidationError as e:
     problems = "\n".join(f"- {'.'.join(map(str, err['loc'])) or 'arguments'}: {err['msg']}" for err in e.errors())
-    return ToolResult(False, f"Error: argument validation failed:\n{problems}\nPlease fix them and try again.", "invalid_args")
+    return None, f"Error: argument validation failed:\n{problems}\nPlease fix them and try again."
+
+# In ToolExecutor.execute: an error becomes an observation that is returned, not an exception that is raised
+kwargs, error = t.parse_arguments(call.arguments)
+if error is not None:
+    return ToolResult(False, error, "invalid_args")
 ```
 
 Part 4 of the demo shows the validation layer's actual output (no model calls involved):
@@ -300,14 +307,53 @@ def reset_password(...): ...
 
 The risk level is **tool metadata**, declared by whoever writes the tool, not judged by the model. Lesson 09's `PermissionPolicy` uses it to decide whether approval is required, and Lesson 08's idempotency store applies only to `write` / `dangerous`. The corresponding concept in the MCP protocol is the tool annotations `readOnlyHint` / `destructiveHint` / `idempotentHint` (see 2.11).
 
-### 2.7 Timeouts and output truncation
+### 2.7 Async tools, timeouts, and output truncation
 
 ```python
 @tool(timeout_s=5, max_output_chars=4000)
 def search_logs(...): ...
 ```
 
-- **Timeouts**: one stuck tool must not hold up the whole agent. Note that agentkit implements timeouts with threads, and **Python threads can't be forcibly killed** — after a timeout, the function may still be running in the background. In production, untrusted or high-risk tools (running code, accessing the internet) should run in a separate process or a sandbox (containers, gVisor, Firecracker).
+**A tool can be `async def`.** Tools that wait on I/O — calling an HTTP API, querying a database, hitting a cache — are best written as async, paired with an async client. Here is the example from Part 5 of the demo:
+
+```python
+@tool(timeout_s=0.3)
+async def fetch_invoice_pdf(expense_id: str) -> str:
+    """Download the invoice PDF for an expense report from the e-invoice platform and return a download link."""
+    try:
+        await asyncio.sleep(5)  # in a real system: await httpx.AsyncClient().get(...) — the platform is especially slow today
+        TRACE.append("async tool: download finished")
+        return f"https://invoice.example/{expense_id}.pdf"
+    except asyncio.CancelledError:
+        TRACE.append("async tool: got CancelledError at the await; connection released, did not continue")
+        raise  # after cleaning up, you must re-raise
+```
+
+`@tool` treats both kinds of function the same way: the schema is generated from the signature, and `ctx` is injected. The difference is **how the tool runs**, and that determines what really happens on a timeout (or when the whole run is cancelled):
+
+| Tool type | How it runs | What really happens on a timeout | Good for |
+|---|---|---|---|
+| `async def` tool | Awaited directly on the event loop | **Really cancelled**: the tool receives `CancelledError` at the `await` it's waiting on, can clean up in `except` / `finally`, and the connection is released | I/O with an async client: HTTP APIs, databases, caches |
+| Plain `def` tool | Run in a thread pool (`ToolExecutor`), so it doesn't block the event loop | The caller gets a `timeout` result on time, but **Python threads can't be forcibly killed**: the function runs to completion in the background, and its side effects still happen | Pure computation; libraries that only have a sync SDK |
+| `@tool(isolation="process")` | Run in a subprocess | **Hard timeout**: the subprocess is killed | CPU-heavy work, third-party code that might loop forever, untrusted code (costs: a subprocess start every time; arguments and return values must be picklable; the function must be module-level) |
+
+Part 5 of the demo puts all three kinds into one `ToolRegistry`, each with a very short timeout (no model calls; measured on an Apple M1 with 8 GB of RAM under high system load):
+
+```text
+▶ fetch_invoice_pdf: error_type=timeout; the caller got the result after 0.30s
+    · async tool: got CancelledError at the await; connection released, did not continue
+▶ mark_invoice_verified: error_type=timeout; the caller got the result after 0.30s
+▶ ocr_receipt: error_type=timeout; the caller got the result after 0.51s
+▶ 1.2 seconds after the timeouts:
+    · sync tool: EX-1009 marked as verified (the caller received the timeout long ago)
+    · subprocesses still alive: 0 (ocr_receipt's subprocess was killed the moment it timed out)
+```
+
+The most dangerous line is the middle one: a synchronous **write** tool timed out, so the model and the user both believe "it didn't happen," yet it finished in the background; if the model retries, it happens twice. So a synchronous write tool either gets a generous timeout or pairs with an idempotency key (Lesson 08) — never treat "timed out" as "didn't run." Untrusted or high-risk tools (running code, accessing the internet) need stronger isolation than a subprocess: containers, gVisor, Firecracker ([Lesson 19](../19_mcp_and_sandbox/README.en.md)).
+
+**Two async traps** ([Lesson 02](../02_agent_loop/README.en.md) section 1.7): **don't** call a blocking function inside an `async def` tool (`time.sleep`, `requests.get`, a sync database driver) — it freezes the whole event loop, and every session stops with it; if a library only has a sync version, write the tool as a plain `def` (the thread pool takes it) or use `await asyncio.to_thread(...)` inside the async tool. And if an async tool catches `CancelledError` to clean up, it **must re-raise** it, or cancellation stops working.
+
+- **Timeouts**: one stuck tool must not hold up the whole agent. Every tool has a `timeout_s` (30 seconds by default); on a timeout the model gets a `timeout` observation and can try another approach or tell the user.
 - **Truncation**: a tool that returns 100,000 lines of logs will blow through the context window instantly. After truncating, agentkit appends `...[output truncated; original length N characters]` so the model knows the information is incomplete. In [Writing effective tools for agents](https://www.anthropic.com/engineering/writing-tools-for-agents), Anthropic mentions that Claude Code limits tool responses to 25,000 tokens by default.
 
 Truncation is the last line of defense. It's better to **avoid returning large amounts of data in the first place, at the tool-design level**: offer filter parameters (`status`, time ranges), pagination (`limit` + `total` + a hint), and search instead of full reads. The exercise's `search_orders` must return a `note` when results are truncated, telling the model "there are 7 in total but only 5 are shown; filter by status or increase limit."
@@ -409,7 +455,7 @@ When connecting to a third-party MCP server, remember two things:
 .venv/bin/python lessons/03_tools/demo.py --offline  # scripted offline run that reproduces the real model's typical behavior
 ```
 
-The demo has 5 parts:
+The demo has 6 parts:
 
 | Part | What it covers | What to notice |
 |---|---|---|
@@ -418,6 +464,7 @@ The demo has 5 parts:
 | Experiment B | Three ways to write an error message | v1 gives up or guesses; v2 hits the wall and self-corrects (3 model calls); v3 gets it right the first time (2) |
 | Experiment C | Model-supplied identity vs. system-injected identity | Bad design: unauthorized access + leaked internal fields; good design: the model **simply has no way** to overstep |
 | Part 4 | The validation layer in action (no model calls) | What each kind of error turns into as an observation; "someone else's record" and "doesn't exist" return the same message |
+| Part 5 | Async tools and the three timeout semantics (no model calls) | The async tool is really cancelled; the sync write tool still finishes in the background after its timeout; the process-isolated infinite loop is killed |
 
 The real model's wording varies slightly from run to run, and v1 in experiment B is especially unstable — which is itself the conclusion: **relying on the model to "guess right" for correctness is unreliable.**
 
@@ -442,7 +489,9 @@ make lesson N=03
 .venv/bin/python -m pytest lessons/03_tools
 ```
 
-30 tests cover: schema quality (enums, ranges, descriptions, required fields, identity not exposed, risk level), unauthorized access, the `ToolError` paths, validation errors via `ToolRegistry.execute`, and an end-to-end flow run with `Agent`. A few "guardrail" tests (e.g. identity parameters not being exposed) pass before you even start — their job is to stop you from breaking a good design while you make changes.
+30 tests cover: schema quality (enums, ranges, descriptions, required fields, identity not exposed, risk level), unauthorized access, the `ToolError` paths, validation errors via `ToolRegistry.execute`, and an end-to-end flow run with `Agent`. A few "guardrail" tests (e.g. identity parameters not being exposed, a smuggled identity argument being rejected by the validation layer) pass before you even start — their job is to stop you from breaking a good design while you make changes.
+
+The two tools you write are plain `def`s: they only compute and read/write an in-memory dict, never wait on I/O, and don't need to be async (agentkit runs them in a thread pool). The tests that go through the registry and `Agent` are `async def test_...` and use `await reg.execute(...)` and `await Agent(...).run(...)`.
 
 ## 5. Going deeper (optional)
 
@@ -454,7 +503,7 @@ make lesson N=03
 
 **Let tools support different levels of detail.** For the same query, the model sometimes needs just a list of IDs and sometimes full details. Anthropic suggests adding a `response_format` parameter (e.g. `"concise"` / `"detailed"`) so the model can choose as needed, striking a balance between information and token cost.
 
-**Sandboxing and side-effect isolation.** Once a tool can execute code, access the file system, or reach the internet, it needs to be isolated from the agent's main process: resource limits (CPU, memory, duration), an egress allowlist, a read-only file system, least-privilege credentials. "A tool failure must not take down the agent" isn't just a `try/except` problem; it's also a matter of process and permission boundaries.
+**Sandboxing and side-effect isolation.** Once a tool can execute code, access the file system, or reach the internet, it needs to be isolated from the agent's main process: resource limits (CPU, memory, duration), an egress allowlist, a read-only file system, least-privilege credentials. "A tool failure must not take down the agent" isn't just a `try/except` problem; it's also a matter of process and permission boundaries. In agentkit, the first step is `@tool(isolation="process")` (section 2.7: killed on timeout); stronger OS-level sandboxes are covered in Lesson 19.
 
 ## 6. Common pitfalls and anti-patterns
 
@@ -471,6 +520,8 @@ make lesson N=03
 11. **Big combined read/write tools** (`manage_order(action=...)`) that can't be authorized per operation.
 12. **Write operations that don't account for repeated execution**: a single retry means a duplicate charge or a duplicate order.
 13. **Unconditionally trusting third-party MCP servers' tool descriptions and annotations.**
+14. **Calling a blocking function inside an `async def` tool** (`time.sleep`, `requests.get`, a sync database driver), which freezes every session in the process. Switch to an async client, or write it as a plain `def` and let the thread pool run it.
+15. **Treating a sync tool's timeout as "didn't run."** Threads can't be killed; after the timeout it may still finish a write in the background (demo Part 5). Pair writes with idempotency keys, and use `isolation="process"` for CPU-heavy or untrusted code.
 
 ## 7. Interview & design review questions
 
@@ -538,6 +589,15 @@ make lesson N=03
 - Treat its tool output as untrusted data too (Lesson 09).
 </details>
 
+<details>
+<summary>Q8: A tool has timeout_s=5. After it times out, has it really stopped?</summary>
+
+- It depends on how it runs. An `async def` tool: yes — the timeout raises `CancelledError` at the `await` it's waiting on, the connection is released, and it can clean up in `finally`.
+- A plain `def` tool: no. It runs in a thread pool; the caller gets the timeout result on time, but Python threads can't be forcibly killed, so the function finishes in the background and its writes still take effect.
+- A tool with `isolation="process"`: yes, the subprocess is killed outright; the costs are process start-up overhead and picklable arguments.
+- Design consequences: writes must not treat "timed out" as "didn't run," so they need idempotency keys; I/O-bound tools should preferably be async; CPU-heavy or untrusted code belongs in a subprocess or a sandbox.
+</details>
+
 ## 8. Self-check
 
 - [ ] I can explain what ACI is, and how a model "uses an interface" differently from a person
@@ -550,6 +610,7 @@ make lesson N=03
 - [ ] I can state the 4 principles of return-value design
 - [ ] I can state the principles for merging and splitting tools
 - [ ] I can explain how MCP maps to ToolRegistry, and the risks of connecting a third-party MCP server
+- [ ] I can say what happens on a timeout to an async tool, a plain sync tool, and an `isolation="process"` tool
 - [ ] My `search_orders` and `cancel_order` pass all 30 tests
 
 ## Further reading

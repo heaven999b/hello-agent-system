@@ -17,7 +17,9 @@ CedarPolicy 是一个 agentkit Hook，行为与 PermissionPolicy 对齐：
 - visible_tools：Action::"call_tool" 不允许的工具不展示给模型；
 - before_tool：先问 Action::"call_tool"（不允许 → 拒绝并说明命中的策略），
   再问 ask_action（默认 Action::"call_tool_unattended"，即"无人值守直接执行"）——不允许就走人工审批：
-  state.approvals → 同步 approver → PauseRun（异步审批），与 PermissionPolicy 完全一致。
+  state.approvals → approver（普通函数或 async 函数）→ PauseRun（落盘等审批人，之后 agent.approve() 继续）。
+visible_tools 和 Cedar 判定本身是纯计算（Rust 实现，微秒级），是普通方法；before_tool 是 async，
+因为它可能要 await 一个 async 的 approver（例如去审批系统查一条记录）。
 """
 
 from __future__ import annotations
@@ -26,11 +28,11 @@ import json
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from agentkit.hooks import Hook, PauseRun
 from agentkit.state import RunState
-from agentkit.tools import Tool, ToolRegistry
+from agentkit.tools import Tool, ToolRegistry, maybe_await
 from agentkit.types import ToolCall
 
 from . import require
@@ -50,7 +52,7 @@ DEFAULT_PLAN = "free"  # 查不到租户套餐：按最受限的套餐处理
 
 EntitiesFn = Callable[[Mapping[str, Any], Mapping[str, dict]], list]
 ContextFn = Callable[[RunState, ToolCall, Tool, dict], dict]
-Approver = Callable[[ToolCall, RunState], bool]
+Approver = Callable[[ToolCall, RunState], "bool | Awaitable[bool]"]
 
 
 def _cedarpy():
@@ -214,7 +216,8 @@ class CedarPolicy(Hook):
     tools:       工具清单（Tool 列表 / ToolRegistry / {名: {"risk","tenant"}}），visible_tools 要用它查风险等级。
     tool_tenants: {工具名: 所属租户}，给租户专属工具打标。
     context_fn:  (state, call, tool, args) -> Cedar context，用于参数级授权；默认空 context。
-    approver:    同步审批函数；为 None 时抛 PauseRun 走异步审批。
+    approver:    审批函数 approver(call, state) -> bool，普通函数或 async 函数都可以（async 的会被 await，
+                 而不是把协程对象当成 True —— 那会把高危操作静默批准）；为 None 时抛 PauseRun，等人工审批后恢复。
     audit:       审计回调 audit(record: dict)；每次判定都会调用（visible_tools 的批量判定除外）。
     """
 
@@ -336,7 +339,7 @@ class CedarPolicy(Hook):
         decisions = self._decide_batch(state.metadata, catalog, [(n, self.call_action, None) for n in names])
         return [n for n, d in zip(names, decisions) if d.allowed]
 
-    def before_tool(self, state: RunState, call: ToolCall, tool: Tool | None) -> str | None:
+    async def before_tool(self, state: RunState, call: ToolCall, tool: Tool | None) -> str | None:
         if tool is None:
             return None  # 不存在的工具交给 registry 报错
         args, arg_error = tool.parse_arguments(call.arguments)
@@ -362,7 +365,7 @@ class CedarPolicy(Hook):
             return None  # 策略允许无人值守执行
         approved = state.approvals.get(call.id)
         if approved is None and self.approver is not None:
-            approved = bool(self.approver(call, state))
+            approved = bool(await maybe_await(self.approver(call, state)))
             state.approvals[call.id] = approved
         if approved is None:
             raise PauseRun(

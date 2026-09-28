@@ -80,6 +80,9 @@ def accumulate_tool_call_deltas(chunks: Sequence[dict]) -> list[ToolCall]:
     6. 返回的列表按 index 从小到大排序。没有任何工具调用时返回 []。
     7. 某个 index 直到最后都没收到 id 或 name → 抛 ValueError
        （没有 id 就无法用 tool_call_id 回应这次调用，继续下去下一轮请求会 400）。
+
+    写完后对照生产版 agentkit.llm.ToolCallAccumulator（OpenAICompatLLM.stream() 用它拼工具调用）：
+    它直接处理 SDK 的分片对象，缺 id 时补一个本地 id 而不是报错 —— 同一个问题的另一种取舍。
     """
     raise NotImplementedError("TODO (a): 按 index 分组，id/name 取第一个非空值，arguments 按顺序拼接")
 

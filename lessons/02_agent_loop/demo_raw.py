@@ -4,14 +4,17 @@
     .venv/bin/python lessons/02_agent_loop/demo_raw.py --offline  # 离线剧本，无需 API key
 
 看点：Agent 没有魔法。它就是一个 for 循环 + 一个不断变长的 messages 列表。
+用的是 openai 的异步客户端 AsyncOpenAI：`await client.chat.completions.create(...)` 等模型的那几秒，
+事件循环可以去推进别的会话（为什么要这样写，见 README 1.7 节和 demo_async.py）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from agentkit.config import env
 
@@ -42,14 +45,14 @@ TOOLS = [{
 }]
 
 
-def run_agent(client, model: str, question: str, max_steps: int = 5) -> str:
+async def run_agent(client, model: str, question: str, max_steps: int = 5) -> str:
     # 2) messages 就是 Agent 的全部"记忆"
     messages = [
         {"role": "system", "content": "你是天气助手。需要天气数据时调用工具，不要编造。回答简洁。"},
         {"role": "user", "content": question},
     ]
     for step in range(1, max_steps + 1):  # 3) 循环 + 步数上限
-        resp = client.chat.completions.create(model=model, messages=messages, tools=TOOLS)
+        resp = await client.chat.completions.create(model=model, messages=messages, tools=TOOLS)  # 等模型时让出事件循环
         choice = resp.choices[0]
         msg = choice.message
 
@@ -107,7 +110,7 @@ def show_all(messages: list[dict]) -> None:
 
 
 class OfflineClient:
-    """离线模式：假装自己是 openai.OpenAI。
+    """离线模式：假装自己是 openai.AsyncOpenAI。
 
     内部用 agentkit 的 ScriptedLLM 按剧本出牌，再包装成和 openai SDK 一模一样的 ChatCompletion 对象，
     所以上面的 run_agent() 一个字都不用改。这也说明了：Agent 循环只依赖"消息进、消息出"这个接口。
@@ -124,10 +127,10 @@ class OfflineClient:
         ])
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
-    def _create(self, *, model: str, messages: list, tools=None, **_):
+    async def _create(self, *, model: str, messages: list, tools=None, **_):
         from openai.types.chat import ChatCompletion
 
-        r = self._llm.chat(messages, tools)
+        r = await self._llm.chat(messages, tools)
         message = {"role": "assistant", "content": r.content}
         if r.tool_calls:
             message["tool_calls"] = [
@@ -141,7 +144,7 @@ class OfflineClient:
         })
 
 
-def main() -> None:
+async def main() -> None:
     offline = "--offline" in sys.argv
     if offline:
         client, model = OfflineClient(), "scripted"
@@ -149,14 +152,14 @@ def main() -> None:
     else:
         # max_retries=2：借用 SDK 自带的重试扛住偶发的 429/5xx。
         # （agentkit 故意关掉它，改用自己可观测、可控的 ResilientLLM —— 第 08 课讲为什么）
-        client = OpenAI(base_url=env("LLM_BASE_URL"), api_key=env("LLM_API_KEY"), max_retries=2)
+        client = AsyncOpenAI(base_url=env("LLM_BASE_URL"), api_key=env("LLM_API_KEY"), max_retries=2)
         model = env("LLM_MODEL", "gpt-5.5")
         print(f"🌐 真实模型：{model}（每次运行结果可能略有不同）")
 
     question = "北京和上海现在哪个更热？高几度？"
     print(f"\n用户问题：{question}")
     try:
-        answer = run_agent(client, model, question)
+        answer = await run_agent(client, model, question)
     except Exception as e:  # noqa: BLE001
         print(f"\n❌ 调用模型失败：{type(e).__name__}: {e}")
         print("   可以先用 --offline 离线运行；或执行 make check-env 检查 .env 配置。")
@@ -167,4 +170,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())  # 脚本入口：创建事件循环，跑完 main() 这个协程，再关闭事件循环

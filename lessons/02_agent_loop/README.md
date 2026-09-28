@@ -44,9 +44,9 @@
   "role": "assistant",
   "content": null,
   "tool_calls": [
-    {"id": "call_vhDW04I4...", "type": "function",
+    {"id": "call_W2Y6Sno3...", "type": "function",
      "function": {"name": "get_weather", "arguments": "{\"city\":\"北京\"}"}},
-    {"id": "call_ENh4I8Ky...", "type": "function",
+    {"id": "call_7CQpUQLs...", "type": "function",
      "function": {"name": "get_weather", "arguments": "{\"city\":\"上海\"}"}}
   ]
 }
@@ -55,8 +55,8 @@
 我们的代码执行后，追加两条 `tool` 消息：
 
 ```json
-{"role": "tool", "tool_call_id": "call_vhDW04I4...", "content": "{\"city\": \"北京\", \"temp_c\": 31, \"condition\": \"晴\"}"}
-{"role": "tool", "tool_call_id": "call_ENh4I8Ky...", "content": "{\"city\": \"上海\", \"temp_c\": 27, \"condition\": \"晴\"}"}
+{"role": "tool", "tool_call_id": "call_W2Y6Sno3...", "content": "{\"city\": \"北京\", \"temp_c\": 31, \"condition\": \"晴\"}"}
+{"role": "tool", "tool_call_id": "call_7CQpUQLs...", "content": "{\"city\": \"上海\", \"temp_c\": 27, \"condition\": \"晴\"}"}
 ```
 
 **三条铁律**（违反任何一条，要么 API 报错，要么 Agent 行为错乱）：
@@ -169,41 +169,160 @@ stateDiagram-v2
 处理并行调用时要注意：
 
 - **每一个都要执行、每一个都要回应**（铁律 2）。只处理 `tool_calls[0]` 是新手最常见的 bug。
-- **执行顺序**：agentkit 按顺序串行执行 —— 简单、确定、审计友好。追求延迟的生产系统可以用线程池并发执行**只读**工具，但所有结果必须在下一次调用模型之前追加完毕。
+- **执行顺序**：如果一轮里的调用**全是只读工具**，agentkit 用 `asyncio.gather` 并发执行它们（`parallel_tools=True`，同时最多 `max_parallel_tools=8` 个），结果**按模型给出的原顺序**写回；只要有一个写 / 高危工具，就按顺序逐个执行，保证副作用有序、每执行完一个就存一次盘。不论哪种，所有结果都必须在下一次调用模型之前追加完毕。本课练习按顺序执行就够了。
 - **有依赖的写操作不适合并行**：比如"创建工单"和"给这个工单加备注"被模型放在同一轮发出时，第二个调用根本拿不到工单号。OpenAI 的接口提供 `parallel_tool_calls=false` 参数来关闭并行调用。
+
+### 1.7 为什么是 async：一个进程怎么同时服务很多会话
+
+动手写循环之前，先算一笔账。第 3 节 `demo.py` 的真实运行里，一次会话耗时 3.8 秒，其中两次 `llm.chat` 各 1.9 秒 —— **几乎全部时间都在等模型回复**，工具执行 0ms。等的时候 CPU 什么都没干。那一个服务同时有 200 个用户在聊，要怎么办？
+
+**比喻：一个服务员照看很多桌。** 把玻璃房想成后厨：专家是厨师，纸条是点菜单，你的代码是跑堂的服务员。
+
+- **同步写法**：服务员把单子递进厨房，就站在出菜口干等，菜不出来不走。200 桌客人就得雇 200 个服务员（200 个线程）—— 每个线程都占内存，操作系统还要在它们之间来回切换，扛不了多少。
+- **async 写法**：服务员递完单子就去招呼别的桌，厨房铃一响（模型回复到了）再回来端菜。一个服务员照看几百桌。这个"记着哪桌在等什么、铃响了叫谁"的调度员，就是**事件循环（event loop）**。
+
+| 比喻 | 技术概念 |
+|---|---|
+| 服务员 | 事件循环（一个线程） |
+| 每一桌客人 | 一个会话（一个协程，跑在一个 asyncio Task 里） |
+| 递完单子说"好了叫我"，转身去别的桌 | `await llm.chat(...)`：把控制权交还给事件循环 |
+| 厨房铃响 | 网络回复到了，事件循环叫醒这个会话，从 `await` 的下一行接着执行 |
+| 同时开很多桌，但最多接待 N 桌 | `asyncio.gather` + `asyncio.Semaphore(N)` |
+| 客人走了，把他那桌的单撤掉 | 取消：`task.cancel()` |
+| 服务员站在某一桌旁边发呆 2 秒 | 在 async 代码里调用阻塞函数：**所有桌子一起等** |
+
+```mermaid
+sequenceDiagram
+    participant L as 事件循环 一个线程
+    participant A as 会话 A
+    participant B as 会话 B
+    participant M as 模型 API
+    L->>A: 运行会话 A
+    A->>M: await llm.chat 发出请求
+    Note over A: A 暂停 让出事件循环
+    L->>B: 运行会话 B
+    B->>M: await llm.chat 发出请求
+    Note over B: B 暂停
+    Note over L: 两个请求同时在途 max_in_flight 为 2
+    M-->>L: A 的回复到了
+    L->>A: 叫醒 A 从 await 的下一行继续
+    M-->>L: B 的回复到了
+    L->>B: 叫醒 B
+```
+
+**三个关键字：`async def`、`await`、`asyncio.run`。**
+
+```python
+import asyncio
+
+async def handle(question: str) -> str:          # async def：定义一个"协程函数"
+    response = await llm.chat([user(question)])  # await：在这里等；等的时候让出事件循环
+    return response.content
+
+answer = asyncio.run(handle("北京天气？"))        # asyncio.run：脚本入口。创建事件循环、跑完协程、关掉循环
+```
+
+- 调用 `async def` 定义的函数**不会执行它**，只会得到一个**协程（coroutine）**—— 一张"待办单"。
+- `await 协程` 才真正执行它。执行到要等外部（网络、定时器）的地方，这个协程暂停，事件循环去跑别的协程；等的东西到了，再从暂停处继续。**只有在 `await` 的地方才可能切换**，两个 `await` 之间的代码不会被别的会话打断。
+- `await` 只能写在 `async def` 里面。脚本的最外层用 `asyncio.run(main())` 启动；在 Web 框架（FastAPI 等）里，框架已经替你运行了事件循环，直接把路由函数写成 `async def` 即可。
+
+**并发：`gather` 同时跑，`Semaphore` 设上限。**
+
+```python
+results = await asyncio.gather(*(agent.run(q) for q in questions))   # 同时跑，结果按输入顺序返回
+
+sem = asyncio.Semaphore(3)                   # 最多 3 个同时在跑（例如模型网关只给了 3 个并发配额）
+
+async def limited(q: str):
+    async with sem:                          # 拿不到名额就在这里排队（排队时同样让出事件循环）
+        return await agent.run(q)
+
+results = await asyncio.gather(*(limited(q) for q in questions))
+```
+
+没有上限的 `gather` 很危险：一次发出 1000 个请求，模型网关会直接回你一片 429（第 08、12 课）。生产代码里的并发一定要配上限。`agentkit.workflows.parallel(fns, max_concurrency=8)` 把这两步封装好了，而且一个失败其余立即取消（第 06 课）。
+
+**取消。** `task.cancel()` 不会当场"杀掉"一个协程，而是让它在**下一次 `await` 的地方**抛出 `asyncio.CancelledError`。异常一路向外传播，途中的 `finally`、`async with` 照常执行收尾。所以：
+
+- 用户关掉页面 → Web 框架取消这次请求的任务 → 正在等模型的那个 `await` 抛出 `CancelledError` → HTTP 请求被断开，不再为没人看的回答付钱。agentkit 的 `Agent` 在这里把检查点记为 `cancelled`，然后继续把异常往外抛。
+- `CancelledError` 是 `BaseException`，不是 `Exception`，所以 `except Exception` 不会误吞它 —— 这是 Python 故意的设计。**不要**写 `except BaseException:` 或裸 `except:` 然后不重新抛出，那等于让"取消"失效。
+
+**头号陷阱：在 async 代码里调用阻塞函数。** 事件循环只有一个线程。一个协程如果调用了 `time.sleep(2)`、`requests.get(...)`、同步的数据库驱动（`psycopg2`、`pymysql`），或者一段要算好几秒的纯 CPU 代码，它**不 await、不让出**，整个事件循环就卡在这里 —— 这 2 秒里**所有**会话都停了：别的会话的模型回复到了没人处理，健康检查超时，新请求没人接。它不报错，只会让服务"莫名其妙地慢"，是 async 服务里最常见、也最难查的问题。修法：
+
+| 情况 | 修法 |
+|---|---|
+| 等一会儿 | `await asyncio.sleep(秒)`，而不是 `time.sleep` |
+| 调 HTTP API | 用 async 客户端：`httpx.AsyncClient`、`openai.AsyncOpenAI` |
+| 查数据库 / 缓存 | 用 async 驱动：`asyncpg`、`psycopg` 的 async 模式、`redis.asyncio` |
+| 只有同步版本的库（换不掉） | `await asyncio.to_thread(函数, 参数...)`：放进线程池执行，await 它的结果 |
+| 要算很久的纯 CPU 代码 | 放进子进程（线程受 GIL 限制，而且杀不掉；第 03 课的 `isolation="process"`） |
+
+agentkit 替你兜了一层：普通 `def` 写的工具会被 `ToolExecutor` 自动放进线程池执行（第 03 课），所以同步工具不会卡住事件循环；但在 `async def` 里面写阻塞调用，框架救不了你。
+
+**忘了 `await`。** `response = llm.chat(messages)` 少写了 `await`，拿到的是 `<coroutine object ScriptedLLM.chat at 0x...>`，模型根本没被调用。接着访问 `response.content` 会报 `AttributeError: 'coroutine' object has no attribute 'content'`；如果只是把它拼进字符串，就会悄悄把 `<coroutine object ...>` 这串字当成工具结果发给模型。Python 通常还会打印一句 `RuntimeWarning: coroutine '...' was never awaited` —— 看到它，就去找漏掉的 `await`。
+
+**实测。** 运行 [`demo_async.py`](demo_async.py)（完全离线，用 `ScriptedLLM(latency=0.2)` 扮演一个每次要"想" 0.2 秒的模型）。下面的数字来自 Apple M1、8 GB 内存，运行时系统负载约 6–8（同时有别的任务在跑，负载偏高）。耗时会随机器和负载波动；`max_in_flight` 和"工具同时在跑"的个数是确定的。
+
+10 个会话，每个会话 = 2 次模型调用 + 1 次工具调用：
+
+| 写法 | 耗时 | `max_in_flight` | 模型调用次数 |
+|---|---|---|---|
+| 一个接一个（`for` + `await`） | 4.06s | 1 | 20 |
+| `asyncio.gather` 同时跑 | 0.41s | 10 | 20 |
+| `gather` + `Semaphore(3)` | 1.63s | 3 | 20 |
+
+`max_in_flight` 是 `ScriptedLLM` 记下的"同一时刻在途的模型调用数"，它是并发真实发生的**确定性证据**：一个接一个时永远是 1；`gather` 时 10 个会话的模型调用同时在等；加了 `Semaphore(3)` 就封顶在 3。全程是同一个 `Agent` 实例、一个线程、一个进程。
+
+同样 10 个会话同时跑，这次每个会话调一次要等 0.2 秒的"查库存"工具，四种写法：
+
+| 工具的写法 | 耗时 | 工具同时在跑 | 事件循环最长卡顿 |
+|---|---|---|---|
+| `async def` + `await asyncio.sleep(0.2)` | 0.61s | 10 个 | 3ms |
+| `async def` + `time.sleep(0.2)` ❌ | 2.48s | 1 个 | 2072ms |
+| `async def` + `await asyncio.to_thread(time.sleep, 0.2)` | 0.61s | 10 个 | 2ms |
+| 普通 `def` + `time.sleep(0.2)`（agentkit 放进线程池） | 0.61s | 10 个 | 3ms |
+
+"事件循环最长卡顿"是用一个每 10ms 醒一次的心跳协程测的：它迟到多久，事件循环就被卡了多久。阻塞写法里 10 个工具只能一个接一个执行，事件循环整整 2 秒没有响应任何事 —— 换成真实服务，就是这 2 秒里所有用户都在转圈。
+
+> 这一节讲的是**一个进程之内**的并发。一个进程能扛多少会话、多个 worker 进程怎么分工、一个进程崩溃后别的进程怎么接手，是第 12、13 课的内容（`agentkit.distributed`，真的起多个进程）。
 
 ## 2. 从玩具到生产：逐层实现
 
 ### 2.1 最小版本：30 行，没有魔法
 
-这是 [`demo_raw.py`](demo_raw.py) 的核心，只用了 `openai` SDK：
+这是 [`demo_raw.py`](demo_raw.py) 的核心，只用了 `openai` SDK 的异步客户端 `AsyncOpenAI`：
 
 ```python
-messages = [{"role": "system", "content": "..."}, {"role": "user", "content": question}]
-for step in range(1, max_steps + 1):                       # 循环 + 步数上限
-    resp = client.chat.completions.create(model=model, messages=messages, tools=TOOLS)
-    msg = resp.choices[0].message
+async def run_agent(client, model, question, max_steps=5):      # client = AsyncOpenAI(...)
+    messages = [{"role": "system", "content": "..."}, {"role": "user", "content": question}]
+    for step in range(1, max_steps + 1):                        # 循环 + 步数上限
+        resp = await client.chat.completions.create(model=model, messages=messages, tools=TOOLS)  # 等模型时让出事件循环
+        msg = resp.choices[0].message
 
-    assistant = {"role": "assistant", "content": msg.content}
-    if msg.tool_calls:
-        assistant["tool_calls"] = [
-            {"id": tc.id, "type": "function",
-             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-            for tc in msg.tool_calls
-        ]
-    messages.append(assistant)                              # 铁律 1：先 assistant
+        assistant = {"role": "assistant", "content": msg.content}
+        if msg.tool_calls:
+            assistant["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in msg.tool_calls
+            ]
+        messages.append(assistant)                               # 铁律 1：先 assistant
 
-    if not msg.tool_calls:                                  # 没有工具调用 = 最终答案
-        return msg.content
+        if not msg.tool_calls:                                   # 没有工具调用 = 最终答案
+            return msg.content
 
-    for tc in msg.tool_calls:                               # 并行调用：每一个都要执行
-        try:
-            result = FUNCTIONS[tc.function.name](**json.loads(tc.function.arguments or "{}"))
-        except Exception as e:                              # 错误也是一种"观察"
-            result = f"错误：{type(e).__name__}: {e}"
-        messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})  # 铁律 2
-return "（达到最大步数，任务未完成）"
+        for tc in msg.tool_calls:                                # 并行调用：每一个都要执行
+            try:
+                result = FUNCTIONS[tc.function.name](**json.loads(tc.function.arguments or "{}"))
+            except Exception as e:                               # 错误也是一种"观察"
+                result = f"错误：{type(e).__name__}: {e}"
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})  # 铁律 2
+    return "（达到最大步数，任务未完成）"
+
+answer = asyncio.run(run_agent(AsyncOpenAI(...), model, "北京和上海现在哪个更热？"))
 ```
+
+和同步写法相比只多了三处：`async def`、调模型前的 `await`、入口的 `asyncio.run`。循环本身一个字没变。
 
 两个值得注意的设计：
 
@@ -212,29 +331,31 @@ return "（达到最大步数，任务未完成）"
 
 ### 2.2 企业版：`agentkit/agent.py` 多了什么
 
-这是 [`agentkit/agent.py`](../../agentkit/agent.py) 的主循环，结构和上面的玩具版一模一样：
+这是 [`agentkit/agent.py`](../../agentkit/agent.py) 的主循环 `_loop_body()`（省略了取消检查），结构和上面的玩具版一模一样：
 
 ```python
-def _loop(self, state: RunState) -> None:
+async def _loop_body(self, state: RunState, prepare) -> None:
+    if prepare is not None:
+        await prepare()                                 # on_run_start 钩子 + 追加用户消息 + 存盘
     # 断点续跑：如果上次停在"模型已发起工具调用、但工具还没执行完"，先把它们补完
-    self._run_pending_tools(state)
+    await self._run_pending_tools(state)
     while state.step < self.max_steps:
-        state.step += 1
-        response = self._call_llm(state)            # 里面：上下文策略 → 钩子 → 追踪 → 调模型 → 记账
+        response = await self._call_llm(state)          # 里面：上下文策略 → 钩子 → 步数 +1 → 追踪 → 调模型 → 记账
         state.messages.append(response.to_message())
-        self._save(state)                           # 每一步都存盘
+        await self._save(state)                         # 每一步都存盘
 
-        if not response.tool_calls:                 # 没有工具调用 = 模型给出了最终答案
+        if not response.tool_calls:                     # 没有工具调用 = 模型给出了最终答案
             output = response.content or ""
             for h in self.hooks:
-                new = h.on_final(state, output)     # 比如 OutputGuard 在这里脱敏
+                new = await _call_hook(h, "on_final", state, output)  # 比如 OutputGuard 在这里脱敏
                 if new is not None:
                     output = new
-            state.messages[-1]["content"] = output  # 历史里也存处理后的版本
-            state.status, state.stop_reason, state.output = "completed", "final_answer", output
+            state.messages[-1]["content"] = output      # 历史里也存处理后的版本
+            reason = "output_truncated" if response.finish_reason == "length" else "final_answer"
+            state.status, state.stop_reason, state.output = "completed", reason, output
             return
 
-        self._run_pending_tools(state)
+        await self._run_pending_tools(state)            # 全是只读工具就并发执行，有写操作就逐个执行
 
     state.status, state.stop_reason = "max_steps", "max_steps"
 ```
@@ -246,11 +367,13 @@ def _loop(self, state: RunState) -> None:
 | 局部变量 `messages` | `RunState` 对象（消息、步数、用量、成本、审批、身份） | 状态可序列化 → 可以存盘、恢复、审计。一个 Agent 运行可能要等审批等到第二天，局部变量活不到那时候 |
 | 无 | 每一步、每个工具执行完都 `_save(state)` | 进程崩溃或滚动发布后能从断点继续，而不是从头再来、重复花钱、重复执行写操作（第 08 课） |
 | 无 | 循环开头先 `_run_pending_tools` | 崩溃发生在"模型已决定调用工具、工具还没执行"时，恢复后只补执行工具，**不重新问模型** —— 重新问既花钱，模型还可能做出不同决定 |
-| 异常直接抛出 | `_drive` 把 `StopRun` / `PauseRun` / `LLMError` 统一收敛成 `status` | 调用方（Web 接口、工单系统）永远拿到一个 `RunResult`，只需看 `status` 决定下一步，而不是到处 `try/except` |
-| 无 | 8 个钩子点 | 安全、权限、预算、审计、脱敏这些**横切关注点**不写进循环（见 2.3） |
+| 异常直接抛出 | `_drive` 把 `StopRun` / `PauseRun` / `LLMError` / 超时 / 限流统一收敛成 `status` | 调用方（Web 接口、工单系统）永远拿到一个 `RunResult`，只需看 `status` 决定下一步，而不是到处 `try/except`。唯一的例外是取消：检查点记为 `cancelled` 后，`CancelledError` 照常向外抛 |
+| 一个函数只跑一个会话 | 全链路 `async`，`Agent` 实例不保存任何"本次运行"的数据（都在 `RunState` 里） | 同一个 `Agent` 实例在一个进程里同时推进成百上千个会话（1.7 节） |
+| 无 | 取消、`run_timeout`、`limiter` | 用户断开 → 立刻停下并记为 `cancelled`；超过时限 → `stopped`（`timeout`）；按租户限制同时在跑的运行数（第 12 课） |
+| 无 | 8 个钩子点（普通方法或 `async def` 都可以） | 安全、权限、预算、审计、脱敏这些**横切关注点**不写进循环（见 2.3） |
 | 无 | `context_strategy.apply()` | 历史太长时截断或摘要（第 04 课） |
 | 无 | `tracer.span(...)` 包住每次模型和工具调用 | 出了问题能看到每一步的输入、输出、耗时、token（第 10 课） |
-| 直接调函数 | `ToolRegistry.execute(call, ctx)` | 统一做 JSON 解析、Schema 校验、身份注入、超时、截断、幂等（第 03 课） |
+| 直接调函数 | `await self.executor.execute(call, ctx)`（`ToolExecutor`） | 统一做 JSON 解析、Schema 校验、身份注入、超时、截断、幂等；同步工具放进线程池，async 工具超时能真正取消（第 03 课） |
 | 原样返回 | `on_final` 改写后**写回历史** | 存进检查点和日志的是脱敏后的版本，而不是含身份证号的原文 |
 
 一个细节：`on_final` 的结果被写回 `state.messages[-1]`。如果只改返回值、不改历史，那么原始的敏感内容仍然躺在检查点文件里、下一轮对话还会发给模型 —— 这是真实系统里常见的数据泄露路径。
@@ -274,7 +397,7 @@ flowchart LR
     F --> E["on_run_end"]
 ```
 
-钩子能做五件事：什么都不做（观察）、改写数据（返回新值）、拒绝一次工具调用（`before_tool` 返回拒绝理由，理由会作为观察反馈给模型）、中止运行（抛 `StopRun`）、暂停等人（抛 `PauseRun`）。
+钩子能做五件事：什么都不做（观察）、改写数据（返回新值）、拒绝一次工具调用（`before_tool` 返回拒绝理由，理由会作为观察反馈给模型）、中止运行（抛 `StopRun`）、暂停等人（抛 `PauseRun`）。钩子方法可以写成普通方法，也可以写成 `async def`（比如要查 Redis 的限流钩子），`Agent` 会自动 `await`；纯计算的钩子（权限表、预算、脱敏）写成普通方法就好。
 
 本课程的企业能力全部是钩子：
 
@@ -309,6 +432,9 @@ flowchart LR
 # 框架版：同一个任务用 agentkit.Agent 实现
 .venv/bin/python lessons/02_agent_loop/demo.py
 .venv/bin/python lessons/02_agent_loop/demo.py --offline
+
+# async：一个进程同时服务很多会话、阻塞调用的陷阱、取消（完全离线）
+.venv/bin/python lessons/02_agent_loop/demo_async.py
 ```
 
 `demo_raw.py` 的真实运行输出（节选）：
@@ -317,8 +443,8 @@ flowchart LR
 ━━━━━━━━ 第 1 轮：把 2 条消息发给模型 ━━━━━━━━
 finish_reason = 'tool_calls'
 👉 模型没有直接回答，而是请求调用 2 个工具。由我们的代码去执行：
-   🔧 执行完毕，追加 tool 消息：{"role": "tool", "tool_call_id": "call_vhDW...", "content": "{\"city\": \"北京\", \"temp_c\": 31, ...}"}
-   🔧 执行完毕，追加 tool 消息：{"role": "tool", "tool_call_id": "call_ENh4...", "content": "{\"city\": \"上海\", \"temp_c\": 27, ...}"}
+   🔧 执行完毕，追加 tool 消息：{"role": "tool", "tool_call_id": "call_W2Y6...", "content": "{\"city\": \"北京\", \"temp_c\": 31, ...}"}
+   🔧 执行完毕，追加 tool 消息：{"role": "tool", "tool_call_id": "call_7CQp...", "content": "{\"city\": \"上海\", \"temp_c\": 27, ...}"}
 
 ━━━━━━━━ 第 2 轮：把 5 条消息发给模型 ━━━━━━━━
 finish_reason = 'stop'
@@ -326,30 +452,33 @@ finish_reason = 'stop'
 ━━━━━━━━ 最终的完整 messages（这就是 Agent 的全部状态）━━━━━━━━
 [0] system    你是天气助手。需要天气数据时调用工具，不要编造。回答简洁。
 [1] user      北京和上海现在哪个更热？高几度？
-[2] assistant   tool_calls=get_weather{"city":"北京"}#ZPwvor, get_weather{"city":"上海"}#u2szpP
-[3] tool      {"city": "北京", "temp_c": 31, "condition": "晴"}  (回应 #ZPwvor)
-[4] tool      {"city": "上海", "temp_c": 27, "condition": "晴"}  (回应 #u2szpP)
-[5] assistant 北京更热。   北京 31℃，上海 27℃，北京高 4℃。
+[2] assistant   tool_calls=get_weather{"city":"北京"}#DTmoKO, get_weather{"city":"上海"}#BxYLS7
+[3] tool      {"city": "北京", "temp_c": 31, "condition": "晴"}  (回应 #DTmoKO)
+[4] tool      {"city": "上海", "temp_c": 27, "condition": "晴"}  (回应 #BxYLS7)
+[5] assistant 北京更热。  - 北京：31℃，晴 - 上海：27℃，晴  北京比上海高 **4℃**。
 ```
 
 `demo.py` 的真实运行输出（节选）：
 
 ```text
 ▶ 钩子事件流（主循环的每个节拍）：
-  [on_run_start] run_id=342a8b385566  用户输入：北京和上海现在哪个更热？高几度？
+  [on_run_start] run_id=fa796532321d  用户输入：北京和上海现在哪个更热？高几度？
   [before_llm]   第 1 步：准备把 2 条消息发给模型
   [after_llm]    模型请求调用 get_weather{"city":"北京"}, get_weather{"city":"上海"}  (finish_reason=tool_calls, tokens=443)
   [before_tool]  即将执行 get_weather，风险等级=read
+  [before_tool]  即将执行 get_weather，风险等级=read
   [after_tool]   get_weather → 成功：{"city": "北京", "temp_c": 31, "condition": "晴"}
+  [after_tool]   get_weather → 成功：{"city": "上海", "temp_c": 27, "condition": "晴"}
+  [before_llm]   第 2 步：准备把 5 条消息发给模型
   ...
   [on_run_end]   运行结束 status=completed（这里是写审计日志的地方，第 09 课）
 
 ▶ 追踪树（第 10 课详讲）：
-agent.run  4394ms  tokens=896→71  status=completed steps=2 cost=$0.00183
-├─ llm.chat  2218ms  tokens=395→48  → tool_calls: get_weather, get_weather
+agent.run  3796ms  tokens=896→71  status=completed steps=2 cost=$0.00183
+├─ llm.chat  1897ms  tokens=395→48  → tool_calls: get_weather, get_weather
 ├─ tool.get_weather  0ms  ok
 ├─ tool.get_weather  0ms  ok
-└─ llm.chat  2171ms  tokens=501→23  → final_answer
+└─ llm.chat  1897ms  tokens=501→23  → final_answer
 
 第 2 部分：Agent 的 5 种结束方式（离线剧本，结果确定）
 场景                      status     stop_reason               steps  output
@@ -360,25 +489,44 @@ token 预算耗尽            stopped    budget_exceeded           2      已超
 高风险操作等待人工审批    paused     needs_approval            1      操作 reset_password({"employee_i…
 ```
 
+`demo_async.py` 的输出（节选，数字见 1.7 节的两张表）：
+
+```text
+实验 1：忘了 await 会怎样
+  oops = llm.chat(...)          → 得到 <coroutine object ScriptedLLM.chat>，类型是 coroutine
+  这时模型被调用了几次？          → call_count = 0（协程只是一张'待办单'，还没执行）
+  right = await llm.chat(...)   → 得到 LLMResponse，content = '你好！'，call_count = 1
+
+实验 4：取消 —— 用户关掉了页面，这次运行要立刻停下，别再花钱
+  0.1s 后：模型调用在途 1 个，调用 task.cancel()
+  await task → 抛出 CancelledError，用时 0ms（不用等满 5 秒）
+  检查点里的状态：status='cancelled'  stop_reason='cancelled'  模型在途 0 个
+```
+
 该观察什么：
 
 1. 两个 demo 的**消息序列完全一样**：`system → user → assistant(tool_calls) → tool → tool → assistant`。框架没有改变 Agent 的本质。
-2. 追踪树里，**耗时几乎全在 `llm.chat` 上**（每次 2 秒多），工具执行是 0ms。在真实系统里，减少模型调用次数（比如用并行工具调用）是降低延迟最有效的手段。
+2. 追踪树里，**耗时几乎全在 `llm.chat` 上**（每次近 2 秒），工具执行是 0ms。在真实系统里，减少模型调用次数（比如用并行工具调用）是降低延迟最有效的手段；而等模型的这段时间，正是 async 让同一个进程去服务别的会话的时间（1.7 节）。
 3. 第 2 轮的输入 token（501）比第 1 轮（395）多 —— 历史被完整重发了。
 4. 5 种结束方式都**返回**一个 `RunResult`，没有一种是抛异常给调用方。
+5. 两次 `before_tool` 先打印、两次 `after_tool` 后打印：两个只读的 `get_weather` 是并发执行的（1.6 节），结果仍按模型给出的顺序写回。
+6. `demo_async.py` 实验 4：取消在"正在等模型"的那个 `await` 处立刻生效，检查点记为 `cancelled`，没有再调用模型。
 
 ## 4. 练习
 
-打开 [`exercise.py`](exercise.py)，实现两个函数：
+打开 [`exercise.py`](exercise.py)，实现两个 **`async def`** 函数：
 
-1. **`execute_tool_call(tools, call) -> str`**：执行一次工具调用，**永远返回字符串、永远不抛异常**。要处理：未知工具、JSON 不合法、JSON 不是对象、`arguments` 为空字符串、函数抛异常（包括参数名不对的 `TypeError`）、非字符串结果的序列化。
-2. **`run_agent_loop(llm, tools, user_input, max_steps=5) -> dict`**：主循环。要处理：直接回答、单次和多轮工具调用、一轮多个并行调用、达到 `max_steps`、没有工具时传 `tools=None`、`content` 和 `tool_calls` 同时存在。
+1. **`async def execute_tool_call(tools, call) -> str`**：执行一次工具调用，**永远返回字符串、永远不抛异常**（取消除外）。要处理：未知工具、JSON 不合法、JSON 不是对象、`arguments` 为空字符串、函数抛异常（包括参数名不对的 `TypeError`）、非字符串结果的序列化。工具**既可以是普通函数，也可以是 `async def` 函数**：调用 `fn(**args)` 得到协程时，要再 `await` 它（`agentkit.tools.maybe_await` 就是做这个的），而且这个 `await` 要放在 `try` 里 —— async 工具的异常是在 `await` 时才抛出来的。
+2. **`async def run_agent_loop(llm, tools, user_input, max_steps=5) -> dict`**：主循环。要处理：直接回答、单次和多轮工具调用、一轮多个并行调用、达到 `max_steps`、没有工具时传 `tools=None`、`content` 和 `tool_calls` 同时存在。调模型写 `await llm.chat(...)`，执行工具写 `await execute_tool_call(...)`。
+
+设计决定：本练习里普通 `def` 工具是在事件循环里**直接调用**的 —— 测试里的工具都是几微秒就算完的纯函数，这样最简单。一个会阻塞的同步工具在这里会卡住所有会话（1.7 节），所以 agentkit 的 `ToolExecutor` 把同步工具放进线程池执行（第 03 课），练习不要求你做这一步。
 
 提示：
 
-- `llm.chat(messages, tools=...)` 返回 `LLMResponse`，用 `response.to_message()` 把它转成 assistant 消息；
+- `await llm.chat(messages, tools=...)` 返回 `LLMResponse`，用 `response.to_message()` 把它转成 assistant 消息；
 - `agentkit.types` 里的 `system()` / `user()` / `tool_message()` 可以帮你构造消息；
-- 测试文件里的 `assert_protocol_ok()` 会检查铁律 1 和铁律 2，失败信息会告诉你哪里没配对上。
+- 测试文件里的 `assert_protocol_ok()` 会检查铁律 1 和铁律 2，失败信息会告诉你哪里没配对上；
+- 最后两个测试检查 async 本身：20 个会话用 `asyncio.gather` 同时跑时，20 个模型调用必须同时在途（`max_in_flight == 20`）；运行被取消时，`CancelledError` 必须原样抛出、不能再调用模型 —— 所以兜底要写 `except Exception`，不要写 `except BaseException`。
 
 验证：
 
@@ -388,7 +536,7 @@ make lesson N=02
 .venv/bin/python -m pytest lessons/02_agent_loop
 ```
 
-20 个测试全部通过即完成。写完后对照 [`solution.py`](solution.py) 和 [`agentkit/agent.py`](../../agentkit/agent.py) 的 `_loop()`，看看你的版本和企业版还差什么。
+25 个测试全部通过即完成。写完后对照 [`solution.py`](solution.py) 和 [`agentkit/agent.py`](../../agentkit/agent.py) 的 `_loop_body()`，看看你的版本和企业版还差什么。
 
 ## 5. 深入（给有余力的你）
 
@@ -396,7 +544,7 @@ make lesson N=02
 
 **拥有你的控制流。** [12-Factor Agents](https://github.com/humanlayer/12-factor-agents) 的第 8 条 "Own your control flow" 主张：自己掌握循环，才能在任意位置暂停等人、序列化上下文、从中断处恢复。agentkit 的 `PauseRun` + 检查点就是这个思路。黑盒框架用来做原型很快，但当你需要"这一步必须等审批"时，往往得和框架较劲。
 
-**流式输出（streaming）。** 生产环境里通常把答案逐字流给用户。流式模式下，`tool_calls` 是**分片**到达的：每个分片带 `index`，`arguments` 被切成若干段字符串，你必须按 `index` 把片段拼起来，等流结束后才能解析 JSON、执行工具。这是手写流式 Agent 时最容易出 bug 的地方。
+**流式输出（streaming）。** 生产环境里通常把答案逐字流给用户。流式模式下，`tool_calls` 是**分片**到达的：每个分片带 `index`，`arguments` 被切成若干段字符串，你必须按 `index` 把片段拼起来，等流结束后才能解析 JSON、执行工具。这是手写流式 Agent 时最容易出 bug 的地方。agentkit 里 `OpenAICompatLLM.stream()` 用 `ToolCallAccumulator` 做这件事（第 01 课练习的生产版），`Agent.stream()` 是一个 async 迭代器，逐步产出文本片段、工具开始 / 结束、需要审批、完成等事件；消费方不再读取（例如 HTTP 客户端断开），运行就会被取消。
 
 **成本的平方增长与前缀缓存。** 既然每一步都重发完整历史，就要让历史的**前缀保持稳定**（缓存和模型路由在第 14 课系统展开）：主流服务商都支持前缀缓存（prompt caching），命中缓存的输入 token 更便宜、更快。所以：历史只追加、不修改；不要在 system prompt 开头放时间戳这类每次都变的内容；动态信息尽量放在后面。第 04 课的"截断/摘要"会破坏前缀，这是一个需要权衡的地方。
 
@@ -409,7 +557,8 @@ make lesson N=02
 **agentkit 还没做、但生产系统值得做的：**
 
 - **循环检测**：同一个工具 + 同样的参数连续调用 N 次，基本可以断定陷入了循环，可以注入一句提示（"你已经用相同参数调用过 3 次了"）或提前停止，而不是傻等 `max_steps`。
-- **只读工具并发执行**：用线程池并发执行一轮里的多个只读工具调用，降低延迟。
+
+（以前这里还有一条"只读工具并发执行"，现在已经做了：同一轮全是只读工具时用 `asyncio.gather` 并发执行，见 1.6 节。）
 
 ## 6. 常见坑与反模式
 
@@ -423,6 +572,8 @@ make lesson N=02
 8. **把工具结果放进 `user` 消息**。这样模型会把网页、邮件里的内容当成用户的指令 —— 为提示词注入敞开了大门（第 09 课），也丢失了 `tool_call_id` 的配对关系。
 9. **修改历史中间的消息**（比如为了省 token 改写早期的工具结果），导致前缀缓存失效、甚至调用和结果不再配对。需要压缩时用第 04 课的按块截断/摘要。
 10. **没有工具时传 `tools=[]`**。空数组没有意义，还可能被部分服务端拒绝；应该不传。
+11. **在 `async def` 里调用阻塞函数**（`time.sleep`、`requests.get`、同步数据库驱动）。它不报错，只会让整个进程的所有会话一起卡住。换成 async 客户端，或 `await asyncio.to_thread(...)`（1.7 节）。
+12. **忘了 `await`，或者吞掉了 `CancelledError`**。前者拿到的是协程对象而不是结果；后者（`except BaseException` / 裸 `except` 不重新抛出）让取消失效：用户早就走了，运行还在接着调模型、接着花钱。
 
 ## 7. 面试 & 设计评审问题
 
@@ -482,6 +633,15 @@ make lesson N=02
 - 钩子之间共享状态（`state.metadata`）可能互相踩踏。缓解：约定命名空间，关键字段做类型约束。
 </details>
 
+<details>
+<summary>Q8：一个 Python 进程怎么同时服务 200 个 Agent 会话？如果有人在某个工具里写了 requests.get，会发生什么？</summary>
+
+- Agent 的时间几乎都花在等模型和外部 API 上。用 async：`await llm.chat(...)` 时让出事件循环，一个线程就能同时推进几百个会话；并发要用 `Semaphore` 之类的上限保护下游（网关配额）。
+- `requests.get` 是阻塞调用：如果写在 `async def` 工具里，它执行的那几秒整个事件循环都停了，**所有**会话一起卡住，而且不报错。本课 `demo_async.py` 实测：10 个会话的工具本该同时跑（0.61s），变成一个接一个（2.48s），事件循环卡顿 2 秒。
+- 修法：换成 `httpx.AsyncClient`；换不掉就 `await asyncio.to_thread(requests.get, url)`；或者把工具写成普通 `def`，交给 agentkit 的 `ToolExecutor` 放进线程池。排查手段：监控事件循环延迟（心跳迟到多久），开 `asyncio` 的 debug 模式看慢回调。
+- 一个进程终究有上限（CPU、内存、一个事件循环）。再往上扩，是多个 worker 进程分工（第 12、13 课）。
+</details>
+
 ## 8. 自测清单
 
 - [ ] 我能说出 4 种消息角色各自由谁写、起什么作用
@@ -492,7 +652,10 @@ make lesson N=02
 - [ ] 我能说出 `finish_reason` 的 4 个常见取值，以及为什么不用它判断结束
 - [ ] 我能说出 agentkit 的主循环比玩具版多了哪些东西，每一样解决什么问题
 - [ ] 我能解释 Hook 中间件模式的优点和代价
-- [ ] 我的 `run_agent_loop` 通过了全部 20 个测试
+- [ ] 我能解释 `await llm.chat(...)` 的那一刻事件循环在做什么，以及为什么一个进程能同时服务很多会话
+- [ ] 我能说出在 async 代码里调用阻塞函数的后果，以及至少三种修法
+- [ ] 我能说出被取消的任务在哪里收到 `CancelledError`，以及为什么不能用 `except BaseException` 吞掉它
+- [ ] 我的 `run_agent_loop` 通过了全部 25 个测试
 
 ## 延伸阅读
 

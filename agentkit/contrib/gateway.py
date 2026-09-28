@@ -219,12 +219,11 @@ class LiteLLMRouterLLM:
         if self.last_route["model_group"] != self.model:
             self.events.append(f"fallback {self.model} -> {self.last_route['model_group']}")
 
-
     async def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs: Any) -> LLMResponse:
         start = time.perf_counter()
         try:
             resp = await self.router.acompletion(**self._params(messages, tools, kwargs))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 —— 统一收敛成 LLMError，Agent 只认这一种；CancelledError 照常穿透
             raise self._on_error(e, start) from e
         self._on_success(getattr(resp, "_hidden_params", None), start)
         return to_llm_response(resp, default_model=self.model)

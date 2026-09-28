@@ -31,7 +31,9 @@ class PermissionPolicy(Hook):
         role_tools: 角色 → 可用工具名集合；集合里放 "*" 表示全部。None 表示不启用 RBAC。
         ask_risks:  哪些风险等级需要人工审批。
         deny_tools: 全局禁用的工具（紧急开关，比如某个工具发现了漏洞）。
-        approver:   同步审批函数（命令行场景）。为 None 时抛 PauseRun，走异步审批。
+        approver:   即时审批函数 approver(call, state) -> bool（命令行里问一句、或调审批服务），
+                    可以是普通函数也可以是 async 函数。为 None 时抛 PauseRun：状态落盘，等审批人稍后
+                    agent.approve() —— 审批人可能一小时后才处理，这时不能让一个协程一直挂着等。
         """
         self.role_tools = role_tools
         self.ask_risks = set(ask_risks)
@@ -51,7 +53,8 @@ class PermissionPolicy(Hook):
     def visible_tools(self, state, names: list[str]) -> list[str]:
         return [n for n in names if self.allowed(state, n)]
 
-    def before_tool(self, state, call, tool) -> str | None:
+    def before_tool(self, state, call, tool):
+        """返回 None 放行、返回字符串拒绝；approver 是 async 函数时返回一个协程（Agent 会 await 它）。"""
         if tool is None:
             return None  # 不存在的工具交给 registry 报错
         if not self.allowed(state, call.name):
@@ -63,13 +66,22 @@ class PermissionPolicy(Hook):
             if decision is None and self.approver is not None:
                 raw = self.approver(call, state)
                 if inspect.isawaitable(raw):
-                    # bool(协程) 恒为 True —— 如果不拦下来，会把高危操作静默批准。异步审批请走 PauseRun + resume。
-                    raw.close()
-                    raise TypeError("approver 不能是 async 函数：异步场景请不传 approver，用 PauseRun + agent.approve() 走异步审批")
+                    # 千万不能 bool(raw)：bool(协程) 恒为 True，会把高危操作静默批准
+                    return self._decide_later(raw, state, call, tool)
                 decision = bool(raw)
                 state.approvals[call.id] = decision
-            if decision is None:
-                raise PauseRun(call, f"操作 {call.name}({call.arguments}) 风险等级为 {tool.risk}，已提交人工审批。")
-            if not decision:
-                return f"拒绝：审批人没有批准 {call.name} 操作。请告知用户该操作未获批准。"
+            return self._apply_decision(decision, call, tool)
+        return None
+
+    async def _decide_later(self, pending, state, call, tool) -> str | None:
+        decision = bool(await pending)
+        state.approvals[call.id] = decision
+        return self._apply_decision(decision, call, tool)
+
+    @staticmethod
+    def _apply_decision(decision: bool | None, call, tool) -> str | None:
+        if decision is None:
+            raise PauseRun(call, f"操作 {call.name}({call.arguments}) 风险等级为 {tool.risk}，已提交人工审批。")
+        if not decision:
+            return f"拒绝：审批人没有批准 {call.name} 操作。请告知用户该操作未获批准。"
         return None

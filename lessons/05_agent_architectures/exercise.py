@@ -2,19 +2,27 @@
 
 运行测试：make lesson N=05    （或 .venv/bin/python -m pytest lessons/05_agent_architectures）
 
-和第 06 课的练习一样，这里的"模型"都被抽象成普通的 Python 函数（planner / executor / critique ……）。
+和第 06 课的练习一样，这里的"模型"都被抽象成可注入的函数（planner / executor / critique ……）。
 架构的本质是**控制流**：谁在什么时候思考、结果回到哪里、什么时候停。把 LLM 关在函数接口后面，
 控制流就变成了普通、确定、可单元测试的代码 —— 企业里写 Agent 架构也应该这样分层。
 
-任务 1：PlanExecuteAgent     先规划 → 逐步执行 → 某步失败时重规划（有上限）→ 返回执行轨迹
-任务 2：reflect_loop          生成 → 批评 → 修改 的循环；批评意见重复出现时提前停止
-任务 3：choose_architecture   按任务特征，用明确的规则选出架构
+async：planner / executor / replanner / generate / critique 在生产中背后是模型或工具调用，一次要等好几秒，
+所以它们都是 async 函数，你要 `await` 它们；调用它们的 PlanExecuteAgent.run 和 reflect_loop 也就要写成
+`async def`。纯计算的部分（校验计划、比较批评意见、choose_architecture）保持普通函数。
+测试里直接 `await agent.run(...)`（pytest-asyncio），你自己试的时候用 `asyncio.run(...)`。
+
+任务 1：PlanExecuteAgent     先规划 → 逐步执行 → 某步失败时重规划（有上限）→ 返回执行轨迹（async）
+任务 2：reflect_loop          生成 → 批评 → 修改 的循环；批评意见重复出现时提前停止（async）
+任务 3：choose_architecture   按任务特征，用明确的规则选出架构（普通函数）
+附：  run_independent_steps   已提供，不是练习：计划里互不依赖的只读步骤怎么并发执行，以及为什么写操作不能这样做
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
+
+from agentkit.workflows import parallel
 
 # ---------------------------------------------------------------- 任务 1：Plan-and-Execute
 
@@ -55,15 +63,16 @@ class PlanExecuteResult:
         return self.status == "completed"
 
 
-Planner = Callable[[str], list]
-Executor = Callable[[Step, dict], Any]
-Replanner = Callable[[str, dict, Step, str, list], list]
+# 三个可注入的函数都是 async 函数（调用它们得到协程，要 await）
+Planner = Callable[[str], Awaitable[list]]
+Executor = Callable[[Step, dict], Awaitable[Any]]
+Replanner = Callable[[str, dict, Step, str, list], Awaitable[list]]
 
 
 class PlanExecuteAgent:
     """先规划、再逐步执行、失败时重规划（有上限）的 Agent 骨架。
 
-    三个可注入的函数（生产中它们背后是 LLM 或工具；测试里是假函数）：
+    三个可注入的 async 函数（生产中它们背后是 LLM 或工具；测试里是假函数）。调用时都要 await：
         planner(task) -> list[Step]
             规划器：看到任务后一次性给出完整计划（结构化的步骤列表）。
         executor(step, results) -> Any
@@ -83,21 +92,26 @@ class PlanExecuteAgent:
         """
         raise NotImplementedError("TODO: 校验参数并保存 planner / executor / replanner / max_replans / max_steps")
 
-    def run(self, task: str) -> PlanExecuteResult:
+    async def run(self, task: str) -> PlanExecuteResult:
         """执行一次任务，返回 PlanExecuteResult。运行中的任何失败都结构化返回，不向外抛异常
         （planner / replanner 自己抛出的异常除外，本练习不要求处理）。
+
+        这是一个 async 方法：await self.planner(...)、await self.executor(...)、await self.replanner(...)。
+        取消不是失败：executor 里抛出的 asyncio.CancelledError（调用方取消了这次运行，比如用户关掉了页面）
+        必须原样向外传播，不能被当成"这一步失败"拿去重规划。它是 BaseException，只写 `except Exception`
+        就不会误捕获它；千万别写 `except BaseException` 或裸 `except:`。
 
         规则：
         1. 调用 planner(task) 得到计划并**校验**。合法的计划必须同时满足：
              - 是一个非空的 list，且每个元素都是 Step；
              - 步骤 id 在计划内不重复。
            不合法 → status="failed"，stop_reason="invalid_plan"，一步都不执行。
-        2. 按顺序执行每一步：executor(step, results 的副本)。
+        2. 按顺序执行每一步：await executor(step, results 的副本)。
              - 成功：results[step.id] = 返回值；
              - 抛异常：这一步失败，进入第 3 条。失败步骤**不**写入 results。
         3. 某一步失败时：
              - 如果 replanner 已经被调用了 max_replans 次 → status="failed"，stop_reason="max_replans"；
-             - 否则调用 replanner(task, results 的副本, 失败的 step, error, 剩余步骤的副本)，replans 加 1：
+             - 否则 await replanner(task, results 的副本, 失败的 step, error, 剩余步骤的副本)，replans 加 1：
                  · 返回 [] → status="failed"，stop_reason="gave_up"；
                  · 返回的计划要按第 1 条的规则校验，并且新步骤的 id 不能与**已成功步骤**的 id 重复
                    （否则会覆盖已有结果）；不合法 → status="failed"，stop_reason="invalid_plan"；
@@ -143,22 +157,25 @@ def normalize_critique(text: str) -> str:
     return " ".join(text.split()).lower()
 
 
-def reflect_loop(
-    generate: Callable[[str | None, str | None], str],
-    critique: Callable[[str], str],
+async def reflect_loop(
+    generate: Callable[[str | None, str | None], Awaitable[str]],
+    critique: Callable[[str], Awaitable[str]],
     max_rounds: int,
     stop_when: Callable[[str], bool],
 ) -> ReflectResult:
     """自我批评循环：生成 → 批评 → 按批评修改 → 再批评 ……
 
+    这是一个 async 函数：generate 和 critique 背后是模型调用，都是 async 函数，要 await；
+    stop_when 是普通函数（纯文本判断），直接调用。
+
     参数：
-        generate(draft, feedback) -> str
-            第 1 轮调用 generate(None, None) 写初稿；之后每轮调用 generate(上一轮的稿子, 上一轮的批评) 修改。
-        critique(draft) -> str
+        generate(draft, feedback) -> str   （async）
+            第 1 轮 await generate(None, None) 写初稿；之后每轮 await generate(上一轮的稿子, 上一轮的批评) 修改。
+        critique(draft) -> str             （async）
             对稿子给出批评意见。
         max_rounds
             最多几轮。一轮 = 一次 generate + 一次 critique。max_rounds < 1 时抛 ValueError。
-        stop_when(critique_text) -> bool
+        stop_when(critique_text) -> bool   （普通函数）
             批评意见表示"已经合格"时返回 True（比如意见以 "LGTM" 开头）。
 
     规则：
@@ -235,3 +252,39 @@ def choose_architecture(profile: TaskProfile) -> str:
                                                                   → "react+reflection+hitl"
     """
     raise NotImplementedError("TODO: 按 docstring 里的规则选出基础架构，再叠加 reflection / hitl")
+
+
+# ---------------------------------------------------------------- 附：独立步骤并发执行（已提供，不是练习）
+
+
+async def run_independent_steps(
+    steps: list[Step],
+    executor: Executor,
+    results: dict,
+    *,
+    is_read_only: Callable[[Step], bool],
+    max_concurrency: int = 4,
+) -> dict[str, Any]:
+    """并发执行一批**相互独立、只读**的步骤，返回 {step.id: 输出}，按 steps 的顺序。（已提供，不需要修改）
+
+    PlanExecuteAgent.run 一步一步地执行，这是最安全的默认。但"查北京、上海、广州三地的天气"这种计划，
+    三步谁也不依赖谁，串行执行等于白白多等两倍时间。这里用 agentkit.workflows.parallel 把它们同时发出去：
+    - 同一个事件循环里真并发，最多 max_concurrency 个同时在途（不需要线程）；
+    - 这一批的每一步拿到的是**同一份** results 副本（开始执行这一批之前的结果）：批内的步骤看不到彼此的结果。
+      如果某一步其实依赖另一步，它会拿不到数据而大声失败，而不是悄悄用到半成品；
+    - 一步失败（抛异常），其余还没完成的步骤**立刻被取消**，异常原样抛出（parallel 的语义）。
+
+    为什么只允许只读步骤（is_read_only 为假的步骤一个都不执行，直接 ValueError）：
+    - 顺序就是语义：计划"先订新航班、再退旧航班"，并发执行后新航班订失败时，旧航班可能已经退了；
+      串行时第一步失败就停下，第二步根本不会发生；
+    - 取消会落在半路：一步失败会取消其余步骤。一个"退款请求已经发出、还没收到响应"的写操作被取消，
+      你不知道钱到底退了没有，只能靠幂等键和对账收拾；
+    - 重试和重规划会重放：这一批失败后重规划，已经成功的写操作可能再执行一次（重复扣款），除非工具幂等。
+    Agent 主循环用的是同一条规则：同一轮里全是只读工具才并行，只要有一个写工具就按顺序执行（agentkit/agent.py）。
+    """
+    writes = [s.id for s in steps if not is_read_only(s)]
+    if writes:
+        raise ValueError(f"这些步骤有副作用，不能并发执行，请按计划顺序逐个执行：{writes}")
+    snapshot = dict(results)
+    outputs = await parallel([lambda s=s: executor(s, dict(snapshot)) for s in steps], max_concurrency=max_concurrency)
+    return {s.id: out for s, out in zip(steps, outputs)}

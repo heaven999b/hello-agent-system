@@ -55,7 +55,7 @@ def refund(order_id: str) -> str:
 
 
 @pytest.fixture
-def traces_file(tmp_path):
+async def traces_file(tmp_path):
     """一次真实的多步运行：并行工具调用 + 工具失败 + 审批暂停 → 恢复。"""
     path = tmp_path / "traces.jsonl"
     tracer = Tracer(exporter=jsonl_exporter(path))
@@ -65,9 +65,9 @@ def traces_file(tmp_path):
         reply("已退款"),
     ])
     agent = Agent(llm, [search_kb, get_order, refund], hooks=[PermissionPolicy()], tracer=tracer, name="support")
-    res = agent.run("帮我退款")
+    res = await agent.run("帮我退款")
     assert res.status == "paused"
-    assert agent.approve(res.run_id).ok
+    assert (await agent.approve(res.run_id)).ok
     return path
 
 
@@ -116,9 +116,9 @@ def test_empty_input():
     assert 'id="waterfall"' in page
 
 
-def test_accepts_span_objects():
+async def test_accepts_span_objects():
     tracer = Tracer()
-    Agent(ScriptedLLM([call_tool("search_kb", query="x"), reply("ok")]), [search_kb], tracer=tracer).run("hi")
+    await Agent(ScriptedLLM([call_tool("search_kb", query="x"), reply("ok")]), [search_kb], tracer=tracer).run("hi")
     traces = build_traces(tracer.traces)  # 直接传根 Span，会自动展开子 span
     assert [s["name"] for s in traces[0]["spans"]] == ["agent.run", "llm.chat", "tool.search_kb", "llm.chat"]
 

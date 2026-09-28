@@ -29,13 +29,15 @@ Think of renovating an apartment. There are several ways to run the job:
 
 Multi-agent systems are the same idea, one level up: **how do several "brains" talk to each other, what do they share, and who has the final say?**
 
-The demo runs one task — "check the weather in three cities and give me travel advice" — through three architectures on a real model (gpt-5.5). The tools are fakes, and the Guangzhou weather endpoint is deliberately "down for maintenance":
+The demo runs one task — "check the weather in three cities and give me travel advice" — through three architectures on a real model (gpt-5.5). The tools are fakes (each lookup simulates 0.3 s of network latency with `asyncio.sleep`), and the Guangzhou weather endpoint is deliberately "down for maintenance":
 
-| Architecture | Model calls | Tool calls | Tokens | Time | Quality check (3 cities / typhoon warning / ≤5 lines) |
-|---|---|---|---|---|---|
-| ReAct (`agentkit.Agent`) | 3 | 4 | 2,705 | 10.7s | ✅ |
-| Plan-and-Execute | 3 | 4 | 2,724 | 14.3s | ✅ |
-| Reflection (ReAct + critique + revise) | 4 | 4 | 3,716 | 11.2s | ✅ |
+| Architecture | Model calls | Tool calls | Peak tools in flight | Tokens | Time | Quality check (3 cities / typhoon warning / ≤5 lines) |
+|---|---|---|---|---|---|---|
+| ReAct (`agentkit.Agent`) | 3 | 4 | 3 | 2,725 | 10.3s | ✅ |
+| Plan-and-Execute | 3 | 4 | 3 | 2,837 | 14.6s | ✅ |
+| Reflection (ReAct + critique + revise) | 4 | 4 | 3 | 3,849 | 14.6s | ✅ |
+
+(Measured 2026-09-28 on a macOS laptop, calling gpt-5.5 through a local OpenAI-compatible gateway, single run; model latency swings by several seconds from run to run, so read the magnitudes. "Peak tools in flight = 3" comes from a counter in the demo: the three cities really were queried at the same time.)
 
 One result runs against intuition: **on this small task, planning first did not save anything.** §7 explains why. It illustrates the single most important point of this lesson: **what an architecture buys you depends on the shape of the task — choose with data, not by name.**
 
@@ -115,14 +117,14 @@ flowchart LR
 | Use it when | The steps can't be known in advance and the agent must react to intermediate results: incident triage, fixing a bug in an unfamiliar codebase, open-ended Q&A |
 | Strengths | Simplest and most flexible; surprises are handled naturally (in the demo, the Guangzhou endpoint was down and the model switched to the backup on the next step); natively supported by every major API |
 | Weaknesses and failure modes | **Myopia**: it only looks one step ahead and drifts on long tasks. **Spinning**: calls the same tool over and over. **Context bloat**: every observation piles into the history. **Quitting early**: declares victory before the work is done |
-| Cost and latency | N steps = N model calls, and each call resends the whole history, so **total input tokens grow roughly quadratically with the number of steps** (step 1 sends one slice of history, step N sends N). Steps run in sequence, so latency adds up |
+| Cost and latency | N steps = N model calls, and each call resends the whole history, so **total input tokens grow roughly quadratically with the number of steps** (step 1 sends one slice of history, step N sends N). Steps run in sequence, so latency adds up. When the model asks for several **read-only** tools in one step, agentkit's `Agent` runs them concurrently (the demo's three lookups in step 1 are in flight at the same time) |
 | Key work | [ReAct](https://arxiv.org/abs/2210.03629) (Yao et al., ICLR 2023): absolute success-rate gains of 34 and 10 points over imitation- and RL-based methods on ALFWorld and WebShop. It is the default loop in nearly every agent framework today |
 
 **With agentkit**: `agentkit.Agent` is itself a ReAct loop with guardrails ([agentkit/agent.py](../../agentkit/agent.py)).
 
 ```python
 agent = Agent(llm, [get_weather, get_weather_by_airport], max_steps=8)  # max_steps stops it from spinning forever
-result = agent.run("Check the weather in Beijing, Shanghai and Guangzhou on my travel days and advise me")
+result = await agent.run("Check the weather in Beijing, Shanghai and Guangzhou on my travel days and advise me")  # inside an async function; the script entry point is asyncio.run(main())
 ```
 
 ### 2.2 Plan-and-Execute: plan, execute, replan when something breaks
@@ -147,10 +149,10 @@ flowchart LR
 | Use it when | Multi-step tasks whose steps you can roughly anticipate, but where execution can go wrong: data reports, research, batch operations |
 | Strengths | Forces the model to think through the whole task first; **the plan can be shown to a human and approved** (a natural hook for HITL); the executor can be a smaller model or plain code; the execution phase doesn't touch the big model |
 | Weaknesses and failure modes | **Plan quality is the bottleneck**; plans rest on stale assumptions (step 2's result should have changed how step 3 is done); **fail → replan → fail** loops, so replanning needs a hard limit (Exercise 1); plans can be absurdly long, so execution steps need a cap too |
-| Cost and latency | With a code-only executor: 1 plan + k replans + 1 summary. If the executor is an agent, add its calls per step. Demo: 3 calls |
+| Cost and latency | With a code-only executor: 1 plan + k replans + 1 summary. If the executor is an agent, add its calls per step. Demo: 3 calls. Independent read-only steps can run as one concurrent batch, which then takes as long as its slowest step rather than the sum (see below) |
 | Key work | [Plan-and-Solve Prompting](https://arxiv.org/abs/2305.04091) (Wang et al., ACL 2023); LangChain's 2023 post [Plan-and-Execute Agents](https://www.langchain.com/blog/plan-and-execute-agents) (inspired by BabyAGI and Plan-and-Solve). In products, Gemini Deep Research shows its research plan so the user can revise or approve it |
 
-**With agentkit**: `run_plan_execute` in [demo.py](demo.py) uses `complete_json` to get a Pydantic-validated plan from the planner, then runs each step through `ToolRegistry.execute`. Exercise 1's `PlanExecuteAgent` is the full version, with plan validation, replan and step limits, and an execution trace. The skeleton:
+**With agentkit**: `run_plan_execute` in [demo.py](demo.py) uses `complete_json` to get a Pydantic-validated plan from the planner, then runs the steps through `ToolRegistry.execute` (independent read-only steps go out as one concurrent batch via `agentkit.workflows.parallel`; see below). Exercise 1's `PlanExecuteAgent` is the full version, with plan validation, replan and step limits, and an execution trace (it runs steps one at a time). The skeleton (all inside async functions):
 
 ```python
 class PlanStep(BaseModel):
@@ -158,13 +160,34 @@ class PlanStep(BaseModel):
     tool: Literal["get_weather", "get_weather_by_airport"]   # an enum: the plan cannot name a tool that doesn't exist
     args: dict[str, str]
 
-plan = complete_json(llm, PLANNER_PROMPT.format(task=task), Plan).steps
+plan = (await complete_json(llm, PLANNER_PROMPT.format(task=task), Plan)).steps
 while remaining:
     step = remaining.pop(0)
-    r = registry.execute(ToolCall(id=step.id, name=step.tool, arguments=json.dumps(step.args)))
+    r = await registry.execute(ToolCall(id=step.id, name=step.tool, arguments=json.dumps(step.args)))
     if not r.ok and replans < MAX_REPLANS:               # only go back to the model on failure
-        remaining = complete_json(llm, REPLANNER_PROMPT.format(...), Plan).steps
+        remaining = (await complete_json(llm, REPLANNER_PROMPT.format(...), Plan)).steps
 ```
+
+**Independent read-only steps in a plan can run as one concurrent batch.** "Check the weather in Beijing, Shanghai and Guangzhou" is three steps that don't depend on each other; running them one after another just means waiting twice as long as necessary. `agentkit.workflows.parallel` sends them out together on one event loop, with a concurrency cap, and cancels the rest the moment one raises:
+
+```python
+async def execute(step):
+    return await registry.execute(ToolCall(id=step.id, name=step.tool, arguments=json.dumps(step.args)))
+
+# Precondition: the steps don't depend on each other (no arguments refer to other steps' results) and every tool is read-only
+assert all(registry.get(s.tool).risk == "read" for s in batch)
+outcomes = await parallel([lambda s=s: execute(s) for s in batch], max_concurrency=4)
+```
+
+Measured in the demo: all three lookups were in flight at once (the counter's peak is 3), and the batch took 0.30 s where running them one by one needs at least 0.9 s. Note that `registry.execute` turns tool errors into `ToolResult(ok=False)` instead of raising, so the Guangzhou failure doesn't get Beijing and Shanghai cancelled. The exercise file ships a general version, `run_independent_steps`, whose tests prove that the three steps really are in flight together, that `max_concurrency` really is the cap, that when one step fails the others are cancelled and have actually stopped, and that a batch containing a write runs nothing at all.
+
+**Steps with side effects must not run like this.** The last section of the demo shows what goes wrong in two small scenarios:
+
+- **Order is meaning** (demo scenario 1): a rebooking plan says "s1 book the new flight, s2 cancel the old one". Run in order, s1 fails (sold out) and everything stops; the old ticket survives. Run concurrently, s2 finishes the cancellation in 0.05 s and s1 only fails at 0.3 s — the user now has no ticket at all.
+- **Cancellation lands mid-flight** (demo scenario 2): s1 issues a refund (the request goes out, then waits for the payment gateway to confirm), s2 sends an SMS. s2 fails, and `parallel` immediately cancels s1: the request was sent, the confirmation never arrived, and whether the money went back is now unknown — only idempotency keys and reconciliation can clean that up. For read-only lookups, "one fails, cancel the rest" is a feature (nothing keeps burning money in the background); for writes it's an incident.
+- **Retries and replans replay work**: if some writes in a batch succeeded and others failed, replanning and rerunning the whole batch executes the successful writes again (double charges) unless the tools are idempotent (Lesson 08).
+
+The rule is the same one the agent loop uses: run a batch concurrently only when every step in it is read-only; as soon as there's a write, execute in plan order, one step at a time. `run_independent_steps` refuses a batch containing a write step and runs nothing.
 
 > 💡 A shift worth noticing: **the plan is turning from a standalone architecture into a tool inside ReAct.** Claude Code has to-do list tools, and LangChain v1 ships a built-in to-do list middleware (the old LangGraph Plan-and-Execute tutorial URL now redirects there). The model keeps an explicit plan while running a ReAct loop, so it gets a global view without losing the ability to adapt.
 
@@ -198,13 +221,13 @@ class Step(BaseModel):
     tool: str
     args: dict[str, str]          # values may contain "#E1", replaced with E1's result at run time
 
-plan = complete_json(llm, f"Write a complete plan. Refer to earlier results as #E1, #E2.\nTask: {task}", Plan)
+plan = await complete_json(llm, f"Write a complete plan. Refer to earlier results as #E1, #E2.\nTask: {task}", Plan)
 evidence: dict[str, str] = {}
-for s in plan.steps:              # no model calls during execution
+for s in plan.steps:              # no model calls during execution; #E dependencies force this order, independent steps could run as a batch as in §2.2
     args = {k: re.sub(r"#(E\d+)", lambda m: evidence[m.group(1)], v) for k, v in s.args.items()}
     call = ToolCall(id=s.var, name=s.tool, arguments=json.dumps(args, ensure_ascii=False))
-    evidence[s.var] = registry.execute(call).content
-answer = complete(llm, f"Task: {task}\nEvidence: {json.dumps(evidence, ensure_ascii=False)}")
+    evidence[s.var] = (await registry.execute(call)).content
+answer = await complete(llm, f"Task: {task}\nEvidence: {json.dumps(evidence, ensure_ascii=False)}")
 ```
 
 ### 2.4 Reflection / Reflexion: find the problems, then fix them
@@ -232,7 +255,7 @@ flowchart LR
 | Use it when | There's an objective way to check the output: code (run the tests), structured output (schema validation), fact-based reports (check against the data) |
 | Strengths | General-purpose; can be layered on top of any architecture; with external feedback, the quality gains are well documented |
 | Weaknesses and failure modes | Unreliable without an external signal; **spinning**: the same feedback comes back round after round; **oscillation**: A becomes B, then B goes back to A; a wrong or overly picky critic causes endless rework; cost doubles |
-| Cost and latency | Each extra round = 1 critique + 1 revision. In the real demo run the first draft passed straight away and it still cost 1 more call and ~1,000 more tokens than ReAct — think of it as an insurance premium |
+| Cost and latency | Each extra round = 1 critique + 1 revision. In the real demo run the first draft passed straight away and it still cost 1 more call and ~1,100 more tokens than ReAct — think of it as an insurance premium |
 | Key work | Self-Refine, Reflexion; LangChain's post [Reflection Agents](https://www.langchain.com/blog/reflection-agents) compares basic reflection, Reflexion and LATS |
 
 **With agentkit**: `evaluator_optimizer` ([agentkit/workflows.py](../../agentkit/workflows.py), 06 §2.5) is exactly this loop. The demo's `run_reflection` has two design choices worth copying:
@@ -309,8 +332,8 @@ flowchart TB
 | In practice | Full tree search is rare in production systems. The common simplification is **best-of-N**: generate N candidates in parallel and let tests or a validator pick the best one — tree search with depth 1 |
 
 ```python
-def best_of_n(generate, score, n=4):
-    candidates = parallel([generate] * n)   # agentkit.workflows.parallel
+async def best_of_n(generate, score, n=4):
+    candidates = await parallel([generate] * n, max_concurrency=n)   # agentkit.workflows.parallel: all n candidates generated at once
     return max(candidates, key=score)       # ideally score is code: run the tests, check the rules
 ```
 
@@ -360,8 +383,8 @@ sequenceDiagram
 
 ```python
 agent = Agent(llm, [refund_order], hooks=[PermissionPolicy(ask_risks={"dangerous"})])
-r = agent.run("Refund order A1001")                   # r.status == "paused"; r.pending_approval is the call awaiting approval
-r = agent.approve(r.run_id, True, by="alice", comment="Delivery record verified")   # logged in approval_log, resumes from the checkpoint
+r = await agent.run("Refund order A1001")             # r.status == "paused"; r.pending_approval is the call awaiting approval
+r = await agent.approve(r.run_id, True, by="alice", comment="Delivery record verified")   # logged in approval_log, resumes from the checkpoint
 ```
 
 ### 2.8 Combining them: real systems rarely use just one
@@ -446,7 +469,7 @@ flowchart TB
   - Anthropic's research system: a lead agent plus parallel subagents (§4.1);
   - [Magentic-One](https://arxiv.org/abs/2411.04468) (Microsoft, 2024): the Orchestrator keeps a **Task Ledger** (facts, guesses, plan) and a **Progress Ledger** (a self-check on progress at every step), and directs four specialists — WebSurfer, FileSurfer, Coder and ComputerTerminal. When progress stalls, it reflects and updates the plan. It's a supervisor combined with Plan-and-Execute.
 - **Failure modes**: the supervisor becomes a bottleneck — everything flows through it, so its context grows; tasks are written with missing context; the supervisor treats an expert's conclusion as fact; delegation depth spirals (experts delegating to experts delegating to…).
-- **Implementation**: `agent_as_tool` (06 §2.7). A hierarchy is just an expert that is itself a supervisor with its own `agent_as_tool` experts. Remember to cap delegation depth.
+- **Implementation**: `agent_as_tool` (06 §2.7). A hierarchy is just an expert that is itself a supervisor with its own `agent_as_tool` experts. Remember to cap delegation depth. `agent_as_tool` produces an async tool: when the supervisor delegates to several experts in one step they run concurrently, and when the supervisor is cancelled, any expert still running is cancelled with it (measured in 06 §3).
 
 ### 3.4 Network / swarm (handoffs)
 
@@ -477,10 +500,10 @@ class Handoff(Hook):
         if call.name.startswith("transfer_to_"):
             raise StopRun("handoff", call.name.removeprefix("transfer_to_"))
 
-def run_swarm(agents: dict[str, Agent], active: str, user_input: str, max_handoffs: int = 3):
+async def run_swarm(agents: dict[str, Agent], active: str, user_input: str, max_handoffs: int = 3):
     history: list = []
     for _ in range(max_handoffs + 1):
-        r = agents[active].run(user_input, history=history)
+        r = await agents[active].run(user_input, history=history)
         if r.stop_reason != "handoff":
             return active, r                         # the next user message also goes to `active`
         active, history = r.output, r.history        # the new agent takes over with the full history
@@ -559,17 +582,17 @@ flowchart LR
 - **Implementation sketch** (this runs):
 
 ```python
-def handle(event: dict) -> None:                        # called by the queue consumer
+async def handle(event: dict) -> None:                  # called by the queue consumer
     run_id = f"evt-{event['id']}"                       # the event ID doubles as run_id, so redeliveries are recognizable
     if agent.checkpointer.load(run_id) is not None:     # already handled: skip (idempotency)
         return
-    result = agent.run(f"New ticket: {event['text']}", run_id=run_id,
-                       metadata={"tenant_id": event["tenant"], "user_id": "system:ambient"})
-    if result.status == "paused":                       # needs a human: park it in the inbox, then agent.approve(run_id, ...)
+    result = await agent.run(f"New ticket: {event['text']}", run_id=run_id,
+                             metadata={"tenant_id": event["tenant"], "user_id": "system:ambient"})
+    if result.status == "paused":                       # needs a human: park it in the inbox, then await agent.approve(run_id, ...)
         inbox.push(run_id, result.pending_approval)
 ```
 
-In production the checkpoints have to live in shared storage (replace `FileCheckpointer` with a database) so every worker can see which events have been handled. There's still a race between "check" and "run"; strict deduplication needs a database unique constraint or a distributed lock (Lesson 13).
+In production the checkpoints have to live in shared storage so every worker process can see which events have been handled: on one machine with several processes, use the SQLite checkpointer and job queue from `agentkit.distributed` ([Lesson 13](../13_distributed_concurrency/README.en.md), which really starts multiple worker processes); across machines, switch to Postgres ([Lesson 26](../26_state_and_queues/README.en.md)). There's still a race between "check" and "run", even inside a single process: if the same event is delivered twice and two coroutines handle it at once, `await agent.run(...)` sits between `load` and the checkpoint write, so both coroutines see "not handled yet" ([Lesson 06](../06_orchestration/README.en.md) §2.3 shows how an await between a read and its write loses updates). Strict deduplication needs an atomic claim: a database unique constraint, or a job queue with leases (Lesson 13).
 
 Event-driven design only answers "when does the agent wake up?" A proactive agent also has to answer "once awake, should it interrupt anyone?" For user models, interruption decisions, and privacy boundaries, see [Lesson 25](../25_proactive_and_frontier/README.en.md).
 
@@ -803,7 +826,7 @@ For from-scratch implementations of these mechanisms (Mem0-style write decisions
 | Category | Architecture | Where the model thinks | Typical model calls | Latency profile | Predictability | Good for | Biggest risk |
 |---|---|---|---|---|---|---|---|
 | Single agent | ReAct | Every step | N (steps) | Adds up serially; slower as history grows | Low | Unknown paths | Myopia, spinning, context bloat |
-| Single agent | Plan-and-Execute | Start + on failure + end | 2 + replans (code executor) | Fast execution phase | Medium | Multi-step tasks you can roughly plan | Bad plans, replan loops |
+| Single agent | Plan-and-Execute | Start + on failure + end | 2 + replans (code executor) | Fast execution phase; independent read-only steps can run concurrently | Medium | Multi-step tasks you can roughly plan | Bad plans, replan loops |
 | Single agent | ReWOO / LLMCompiler | Start + end | 2 (fixed) | Tools can run in parallel; fastest | High | Data-gathering, parallelizable tasks | Can't adapt to surprises |
 | Layer | Reflection | After the work | +2 per round | A few more serial rounds | Medium | Objectively checkable output | Useless without external evidence; spinning |
 | Single agent | CodeAct | Every step, each doing more | Fewer than ReAct | Plus sandbox overhead | Low | Many tools, data processing | Security risk of running code |
@@ -867,7 +890,7 @@ Exercise 3's `choose_architecture` is the first decision tree written as code. *
 .venv/bin/python lessons/05_agent_architectures/demo.py --offline  # scripted, no API key needed
 ```
 
-An excerpt from a real run (gpt-5.5). The demo prints in Chinese; it's translated here for readability:
+An excerpt from a real run (gpt-5.5, 2026-09-28). The demo prints in Chinese; it's translated here for readability:
 
 ```text
 Architecture 1: ReAct — think while you act (agentkit.Agent is ReAct)
@@ -876,18 +899,21 @@ Architecture 1: ReAct — think while you act (agentkit.Agent is ReAct)
         ← ❌ Error: the Guangzhou weather station API is under maintenance (503). Use get_weather_by_airport with the airport code instead; Guangzhou Baiyun is CAN.
     Step 2 (model) → get_weather_by_airport(CAN,10-17)
     Step 3 (model) → answers
+  ⏱ 10.3s | 3 model calls | 4 tool calls (peak in flight 3) | 2725 tokens
 
 Architecture 2: Plan-and-Execute — plan, execute, replan only on failure
   📋 Plan from the planner (1 model call):
     s1: get_weather(Beijing,10-15)
     s2: get_weather(Shanghai,10-16)
     s3: get_weather(Guangzhou,10-17)
-  ⚙️  Execution (code calls the tools one by one, no model involved):
+  ⚙️  Execution (code calls the tools, no model involved; a batch's steps go out together):
     ✅ s1: get_weather(Beijing,10-15)
     ✅ s2: get_weather(Shanghai,10-16)
     ❌ s3: get_weather(Guangzhou,10-17) → Error: the Guangzhou weather station API is under maintenance (503)...
+       This batch, 3 steps: peak in flight 3, took 0.30s (one at a time would need at least 0.9s)
     🔁 Replan (#1, 1 model call) → s3: get_weather_by_airport(CAN,10-17)
     ✅ s3: get_weather_by_airport(CAN,10-17)
+       This batch, 1 step: peak in flight 1, took 0.30s (one at a time would need at least 0.3s)
 
 Architecture 3: Reflection — draft, critique, revise
     Step 1 (model) → get_weather(Beijing,10-15)  get_weather(Shanghai,10-16)  get_weather(Guangzhou,10-17)
@@ -896,23 +922,36 @@ Architecture 3: Reflection — draft, critique, revise
     🔍 Review round 1 · model check → ✅ passed
 
 Comparison: one task, three architectures
-  Architecture      Model calls  Tool calls  Tokens  Time    Quality check                 Where the model thinks
-  ReAct             3            4           2705    10.7s   3/3 cities · typhoon✅ · 4 lines✅   every step
-  Plan-and-Execute  3            4           2724    14.3s   3/3 cities · typhoon✅ · 4 lines✅   plan + replan on failure + summary
-  Reflection        4            4           3716    11.2s   3/3 cities · typhoon✅ · 4 lines✅   ReAct draft + model/code critique + revise
+  Architecture      Model calls  Tool calls  Tool peak  Tokens  Time    Quality check                        Where the model thinks
+  ReAct             3            4           3          2725    10.3s   3/3 cities · typhoon✅ · 4 lines✅   every step
+  Plan-and-Execute  3            4           3          2837    14.6s   3/3 cities · typhoon✅ · 4 lines✅   plan + replan on failure + summary
+  Reflection        4            4           3          3849    14.6s   3/3 cities · typhoon✅ · 4 lines✅   ReAct draft + model/code critique + revise
+
+Appendix: why a plan with writes can't run as one concurrent batch (plain code, no model calls)
+  Scenario 1: rebooking — the plan is s1 book the new flight (book_flight), s2 cancel the old booking (cancel_booking)
+    In order: s1 failed (CZ3105 sold out) → stop. Remaining bookings: ['B-OLD']
+    Concurrently: when s1 failed (CZ3105 sold out), s2 had already finished → cancelled 10-17 CZ3101 Beijing→Guangzhou. Remaining bookings: none ❌
+  Scenario 2: the plan is s1 refund (refund), s2 send an SMS (send_sms), run concurrently
+    s2 failed (SMS service 500) → parallel immediately cancels s1, which is still waiting for a response
+    · Refund request sent to the payment gateway (order A1001)
+    Did the refund go through? The request went out, the confirmation never came — the state is unknown; only idempotency keys + reconciliation can clean this up ❌
 ```
 
 **What to look for:**
 
 1. **Same surprise, two responses**: ReAct stepped around the Guangzhou outage inside its loop, because every step goes back to the model. Plan-and-Execute's executor is plain code, so it had to stop and spend a model call on replanning.
 2. **Planning first didn't save anything here**: ReAct called 3 tools **in parallel** on step 1 and finished in 3 steps while the history was still short. Meanwhile, every Plan-and-Execute planning call goes through `complete_json`, which puts the JSON Schema into the prompt, and the replanning prompt repeats the context. Plan-and-Execute pulls ahead on tasks with **many steps**: ReAct's input tokens grow roughly quadratically with step count, while Plan-and-Execute spends zero model tokens during execution. Add a few more cities to `WEATHER` and `TRIP` and rerun to watch the gap change.
-3. **Plan-and-Execute was actually the slowest**: its 3 model calls are all serial, each carrying a long structured prompt. "No model during execution" saves time in the execution phase, not in the planning itself.
-4. **Reflection's insurance premium**: in the real run the first draft passed straight away, and it still cost 1 more call and ~1,000 more tokens. In offline mode (`--offline`) the script deliberately leaves the typhoon warning out of the first draft: you'll see round 1 rejected by the **code check** without spending a single model call, and only round 2 checked by the model.
-5. **The quality-check column** is a minimal evaluation written in a few lines of code. Architecture choices should rest on data like this, not on names ([Lesson 11](../11_evals/README.en.md)).
+3. **Plan-and-Execute was over 4 seconds slower than ReAct**: its 3 model calls are all serial, each carrying a long structured prompt. Running the execution phase as a concurrent batch saved only about 0.6 s of tool time (3 × 0.3 s became 0.3 s), which is negligible next to the model calls. "No model during execution" and concurrency both save time in the execution phase, not in the planning itself.
+4. **Reflection's insurance premium**: in the real run the first draft passed straight away, and it still cost 1 more call and ~1,100 more tokens. In offline mode (`--offline`) the script deliberately leaves the typhoon warning out of the first draft: you'll see round 1 rejected by the **code check** without spending a single model call, and only round 2 checked by the model.
+5. **The tool-peak column** is 3 for all three architectures. ReAct and Reflection get there because `Agent` runs read-only tools from the same step concurrently; Plan-and-Execute gets there through `parallel`. In offline mode model calls take no time, so the elapsed time is all tool latency: ReAct's 0.6 s = two rounds of tools × 0.3 s. Had the three lookups run one after another, it would be 1.2 s.
+6. **The last section**: the very same `parallel`, applied to writes, produced two incidents — a rebooking that left the user with no ticket, and a refund in an unknown state. Before running steps concurrently, ask "do these depend on each other, and do they have side effects?"
+7. **The quality-check column** is a minimal evaluation written in a few lines of code. Architecture choices should rest on data like this, not on names ([Lesson 11](../11_evals/README.en.md)).
 
 ## 8. Exercises
 
-Open [`exercise.py`](exercise.py) and implement skeletons for three architectures. The planner, executor and critic are plain functions, so the tests run fully offline and deterministically:
+Open [`exercise.py`](exercise.py) and implement skeletons for three architectures. The planner, executor and critic are injected async functions (fakes in the tests), so the tests run fully offline and deterministically.
+
+**Writing it async**: `PlanExecuteAgent.run` and `reflect_loop` must be `async def`; inside them you `await self.planner(task)`, `await self.executor(step, dict(results))`, `await self.replanner(...)`, `await generate(...)` and `await critique(...)`. `stop_when` and `choose_architecture` are plain functions you call directly. When the executor fails, catch only `Exception`: the `asyncio.CancelledError` raised when the caller cancels the run is a `BaseException` and must propagate unchanged — it is not "this step failed" and must never trigger a replan (there's a test for this).
 
 **Task 1: `PlanExecuteAgent`**
 - The planner returns a structured list of steps (`Step`); validate the plan first: non-empty, correct element types, unique ids;
@@ -931,7 +970,7 @@ Open [`exercise.py`](exercise.py) and implement skeletons for three architecture
 Check your work:
 
 ```bash
-make lesson N=05                     # done when everything passes (30 tests)
+make lesson N=05                     # done when everything passes (34 tests: 31 exercise tests + 3 tests of the provided run_independent_steps)
 AGENTKIT_SOLUTION=1 make lesson N=05 # run against the reference solution to confirm the tests themselves are right
 ```
 
@@ -963,6 +1002,8 @@ Every architecture can be drawn as a state graph: nodes are "call the model / ru
 |---|---|---|
 | Choosing by hype ("everyone's doing multi-agent") | Double the cost, not necessarily better results | Start with ReAct or a workflow and let eval data justify anything more complex |
 | Plan-and-Execute with no replan limit | Fail → replan → fail, forever | Cap replans and executed steps (Exercise 1) |
+| Running a plan's write steps as one concurrent batch | When one step fails, other writes have already taken effect, or were cancelled mid-flight in an unknown state | Only independent read-only steps run concurrently; writes run in order, and write tools are idempotent (§2.2) |
+| An executor that catches everything with `except BaseException` or a bare `except` | After the user cancels, the run keeps going: the cancellation triggers a replan and keeps spending | Catch only `Exception`; let `CancelledError` propagate (Exercise 1) |
 | A plan that's a paragraph of free text | The executor has to guess; parsing fails | A structured plan with schema validation and an enum of tool names |
 | ReWOO on tasks where results change the plan | When something unexpected happens, it answers with bad data | Use Plan-and-Execute, or add replanning |
 | "Self-reflection" with no external evidence | Costs more, results unstable or worse | Give the critic test results, validators or raw data to check against |
@@ -1051,6 +1092,15 @@ Every architecture can be drawn as a state graph: nodes are "call the model / ru
 - All long-term memory must be isolated, deletable and resistant to poisoning; changes to procedural memory should go through review and release.
 </details>
 
+<details>
+<summary>Q9: A Plan-and-Execute plan has 10 steps. Can you run them all concurrently?</summary>
+
+- Check dependencies first: a step that needs an earlier step's result has to wait; represent the plan as a dependency graph (LLMCompiler's approach), and only the independent steps within one level can run together;
+- Then check side effects: read-only steps can run concurrently; once writes run concurrently, order stops meaning anything (book the new ticket before cancelling the old one), one failure cancels other steps mid-flight (request sent, outcome unknown), and retries or replans replay writes that already succeeded;
+- Cap the concurrency (`parallel(..., max_concurrency=...)`), or a single fan-out can push the model gateway or a downstream API into 429s;
+- Measure that concurrency actually happened: the peak of an in-flight counter, and a batch that takes as long as its slowest step rather than the sum (this lesson's demo: peak 3, 0.30 s, versus at least 0.9 s one at a time).
+</details>
+
 ## 12. Self-check
 
 - [ ] I can tell ReAct, Plan-and-Execute, ReWOO, Reflection, CodeAct and tree search apart in one sentence each, using "where the model thinks"
@@ -1062,6 +1112,7 @@ Every architecture can be drawn as a state graph: nodes are "call the model / ru
 - [ ] I can describe deep research, coding agents, computer use, customer support and agentic RAG each as a one-line combination of architectures
 - [ ] I can distinguish short-term, working, episodic, semantic and procedural memory and say where each lives
 - [ ] I can use the decision tree to pick an architecture for a new requirement and explain why the simpler option isn't enough
+- [ ] I can say which steps in a plan can run concurrently and which can't, and name the three incidents that concurrent writes cause
 - [ ] I've finished the exercises and `make lesson N=05` passes
 
 ## Further reading

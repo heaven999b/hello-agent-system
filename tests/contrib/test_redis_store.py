@@ -226,10 +226,10 @@ async def test_bucket_allows_a_burst_then_denies_and_keys_are_independent(r):
 
 
 async def test_bucket_refills_over_time_using_the_redis_clock(r):
-    bucket = RedisTokenBucket(r, rate_per_sec=20, capacity=1)
+    bucket = RedisTokenBucket(r, rate_per_sec=2, capacity=1)  # 0.5 秒补一个：机器再忙，三次往返也用不了这么久
     assert await bucket.try_acquire("t") and not await bucket.try_acquire("t")
     ok, wait, _ = await bucket.take("t")
-    assert not ok and 0 < wait <= 0.05  # 每 0.05 秒补一个：脚本算出来还要等多久
+    assert not ok and 0 < wait <= 0.5  # 脚本算出来还要等多久
     assert await bucket.acquire("t", timeout=5.0)  # 按算出来的时间睡一会儿，再拿就拿到了
 
 
@@ -302,12 +302,12 @@ async def test_rate_limit_hook_waits_without_blocking_the_event_loop(r):
             ticks += 1
 
     t = asyncio.create_task(ticker())
-    await hook.before_llm(state, [])
     t0 = time.monotonic()
-    await hook.before_llm(state, [])  # 桶空了，要等约 0.2 秒
-    waited = time.monotonic() - t0
+    await hook.before_llm(state, [])  # 拿走唯一的令牌
+    await hook.before_llm(state, [])  # 桶空了：第二个令牌最早在第一次拿走之后 0.2 秒补上
+    elapsed = time.monotonic() - t0
     t.cancel()
-    assert waited > 0.15  # 确实等了（5 个/秒 → 约 0.2 秒；sleep 不会提前返回）
+    assert elapsed >= 0.19  # 确实等了（5 个/秒；以第一次拿令牌为起点量，机器忙时也不会误报）
     assert ticks >= 3, "等令牌时事件循环被卡住了：别的协程一次都没跑"
     assert hook.stats["acme"]["calls"] == 2
 

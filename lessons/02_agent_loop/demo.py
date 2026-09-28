@@ -5,11 +5,16 @@
 
 看点：
   第 1 部分：一个"打印事件"的 Hook 让你看到主循环的每个节拍；追踪树让你看到每一步的耗时和 token。
+            两个只读工具是并发执行的：先打印两次 before_tool，再打印两次 after_tool。
   第 2 部分：Agent 的 5 种结束方式（最终答案 / 步数上限 / 预算 / 模型故障 / 等待审批）。
+
+Agent 是 async 的：`result = await agent.run(...)`，脚本入口是 `asyncio.run(main())`。
+一个进程怎么同时服务很多会话，见 demo_async.py。
 """
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from typing import Annotated
 
@@ -49,7 +54,8 @@ class EventPrinter(Hook):
         print(f"  [on_run_start] run_id={state.run_id}  用户输入：{user_input}")
 
     def before_llm(self, state, messages):
-        print(f"  [before_llm]   第 {state.step} 步：准备把 {len(messages)} 条消息发给模型")
+        # state.step 是"已经发出的模型调用次数"，在 before_llm 之后、真正调用模型时才加一，所以这里 +1
+        print(f"  [before_llm]   第 {state.step + 1} 步：准备把 {len(messages)} 条消息发给模型")
 
     def after_llm(self, state, response):
         what = "请求调用 " + ", ".join(f"{c.name}{c.arguments}" for c in response.tool_calls) if response.tool_calls else "给出最终答案"
@@ -72,7 +78,7 @@ def banner(title: str) -> None:
     print(f"\n{'═' * 70}\n{title}\n{'═' * 70}")
 
 
-def part1(offline: bool) -> None:
+async def part1(offline: bool) -> None:
     banner("第 1 部分：同一个任务，用 agentkit.Agent 实现")
     if offline:
         llm = ScriptedLLM([
@@ -91,7 +97,7 @@ def part1(offline: bool) -> None:
 
     question = "北京和上海现在哪个更热？高几度？"
     print(f"用户问题：{question}\n\n▶ 钩子事件流（主循环的每个节拍）：")
-    result = agent.run(question)
+    result = await agent.run(question)
 
     print(f"\n▶ 运行结果（RunResult）：")
     print(f"  output      = {result.output}")
@@ -108,7 +114,7 @@ def part1(offline: bool) -> None:
     print("   框架没有改变 Agent 的本质，只是把 步数上限 / 钩子 / 检查点 / 追踪 / 成本统计 做成了标准件。")
 
 
-def part2() -> None:
+async def part2() -> None:
     banner("第 2 部分：Agent 的 5 种结束方式（离线剧本，结果确定）")
 
     @tool(risk="dangerous")
@@ -132,14 +138,14 @@ def part2() -> None:
     print(pad("场景", 26) + pad("status", 11) + pad("stop_reason", 26) + pad("steps", 7) + "output")
     print("─" * 110)
     for label, agent in scenarios:
-        r = agent.run("演示")
+        r = await agent.run("演示")
         out = r.output or ""
         out = out if len(out) <= 30 else out[:30] + "…"
         print(pad(label, 26) + pad(r.status, 11) + pad(str(r.stop_reason), 26) + pad(str(r.steps), 7) + out)
 
-    print("\n💡 关键设计：不论以哪种方式结束，agent.run() 都「返回」一个 RunResult，而不是把异常抛给调用方。")
+    print("\n💡 关键设计：不论以哪种方式结束，await agent.run() 都「返回」一个 RunResult，而不是把异常抛给调用方。")
     print("   调用方（Web 接口、工单系统）只需要看 status 决定下一步：展示答案 / 提示重试 / 通知审批人。")
-    print("   其中 paused 的运行已存入检查点，审批后用 agent.approve(run_id) 从断点继续（第 08、09 课）。")
+    print("   其中 paused 的运行已存入检查点，审批后用 await agent.approve(run_id) 从断点继续（第 08、09 课）。")
 
 
 def pad(s: str, width: int) -> str:
@@ -148,15 +154,15 @@ def pad(s: str, width: int) -> str:
     return s + " " * max(1, width - shown)
 
 
-def main() -> None:
+async def main() -> None:
     offline = "--offline" in sys.argv
     print("🎬 离线模式：用剧本扮演模型" if offline else "🌐 真实模型模式（每次结果可能略有不同）")
     try:
-        part1(offline)
+        await part1(offline)
     except Exception as e:  # noqa: BLE001
         print(f"\n❌ 第 1 部分调用模型失败：{type(e).__name__}: {e}\n   可以先用 --offline 运行，或 make check-env 检查配置。")
-    part2()
+    await part2()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

@@ -2,7 +2,7 @@
 
 # 第 13 课：高并发与分布式执行 —— 一台机器不够用之后
 
-> 🕐 建议用时：25 分钟 ｜ 🎯 学完你能：把单进程 Agent 扩展成多 worker 集群，让任务"不丢、不重、不乱、不被压垮"，并为每一项在多种方案里做出有依据的选择 ｜ 📦 对应源码：[`jobqueue.py`](jobqueue.py)（租约队列）、[`session_store.py`](session_store.py)（乐观并发）、[`agentkit/state.py`](../../agentkit/state.py)（检查点）、[`agentkit/tools.py`](../../agentkit/tools.py)（幂等键）
+> 🕐 建议用时：25 分钟 ｜ 🎯 学完你能：把一个进程里的 async Agent 扩展成多个 worker 进程（再到多台机器），让任务"不丢、不重、不乱、不被压垮"，用真实的 kill -9 / SIGSTOP / SIGTERM 验证它，并为每一项在多种方案里做出有依据的选择 ｜ 📦 对应源码：[`jobqueue.py`](jobqueue.py)（租约队列）、[`session_store.py`](session_store.py)（乐观并发）、[`race.py`](race.py)（真进程竞争）、[`agentkit/distributed/`](../../agentkit/distributed/__init__.py)（框架版：队列、fence 检查点、worker 进程池）、[`agentkit/tools.py`](../../agentkit/tools.py)（幂等键）
 >
 > 📖 必读：[How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)（Martin Kleppmann, 2016）—— 本课 fencing token 时间线的出处；重点读 "Protecting a resource with a lock" 和 "Making the lock safe with fencing" 两节，理解为什么进程暂停和网络延迟会让"拿到过锁"不等于"现在还持有锁"。
 
@@ -10,7 +10,7 @@
 
 **分布式系统最难的不是"让很多机器一起干活"，而是"其中一台机器慢了、死了、假死了的时候，活儿不丢、不重、不乱"。**
 
-想象一家餐厅的后厨。一开始只有一个厨师（单进程），生意好了雇到 8 个（多 worker），新问题马上就来了：
+想象一家餐厅的后厨。一开始只有一个厨师（一个进程）。他很能干，能同时照看十几口锅（async：一个进程同时推进几百个会话，第 02 课），但他会累倒、会被换班（进程崩溃、发版替换），一个人的灶台也就那么大（一个进程只能用满一个 CPU 核）。生意好了雇到 8 个（多个 worker 进程，再到多台机器），新问题马上就来了：
 
 | 后厨里发生的事 | 分布式里叫什么 | 本课的解法 |
 |---|---|---|
@@ -29,9 +29,9 @@
 - **瓶颈不在你手里**：模型 API 按每分钟请求数（RPM）和 token 数（TPM）限额，加再多机器也突破不了。
 - **有状态**：对话历史、检查点、等待审批的暂停状态，都要在多台机器之间共享。
 
-先算一笔账。**利特尔法则（Little's Law）**：系统里同时在处理的任务数 = 到达速率 × 平均处理时长。如果早高峰每秒进来 20 条请求、每个 Agent 任务平均跑 15 秒，那么同时在跑的任务就是 20 × 15 = **300 个**。一个 32 线程的进程根本装不下，而这 300 个"跑到一半"的任务，会在下一次发版时一起被打断。
+先算一笔账。**利特尔法则（Little's Law）**：系统里同时在处理的任务数 = 到达速率 × 平均处理时长。如果早高峰每秒进来 20 条请求、每个 Agent 任务平均跑 15 秒，那么同时在跑的任务就是 20 × 15 = **300 个**。一个 async 进程装得下 300 个"在等模型"的会话（第 02 课），但这 300 个跑到一半的任务全押在一个进程上：它一崩溃、一发版，就一起被打断；它也只能用一个 CPU 核。所以要多个进程，而多个进程一起干活，才有了这节课的所有问题。
 
-这节课就是把上面那张后厨的表，变成一个能在多进程下真实运行的系统。
+这节课就是把上面那张后厨的表，变成一个在多个真实进程之间运行、并用真实的操作系统信号（kill -9、SIGSTOP、SIGTERM）检验过的系统。
 
 ## 1. 核心概念
 
@@ -59,11 +59,11 @@ flowchart LR
 
 | 层 | 有状态吗 | 怎么扩展 | 本课在哪 |
 |---|---|---|---|
-| API 网关 | 无 | 随便加机器 | [第 12 课](../12_production_architecture/README.md)（鉴权、按租户限流） |
-| 任务队列 | **有**（持久化） | 换成专业队列 / 分区 | [`jobqueue.py`](jobqueue.py) |
-| worker | **无** | 按队列积压量加减进程 | [`demo.py`](demo.py) 的 `agent_worker` |
-| 会话存储、检查点 | **有** | 数据库 / KV 存储 | [`session_store.py`](session_store.py)、`FileCheckpointer` |
-| 限流 / 配额 | **有**（计数器） | 集中式（Redis） | demo 里的 `LimitedLLM` |
+| API 网关 | 无 | 随便加机器 | [第 12 课](../12_production_architecture/README.md)（鉴权、按租户限流，真实的 HTTP API 进程） |
+| 任务队列 | **有**（持久化） | 换成专业队列 / 分区 | [`jobqueue.py`](jobqueue.py)（手写）、`SQLiteJobQueue`（框架） |
+| worker | **无** | 按队列积压量加减进程 | [`demo.py`](demo.py) 的 `agent_worker`（手写）、`run_worker` + `WorkerPool`（框架，[`demo_agents.py`](demo_agents.py)） |
+| 会话存储、检查点 | **有** | 数据库 / KV 存储 | [`session_store.py`](session_store.py)、`SQLiteCheckpointer`（带 fence 接管） |
+| 限流 / 配额 | **有**（计数器） | 集中式（Redis） | `SQLiteSemaphore`（跨进程并发名额）、`SQLiteTokenBucket`（跨进程令牌桶） |
 | 下游系统 | 有 | 不归你管，但要求它支持幂等键 | demo 里的 `TicketSystem` |
 
 整个设计的核心思想只有一句：**worker 可以随时死掉、随时增减，因为所有"不能丢"的东西都不在 worker 身上。**
@@ -102,7 +102,7 @@ stateDiagram-v2
 | 术语 | 大白话 | 精确一点 | 本课代码 |
 |---|---|---|---|
 | 租约 lease（SQS 里叫 visibility timeout） | 任务是"借"走的，到点不还就自动收回 | 领取时写入 `lease_until`；过期后任务可被他人重新领取 | `JobQueue.claim` |
-| 心跳 heartbeat | "我还活着，再借我一会儿" | 定期把 `lease_until` 往后推；worker 一死心跳就停 | `JobQueue.heartbeat`、demo 的 `Heartbeat` 线程 |
+| 心跳 heartbeat | "我还活着，再借我一会儿" | 定期把 `lease_until` 往后推；worker 一死心跳就停 | `JobQueue.heartbeat`、demo 的 `heartbeat` 协程 |
 | fencing token | 每次领取发一个更大的号码，存储只认最新的号 | 单调递增的整数；所有由租约保护的写入都带上它，存储拒绝更小的 | `jobs.fence` 列 |
 | 幂等键 idempotency key | 同一件事做两次 = 做一次 | 每个逻辑操作一个稳定的唯一 ID，下游据此去重 | `ToolContext.idempotency_key` |
 | CAS / 乐观并发控制 | "只有它还是我看到的那个样子，我才改" | `UPDATE ... WHERE version = 我读到的版本`，影响 0 行 = 被人抢先了 | `SessionStore.compare_and_set` |
@@ -113,7 +113,7 @@ stateDiagram-v2
 
 ### 问题 1：单进程 Agent 撑不住了，怎么横向扩展？
 
-**场景**：IT 服务台 Agent 起初跑在一台 4 核虚拟机的单个 Python 进程里（Web 框架 + 32 个线程）。全员推广后，早上 9:00–9:30 每秒约 20 条报修，每个 Agent 任务平均 15 秒。按利特尔法则，同时在跑的任务约 300 个 —— 32 个线程远远不够，请求越排越长、开始超时。更要命的是：这台机器一重启，所有跑到一半的任务全部丢失。
+**场景**：IT 服务台 Agent 起初跑在一台 4 核虚拟机的单个 Python 进程里（async Web 框架，一个事件循环）。全员推广后，早上 9:00–9:30 每秒约 20 条报修，每个 Agent 任务平均 15 秒。按利特尔法则，同时在跑的任务约 300 个 —— 事件循环装得下这么多"在等模型"的会话，可这个进程只能用满 4 个核里的 1 个（GIL），每一步序列化对话历史、写检查点、解析工具参数的 CPU 开销叠起来，p99 延迟越来越长。更要命的是：这台机器一重启，所有跑到一半的任务全部丢失。
 
 **为什么难**：直觉方案是"多开几台一样的机器，前面挂负载均衡"。但 Agent 是**有状态**的：对话历史、检查点、等待审批的暂停状态都在进程内存里。用户的第二条消息被负载均衡发到了另一台机器，那台机器完全不知道之前聊过什么；更糟的是，两台机器可能同时在处理同一个会话。
 
@@ -125,7 +125,7 @@ stateDiagram-v2
 
 **怎么选**：默认选 A。先把 Agent 改造成"无状态 worker + 外部状态"，这是后面所有方案（队列、租约、检查点）的地基。A 带来的"同一会话并发写"问题，用问题 4 的方案补上：CAS 兜底，或者让队列按会话串行（它其实就是"穷人版 actor"）。B 只用作过渡。真正值得上 C 的信号是：会话状态很大、每次从存储加载都很贵，或者对会话内顺序和延迟的要求非常高。
 
-**本课实现**：Demo 场景 1 就是方案 A：worker 是独立的操作系统进程，除了 SQLite 文件什么都不共享；检查点用 agentkit 的 `FileCheckpointer`，`run_id = f"job-{id}"`，任何 worker 都能接着跑。队列的 `group_key`（[`jobqueue.py`](jobqueue.py) 的 `CLAIMABLE_WHERE`）保证同一会话同一时刻只有一个 worker 在处理，用队列达到了 C 的效果。升级到生产：SQLite → Postgres / Redis；worker 部署为 K8s Deployment，按队列积压量自动扩缩容（例如 KEDA）。
+**本课实现**：三个 demo 都是方案 A：worker 是独立的操作系统进程，除了 SQLite 文件什么都不共享；检查点用 `SQLiteCheckpointer`（带 fence 接管，3.10 节），`run_id = f"job-{id}"`，任何 worker 都能接着跑。队列的 `group_key`（[`jobqueue.py`](jobqueue.py) 的 `CLAIMABLE_WHERE`）保证同一会话同一时刻只有一个 worker 在处理，用队列达到了 C 的效果。加进程到底能快多少、什么时候不再变快，[`demo_scale.py`](demo_scale.py) 实测了（3.12 节）。升级到生产：SQLite → Postgres / Redis；worker 部署为 K8s Deployment，按队列积压量自动扩缩容（例如 KEDA）。
 
 ### 问题 2：Agent 要跑 3 分钟，HTTP 请求 60 秒就断了
 
@@ -144,7 +144,7 @@ OpenAI 的 Responses API 提供的 background 模式就是 C 的形态：请求�
 
 **怎么选**：按任务时长分层。30 秒以内用 A；交互式、几十秒到几分钟用 B，**并且最好在 B 下面垫一层 C**：先提交任务拿到 job_id，SSE 只负责推送这个 job 的进度，断线后按 job_id 重新订阅 —— 流断了，任务不会断。分钟级以上、不需要人盯着的用 C；流程长达小时 / 天、涉及审批和多个系统时再上 D。**不要用"把超时调大"来解决长任务问题。**
 
-**本课实现**：Demo 实现的是 C 的执行端：任务进 SQLite 队列，worker 领取、心跳、提交。agentkit 的检查点（[第 08 课](../08_reliability/README.md)）是 D 的最小版本："每走一步存一次盘，崩溃后按 run_id 恢复"。升级：队列换成 SQS、RabbitMQ、Redis Streams 或 Postgres；D 换成 Temporal 这类引擎。
+**本课实现**：本课的 demo 实现的是 C 的执行端：任务进 SQLite 队列，worker 进程领取、心跳、提交。C 的入口端（HTTP `POST /runs` 立即返回 `202`、客户端轮询）在[第 12 课](../12_production_architecture/README.md)的迷你部署里：真实的 API 进程 + 这里的 worker 进程。agentkit 的检查点（[第 08 课](../08_reliability/README.md)）是 D 的最小版本："每走一步存一次盘，崩溃后按 run_id 恢复"。升级：队列换成 SQS、RabbitMQ、Redis Streams 或 Postgres；D 换成 Temporal 这类引擎。
 
 ### 问题 3：任务会丢、会重复，到底执行了几次？
 
@@ -176,7 +176,7 @@ B 要可靠地跑起来，还需要四个配套机制：
 
 **怎么选**：有副作用的 Agent 任务一律选 C。经验参数：租约约为心跳间隔的 3 倍，`max_attempts` 取 3~5，死信必须配告警。只有没有副作用、丢了能接受的任务才用 A。
 
-**本课实现**：[`jobqueue.py`](jobqueue.py) 实现了 B 的全部机制：`enqueue` 幂等去重、`claim` 租约 + attempts + fence、`heartbeat`、`fail` 的退避 / 失败 / 死信三条路、`claim` 时把"租约过期且次数用尽"的毒消息送进死信、`redrive`。Demo 场景 2 演示了从 B 到 C：`kill -9` 之后任务被别人接手（不丢），不带幂等键时多出一张工单（会重），带上之后只有一张（effectively-once）。升级：SQS（visibility timeout + `ChangeMessageVisibility` 续约 + DLQ）；或者 Postgres 用 `FOR UPDATE SKIP LOCKED` 做领取（见第 6.1 节）。
+**本课实现**：[`jobqueue.py`](jobqueue.py) 实现了 B 的全部机制：`enqueue` 幂等去重、`claim` 租约 + attempts + fence、`heartbeat`、`fail` 的退避 / 失败 / 死信三条路、`claim` 时把"租约过期且次数用尽"的毒消息送进死信、`redrive`。`demo.py` 场景 2 演示了从 B 到 C：`kill -9` 之后任务被别人接手（不丢），不带幂等键时多出一张工单（会重），带上之后只有一张（effectively-once）。[`demo_agents.py`](demo_agents.py) 用框架再跑一遍：被 `kill -9` 的那次工具调用在接手时重放，由所有进程共享的 `SQLiteIdempotencyStore` 挡住，工具函数一共只执行了 8 次（3.10 节）。升级：SQS（visibility timeout + `ChangeMessageVisibility` 续约 + DLQ）；或者 Postgres 用 `FOR UPDATE SKIP LOCKED` 做领取（见第 6.1 节）。
 
 ### 问题 4：用户连发两条消息，第二条的回复"忘了"第一条
 
@@ -215,7 +215,7 @@ sequenceDiagram
 
 **怎么选**：对话类 Agent 以 C 为主（同一会话串行，顺序天然正确），再用 B 兜底（万一租约过期导致两个 worker 同时处理同一会话，CAS 保证不丢更新）。不适合分区的共享状态（比如团队共享的知识条目、多人协作的文档）：冲突少用 B；冲突多、重做代价高用 A，并且 A 一定要带 fencing token。**不要用不带 fencing token 的分布式锁来保证正确性。**
 
-**本课实现**：[`session_store.py`](session_store.py) 实现 B，练习 (c) 让你写 CAS 重试循环；[`jobqueue.py`](jobqueue.py) 的 `group_key` 实现 C（`CLAIMABLE_WHERE` 里的 `NOT EXISTS`：只有组里最老的未完成任务可以被领取）；`fence` 列就是 fencing token，`complete` / `heartbeat` 都要校验它（练习 (b)）。Demo 场景 4 用 4 个 worker 同时处理同一会话的 16 条消息：不做控制时只保存下来 4 条；CAS 一条不丢，但多调用了约 20 次"模型"，顺序也乱了；按会话串行零冲突、顺序正确，在这个场景下甚至比 CAS 还快。
+**本课实现**：[`session_store.py`](session_store.py) 实现 B，练习 (c) 让你写 CAS 重试循环（测试用 10 个真实进程并发自增 100 次）；[`jobqueue.py`](jobqueue.py) 的 `group_key` 实现 C（`CLAIMABLE_WHERE` 里的 `NOT EXISTS`：只有组里最老的未完成任务可以被领取）；`fence` 列就是 fencing token，`complete` / `heartbeat` 都要校验它（练习 (b)）。`demo.py` 场景 4 用 4 个 worker 进程同时处理同一会话的 16 条消息：不做控制时只保存下来 4 条；CAS 一条不丢，但多调用了二十来次"模型"，顺序也乱了；按会话串行零冲突、顺序正确，在这个场景下甚至比 CAS 还快。
 
 ### 问题 5：模型 API 每分钟只给 500 次，高峰期来了 3000 个任务
 
@@ -244,7 +244,7 @@ EXEC
 
 **怎么选**：生产里通常是组合拳，从外到内依次是：入口按租户限流（第 12 课的每租户令牌桶）→ 按优先级 / 租户的公平队列（E + D）→ worker 调模型前拿全局许可（B 管 RPM / TPM，C 管在途数）→ 仍然收到 429 时按 `Retry-After` 退避。只有几个 worker 的小规模系统，用 A + C 就够了。一条原则：**让等待发生在自己的队列里，而不是发生在模型 API 的 429 上。**
 
-**本课实现**：Demo 场景 1 用跨进程共享的 `multiprocessing` 信号量实现了 C（`LimitedLLM`）：8 个 worker 在"模型并发 ≤ 3"的限制下，吞吐只剩约 3 倍 —— 这就是配额在给吞吐封顶。第 12 课的 `TokenBucket` / `TenantRateLimiter` 是 A 和按租户隔离；`jobqueue` 的 `enqueue` + `claim` 就是 D 的骨架；第 6.3 节给出了在 `claim` 里做加权公平调度的写法。
+**本课实现**：C 用的是 `agentkit.distributed.SQLiteSemaphore`：每个名额是数据库里带租约的一行，所有 worker 进程共用。[`demo_scale.py`](demo_scale.py) 里 4 个进程 × 每个 8 并发，共用 3 个模型名额，实测吞吐被压到 14.2 任务/秒（3 个并发的理论上限是 15）—— 这就是配额在给吞吐封顶；`demo.py` 场景 5 对比了持有名额的进程被 `kill -9` 之后：`multiprocessing.Semaphore` 永久少一个名额，`SQLiteSemaphore` 约 1 秒后租约到期自动归还。B 的单机版是 `SQLiteTokenBucket`（所有进程共用一个桶），[第 12 课](../12_production_architecture/README.md)实测了"两个 API 进程各用各的内存桶放行约 2 倍、共用一个桶守住配额"；多机用 Redis（第 26 课）。`jobqueue` 的 `enqueue` + `claim` 就是 D 的骨架；第 6.3 节给出了在 `claim` 里做加权公平调度的写法。
 
 ### 问题 6：订机票成功了，订酒店失败了
 
@@ -284,7 +284,7 @@ EXEC
 
 **怎么选**：A 是所有重试的底线（第 08 课的 `backoff_delay` 已经是 full jitter）；有多层调用时必须加 B（第 08 课练习的重试预算）；每个外部依赖都要有 D（第 08 课的 `CircuitBreaker`）；热点读路径（检索、嵌入、配置）加 C，再给缓存过期时间加抖动。到了集群规模还要注意一点：**熔断器和预算的状态是每个进程各一份的**。200 个进程各自要连续失败 5 次才熔断，意味着下游要先挨 1000 次打；所以大规模时要把熔断 / 预算放到共享的一层（比如模型网关或 sidecar），恢复阶段也要逐步放量。
 
-**本课实现**：队列的 `fail()` 用"指数退避 + 全抖动"计算下次可执行时间 `available_at`，失败的任务不会在同一秒卷土重来；worker 轮询间隔也带抖动（`poll_s × uniform(0.5, 1.5)`）；重试次数有上限，超出就进死信。重试预算和熔断器在第 08 课实现；singleflight 的示意代码见第 6.6 节。
+**本课实现**：队列的 `fail()` 用"指数退避 + 全抖动"计算下次可执行时间 `available_at`，失败的任务不会在同一秒卷土重来；worker 轮询间隔也带抖动（`poll_s × uniform(0.5, 1.5)`）；重试次数有上限，超出就进死信。重试预算和熔断器在第 08 课实现；"每个进程各一份熔断器"的问题，`agentkit.distributed.SQLiteCircuitBreaker` 把状态放进所有进程共享的数据库：一个进程熔断，其他进程第一次调用就快速失败（`tests/test_distributed.py` 用真实的子进程验证）。singleflight 的示意代码见第 6.6 节（进程内）。
 
 ## 3. 从玩具到生产：逐层实现
 

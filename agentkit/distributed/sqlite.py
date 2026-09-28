@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable
 
 from ..limits import LimitExceeded
+from ..reliability import CircuitOpenError
 from ..state import RunState
 from ..tools import ToolResult
 from .jobs import CheckpointConflict, Job, LeaseLost, explain_rejection, summarize_stats
@@ -751,3 +752,118 @@ class SQLiteSemaphore(_Owner):
             renewer.cancel()
             # 释放放进 shield：调用方被取消时也要把槽位还回去，否则要等租约过期
             await asyncio.shield(self.db.write(lambda conn: conn.execute(f"DELETE FROM {self.table} WHERE holder = ?", (holder,))))
+
+
+# =====================================================================================
+# 跨进程熔断器
+# =====================================================================================
+
+
+class SQLiteCircuitBreaker(_Owner):
+    """所有 worker 进程共享的熔断器（与 reliability.CircuitBreaker 同一个状态机，状态存在数据库里）。
+
+    进程内的熔断器：worker A 连续失败 5 次已经熔断，worker B、C 还各自要再失败 5 次才会熔断 ——
+    下游已经挂了，你还要再往它身上打 10 个请求；而且每个新扩容出来的进程都从 closed 开始，重新试错。
+    这里的失败计数、熔断时间、"谁在试探"都在数据库里，一个进程熔断，所有进程立刻都知道。
+
+    半开时的**单个试探**用带过期时间的"试探租约"（probe_until）实现：拿到租约的进程去试探，
+    其余进程继续快速失败；试探者如果中途崩溃，租约过期后别的进程可以接着试探，不会永远卡在半开。
+
+    用法：ResilientLLM(primary, breaker_factory=lambda model: SQLiteCircuitBreaker(db, model))
+    """
+
+    def __init__(
+        self,
+        path_or_db: str | Path | SQLiteDB,
+        name: str = "llm",
+        failure_threshold: int = 5,
+        reset_timeout: float = 30.0,
+        *,
+        record_if: Callable[[Exception], bool] | None = None,
+        probe_timeout: float = 60.0,
+        table: str = "circuit_breakers",
+        clock: Callable[[], float] = time.time,
+    ):
+        super().__init__(path_or_db, table)
+        self.name, self.failure_threshold, self.reset_timeout = name, failure_threshold, reset_timeout
+        self.record_if, self.probe_timeout, self.clock = record_if, probe_timeout, clock
+        self._ready = False
+
+    async def setup(self) -> None:
+        await self.db.write(lambda conn: conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {self.table} (name TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0, "
+            f"opened_at REAL, probe_until REAL)"
+        ))
+        self._ready = True
+
+    async def _ensure(self) -> None:
+        if not self._ready:
+            await self.setup()
+
+    def _state_of(self, row, now: float) -> str:
+        if row is None or row["opened_at"] is None:
+            return "closed"
+        return "half_open" if now - row["opened_at"] >= self.reset_timeout else "open"
+
+    async def current_state(self) -> str:
+        await self._ensure()
+        row = await self.db.run(lambda conn: conn.execute(
+            f"SELECT failures, opened_at, probe_until FROM {self.table} WHERE name = ?", (self.name,)
+        ).fetchone())
+        return self._state_of(row, self.clock())
+
+    async def _enter(self) -> bool:
+        """放行检查。返回 True 表示本次是半开状态下的试探请求。熔断中 / 别人正在试探 → CircuitOpenError。"""
+        def op(conn):
+            now = self.clock()
+            row = conn.execute(f"SELECT failures, opened_at, probe_until FROM {self.table} WHERE name = ?", (self.name,)).fetchone()
+            state = self._state_of(row, now)
+            if state == "open":
+                raise CircuitOpenError(self.name)
+            if state == "half_open":
+                if row["probe_until"] is not None and row["probe_until"] > now:
+                    raise CircuitOpenError(self.name)  # 已经有一个进程在试探
+                conn.execute(f"UPDATE {self.table} SET probe_until = ? WHERE name = ?", (now + self.probe_timeout, self.name))
+                return True
+            return False
+
+        return await self.db.write(op)
+
+    async def record_failure(self, probe: bool = False) -> None:
+        await self._ensure()
+
+        def op(conn):
+            now = self.clock()
+            conn.execute(f"INSERT OR IGNORE INTO {self.table} (name, failures) VALUES (?, 0)", (self.name,))
+            row = conn.execute(f"SELECT failures, opened_at FROM {self.table} WHERE name = ?", (self.name,)).fetchone()
+            failures = row["failures"] + 1
+            reopen = probe or self._state_of(row, now) == "half_open" or failures >= self.failure_threshold
+            conn.execute(
+                f"UPDATE {self.table} SET failures = ?, opened_at = CASE WHEN ? THEN ? ELSE opened_at END, probe_until = NULL "
+                f"WHERE name = ?", (failures, reopen, now, self.name),
+            )
+
+        await self.db.write(op)
+
+    async def record_success(self) -> None:
+        await self._ensure()
+        await self.db.write(lambda conn: conn.execute(
+            f"INSERT OR REPLACE INTO {self.table} (name, failures, opened_at, probe_until) VALUES (?, 0, NULL, NULL)", (self.name,)
+        ))
+
+    async def call(self, fn: Callable[[], Any]) -> Any:
+        await self._ensure()
+        probe = await self._enter()
+        try:
+            result = await fn()
+        except Exception as e:
+            if self.record_if is not None and not self.record_if(e):
+                if probe:  # 试探请求因为"请求自身的问题"失败：不算下游不健康，但要把试探租约还回去
+                    await self.db.write(lambda conn: conn.execute(
+                        f"UPDATE {self.table} SET probe_until = NULL WHERE name = ?", (self.name,)))
+                raise
+            await self.record_failure(probe=probe)
+            raise
+        await self.record_success()
+        return result
+

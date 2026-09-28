@@ -375,3 +375,89 @@ async def test_token_bucket_is_shared_by_all_processes(tmp_path):
     span = log[-1]["start"] - log[0]["start"]
     assert len(log) <= capacity + rate * span + 2  # +2：边界上的取整余量
     assert len({r["pid"] for r in log}) >= 2
+
+
+# ------------------------------------------------------------------ 跨进程熔断器
+
+
+async def test_breaker_opened_by_another_process_is_seen_here(tmp_path):
+    """另一个真实的进程把下游打到熔断；本进程第一次调用就快速失败，而不是自己再失败 5 次。"""
+    import sys
+
+    from agentkit import LLMError, ResilientLLM
+    from agentkit.distributed import SQLiteCircuitBreaker
+    from agentkit.reliability import CircuitOpenError
+
+    db = str(tmp_path / "b.db")
+    script = (
+        "import asyncio\n"
+        "from agentkit import LLMError\n"
+        "from agentkit.distributed import SQLiteCircuitBreaker\n"
+        "async def main():\n"
+        f"    b = SQLiteCircuitBreaker({db!r}, 'gpt', failure_threshold=3, reset_timeout=60)\n"
+        "    async def boom():\n"
+        "        raise LLMError('503', retryable=True)\n"
+        "    for _ in range(3):\n"
+        "        try:\n"
+        "            await b.call(boom)\n"
+        "        except LLMError:\n"
+        "            pass\n"
+        "    print(await b.current_state())\n"
+        "    await b.close()\n"
+        "asyncio.run(main())\n"
+    )
+    proc = await asyncio.create_subprocess_exec(sys.executable, "-c", script, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    assert proc.returncode == 0 and out.decode().strip().endswith("open"), out.decode()
+
+    here = SQLiteCircuitBreaker(db, "gpt", failure_threshold=3, reset_timeout=60)
+    assert await here.current_state() == "open"
+    primary = ScriptedLLM([reply("不该被调用")], model="gpt")
+    backup = ScriptedLLM([reply("备用模型的回答")], model="backup")
+    llm = ResilientLLM(primary, [backup], breaker_factory=lambda m: SQLiteCircuitBreaker(db, m, failure_threshold=3,
+                                                                                           reset_timeout=60))
+    res = await Agent(llm, []).run("hi")
+    assert res.output == "备用模型的回答" and primary.call_count == 0  # 主模型一次都没被打
+    with pytest.raises(CircuitOpenError):
+        await here.call(lambda: None)
+    await here.close()
+
+
+async def test_shared_breaker_lets_only_one_probe_through(tmp_path):
+    from agentkit import LLMError
+    from agentkit.distributed import SQLiteCircuitBreaker
+    from agentkit.reliability import CircuitOpenError
+
+    now = [0.0]
+    db = str(tmp_path / "b.db")
+    # 两个实例各用自己的连接（和两个进程一样只通过文件共享状态）
+    a = SQLiteCircuitBreaker(db, "m", failure_threshold=1, reset_timeout=10, clock=lambda: now[0])
+    b = SQLiteCircuitBreaker(db, "m", failure_threshold=1, reset_timeout=10, clock=lambda: now[0])
+
+    async def boom():
+        raise LLMError("503", retryable=True)
+
+    with pytest.raises(LLMError):
+        await a.call(boom)
+    assert await b.current_state() == "open"
+    now[0] = 11  # 半开
+    release = asyncio.Event()
+
+    async def slow_ok():
+        await release.wait()
+        return "ok"
+
+    probe = asyncio.create_task(a.call(slow_ok))
+    await eventually(lambda: _probing(db), what="试探租约被占用")
+    with pytest.raises(CircuitOpenError):
+        await b.call(slow_ok)  # 另一个"进程"在试探期间快速失败
+    release.set()
+    assert await probe == "ok"
+    assert await b.current_state() == "closed"
+    await a.close()
+    await b.close()
+
+
+def _probing(db) -> bool:
+    return bool(rows(db, "SELECT 1 FROM circuit_breakers WHERE probe_until IS NOT NULL"))

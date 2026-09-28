@@ -1,9 +1,13 @@
 """第 13 课练习：高并发与分布式执行。
 
 三道题，全都围绕"多个 worker 同时操作同一份数据"：
-  (a) claim_job                  原子领取任务：租约 + fencing token 递增（8 个线程同时抢，不能有任务被领两次）
+  (a) claim_job                  原子领取任务：租约 + fencing token 递增（8 个进程同时抢，不能有任务被领两次）
   (b) complete_job               提交结果时校验 fencing token（租约被别人接手后，旧 worker 的提交必须被拒绝）
-  (c) update_session_with_retry  乐观并发控制：版本号 CAS + 有限次重试（100 次并发自增，一次都不能丢）
+  (c) update_session_with_retry  乐观并发控制：版本号 CAS + 有限次重试（10 个进程并发自增 100 次，一次都不能丢）
+
+三个函数都是**普通的同步函数**（不是 async def）：它们直接调用阻塞的 sqlite3，
+测试和 demo 在**没有事件循环的独立进程**里调用它们，阻塞只会挡住调用者自己。
+要在事件循环里用这类阻塞代码，得先把它挪到线程里（jobqueue.AsyncJobQueue 就是这么做的，README 3.10 节）。
 
 开始之前，先读两个文件（都不长）：
   - jobqueue.py      表结构 SCHEMA、CLAIMABLE_WHERE、connect()、Job、LeaseLostError，以及完整版的 JobQueue
@@ -14,8 +18,9 @@
     make lesson N=13
     # 或者：.venv/bin/python -m pytest lessons/13_distributed_concurrency -v
 
-测试会用多个线程制造**真实的**竞争（还会故意把每条 SQL 拖慢 1 毫秒，放大竞态窗口），
-所以"单线程下看起来能跑"的实现不一定能通过。卡住了？先重读 README 第 3 节，再看 solution.py。
+并发测试会用 race.py 同时拉起多个**真实的 python 进程**（各用各的数据库连接，站在同一条起跑线上一起开抢，
+还会故意把每条 SQL 拖慢 1 毫秒，放大竞态窗口），所以"单进程里看起来能跑"的实现不一定能通过。
+卡住了？先重读 README 第 3 节，再看 solution.py。
 """
 
 from __future__ import annotations
@@ -77,7 +82,7 @@ def claim_job(conn: sqlite3.Connection, worker_id: str, lease_seconds: float, *,
         attempts=attempts+1, fence=fence+1, updated_at=now
     返回领取后的 Job（可以用 get_job(conn, job_id) 重新读一遍）。
 
-    ⚠️ 本题的全部难点：多个 worker 同时来抢时，**同一个任务只能被一个 worker 领到**。
+    ⚠️ 本题的全部难点：多个 worker 进程同时来抢时，**同一个任务只能被一个 worker 领到**。
     ❌ 错误写法：先 SELECT 出 id，再无条件 UPDATE ... WHERE id = ?
        两个 worker 可能 SELECT 到同一个 id，然后都 UPDATE 成功 → 同一个任务被处理两次。
     ✅ 正确写法二选一（测试都认）：

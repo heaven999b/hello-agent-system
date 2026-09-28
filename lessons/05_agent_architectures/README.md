@@ -29,13 +29,15 @@
 
 多 Agent 也一样，只是问题变成：**几个"大脑"之间怎么传话、共用什么、谁说了算**。
 
-本课 Demo 用真实模型（gpt-5.5）把同一个任务"查三个城市的天气，给出差建议"用三种架构各跑了一遍。工具是假的，而且广州的天气接口被故意设成"维护中"：
+本课 Demo 用真实模型（gpt-5.5）把同一个任务"查三个城市的天气，给出差建议"用三种架构各跑了一遍。工具是假的（每次查询用 `asyncio.sleep` 模拟 0.3 秒网络延迟），而且广州的天气接口被故意设成"维护中"：
 
-| 架构 | 模型调用 | 工具调用 | tokens | 耗时 | 质量检查（3 城 / 台风预警 / ≤5 行） |
-|---|---|---|---|---|---|
-| ReAct（`agentkit.Agent`） | 3 | 4 | 2,705 | 10.7s | ✅ |
-| Plan-and-Execute | 3 | 4 | 2,724 | 14.3s | ✅ |
-| Reflection（ReAct + 批评 + 修改） | 4 | 4 | 3,716 | 11.2s | ✅ |
+| 架构 | 模型调用 | 工具调用 | 工具同时在途峰值 | tokens | 耗时 | 质量检查（3 城 / 台风预警 / ≤5 行） |
+|---|---|---|---|---|---|---|
+| ReAct（`agentkit.Agent`） | 3 | 4 | 3 | 2,725 | 10.3s | ✅ |
+| Plan-and-Execute | 3 | 4 | 3 | 2,837 | 14.6s | ✅ |
+| Reflection（ReAct + 批评 + 修改） | 4 | 4 | 3 | 3,849 | 14.6s | ✅ |
+
+（2026-09-28 实测：macOS 笔记本，经本地 OpenAI 兼容网关调用 gpt-5.5，单次运行；模型耗时每次都有几秒的波动，看量级就好。"工具同时在途峰值 3"是 Demo 里的计数器量出来的：三个城市的查询确实是同时发出的。）
 
 一个反直觉的结果：**在这个小任务上，"先规划"并没有更省**。原因在 §7 细说。它说明了本课最重要的一点：**架构的收益取决于任务的形状，要用数据选，而不是看名字选。**
 
@@ -115,14 +117,14 @@ flowchart LR
 | 适用 | 步骤无法预知、要根据中间结果随机应变：排查故障、在陌生代码库里改 bug、开放式问答 |
 | 优点 | 最简单、最灵活；意外会被自然处理（Demo 里广州接口维护，模型下一步就换成了备用接口）；所有主流 API 原生支持 |
 | 缺点与失败模式 | **短视**：只看下一步，长任务容易跑偏；**原地打转**：反复调用同一个工具；**上下文膨胀**：每一步的观察都堆进历史；**过早收工**：没做完就宣布完成 |
-| 成本与延迟 | N 步 = N 次模型调用，而且每次都要重发全部历史，**总输入 token 随步数大致按平方增长**（第 1 步发 1 份历史，第 N 步发 N 份）；各步串行，延迟是逐步累加的 |
+| 成本与延迟 | N 步 = N 次模型调用，而且每次都要重发全部历史，**总输入 token 随步数大致按平方增长**（第 1 步发 1 份历史，第 N 步发 N 份）；各步串行，延迟是逐步累加的。同一步里模型一次请求的多个**只读**工具，agentkit 的 `Agent` 会并发执行（Demo 第 1 步的三个查询同时在途） |
 | 代表 | [ReAct](https://arxiv.org/abs/2210.03629)（Yao 等，ICLR 2023）：在 ALFWorld 和 WebShop 上，成功率比模仿学习和强化学习方法分别高出 34 和 10 个百分点；今天几乎所有 Agent 框架的默认循环 |
 
 **用 agentkit 实现**：`agentkit.Agent` 本身就是一个带护栏的 ReAct 循环（[agentkit/agent.py](../../agentkit/agent.py)）。
 
 ```python
 agent = Agent(llm, [get_weather, get_weather_by_airport], max_steps=8)  # max_steps 防止原地打转
-result = agent.run("查北京、上海、广州出差当天的天气，给出差建议")
+result = await agent.run("查北京、上海、广州出差当天的天气，给出差建议")   # 在 async 函数里；脚本入口是 asyncio.run(main())
 ```
 
 ### 2.2 Plan-and-Execute：先规划，再执行，出错时重规划
@@ -147,10 +149,10 @@ flowchart LR
 | 适用 | 步骤能大致预先想清楚、但执行中可能出意外的多步任务：数据报表、调研、批量操作 |
 | 优点 | 逼模型先想清全局；**计划可以展示给人看、让人批准**（HITL 的天然接口）；执行器可以用更小的模型甚至纯代码；执行阶段不经过大模型 |
 | 缺点与失败模式 | **计划质量是瓶颈**；计划基于过时的假设（第 2 步的结果本该改变第 3 步怎么做）；**失败 → 重规划 → 再失败**的死循环，所以重规划必须有上限（练习 1）；计划可能长得离谱，所以执行步数也要有上限 |
-| 成本与延迟 | 执行器是纯代码时：1 次规划 + k 次重规划 + 1 次汇总；执行器是 Agent 时再加上每步的调用。Demo：3 次调用 |
+| 成本与延迟 | 执行器是纯代码时：1 次规划 + k 次重规划 + 1 次汇总；执行器是 Agent 时再加上每步的调用。Demo：3 次调用。互不依赖的只读步骤可以整批并发，这一批的耗时是最慢的那一步而不是总和（见下文） |
 | 代表 | [Plan-and-Solve Prompting](https://arxiv.org/abs/2305.04091)（Wang 等，ACL 2023）；LangChain 2023 年的博客 [Plan-and-Execute Agents](https://www.langchain.com/blog/plan-and-execute-agents)（灵感来自 BabyAGI 和 Plan-and-Solve）；产品里，Gemini Deep Research 会先给出研究计划，让用户修改或批准 |
 
-**用 agentkit 实现**：[demo.py](demo.py) 的 `run_plan_execute` 用 `complete_json` 让规划器输出 Pydantic 校验过的计划，由 `ToolRegistry.execute` 逐步执行；练习 1 的 `PlanExecuteAgent` 实现了带校验、重规划上限、步数上限和执行轨迹的完整版本。核心骨架：
+**用 agentkit 实现**：[demo.py](demo.py) 的 `run_plan_execute` 用 `complete_json` 让规划器输出 Pydantic 校验过的计划，由 `ToolRegistry.execute` 执行（互不依赖的只读步骤用 `agentkit.workflows.parallel` 整批并发，见下文）；练习 1 的 `PlanExecuteAgent` 实现了带校验、重规划上限、步数上限和执行轨迹的完整版本（逐步执行）。核心骨架（都在 async 函数里）：
 
 ```python
 class PlanStep(BaseModel):
@@ -158,13 +160,34 @@ class PlanStep(BaseModel):
     tool: Literal["get_weather", "get_weather_by_airport"]   # 用枚举收窄：计划里不可能出现不存在的工具
     args: dict[str, str]
 
-plan = complete_json(llm, PLANNER_PROMPT.format(task=task), Plan).steps
+plan = (await complete_json(llm, PLANNER_PROMPT.format(task=task), Plan)).steps
 while remaining:
     step = remaining.pop(0)
-    r = registry.execute(ToolCall(id=step.id, name=step.tool, arguments=json.dumps(step.args)))
+    r = await registry.execute(ToolCall(id=step.id, name=step.tool, arguments=json.dumps(step.args)))
     if not r.ok and replans < MAX_REPLANS:               # 失败才回到模型
-        remaining = complete_json(llm, REPLANNER_PROMPT.format(...), Plan).steps
+        remaining = (await complete_json(llm, REPLANNER_PROMPT.format(...), Plan)).steps
 ```
+
+**计划里互不依赖的只读步骤，可以整批并发。** "查北京、上海、广州三地天气"这三步谁也不依赖谁，一个接一个执行等于白等两倍时间。`agentkit.workflows.parallel` 在同一个事件循环里把它们同时发出去，有并发上限，一个抛异常时其余立刻取消：
+
+```python
+async def execute(step):
+    return await registry.execute(ToolCall(id=step.id, name=step.tool, arguments=json.dumps(step.args)))
+
+# 前提：步骤之间互不依赖（参数里没有引用别的步骤结果），而且全是只读工具
+assert all(registry.get(s.tool).risk == "read" for s in batch)
+outcomes = await parallel([lambda s=s: execute(s) for s in batch], max_concurrency=4)
+```
+
+Demo 实测：三个查询同时在途（计数器量到的峰值是 3），这一批用时 0.30s，逐个执行至少要 0.9s。注意 `registry.execute` 把工具错误变成 `ToolResult(ok=False)` 而不是抛异常，所以广州查不到不会连累北京和上海被取消。练习文件里已经提供了一个通用版本 `run_independent_steps`，它的测试证明了：三步真的同时在途、`max_concurrency` 是真正的上限、一步失败时其余步骤被取消并且真正停了下来、批里有写操作时一步都不执行。
+
+**有写操作的步骤不能这样并发。** Demo 最后一节用两个小场景演示了会出什么事：
+
+- **顺序就是语义**（Demo 场景 1）：改签计划是"s1 订新航班、s2 退旧航班"。串行时 s1 因售罄失败就停下，旧票还在；并发时 s2 0.05 秒就退完了，s1 0.3 秒后才失败——用户一张票都没有。
+- **取消会落在半路**（Demo 场景 2）：s1 退款（请求发出后要等网关确认）、s2 发短信。s2 失败，`parallel` 立刻取消 s1：请求已经发出去、确认没等到，钱退没退成变成了未知状态，只能靠幂等键和对账收拾。对只读查询来说，"一个失败、其余取消"是好事（不在后台白花钱）；对写操作，它就是事故。
+- **重试和重规划会重放**：一批里有的写操作成功了、有的失败了，如果重规划后整批重来，已经成功的写操作会再执行一次（重复扣款），除非工具是幂等的（第 08 课）。
+
+规则和 Agent 主循环一样：同一批全是只读步骤才并发，只要有写操作就按计划顺序逐个执行。`run_independent_steps` 遇到写步骤会直接报错、一步都不执行。
 
 > 💡 一个值得注意的演变：**"计划"正在从一种独立架构，变成 ReAct 里的一个工具。** Claude Code 有待办列表类工具，LangChain v1 有内置的 To-do list 中间件（LangGraph 旧的 Plan-and-Execute 教程页现在就跳转到这里）。模型在 ReAct 循环里自己维护一份显式计划，既保留了随机应变的能力，又有了全局视野。
 
@@ -198,13 +221,13 @@ class Step(BaseModel):
     tool: str
     args: dict[str, str]          # 值里可以写 "#E1"，执行时替换成 E1 的结果
 
-plan = complete_json(llm, f"为任务写出完整计划，后面的步骤用 #E1、#E2 引用前面步骤的结果。\n任务：{task}", Plan)
+plan = await complete_json(llm, f"为任务写出完整计划，后面的步骤用 #E1、#E2 引用前面步骤的结果。\n任务：{task}", Plan)
 evidence: dict[str, str] = {}
-for s in plan.steps:              # 执行期间不调用模型
+for s in plan.steps:              # 执行期间不调用模型；有 #E 依赖所以按顺序，互不依赖的步骤可以像 §2.2 那样整批并发
     args = {k: re.sub(r"#(E\d+)", lambda m: evidence[m.group(1)], v) for k, v in s.args.items()}
     call = ToolCall(id=s.var, name=s.tool, arguments=json.dumps(args, ensure_ascii=False))
-    evidence[s.var] = registry.execute(call).content
-answer = complete(llm, f"任务：{task}\n证据：{json.dumps(evidence, ensure_ascii=False)}")
+    evidence[s.var] = (await registry.execute(call)).content
+answer = await complete(llm, f"任务：{task}\n证据：{json.dumps(evidence, ensure_ascii=False)}")
 ```
 
 ### 2.4 Reflection / Reflexion：做完之后挑错，再改
@@ -232,7 +255,7 @@ flowchart LR
 | 适用 | 有客观检查手段的任务：代码（跑测试）、结构化输出（Schema 校验）、有事实依据的报告（对照数据） |
 | 优点 | 通用，能叠加在任何架构之上；在有外部反馈时，质量提升有据可查 |
 | 缺点与失败模式 | 没有外部信号时效果不稳定；**原地打转**：同一条意见反复出现；**来回摇摆**：A 改成 B、B 又改回 A；批评者本身出错或过于挑剔，导致无休止返工；成本翻倍 |
-| 成本与延迟 | 每多一轮 = 1 次批评 + 1 次修改。Demo 真实运行时初稿一次通过，也比 ReAct 多花了 1 次调用、约 1,000 token，这是"保险费" |
+| 成本与延迟 | 每多一轮 = 1 次批评 + 1 次修改。Demo 真实运行时初稿一次通过，也比 ReAct 多花了 1 次调用、约 1,100 token，这是"保险费" |
 | 代表 | Self-Refine、Reflexion；LangChain 博客 [Reflection Agents](https://www.langchain.com/blog/reflection-agents) 对比了基础 Reflection、Reflexion 和 LATS |
 
 **用 agentkit 实现**：`evaluator_optimizer`（[agentkit/workflows.py](../../agentkit/workflows.py)，06 §2.5）就是这个循环。Demo 的 `run_reflection` 里有两个值得借鉴的设计：
@@ -309,8 +332,8 @@ flowchart TB
 | 企业里怎么用 | 线上系统很少直接用完整的树搜索。最常见的简化版是 **best-of-N**：并行生成 N 个候选，用测试或校验器挑最好的一个，相当于深度为 1 的树搜索 |
 
 ```python
-def best_of_n(generate, score, n=4):
-    candidates = parallel([generate] * n)   # agentkit.workflows.parallel，并行生成
+async def best_of_n(generate, score, n=4):
+    candidates = await parallel([generate] * n, max_concurrency=n)   # agentkit.workflows.parallel：n 个候选同时生成
     return max(candidates, key=score)       # score 最好是代码：跑测试、查规则
 ```
 
@@ -360,8 +383,8 @@ sequenceDiagram
 
 ```python
 agent = Agent(llm, [refund_order], hooks=[PermissionPolicy(ask_risks={"dangerous"})])
-r = agent.run("给订单 A1001 退款")                    # r.status == "paused"，r.pending_approval 是待批的调用
-r = agent.approve(r.run_id, True, by="alice", comment="已核实签收记录")   # 审批记录写入 approval_log，从断点继续
+r = await agent.run("给订单 A1001 退款")              # r.status == "paused"，r.pending_approval 是待批的调用
+r = await agent.approve(r.run_id, True, by="alice", comment="已核实签收记录")   # 审批记录写入 approval_log，从断点继续
 ```
 
 ### 2.8 组合：真实系统很少只用一种
@@ -446,7 +469,7 @@ flowchart TB
   - Anthropic 的研究系统：主导 Agent 加并行子 Agent（§4.1）；
   - [Magentic-One](https://arxiv.org/abs/2411.04468)（微软，2024）：Orchestrator 维护一份 **Task Ledger**（事实、猜测、计划）和一份 **Progress Ledger**（每一步的进展自检），指挥 WebSurfer、FileSurfer、Coder、ComputerTerminal 四个专家；发现进展停滞时先反思，再更新计划。这是"主管 + Plan-and-Execute"的组合。
 - **失败模式**：主管成为瓶颈，所有信息都经过它，它的上下文会膨胀；task 写得不完整；专家的结论被主管当成事实继续推理；委派深度失控（专家又委派专家……）。
-- **实现**：`agent_as_tool`（06 §2.7）。层级就是：专家本身也是一个挂着 `agent_as_tool` 的主管。别忘了限制委派深度。
+- **实现**：`agent_as_tool`（06 §2.7）。层级就是：专家本身也是一个挂着 `agent_as_tool` 的主管。别忘了限制委派深度。`agent_as_tool` 生成的是 async 工具：主管在同一步里委派给多个专家时，它们并发执行；主管被取消时，正在跑的专家也跟着取消（06 §3 有实测）。
 
 ### 3.4 网络 / 群体（Network / Swarm，handoff）
 
@@ -477,10 +500,10 @@ class Handoff(Hook):
         if call.name.startswith("transfer_to_"):
             raise StopRun("handoff", call.name.removeprefix("transfer_to_"))
 
-def run_swarm(agents: dict[str, Agent], active: str, user_input: str, max_handoffs: int = 3):
+async def run_swarm(agents: dict[str, Agent], active: str, user_input: str, max_handoffs: int = 3):
     history: list = []
     for _ in range(max_handoffs + 1):
-        r = agents[active].run(user_input, history=history)
+        r = await agents[active].run(user_input, history=history)
         if r.stop_reason != "handoff":
             return active, r                         # 下一轮用户消息继续交给 active
         active, history = r.output, r.history        # 新 Agent 接手，带着完整对话历史
@@ -559,17 +582,17 @@ flowchart LR
 - **实现草图**（已跑通）：
 
 ```python
-def handle(event: dict) -> None:                        # 由队列消费者调用
+async def handle(event: dict) -> None:                  # 由队列消费者调用
     run_id = f"evt-{event['id']}"                       # 事件 ID 当 run_id：重复投递时认得出来
     if agent.checkpointer.load(run_id) is not None:     # 处理过了就跳过（幂等）
         return
-    result = agent.run(f"新工单：{event['text']}", run_id=run_id,
-                       metadata={"tenant_id": event["tenant"], "user_id": "system:ambient"})
-    if result.status == "paused":                       # 需要人：放进收件箱，人批了再 agent.approve(run_id, ...)
+    result = await agent.run(f"新工单：{event['text']}", run_id=run_id,
+                             metadata={"tenant_id": event["tenant"], "user_id": "system:ambient"})
+    if result.status == "paused":                       # 需要人：放进收件箱，人批了再 await agent.approve(run_id, ...)
         inbox.push(run_id, result.pending_approval)
 ```
 
-生产中检查点要放在共享存储里（`FileCheckpointer` 换成数据库），多个工作进程才能看到彼此处理过哪些事件。"先查再跑"之间还有并发窗口，严格的去重需要数据库唯一约束或分布式锁（第 13 课）。
+生产中检查点要放在共享存储里，多个工作进程才能看到彼此处理过哪些事件：单机多进程用 `agentkit.distributed` 的 SQLite 检查点和任务队列（[第 13 课](../13_distributed_concurrency/README.md)，真的起多个 worker 进程），多机换成 Postgres（[第 26 课](../26_state_and_queues/README.md)）。"先查再跑"之间还有并发窗口，哪怕只有一个进程也有：同一事件被投递两次、两个协程同时处理时，`load` 和"写入检查点"之间隔着 `await agent.run(...)`，两个协程都会看到"没处理过"（[第 06 课](../06_orchestration/README.md) §2.3 讲了"读和写之间隔着 await 就会丢更新"）。严格的去重要靠原子的认领：数据库唯一约束，或者带租约的任务队列（第 13 课）。
 
 事件驱动只回答了"什么时候醒来"；主动式 Agent 还要回答"醒来之后该不该打扰人"。用户模型、打扰决策和隐私边界，见[第 25 课](../25_proactive_and_frontier/README.md)。
 
@@ -803,7 +826,7 @@ flowchart LR
 | 类别 | 架构 | 模型在哪里思考 | 典型模型调用次数 | 延迟特征 | 可预测性 | 适合 | 最大风险 |
 |---|---|---|---|---|---|---|---|
 | 单 Agent | ReAct | 每一步 | N（步数） | 串行累加，历史越长越慢 | 低 | 路径未知 | 短视、打转、上下文膨胀 |
-| 单 Agent | Plan-and-Execute | 开头 + 失败时 + 结尾 | 2 + 重规划次数（执行器是代码时） | 执行阶段快 | 中 | 能大致规划的多步任务 | 计划错误、重规划死循环 |
+| 单 Agent | Plan-and-Execute | 开头 + 失败时 + 结尾 | 2 + 重规划次数（执行器是代码时） | 执行阶段快；互不依赖的只读步骤可并发 | 中 | 能大致规划的多步任务 | 计划错误、重规划死循环 |
 | 单 Agent | ReWOO / LLMCompiler | 开头 + 结尾 | 2（固定） | 工具可并行，最快 | 高 | 取数型、可并行的任务 | 意外时无法调整 |
 | 叠加层 | Reflection | 做完之后 | 每轮 +2 | 多几轮串行 | 中 | 有客观检查手段 | 没有外部依据时无效、原地打转 |
 | 单 Agent | CodeAct | 每一步，一步做很多事 | 少于 ReAct | 加上沙箱开销 | 低 | 多工具组合、数据处理 | 代码执行的安全风险 |
@@ -867,7 +890,7 @@ flowchart TD
 .venv/bin/python lessons/05_agent_architectures/demo.py --offline  # 离线剧本，无需 API key
 ```
 
-真实模型运行节选（gpt-5.5）：
+真实模型运行节选（gpt-5.5，2026-09-28）：
 
 ```text
 架构 1：ReAct —— 边想边做（agentkit.Agent 本身就是 ReAct）
@@ -876,18 +899,21 @@ flowchart TD
         ← ❌ 错误：广州气象站接口维护中（503）。可以改用 get_weather_by_airport 按机场三字码查询，例如广州白云机场是 CAN。
     第 2 步（模型）→ get_weather_by_airport(CAN,10-17)
     第 3 步（模型）→ 给出回答
+  ⏱ 耗时 10.3s ｜ 模型调用 3 次 ｜ 工具调用 4 次（同时在途峰值 3）｜ tokens 2725
 
 架构 2：Plan-and-Execute —— 先规划，再执行，失败才重规划
   📋 规划器给出的计划（1 次模型调用）：
     s1: get_weather(北京,10-15)
     s2: get_weather(上海,10-16)
     s3: get_weather(广州,10-17)
-  ⚙️  执行（由代码逐步调用工具，不经过模型）：
+  ⚙️  执行（由代码调用工具，不经过模型；一批里的步骤同时发出）：
     ✅ s1: get_weather(北京,10-15)
     ✅ s2: get_weather(上海,10-16)
     ❌ s3: get_weather(广州,10-17) → 错误：广州气象站接口维护中（503）……
+       这一批 3 步：同时在途峰值 3，用时 0.30s（逐个执行至少要 0.9s）
     🔁 重规划（第 1 次，1 次模型调用）→ s3: get_weather_by_airport(CAN,10-17)
     ✅ s3: get_weather_by_airport(CAN,10-17)
+       这一批 1 步：同时在途峰值 1，用时 0.30s（逐个执行至少要 0.3s）
 
 架构 3：Reflection —— 先写初稿，再挑错，再修改
     第 1 步（模型）→ get_weather(北京,10-15)  get_weather(上海,10-16)  get_weather(广州,10-17)
@@ -896,23 +922,36 @@ flowchart TD
     🔍 第 1 轮评审 · 模型检查 → ✅ 通过
 
 对比：同一个任务，三种架构的价格和结果
-  架构              模型调用  工具调用  tokens   耗时    质量检查                    模型在哪里思考
-  ReAct             3         4         2705     10.7s   3/3 城 · 台风✅ · 4 行✅    每一步都由模型决定
-  Plan-and-Execute  3         4         2724     14.3s   3/3 城 · 台风✅ · 4 行✅    开头规划 + 失败重规划 + 最后汇总
-  Reflection        4         4         3716     11.2s   3/3 城 · 台风✅ · 4 行✅    ReAct 写稿 + 模型/代码挑错 + 修改
+  架构              模型调用  工具调用  工具峰值  tokens   耗时    质量检查                    模型在哪里思考
+  ReAct             3         4         3         2725     10.3s   3/3 城 · 台风✅ · 4 行✅    每一步都由模型决定
+  Plan-and-Execute  3         4         3         2837     14.6s   3/3 城 · 台风✅ · 4 行✅    开头规划 + 失败重规划 + 最后汇总
+  Reflection        4         4         3         3849     14.6s   3/3 城 · 台风✅ · 4 行✅    ReAct 写稿 + 模型/代码挑错 + 修改
+
+附：计划里有写操作时，为什么不能整批并发（纯代码演示，不调用模型）
+  场景 1：改签 —— 计划是 s1 订新航班（book_flight），s2 退旧航班（cancel_booking）
+    按顺序执行：s1 失败（CZ3105 已售罄）→ 停下。剩余订单：['B-OLD']
+    整批并发：s1 失败（CZ3105 已售罄）时，s2 早已完成 → 已退订 10-17 CZ3101 北京→广州。剩余订单：无 ❌
+  场景 2：计划是 s1 退款（refund），s2 发短信通知（send_sms），两步并发执行
+    s2 失败（短信服务 500）→ parallel 立刻取消还在等响应的 s1
+    · 退款请求已发给支付网关（订单 A1001）
+    退款到底成功了没有？请求已经发出去了，确认没等到 —— 状态未知，只能靠幂等键 + 对账收拾 ❌
 ```
 
 **该观察什么：**
 
 1. **同一个意外，两种应对**：ReAct 在循环里"顺手"绕过了广州接口维护，因为每一步都回到模型；Plan-and-Execute 的执行器是代码，只能停下来花一次模型调用重规划。
 2. **"先规划"在这里没有更省**：ReAct 第 1 步就**并行**调用了 3 个工具，总共只走了 3 步，历史还很短；而 Plan-and-Execute 的每次规划都通过 `complete_json` 把 JSON Schema 塞进提示词，重规划提示词又重复了一遍上下文。Plan-and-Execute 的优势要在**步数多**的任务上才显现：ReAct 的输入 token 随步数大致按平方增长，而 Plan-and-Execute 执行阶段的模型开销是零。可以在 `WEATHER` 和 `TRIP` 里多加几个城市再跑一次，观察两者差距怎么变化。
-3. **Plan-and-Execute 反而最慢**：3 次模型调用全部串行，每次都带着较长的结构化提示词。"不经过模型"省的是执行阶段，不是规划本身。
-4. **Reflection 的保险费**：真实运行时初稿一次就通过了，仍然多花了 1 次调用、约 1,000 token。离线模式（`--offline`）的剧本故意让初稿漏掉台风预警，你会看到第 1 轮由**代码检查**直接退回，没花一分钱模型调用；第 2 轮才由模型核对。
-5. **质量检查那一栏**是几行代码写的最小评估。选架构要看这类数据，而不是看名字（[第 11 课](../11_evals/README.md)）。
+3. **Plan-and-Execute 比 ReAct 慢了 4 秒多**：3 次模型调用全部串行，每次都带着较长的结构化提示词。执行阶段整批并发只省下了约 0.6 秒工具时间（3 × 0.3s 变成 0.3s），和模型调用的耗时比起来微不足道。"不经过模型"和"并发"省的是执行阶段，不是规划本身。
+4. **Reflection 的保险费**：真实运行时初稿一次就通过了，仍然多花了 1 次调用、约 1,100 token。离线模式（`--offline`）的剧本故意让初稿漏掉台风预警，你会看到第 1 轮由**代码检查**直接退回，没花一分钱模型调用；第 2 轮才由模型核对。
+5. **工具峰值那一栏**：三种架构都是 3。ReAct 和 Reflection 靠的是 `Agent` 在同一步里并发执行只读工具，Plan-and-Execute 靠的是 `parallel`。离线模式里模型调用不耗时，耗时全是工具延迟：ReAct 0.6s = 两轮工具 × 0.3s，如果三个查询是一个接一个执行的，就会是 1.2s。
+6. **最后一节**：同样的 `parallel`，换成写操作就出了两种事故——改签后一张票都没有、退款状态未知。并发之前先问"这些步骤互相依赖吗、有副作用吗"。
+7. **质量检查那一栏**是几行代码写的最小评估。选架构要看这类数据，而不是看名字（[第 11 课](../11_evals/README.md)）。
 
 ## 8. 练习
 
-打开 [`exercise.py`](exercise.py)，实现三种架构的骨架。planner、executor、critique 都是普通函数，测试完全离线、结果确定：
+打开 [`exercise.py`](exercise.py)，实现三种架构的骨架。planner、executor、critique 都是可注入的 async 函数（测试里是假函数），测试完全离线、结果确定。
+
+**async 怎么写**：`PlanExecuteAgent.run` 和 `reflect_loop` 要写成 `async def`，里面 `await self.planner(task)`、`await self.executor(step, dict(results))`、`await self.replanner(...)`、`await generate(...)`、`await critique(...)`；`stop_when` 和 `choose_architecture` 是普通函数，直接调用。执行器出错时只捕获 `Exception`：调用方取消运行时抛出的 `asyncio.CancelledError` 是 `BaseException`，必须原样向外传，不能当成"这一步失败"拿去重规划（有专门的测试）。
 
 **任务 1：`PlanExecuteAgent`**
 - 规划器返回结构化的步骤列表（`Step`）；计划要先校验：非空、元素类型正确、id 不重复；
@@ -931,7 +970,7 @@ flowchart TD
 验证：
 
 ```bash
-make lesson N=05                     # 全部通过即完成（共 30 个测试）
+make lesson N=05                     # 全部通过即完成（共 34 个测试：31 个练习测试 + 3 个已提供的 run_independent_steps 的测试）
 AGENTKIT_SOLUTION=1 make lesson N=05 # 用参考答案跑，确认测试本身没问题
 ```
 
@@ -963,6 +1002,8 @@ Plan-and-Execute、ReWOO、Reflection 都依赖结构化输出（计划、评审
 |---|---|---|
 | 按名气选架构（"大家都在用多 Agent"） | 成本翻倍，效果未必更好 | 从 ReAct 或 Workflow 开始，用评估数据证明需要更复杂的架构 |
 | Plan-and-Execute 不限重规划次数 | "失败 → 重规划 → 失败"死循环 | 重规划上限 + 执行步数上限（练习 1） |
+| 把有写操作的计划步骤整批并发 | 一步失败时，别的写操作已经生效，或者被取消在半路、状态未知 | 只读且互不依赖的步骤才并发；写操作按顺序执行，写工具要幂等（§2.2） |
+| 执行器用 `except BaseException` 或裸 `except` 兜住一切 | 用户取消后运行还在继续：拿取消去重规划、接着花钱 | 只捕获 `Exception`，`CancelledError` 原样向外传（练习 1） |
 | 计划是一段自由文本 | 执行器只能靠猜，解析失败 | 结构化计划 + Schema 校验，工具名用枚举 |
 | ReWOO 用在中间结果会改变计划的任务上 | 意外发生时只能带着错误结果硬答 | 换 Plan-and-Execute，或加重规划 |
 | 没有外部依据的"自我反思" | 多花钱，效果不稳定甚至变差 | 让批评者拿着测试结果、校验器、原始数据去挑错 |
@@ -1051,6 +1092,15 @@ Plan-and-Execute、ReWOO、Reflection 都依赖结构化输出（计划、评审
 - 长期记忆都要隔离、可删除、防投毒；程序性记忆的变更要走评审和发布流程。
 </details>
 
+<details>
+<summary>Q9：Plan-and-Execute 的计划有 10 个步骤，能不能全部并发执行？</summary>
+
+- 先看依赖：后面的步骤要用前面步骤的结果，就只能等；把计划表示成依赖图（LLMCompiler 的做法），同一层里互不依赖的步骤才能一起执行；
+- 再看副作用：只读步骤可以并发；写操作并发后，顺序语义没了（先订新票再退旧票），一步失败会让其他步骤被取消在半路（请求已发出、结果未知），重试和重规划还会重放已经成功的写操作；
+- 并发要有上限（`parallel(..., max_concurrency=...)`），否则一次扇出就可能把模型网关或下游 API 打出 429；
+- 并发是否真的发生要量出来：在途计数的峰值，以及这一批的耗时是"最慢那一步"而不是总和（本课 Demo：峰值 3，0.30s，逐个执行至少要 0.9s）。
+</details>
+
 ## 12. 自测清单
 
 - [ ] 我能用"模型在哪里思考"一句话区分 ReAct、Plan-and-Execute、ReWOO、Reflection、CodeAct、树搜索
@@ -1062,6 +1112,7 @@ Plan-and-Execute、ReWOO、Reflection 都依赖结构化输出（计划、评审
 - [ ] 我能把深度研究、编码 Agent、Computer-Use、客服、Agentic RAG 各拆成一句话的架构组合
 - [ ] 我能区分短期、工作、情景、语义、程序性记忆，并说出它们各放在哪里
 - [ ] 我能用决策树为一个新需求选出架构，并回答"为什么更简单的不够用"
+- [ ] 我能说出计划里什么样的步骤可以并发执行、什么样的不行，以及写操作并发会出的三种事故
 - [ ] 我完成了练习，`make lesson N=05` 全部通过
 
 ## 延伸阅读

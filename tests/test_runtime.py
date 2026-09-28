@@ -117,14 +117,20 @@ def test_pause_approve_resume_with_async_checkpointer():
     run(main())
 
 
-def test_async_approver_is_rejected_instead_of_silently_approving():
-    async def approver(call, state):  # 常见误用：bool(协程) 恒为 True
-        return False
+async def test_async_approver_is_awaited_not_silently_approved():
+    """async 审批函数的返回值是协程，bool(协程) 恒为 True —— 如果不 await，"拒绝"会被当成"批准"。"""
+    seen = []
 
-    llm = ScriptedLLM([call_tool("delete_db", name="x")])
-    agent = Agent(llm, [delete_db], hooks=[PermissionPolicy(approver=approver)])
-    with pytest.raises(TypeError, match="approver"):
-        run(agent.run("删"))
+    async def approver(call, state):
+        await asyncio.sleep(0)  # 比如去问审批服务
+        seen.append(call.name)
+        return call.arguments == '{"name": "x"}'
+
+    llm = ScriptedLLM([call_tool("delete_db", name="prod"), call_tool("delete_db", name="x"), reply("好的")])
+    res = await Agent(llm, [delete_db], hooks=[PermissionPolicy(approver=approver)]).run("删")
+    tool_results = [m["content"] for m in res.messages if m["role"] == "tool"]
+    assert seen == ["delete_db", "delete_db"]
+    assert "没有批准" in tool_results[0] and tool_results[1] == "deleted x"
 
 
 def test_async_hooks_are_awaited():

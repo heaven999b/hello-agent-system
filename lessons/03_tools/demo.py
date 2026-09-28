@@ -9,13 +9,20 @@
   实验 B     错误信息的三种写法 —— 放弃 / 自我纠正 / 一次做对
   实验 C     身份从哪里来 —— 模型传 employee_id vs 系统注入 ctx
   第 4 部分  校验层实拍（不调用模型，结果确定）
+  第 5 部分  工具可以是 async def：三种工具、三种超时语义（不调用模型）
+
+Agent 和工具注册表都是 async 的：`await agent.run(...)`、`await registry.execute(call, ctx)`。
+工具函数本身可以是普通 def（agentkit 放进线程池执行），也可以是 async def（直接在事件循环里 await）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
+import multiprocessing
 import sys
+import time
 from typing import Annotated, Literal
 
 from pydantic import Field
@@ -34,6 +41,7 @@ from agentkit import (
     reply,
     tool,
 )
+from agentkit.testing import busy_loop
 
 SYSTEM = "你是公司的报销助手。今天是 2026-09-27。需要数据时调用工具，不要编造。回答简洁。"
 ME = {"user_id": "E100"}  # 可信身份：来自登录态（SSO），由系统注入，不经过模型
@@ -180,9 +188,9 @@ def banner(title: str) -> None:
     print(f"\n{'═' * 72}\n{title}\n{'═' * 72}")
 
 
-def run(label: str, tools: list, question: str, script: list):
+async def run(label: str, tools: list, question: str, script: list):
     print(f"\n── {label} ──")
-    result = Agent(llm_for(script), tools, system_prompt=SYSTEM).run(question, metadata=ME)
+    result = await Agent(llm_for(script), tools, system_prompt=SYSTEM).run(question, metadata=ME)
     for i, m in enumerate(result.messages):
         for c in m.get("tool_calls") or []:
             obs = next(x["content"] for x in result.messages[i:] if x.get("tool_call_id") == c["id"])
@@ -205,15 +213,15 @@ def part0() -> None:
     print("      additionalProperties=false —— 模型多传任何参数（比如 employee_id）都会被拒绝。")
 
 
-def experiment_a() -> None:
+async def experiment_a() -> None:
     banner("实验 A  自由字符串 vs 枚举 —— \"沉默的失败\"")
     q = "我有哪些报销已经审批通过了、但钱还没到账？"
     print(f"用户（E100）：{q}\n正确答案：只有 1 笔 —— EX-1008 客户招待餐费 560 元（数据库里的状态码是 PENDING_PAYOUT）")
-    bad = run("❌ 糟糕设计：status 是自由字符串，描述只有「查询报销」", [bad_search], q, [
+    bad = await run("❌ 糟糕设计：status 是自由字符串，描述只有「查询报销」", [bad_search], q, [
         call_tool("search_expenses", status="approved_unpaid"),
         reply("目前没有查询到已审批通过但未到账的报销记录。"),
     ])
-    good = run("✅ 良好设计：status 是枚举，并写清每个取值的含义", [list_my_expenses], q, [
+    good = await run("✅ 良好设计：status 是枚举，并写清每个取值的含义", [list_my_expenses], q, [
         call_tool("list_my_expenses", status="pending_payout"),
         reply("你有 1 笔报销已审批通过、等待打款：EX-1008 客户招待餐费 560 元。"),
     ])
@@ -223,7 +231,7 @@ def experiment_a() -> None:
     print("   模型不可能猜中你的内部状态码。枚举 + 含义说明，让它根本没有机会猜错。")
 
 
-def experiment_b() -> None:
+async def experiment_b() -> None:
     banner("实验 B  错误信息的三种写法 —— 放弃 / 自我纠正 / 一次做对")
     q = "我今年到现在一共报销了多少钱？"
     print(f"用户（E100）：{q}\n隐藏的业务规则：单次查询跨度不能超过 90 天。正确答案：9723.5 元")
@@ -232,16 +240,16 @@ def experiment_b() -> None:
              ("expense_total", {"start_date": "2026-06-30", "end_date": "2026-09-27"})]
     whole = {"start_date": "2026-01-01", "end_date": "2026-09-27"}
     results = [
-        run("v1 ❌ 描述含糊 + 只抛内部错误码 E_RANGE_LIMIT", [total_v1], q, [
+        await run("v1 ❌ 描述含糊 + 只抛内部错误码 E_RANGE_LIMIT", [total_v1], q, [
             call_tool("expense_total", **whole),
             reply("抱歉，查询时系统返回了范围限制错误（E_RANGE_LIMIT），暂时无法给出准确总额。"),
         ]),
-        run("v2 🟡 描述没提限制，但错误信息告诉模型「怎么改」", [total_v2], q, [
+        await run("v2 🟡 描述没提限制，但错误信息告诉模型「怎么改」", [total_v2], q, [
             call_tool("expense_total", **whole),
             call_tools(*split),
             reply("你今年一共报销了 9723.5 元（1520 + 2386.5 + 5817）。"),
         ]),
-        run("v3 ✅ 限制写进描述 + 错误信息可行动", [total_v3], q, [
+        await run("v3 ✅ 限制写进描述 + 错误信息可行动", [total_v3], q, [
             call_tools(*split),
             reply("你今年一共报销了 9723.5 元（1520 + 2386.5 + 5817）。"),
         ]),
@@ -257,15 +265,15 @@ def experiment_b() -> None:
     print("   错误信息是写给模型看的：说清 哪里错了 + 为什么 + 下一步怎么做。正确性不能寄托在模型的猜测上。")
 
 
-def experiment_c() -> None:
+async def experiment_c() -> None:
     banner("实验 C  身份从哪里来 —— 越权访问")
     q = "帮我看看同事张三（工号 E200）的报销单都有哪些，金额多少。"
     print(f"用户（E100）：{q}")
-    bad = run("❌ 糟糕设计：employee_id 由模型填写", [bad_get_by_employee], q, [
+    bad = await run("❌ 糟糕设计：employee_id 由模型填写", [bad_get_by_employee], q, [
         call_tool("get_expenses", employee_id="E200"),
         reply("张三（E200）有 1 笔报销：EX-2001 年会礼品采购 4200 元，成本中心 CC-HR-01，待打款。"),
     ])
-    good = run("✅ 良好设计：身份由系统从 ctx 注入，schema 里没有这个参数", [list_my_expenses], q, [
+    good = await run("✅ 良好设计：身份由系统从 ctx 注入，schema 里没有这个参数", [list_my_expenses], q, [
         reply("抱歉，我只能查询你本人的报销单，无法查询同事的信息。"),
     ])
     leaked = "EX-2001" in json.dumps(bad.messages, ensure_ascii=False)
@@ -275,7 +283,7 @@ def experiment_c() -> None:
     print("   身份必须来自登录态（ctx），工具内部再做一次\"这条数据是不是你的\"检查。")
 
 
-def part4() -> None:
+async def part4() -> None:
     banner("第 4 部分  校验层实拍：ToolRegistry.execute 如何把错误变成\"观察\"（不调用模型）")
     reg = ToolRegistry([list_my_expenses, withdraw_expense])
     ctx = ToolContext(run_id="demo", call_id="c1", user_id="E100")
@@ -291,7 +299,7 @@ def part4() -> None:
         ("正常调用", "list_my_expenses", '{"status": "in_review"}'),
     ]
     for label, name, args in cases:
-        r = reg.execute(ToolCall("c1", name, args), ctx)
+        r = await reg.execute(ToolCall("c1", name, args), ctx)
         print(f"\n▶ {label}：{name}({args})")
         print(f"  ok={r.ok}  error_type={r.error_type}")
         print("  " + r.content.replace("\n", "\n  "))
@@ -299,17 +307,84 @@ def part4() -> None:
     print("   注意「别人的单据」和「完全不存在」返回的是同一句话 —— 攻击者无法借此探测哪些编号真实存在。")
 
 
-def main() -> None:
+# ═════════════════════════════ 第 5 部分：async 工具与三种超时语义 ═════════════════════════════
+
+TRACE: list[str] = []  # 记录工具在"超时之后"到底发生了什么
+
+
+@tool(timeout_s=0.3)
+async def fetch_invoice_pdf(expense_id: str) -> str:
+    """从电子发票平台下载报销单的发票 PDF，返回下载链接。"""
+    try:
+        await asyncio.sleep(5)  # 真实系统里是 await httpx.AsyncClient().get(...)：平台今天特别慢
+        TRACE.append("async 工具：下载完成")
+        return f"https://invoice.example/{expense_id}.pdf"
+    except asyncio.CancelledError:
+        TRACE.append("async 工具：在 await 处收到 CancelledError，连接释放，没有继续执行")
+        raise  # 收尾之后必须重新抛出
+
+
+@tool(timeout_s=0.3, risk="write")
+def mark_invoice_verified(expense_id: str) -> str:
+    """把报销单的发票标记为"已验真"（写操作）。"""
+    time.sleep(1.0)  # 同步的老 SDK，没有 async 版本：agentkit 把它放进线程池执行
+    TRACE.append(f"同步工具：{expense_id} 已标记为已验真（此时调用方早就收到超时了）")
+    return "ok"
+
+
+# busy_loop 是 agentkit.testing 里的模块级函数（子进程要能按模块名 import 到它）：纯 CPU 死循环，没有任何 await 点
+ocr_receipt = tool(busy_loop, name="ocr_receipt", timeout_s=0.5, isolation="process")
+
+
+async def part5() -> None:
+    banner("第 5 部分  工具可以是 async def：三种工具、三种超时语义（不调用模型）")
+    print("同一个 ToolRegistry 里放三种工具，超时都设得很短，看「超时」之后工具本身怎么样了：")
+    print("  fetch_invoice_pdf      async def，要等 5 秒的网络请求，timeout_s=0.3")
+    print("  mark_invoice_verified  普通 def，同步 SDK 要跑 1 秒，timeout_s=0.3，risk=write")
+    print("  ocr_receipt            普通 def + isolation=\"process\"，纯 CPU 死循环 30 秒，timeout_s=0.5")
+    reg = ToolRegistry([fetch_invoice_pdf, mark_invoice_verified, ocr_receipt])
+    ctx = ToolContext(run_id="demo", call_id="c1", user_id="E100")
+    TRACE.clear()
+    rows = []
+    for name, args in (("fetch_invoice_pdf", '{"expense_id": "EX-1009"}'),
+                       ("mark_invoice_verified", '{"expense_id": "EX-1009"}'),
+                       ("ocr_receipt", '{"seconds": 30}')):
+        t0 = time.perf_counter()
+        r = await reg.execute(ToolCall("c1", name, args), ctx)
+        rows.append((name, r.error_type, time.perf_counter() - t0, list(TRACE)))
+        TRACE.clear()
+    await asyncio.sleep(1.2)  # 再等一会儿：看看"超时"之后，后台还有没有东西在跑
+    late = list(TRACE)
+    alive = len(multiprocessing.active_children())
+
+    print()
+    for name, err, secs, trace in rows:
+        print(f"▶ {name}: error_type={err}，调用方 {secs:.2f}s 后拿到结果")
+        for line in trace:
+            print(f"    · {line}")
+    print("▶ 超时 1.2 秒之后：")
+    for line in late:
+        print(f"    · {line}")
+    print(f"    · 还活着的子进程：{alive} 个（ocr_receipt 的子进程在超时那一刻就被 kill 了）")
+    print("\n💡 三种工具，三种真实的超时语义：")
+    print("   async def 工具：超时 = 在它正在等待的 await 处抛 CancelledError，工具真的停了（可以在 except/finally 里收尾）；")
+    print("   普通 def 工具：在线程池里跑，调用方按时拿到超时，但 Python 线程杀不掉 —— 它会在后台跑完，副作用照样发生；")
+    print("   isolation=\"process\"：在子进程里跑，超时直接 kill 进程，适合 CPU 密集、第三方库、不可信代码（代价：启动开销、参数要能 pickle）。")
+    print("   所以：写操作如果只有同步 SDK，要么给足超时，要么配合幂等键（第 08 课），绝不能假设\"超时 = 没执行\"。")
+
+
+async def main() -> None:
     print("🎬 离线模式：剧本复现真实模型的典型表现" if OFFLINE else "🌐 真实模型模式（约 1 分钟；模型的措辞每次会略有不同）")
     part0()
     try:
-        experiment_a()
-        experiment_b()
-        experiment_c()
+        await experiment_a()
+        await experiment_b()
+        await experiment_c()
     except Exception as e:  # noqa: BLE001
         print(f"\n❌ 调用模型失败：{type(e).__name__}: {e}\n   可以先用 --offline 运行，或 make check-env 检查配置。")
-    part4()
+    await part4()
+    await part5()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

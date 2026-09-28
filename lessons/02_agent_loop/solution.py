@@ -1,7 +1,7 @@
 """第 02 课参考答案。接口与 exercise.py 完全一致。
 
-建议先自己写，卡住超过 10 分钟再来看。对照 agentkit/agent.py 的 _loop()，
-你会发现"企业版"只是在这个骨架上加了钩子、检查点和追踪。
+建议先自己写，卡住超过 10 分钟再来看。对照 agentkit/agent.py 的 _loop_body()，
+你会发现"企业版"只是在这个骨架上加了钩子、检查点、追踪、并行只读工具和取消收尾。
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import typing
 from typing import Any, Callable
 
 from agentkit.llm import LLM
+from agentkit.tools import maybe_await
 from agentkit.types import Message, ToolCall, system, tool_message, user
 
 SYSTEM_PROMPT = "你是一个有帮助的助手。需要外部信息时调用工具；工具返回错误时，根据错误信息修正参数后重试。"
@@ -52,8 +53,8 @@ def build_tool_schemas(tools: dict[str, Callable[..., Any]]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def execute_tool_call(tools: dict[str, Callable[..., Any]], call: ToolCall) -> str:
-    """执行模型发起的一次工具调用，永远返回字符串，永远不抛异常（错误即观察）。"""
+async def execute_tool_call(tools: dict[str, Callable[..., Any]], call: ToolCall) -> str:
+    """执行模型发起的一次工具调用，永远返回字符串，永远不抛异常（错误即观察；取消照常向外传播）。"""
     fn = tools.get(call.name)
     if fn is None:
         available = ", ".join(tools) or "（无）"
@@ -67,8 +68,10 @@ def execute_tool_call(tools: dict[str, Callable[..., Any]], call: ToolCall) -> s
         return '错误：参数必须是 JSON 对象，例如 {"city": "北京"}。请重新生成参数。'
 
     try:
-        result = fn(**args)
-    except Exception as e:  # noqa: BLE001 —— 任何异常都要变成观察，不能让 Agent 崩溃
+        # 同步工具：fn(**args) 直接得到结果；async 工具：得到协程，maybe_await 再 await 它。
+        # await 放在 try 里：async 工具的异常是在 await 时才抛出来的。
+        result = await maybe_await(fn(**args))
+    except Exception as e:  # noqa: BLE001 —— 任何异常都要变成观察；CancelledError 是 BaseException，不会被这里吞掉
         return f"错误：工具 {call.name} 执行失败：{type(e).__name__}: {e}"
 
     return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
@@ -79,7 +82,7 @@ def execute_tool_call(tools: dict[str, Callable[..., Any]], call: ToolCall) -> s
 # ---------------------------------------------------------------------------
 
 
-def run_agent_loop(
+async def run_agent_loop(
     llm: LLM,
     tools: dict[str, Callable[..., Any]],
     user_input: str,
@@ -93,7 +96,7 @@ def run_agent_loop(
     messages: list[Message] = [system(SYSTEM_PROMPT), user(user_input)]
 
     for step in range(1, max_steps + 1):
-        response = llm.chat(messages, tools=schemas)
+        response = await llm.chat(messages, tools=schemas)  # 等模型的这 1–10 秒，事件循环去推进别的会话
         messages.append(response.to_message())  # assistant 消息必须先于它的 tool 结果
 
         if not response.tool_calls:  # 没有工具调用 = 模型认为任务完成
@@ -105,6 +108,6 @@ def run_agent_loop(
             }
 
         for call in response.tool_calls:  # 模型可能一次并行发起多个调用，每个都要回应
-            messages.append(tool_message(call.id, execute_tool_call(tools, call)))
+            messages.append(tool_message(call.id, await execute_tool_call(tools, call)))
 
     return {"output": None, "messages": messages, "steps": max_steps, "stop_reason": "max_steps"}

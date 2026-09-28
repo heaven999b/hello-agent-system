@@ -44,9 +44,9 @@ Below is one turn (excerpted) from running `demo_raw.py` against a real model. (
   "role": "assistant",
   "content": null,
   "tool_calls": [
-    {"id": "call_vhDW04I4...", "type": "function",
+    {"id": "call_W2Y6Sno3...", "type": "function",
      "function": {"name": "get_weather", "arguments": "{\"city\":\"Beijing\"}"}},
-    {"id": "call_ENh4I8Ky...", "type": "function",
+    {"id": "call_7CQpUQLs...", "type": "function",
      "function": {"name": "get_weather", "arguments": "{\"city\":\"Shanghai\"}"}}
   ]
 }
@@ -55,8 +55,8 @@ Below is one turn (excerpted) from running `demo_raw.py` against a real model. (
 After our code executes them, it appends two `tool` messages:
 
 ```json
-{"role": "tool", "tool_call_id": "call_vhDW04I4...", "content": "{\"city\": \"Beijing\", \"temp_c\": 31, \"condition\": \"sunny\"}"}
-{"role": "tool", "tool_call_id": "call_ENh4I8Ky...", "content": "{\"city\": \"Shanghai\", \"temp_c\": 27, \"condition\": \"sunny\"}"}
+{"role": "tool", "tool_call_id": "call_W2Y6Sno3...", "content": "{\"city\": \"Beijing\", \"temp_c\": 31, \"condition\": \"sunny\"}"}
+{"role": "tool", "tool_call_id": "call_7CQpUQLs...", "content": "{\"city\": \"Shanghai\", \"temp_c\": 27, \"condition\": \"sunny\"}"}
 ```
 
 **Three iron rules** (break any one of them and either the API returns an error or the agent misbehaves):
@@ -169,41 +169,160 @@ A single assistant message can contain **multiple** `tool_calls` (as in the weat
 When handling parallel calls, keep in mind:
 
 - **Execute every one, and respond to every one** (iron rule 2). Handling only `tool_calls[0]` is the most common beginner bug.
-- **Execution order**: agentkit executes them sequentially — simple, deterministic, and audit-friendly. Latency-sensitive production systems can run **read-only** tools concurrently in a thread pool, but all results must be appended before the next model call.
+- **Execution order**: if every call in the round is a **read-only** tool, agentkit runs them concurrently with `asyncio.gather` (`parallel_tools=True`, at most `max_parallel_tools=8` at a time) and writes the results back **in the order the model gave them**; as soon as one write / dangerous tool is involved, it runs them one by one, so side effects stay ordered and the state is saved after each one. Either way, all results must be appended before the next model call. Running them in order is enough for this lesson's exercise.
 - **Dependent writes don't belong in parallel**: if the model sends "create a ticket" and "add a note to that ticket" in the same round, the second call has no way to get the ticket ID. OpenAI's API offers a `parallel_tool_calls=false` parameter to turn parallel calls off.
+
+### 1.7 Why async: how one process serves many sessions at once
+
+Before writing the loop, do the math. In the real run of `demo.py` in section 3, one session took 3.8 seconds, and the two `llm.chat` calls took 1.9 seconds each — **nearly all of the time is spent waiting for the model**, while tool execution took 0ms. The CPU does nothing while it waits. So what happens when 200 users are chatting with your service at the same time?
+
+**Analogy: one waiter looking after many tables.** Think of the glass room as a kitchen: the expert is the chef, the notes are order tickets, and your code is the waiter.
+
+- **Synchronous code**: the waiter hands the ticket into the kitchen and then stands at the pass, waiting, until the dish comes out. 200 tables means hiring 200 waiters (200 threads) — every thread costs memory, and the OS has to keep switching between them, so this doesn't scale far.
+- **Async code**: the waiter hands in the ticket and goes to serve other tables, then comes back when the kitchen bell rings (the model's reply has arrived). One waiter looks after hundreds of tables. The dispatcher that "remembers which table is waiting for what, and whom to call when the bell rings" is the **event loop**.
+
+| Analogy | Technical concept |
+|---|---|
+| The waiter | The event loop (one thread) |
+| Each table of guests | One session (one coroutine, running in an asyncio Task) |
+| Handing in the ticket, saying "call me when it's ready," and moving on | `await llm.chat(...)`: handing control back to the event loop |
+| The kitchen bell | The network reply arrives; the event loop wakes the session up, and it continues from the line after the `await` |
+| Seating many tables at once, but serving at most N | `asyncio.gather` + `asyncio.Semaphore(N)` |
+| A guest leaves, so their order is cancelled | Cancellation: `task.cancel()` |
+| The waiter standing at one table, staring into space for 2 seconds | Calling a blocking function inside async code: **every table waits** |
+
+```mermaid
+sequenceDiagram
+    participant L as Event loop one thread
+    participant A as Session A
+    participant B as Session B
+    participant M as Model API
+    L->>A: Run session A
+    A->>M: await llm.chat sends the request
+    Note over A: A pauses and yields the event loop
+    L->>B: Run session B
+    B->>M: await llm.chat sends the request
+    Note over B: B pauses
+    Note over L: Both requests in flight max_in_flight is 2
+    M-->>L: A's reply arrives
+    L->>A: Wake A up and continue after the await
+    M-->>L: B's reply arrives
+    L->>B: Wake B up
+```
+
+**Three keywords: `async def`, `await`, `asyncio.run`.**
+
+```python
+import asyncio
+
+async def handle(question: str) -> str:          # async def: defines a "coroutine function"
+    response = await llm.chat([user(question)])  # await: wait here, and yield the event loop while waiting
+    return response.content
+
+answer = asyncio.run(handle("What's the weather in Beijing?"))  # asyncio.run: script entry point. Creates the event loop, runs the coroutine, closes the loop
+```
+
+- Calling a function defined with `async def` **doesn't run it**; it just gives you a **coroutine** — a to-do ticket.
+- `await coroutine` is what actually runs it. When it reaches something that has to wait on the outside world (the network, a timer), the coroutine pauses and the event loop runs other coroutines; once the thing it was waiting for arrives, it resumes where it left off. **Switching can only happen at an `await`**: the code between two `await`s is never interrupted by another session.
+- `await` can only appear inside an `async def`. At the top level of a script you start things with `asyncio.run(main())`; inside a web framework (FastAPI, etc.) the framework already runs the event loop for you, so you just write your route functions as `async def`.
+
+**Concurrency: `gather` to run together, `Semaphore` to cap it.**
+
+```python
+results = await asyncio.gather(*(agent.run(q) for q in questions))   # run them together; results come back in input order
+
+sem = asyncio.Semaphore(3)                   # at most 3 running at once (e.g. the model gateway gave you a concurrency quota of 3)
+
+async def limited(q: str):
+    async with sem:                          # no slot available → wait in line here (waiting also yields the event loop)
+        return await agent.run(q)
+
+results = await asyncio.gather(*(limited(q) for q in questions))
+```
+
+An uncapped `gather` is dangerous: fire off 1,000 requests at once and the model gateway answers with a wall of 429s (Lessons 08, 12). Concurrency in production code always comes with a cap. `agentkit.workflows.parallel(fns, max_concurrency=8)` wraps both steps for you, and cancels the rest as soon as one fails (Lesson 06).
+
+**Cancellation.** `task.cancel()` doesn't "kill" a coroutine on the spot; it makes it raise `asyncio.CancelledError` **at its next `await`**. The exception propagates outward, and every `finally` and `async with` along the way still runs its cleanup. So:
+
+- The user closes the page → the web framework cancels that request's task → the `await` that's waiting on the model raises `CancelledError` → the HTTP request is dropped, and you stop paying for an answer nobody will read. agentkit's `Agent` records the checkpoint as `cancelled` at this point and keeps propagating the exception.
+- `CancelledError` is a `BaseException`, not an `Exception`, so `except Exception` won't swallow it by accident — Python designed it that way on purpose. **Don't** write `except BaseException:` or a bare `except:` without re-raising; that disables cancellation.
+
+**The #1 pitfall: calling a blocking function inside async code.** The event loop has only one thread. If a coroutine calls `time.sleep(2)`, `requests.get(...)`, a synchronous database driver (`psycopg2`, `pymysql`), or some pure-CPU code that runs for seconds, it **doesn't await and doesn't yield**, and the whole event loop is stuck right there — for those 2 seconds **every** session stops: other sessions' model replies arrive with nobody to handle them, health checks time out, new requests go unanswered. There's no error; the service just gets "mysteriously slow." It's the most common and hardest-to-diagnose problem in async services. The fixes:
+
+| Situation | Fix |
+|---|---|
+| Waiting a bit | `await asyncio.sleep(seconds)`, not `time.sleep` |
+| Calling an HTTP API | Use an async client: `httpx.AsyncClient`, `openai.AsyncOpenAI` |
+| Querying a database / cache | Use an async driver: `asyncpg`, `psycopg` in async mode, `redis.asyncio` |
+| A library that only has a sync version (and you can't replace it) | `await asyncio.to_thread(func, args...)`: run it in a thread pool and await its result |
+| Pure-CPU code that runs for a long time | Run it in a subprocess (threads are limited by the GIL, and can't be killed; see `isolation="process"` in Lesson 03) |
+
+agentkit gives you one safety net: tools written as a plain `def` are automatically run in a thread pool by `ToolExecutor` (Lesson 03), so sync tools don't block the event loop. But if you put a blocking call inside an `async def`, the framework can't save you.
+
+**Forgetting `await`.** Write `response = llm.chat(messages)` without the `await` and what you get is `<coroutine object ScriptedLLM.chat at 0x...>` — the model was never called. Accessing `response.content` next raises `AttributeError: 'coroutine' object has no attribute 'content'`; if you only interpolate it into a string, you silently send the text `<coroutine object ...>` to the model as a tool result. Python usually also prints `RuntimeWarning: coroutine '...' was never awaited` — when you see it, go find the missing `await`.
+
+**Measured.** Run [`demo_async.py`](demo_async.py) (fully offline; `ScriptedLLM(latency=0.2)` plays a model that "thinks" for 0.2 seconds per call). The numbers below come from an Apple M1 with 8 GB of RAM, with a system load average of about 6–8 during the run (other jobs were running at the same time, so load was high). Timings vary with the machine and the load; `max_in_flight` and the "tools running at once" counts are deterministic.
+
+10 sessions, each = 2 model calls + 1 tool call:
+
+| Approach | Time | `max_in_flight` | Model calls |
+|---|---|---|---|
+| One after another (`for` + `await`) | 4.06s | 1 | 20 |
+| `asyncio.gather`, all together | 0.41s | 10 | 20 |
+| `gather` + `Semaphore(3)` | 1.63s | 3 | 20 |
+
+`max_in_flight` is what `ScriptedLLM` records as "model calls in flight at the same moment," and it's **deterministic evidence** that concurrency really happened: one after another, it's always 1; with `gather`, all 10 sessions' model calls are waiting at once; with `Semaphore(3)`, it caps at 3. Throughout, it's the same `Agent` instance, one thread, one process.
+
+The same 10 sessions running together, but this time each session calls an "inventory lookup" tool that has to wait 0.2 seconds. Four ways to write it:
+
+| How the tool is written | Time | Tools running at once | Longest event-loop stall |
+|---|---|---|---|
+| `async def` + `await asyncio.sleep(0.2)` | 0.61s | 10 | 3ms |
+| `async def` + `time.sleep(0.2)` ❌ | 2.48s | 1 | 2072ms |
+| `async def` + `await asyncio.to_thread(time.sleep, 0.2)` | 0.61s | 10 | 2ms |
+| Plain `def` + `time.sleep(0.2)` (agentkit runs it in a thread pool) | 0.61s | 10 | 3ms |
+
+"Longest event-loop stall" is measured with a heartbeat coroutine that wakes up every 10ms: however late it is, that's how long the event loop was stuck. With the blocking version, the 10 tools can only run one after another, and the event loop doesn't respond to anything for a full 2 seconds — in a real service, every user would be staring at a spinner for those 2 seconds.
+
+> This section is about concurrency **within one process**. How many sessions one process can handle, how multiple worker processes share the work, and how other processes take over when one crashes are covered in Lessons 12 and 13 (`agentkit.distributed`, with real, separate processes).
 
 ## 2. From toy to production: building it layer by layer
 
 ### 2.1 The minimal version: 30 lines, no magic
 
-This is the core of [`demo_raw.py`](demo_raw.py), using nothing but the `openai` SDK:
+This is the core of [`demo_raw.py`](demo_raw.py), using nothing but the `openai` SDK's async client, `AsyncOpenAI`:
 
 ```python
-messages = [{"role": "system", "content": "..."}, {"role": "user", "content": question}]
-for step in range(1, max_steps + 1):                       # loop + step limit
-    resp = client.chat.completions.create(model=model, messages=messages, tools=TOOLS)
-    msg = resp.choices[0].message
+async def run_agent(client, model, question, max_steps=5):      # client = AsyncOpenAI(...)
+    messages = [{"role": "system", "content": "..."}, {"role": "user", "content": question}]
+    for step in range(1, max_steps + 1):                        # loop + step limit
+        resp = await client.chat.completions.create(model=model, messages=messages, tools=TOOLS)  # yields the event loop while waiting for the model
+        msg = resp.choices[0].message
 
-    assistant = {"role": "assistant", "content": msg.content}
-    if msg.tool_calls:
-        assistant["tool_calls"] = [
-            {"id": tc.id, "type": "function",
-             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-            for tc in msg.tool_calls
-        ]
-    messages.append(assistant)                              # Iron rule 1: assistant first
+        assistant = {"role": "assistant", "content": msg.content}
+        if msg.tool_calls:
+            assistant["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in msg.tool_calls
+            ]
+        messages.append(assistant)                               # Iron rule 1: assistant first
 
-    if not msg.tool_calls:                                  # no tool calls = final answer
-        return msg.content
+        if not msg.tool_calls:                                   # no tool calls = final answer
+            return msg.content
 
-    for tc in msg.tool_calls:                               # parallel calls: execute every one
-        try:
-            result = FUNCTIONS[tc.function.name](**json.loads(tc.function.arguments or "{}"))
-        except Exception as e:                              # errors are "observations" too
-            result = f"Error: {type(e).__name__}: {e}"
-        messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})  # Iron rule 2
-return "(Reached the maximum number of steps; task not completed)"
+        for tc in msg.tool_calls:                                # parallel calls: execute every one
+            try:
+                result = FUNCTIONS[tc.function.name](**json.loads(tc.function.arguments or "{}"))
+            except Exception as e:                               # errors are "observations" too
+                result = f"Error: {type(e).__name__}: {e}"
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})  # Iron rule 2
+    return "(Reached the maximum number of steps; task not completed)"
+
+answer = asyncio.run(run_agent(AsyncOpenAI(...), model, "Which is hotter right now, Beijing or Shanghai?"))
 ```
+
+Compared with the synchronous version, only three things are new: `async def`, the `await` before the model call, and `asyncio.run` at the entry point. The loop itself hasn't changed by a single word.
 
 Two design choices worth noting:
 
@@ -212,29 +331,31 @@ Two design choices worth noting:
 
 ### 2.2 The enterprise version: what `agentkit/agent.py` adds
 
-This is the main loop of [`agentkit/agent.py`](../../agentkit/agent.py). Its structure is identical to the toy version above:
+This is the main loop of [`agentkit/agent.py`](../../agentkit/agent.py), `_loop_body()` (with the cancellation checks omitted). Its structure is identical to the toy version above:
 
 ```python
-def _loop(self, state: RunState) -> None:
+async def _loop_body(self, state: RunState, prepare) -> None:
+    if prepare is not None:
+        await prepare()                                 # on_run_start hooks + append the user message + save
     # Resuming: if we last stopped after the model issued tool calls but before they all ran, finish them first
-    self._run_pending_tools(state)
+    await self._run_pending_tools(state)
     while state.step < self.max_steps:
-        state.step += 1
-        response = self._call_llm(state)            # inside: context strategy → hooks → tracing → model call → accounting
+        response = await self._call_llm(state)          # inside: context strategy → hooks → step += 1 → tracing → model call → accounting
         state.messages.append(response.to_message())
-        self._save(state)                           # persist after every step
+        await self._save(state)                         # persist after every step
 
-        if not response.tool_calls:                 # no tool calls = the model gave its final answer
+        if not response.tool_calls:                     # no tool calls = the model gave its final answer
             output = response.content or ""
             for h in self.hooks:
-                new = h.on_final(state, output)     # e.g. OutputGuard redacts here
+                new = await _call_hook(h, "on_final", state, output)  # e.g. OutputGuard redacts here
                 if new is not None:
                     output = new
-            state.messages[-1]["content"] = output  # store the processed version in the history too
-            state.status, state.stop_reason, state.output = "completed", "final_answer", output
+            state.messages[-1]["content"] = output      # store the processed version in the history too
+            reason = "output_truncated" if response.finish_reason == "length" else "final_answer"
+            state.status, state.stop_reason, state.output = "completed", reason, output
             return
 
-        self._run_pending_tools(state)
+        await self._run_pending_tools(state)            # all read-only → run concurrently; any write → one by one
 
     state.status, state.stop_reason = "max_steps", "max_steps"
 ```
@@ -246,11 +367,13 @@ Let's go through what's been added, one piece at a time, and **why**:
 | Local variable `messages` | A `RunState` object (messages, step count, usage, cost, approvals, identity) | Serializable state → it can be persisted, restored, and audited. An agent run may wait until the next day for approval; a local variable won't live that long |
 | None | `_save(state)` after every step and every tool execution | After a process crash or a rolling deploy, the run resumes from where it stopped instead of starting over, paying twice, and repeating writes (Lesson 08) |
 | None | `_run_pending_tools` at the start of the loop | If the crash happened after the model decided to call a tool but before the tool ran, recovery only runs the pending tools and **doesn't ask the model again** — asking again costs money, and the model might decide differently |
-| Exceptions propagate | `_drive` funnels `StopRun` / `PauseRun` / `LLMError` into a single `status` | The caller (a web endpoint, a ticketing system) always gets a `RunResult` and only has to check `status` to decide what's next, instead of scattering `try/except` everywhere |
-| None | 8 hook points | **Cross-cutting concerns** like security, permissions, budgets, auditing, and redaction stay out of the loop (see 2.3) |
+| Exceptions propagate | `_drive` funnels `StopRun` / `PauseRun` / `LLMError` / timeouts / rate limits into a single `status` | The caller (a web endpoint, a ticketing system) always gets a `RunResult` and only has to check `status` to decide what's next, instead of scattering `try/except` everywhere. The one exception is cancellation: after the checkpoint is recorded as `cancelled`, `CancelledError` keeps propagating |
+| One function runs one session | `async` all the way down; the `Agent` instance keeps no per-run data (it all lives in `RunState`) | The same `Agent` instance drives hundreds or thousands of sessions at once in one process (section 1.7) |
+| None | Cancellation, `run_timeout`, `limiter` | User disconnects → stop immediately and record `cancelled`; time limit exceeded → `stopped` (`timeout`); cap the number of concurrent runs per tenant (Lesson 12) |
+| None | 8 hook points (plain methods or `async def`) | **Cross-cutting concerns** like security, permissions, budgets, auditing, and redaction stay out of the loop (see 2.3) |
 | None | `context_strategy.apply()` | Truncates or summarizes the history when it gets too long (Lesson 04) |
 | None | `tracer.span(...)` wraps every model and tool call | When something goes wrong, you can see each step's inputs, outputs, latency, and tokens (Lesson 10) |
-| Calls functions directly | `ToolRegistry.execute(call, ctx)` | One place for JSON parsing, schema validation, identity injection, timeouts, truncation, and idempotency (Lesson 03) |
+| Calls functions directly | `await self.executor.execute(call, ctx)` (`ToolExecutor`) | One place for JSON parsing, schema validation, identity injection, timeouts, truncation, and idempotency; sync tools run in a thread pool, and async tools can really be cancelled on timeout (Lesson 03) |
 | Returns output as-is | `on_final` rewrites it and **writes it back to the history** | What goes into checkpoints and logs is the redacted version, not the original with someone's resident ID number in it |
 
 One detail: the result of `on_final` is written back to `state.messages[-1]`. If you only change the return value and not the history, the original sensitive content still sits in the checkpoint file and gets sent to the model again on the next turn — a common data-leak path in real systems.
@@ -274,7 +397,7 @@ flowchart LR
     F --> E["on_run_end"]
 ```
 
-A hook can do five things: nothing (just observe), rewrite data (return a new value), reject a tool call (`before_tool` returns a reason, which is fed back to the model as an observation), abort the run (raise `StopRun`), or pause for a human (raise `PauseRun`).
+A hook can do five things: nothing (just observe), rewrite data (return a new value), reject a tool call (`before_tool` returns a reason, which is fed back to the model as an observation), abort the run (raise `StopRun`), or pause for a human (raise `PauseRun`). Hook methods can be plain methods or `async def` (for example, a rate-limit hook that queries Redis); `Agent` awaits them automatically. Pure-computation hooks (permission tables, budgets, redaction) are best left as plain methods.
 
 Every enterprise capability in this course is a hook:
 
@@ -309,6 +432,9 @@ Be clear about the costs, too:
 # Framework version: the same task implemented with agentkit.Agent
 .venv/bin/python lessons/02_agent_loop/demo.py
 .venv/bin/python lessons/02_agent_loop/demo.py --offline
+
+# async: one process serving many sessions, the blocking-call pitfall, cancellation (fully offline)
+.venv/bin/python lessons/02_agent_loop/demo_async.py
 ```
 
 Real-model output of `demo_raw.py` (excerpt):
@@ -317,8 +443,8 @@ Real-model output of `demo_raw.py` (excerpt):
 ━━━━━━━━ Round 1: sending 2 messages to the model ━━━━━━━━
 finish_reason = 'tool_calls'
 👉 The model didn't answer directly; it requested 2 tool calls. Our code executes them:
-   🔧 Done, appending tool message: {"role": "tool", "tool_call_id": "call_vhDW...", "content": "{\"city\": \"Beijing\", \"temp_c\": 31, ...}"}
-   🔧 Done, appending tool message: {"role": "tool", "tool_call_id": "call_ENh4...", "content": "{\"city\": \"Shanghai\", \"temp_c\": 27, ...}"}
+   🔧 Done, appending tool message: {"role": "tool", "tool_call_id": "call_W2Y6...", "content": "{\"city\": \"Beijing\", \"temp_c\": 31, ...}"}
+   🔧 Done, appending tool message: {"role": "tool", "tool_call_id": "call_7CQp...", "content": "{\"city\": \"Shanghai\", \"temp_c\": 27, ...}"}
 
 ━━━━━━━━ Round 2: sending 5 messages to the model ━━━━━━━━
 finish_reason = 'stop'
@@ -326,30 +452,33 @@ finish_reason = 'stop'
 ━━━━━━━━ The final, complete messages (this is the agent's entire state) ━━━━━━━━
 [0] system    You are a weather assistant. Call tools when you need weather data; don't make anything up. Keep answers brief.
 [1] user      Which is hotter right now, Beijing or Shanghai? By how many degrees?
-[2] assistant   tool_calls=get_weather{"city":"Beijing"}#ZPwvor, get_weather{"city":"Shanghai"}#u2szpP
-[3] tool      {"city": "Beijing", "temp_c": 31, "condition": "sunny"}  (responds to #ZPwvor)
-[4] tool      {"city": "Shanghai", "temp_c": 27, "condition": "sunny"}  (responds to #u2szpP)
-[5] assistant Beijing is hotter.   Beijing is 31℃ and Shanghai is 27℃, so Beijing is 4℃ warmer.
+[2] assistant   tool_calls=get_weather{"city":"Beijing"}#DTmoKO, get_weather{"city":"Shanghai"}#BxYLS7
+[3] tool      {"city": "Beijing", "temp_c": 31, "condition": "sunny"}  (responds to #DTmoKO)
+[4] tool      {"city": "Shanghai", "temp_c": 27, "condition": "sunny"}  (responds to #BxYLS7)
+[5] assistant Beijing is hotter.  - Beijing: 31℃, sunny - Shanghai: 27℃, sunny  Beijing is **4℃** warmer than Shanghai.
 ```
 
 Real-model output of `demo.py` (excerpt):
 
 ```text
 ▶ Hook event stream (every beat of the main loop):
-  [on_run_start] run_id=342a8b385566  user input: Which is hotter right now, Beijing or Shanghai? By how many degrees?
+  [on_run_start] run_id=fa796532321d  user input: Which is hotter right now, Beijing or Shanghai? By how many degrees?
   [before_llm]   step 1: about to send 2 messages to the model
   [after_llm]    model requested get_weather{"city":"Beijing"}, get_weather{"city":"Shanghai"}  (finish_reason=tool_calls, tokens=443)
   [before_tool]  about to run get_weather, risk level=read
+  [before_tool]  about to run get_weather, risk level=read
   [after_tool]   get_weather → success: {"city": "Beijing", "temp_c": 31, "condition": "sunny"}
+  [after_tool]   get_weather → success: {"city": "Shanghai", "temp_c": 27, "condition": "sunny"}
+  [before_llm]   step 2: about to send 5 messages to the model
   ...
   [on_run_end]   run finished, status=completed (this is where the audit log gets written, Lesson 09)
 
 ▶ Trace tree (covered in depth in Lesson 10):
-agent.run  4394ms  tokens=896→71  status=completed steps=2 cost=$0.00183
-├─ llm.chat  2218ms  tokens=395→48  → tool_calls: get_weather, get_weather
+agent.run  3796ms  tokens=896→71  status=completed steps=2 cost=$0.00183
+├─ llm.chat  1897ms  tokens=395→48  → tool_calls: get_weather, get_weather
 ├─ tool.get_weather  0ms  ok
 ├─ tool.get_weather  0ms  ok
-└─ llm.chat  2171ms  tokens=501→23  → final_answer
+└─ llm.chat  1897ms  tokens=501→23  → final_answer
 
 Part 2: the 5 ways an agent run ends (scripted offline run, deterministic results)
 Scenario                            status     stop_reason                steps  output
@@ -360,25 +489,44 @@ Model service completely down       failed     llm_error: 503 overloaded  1     
 High-risk action awaiting approval  paused     needs_approval             1      Action reset_password({"employee_i…
 ```
 
+Output of `demo_async.py` (excerpt; the numbers are in the two tables in section 1.7):
+
+```text
+Experiment 1: what happens if you forget await
+  oops = llm.chat(...)          → got <coroutine object ScriptedLLM.chat>, type coroutine
+  How many times was the model called? → call_count = 0 (a coroutine is just a 'to-do ticket'; it hasn't run)
+  right = await llm.chat(...)   → got LLMResponse, content = 'Hello!', call_count = 1
+
+Experiment 4: cancellation — the user closed the page, so this run must stop now and stop spending money
+  After 0.1s: 1 model call in flight; calling task.cancel()
+  await task → raised CancelledError in 0ms (no need to wait the full 5 seconds)
+  State in the checkpoint: status='cancelled'  stop_reason='cancelled'  model calls in flight: 0
+```
+
 What to notice:
 
 1. Both demos produce **exactly the same message sequence**: `system → user → assistant(tool_calls) → tool → tool → assistant`. The framework doesn't change what an agent fundamentally is.
-2. In the trace tree, **nearly all the time is spent in `llm.chat`** (over 2 seconds per call), while tool execution takes 0ms. In real systems, reducing the number of model calls (for example, with parallel tool calls) is the most effective way to cut latency.
+2. In the trace tree, **nearly all the time is spent in `llm.chat`** (almost 2 seconds per call), while tool execution takes 0ms. In real systems, reducing the number of model calls (for example, with parallel tool calls) is the most effective way to cut latency; and the time spent waiting on the model is exactly the time async lets the same process serve other sessions (section 1.7).
 3. Round 2's input tokens (501) exceed round 1's (395) — the history was resent in full.
 4. All 5 endings **return** a `RunResult`; none of them throws an exception at the caller.
+5. Both `before_tool` lines print before both `after_tool` lines: the two read-only `get_weather` calls ran concurrently (section 1.6), and the results were still written back in the model's order.
+6. `demo_async.py` experiment 4: cancellation takes effect immediately at the `await` that is waiting on the model; the checkpoint records `cancelled`, and the model isn't called again.
 
 ## 4. Exercise
 
-Open [`exercise.py`](exercise.py) and implement two functions:
+Open [`exercise.py`](exercise.py) and implement two **`async def`** functions:
 
-1. **`execute_tool_call(tools, call) -> str`**: executes one tool call, **always returns a string, and never raises**. It must handle: an unknown tool, invalid JSON, JSON that isn't an object, an empty `arguments` string, exceptions raised by the function (including the `TypeError` from wrong argument names), and serializing non-string results.
-2. **`run_agent_loop(llm, tools, user_input, max_steps=5) -> dict`**: the main loop. It must handle: direct answers, single and multi-round tool calls, multiple parallel calls in one round, hitting `max_steps`, passing `tools=None` when there are no tools, and responses that contain both `content` and `tool_calls`.
+1. **`async def execute_tool_call(tools, call) -> str`**: executes one tool call, **always returns a string, and never raises** (except for cancellation). It must handle: an unknown tool, invalid JSON, JSON that isn't an object, an empty `arguments` string, exceptions raised by the function (including the `TypeError` from wrong argument names), and serializing non-string results. A tool **can be either a plain function or an `async def` function**: when `fn(**args)` gives you a coroutine, you have to `await` it as well (that's exactly what `agentkit.tools.maybe_await` does), and that `await` must be inside the `try` — an async tool's exception is only raised when you await it.
+2. **`async def run_agent_loop(llm, tools, user_input, max_steps=5) -> dict`**: the main loop. It must handle: direct answers, single and multi-round tool calls, multiple parallel calls in one round, hitting `max_steps`, passing `tools=None` when there are no tools, and responses that contain both `content` and `tool_calls`. Call the model with `await llm.chat(...)` and run tools with `await execute_tool_call(...)`.
+
+Design decision: in this exercise, plain `def` tools are **called directly** on the event loop — the tools in the tests are pure functions that finish in microseconds, so this is the simplest choice. A sync tool that blocks would freeze every session here (section 1.7), which is why agentkit's `ToolExecutor` runs sync tools in a thread pool (Lesson 03); the exercise doesn't ask you to do that.
 
 Hints:
 
-- `llm.chat(messages, tools=...)` returns an `LLMResponse`; use `response.to_message()` to convert it into an assistant message;
+- `await llm.chat(messages, tools=...)` returns an `LLMResponse`; use `response.to_message()` to convert it into an assistant message;
 - `system()` / `user()` / `tool_message()` in `agentkit.types` help you build messages;
-- `assert_protocol_ok()` in the test file checks iron rules 1 and 2, and its failure message tells you where the pairing broke.
+- `assert_protocol_ok()` in the test file checks iron rules 1 and 2, and its failure message tells you where the pairing broke;
+- The last two tests check async itself: when 20 sessions run together with `asyncio.gather`, all 20 model calls must be in flight at once (`max_in_flight == 20`); when a run is cancelled, `CancelledError` must propagate unchanged and the model must not be called again — so your catch-all should be `except Exception`, not `except BaseException`.
 
 Verify:
 
@@ -388,7 +536,7 @@ make lesson N=02
 .venv/bin/python -m pytest lessons/02_agent_loop
 ```
 
-You're done when all 20 tests pass. Afterwards, compare your version with [`solution.py`](solution.py) and the `_loop()` in [`agentkit/agent.py`](../../agentkit/agent.py) to see what yours is still missing compared with the enterprise version.
+You're done when all 25 tests pass. Afterwards, compare your version with [`solution.py`](solution.py) and the `_loop_body()` in [`agentkit/agent.py`](../../agentkit/agent.py) to see what yours is still missing compared with the enterprise version.
 
 ## 5. Going deeper (optional)
 
@@ -396,7 +544,7 @@ You're done when all 20 tests pass. Afterwards, compare your version with [`solu
 
 **Own your control flow.** Factor 8 of [12-Factor Agents](https://github.com/humanlayer/12-factor-agents), "Own your control flow," argues that only by owning the loop can you pause for a human at any point, serialize the context, and resume from where you stopped. agentkit's `PauseRun` + checkpoints follow the same idea. Black-box frameworks are fast for prototyping, but when you need "this step must wait for approval," you often end up fighting the framework.
 
-**Streaming.** In production you usually stream the answer to the user token by token. In streaming mode, `tool_calls` arrive in **chunks**: each chunk carries an `index`, and `arguments` is split into several string fragments. You have to stitch the fragments together by `index` and wait until the stream ends before parsing the JSON and running the tool. This is where hand-written streaming agents most often break.
+**Streaming.** In production you usually stream the answer to the user token by token. In streaming mode, `tool_calls` arrive in **chunks**: each chunk carries an `index`, and `arguments` is split into several string fragments. You have to stitch the fragments together by `index` and wait until the stream ends before parsing the JSON and running the tool. This is where hand-written streaming agents most often break. In agentkit, `OpenAICompatLLM.stream()` does this with `ToolCallAccumulator` (the production version of Lesson 01's exercise), and `Agent.stream()` is an async iterator that yields events step by step — text deltas, tool started / finished, approval required, finished; if the consumer stops reading (e.g. the HTTP client disconnects), the run is cancelled.
 
 **Quadratic cost and prefix caching.** Since every step resends the full history, you want the history's **prefix to stay stable** (caching and model routing are covered systematically in Lesson 14): all major providers support prefix caching (prompt caching), and cached input tokens are cheaper and faster. So: only append to the history, never modify it; don't put content that changes on every call, like timestamps, at the start of the system prompt; push dynamic information as late as you can. Lesson 04's truncation/summarization breaks the prefix — that's a trade-off you'll need to weigh.
 
@@ -409,7 +557,8 @@ You're done when all 20 tests pass. Afterwards, compare your version with [`solu
 **What agentkit doesn't do yet, but production systems should:**
 
 - **Loop detection**: when the same tool is called with the same arguments N times in a row, the agent is almost certainly stuck in a loop. You can inject a hint ("You've already called this with the same arguments 3 times") or stop early, rather than just waiting for `max_steps`.
-- **Concurrent execution of read-only tools**: run the read-only tool calls from one round concurrently in a thread pool to reduce latency.
+
+(This list used to include "concurrent execution of read-only tools." That's done now: when a round contains only read-only tools, they run concurrently with `asyncio.gather`; see section 1.6.)
 
 ## 6. Common pitfalls and anti-patterns
 
@@ -423,6 +572,8 @@ You're done when all 20 tests pass. Afterwards, compare your version with [`solu
 8. **Putting tool results in `user` messages.** The model will then treat content from web pages and emails as the user's instructions — throwing the door wide open to prompt injection (Lesson 09) — and you lose the `tool_call_id` pairing.
 9. **Modifying messages in the middle of the history** (e.g. rewriting early tool results to save tokens), which invalidates the prefix cache and can even break call/result pairing. When you need to compress, use Lesson 04's block-level truncation/summarization.
 10. **Passing `tools=[]` when there are no tools.** An empty array is meaningless and may be rejected by some servers; omit the parameter instead.
+11. **Calling a blocking function inside `async def`** (`time.sleep`, `requests.get`, a sync database driver). There's no error; every session in the process just freezes together. Switch to an async client, or use `await asyncio.to_thread(...)` (section 1.7).
+12. **Forgetting `await`, or swallowing `CancelledError`.** The former gives you a coroutine object instead of a result; the latter (`except BaseException` / a bare `except` without re-raising) disables cancellation: the user is long gone, but the run keeps calling the model and keeps spending money.
 
 ## 7. Interview & design review questions
 
@@ -482,6 +633,15 @@ You're done when all 20 tests pass. Afterwards, compare your version with [`solu
 - Hooks that share state (`state.metadata`) can trample each other. Mitigation: agree on namespaces and put type constraints on key fields.
 </details>
 
+<details>
+<summary>Q8: How does one Python process serve 200 agent sessions at once? What happens if someone puts requests.get inside a tool?</summary>
+
+- An agent spends nearly all its time waiting on the model and external APIs. With async, `await llm.chat(...)` yields the event loop, so one thread can drive hundreds of sessions at once; concurrency needs a cap such as a `Semaphore` to protect downstream services (the gateway quota).
+- `requests.get` is a blocking call: inside an `async def` tool, the whole event loop stops for as long as it runs — **every** session freezes, and nothing reports an error. Measured in this lesson's `demo_async.py`: the tools of 10 sessions should run together (0.61s) but instead run one after another (2.48s), and the event loop stalls for 2 seconds.
+- Fixes: switch to `httpx.AsyncClient`; if you can't, use `await asyncio.to_thread(requests.get, url)`; or write the tool as a plain `def` and let agentkit's `ToolExecutor` run it in a thread pool. To diagnose it: monitor event-loop lag (how late a heartbeat is), and turn on asyncio's debug mode to see slow callbacks.
+- One process still has a ceiling (CPU, memory, one event loop). Beyond that, multiple worker processes share the work (Lessons 12, 13).
+</details>
+
 ## 8. Self-check
 
 - [ ] I can name the 4 message roles, who writes each one, and what each one is for
@@ -492,7 +652,10 @@ You're done when all 20 tests pass. Afterwards, compare your version with [`solu
 - [ ] I can name the 4 common values of `finish_reason`, and explain why it shouldn't be used to detect the end
 - [ ] I can list what agentkit's main loop adds over the toy version, and what problem each addition solves
 - [ ] I can explain the benefits and costs of the hook middleware pattern
-- [ ] My `run_agent_loop` passes all 20 tests
+- [ ] I can explain what the event loop does at the moment of `await llm.chat(...)`, and why one process can serve many sessions at once
+- [ ] I can describe what happens when you call a blocking function inside async code, and at least three ways to fix it
+- [ ] I can say where a cancelled task receives `CancelledError`, and why it must not be swallowed with `except BaseException`
+- [ ] My `run_agent_loop` passes all 25 tests
 
 ## Further reading
 

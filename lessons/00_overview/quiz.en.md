@@ -2,7 +2,7 @@
 
 # Lesson 00 quiz
 
-15 questions, about 8 minutes. Answer on your own first, then expand the answers to check. For any you get wrong, go back and reread the relevant section of the [README](README.en.md).
+17 questions, about 9 minutes. Answer on your own first, then expand the answers to check. For any you get wrong, go back and reread the relevant section of the [README](README.en.md).
 
 ---
 
@@ -82,14 +82,14 @@
 
 ---
 
-### 6. (Short answer) In demo scenario 2, why doesn't approval work as "the program blocks until the approver clicks," but as "pause → write a checkpoint → another instance resumes later"?
+### 6. (Short answer) In demo scenario 2, why doesn't approval work as "the program blocks until the approver clicks," but as "pause → write a checkpoint → another process resumes later"?
 
 <details>
 <summary>Answer</summary>
 
 - The approver might act in a few minutes, or not until the next day; blocking would tie up a process and its connections for a long time;
 - In the meantime, the service may restart, go through a rolling deploy, or scale up or down, and in-memory state would be lost;
-- Once the full state (message history, calls awaiting approval, usage) is in a checkpoint, any instance can resume it by `run_id` and continue from where it stopped, instead of asking the model again from scratch (which saves money and keeps the model from making a different decision).
+- Once the full state (message history, calls awaiting approval, usage) is in a checkpoint, any process can resume it by `run_id` and continue from where it stopped, instead of asking the model again from scratch (which saves money and keeps the model from making a different decision). In the demo, the approval really is handled by a separate OS process, and the two processes share only the checkpoint directory; put the checkpoints in Postgres and that process can be on another machine.
 
 This is the idea behind durable execution, covered in depth in Lesson 08.
 </details>
@@ -256,7 +256,7 @@ None of these is always best: conflict frequency, latency requirements, and your
 2. Approval for a high-risk action takes three days, the service is deployed twice in the meantime, and the run must resume exactly where it left off once approved
 3. A user says "it's slow," but the trace breaks in two at the queue between the API and the worker, so you can't see where the time went
 4. When the primary model provider goes down, calls should switch to a backup model automatically; the security team wants to change permission rules without a code change and a deploy every time
-5. The sync version needs 200 threads to serve 200 sessions at once, and one tenant flooding requests pushes every other tenant to the back of the line
+5. One tenant flooding requests pushes every other tenant's sessions in the same worker process to the back of the line; and after a user closes the page, their run keeps calling the model — and spending money — in the background
 6. Every rolling deploy interrupts runs in progress, and every morning at 9 the queue backs up and needs more workers automatically
 
 <details>
@@ -268,10 +268,32 @@ None of these is always best: conflict frequency, latency requirements, and your
 | 2 | [27 Durable workflows](../27_durable_workflows/README.en.md) | Wait for the approval with a Temporal Signal/Update while the engine persists workflow state; mind determinism and versioning when you deploy |
 | 3 | [28 Production observability](../28_production_observability/README.en.md) | Put the trace context into the queue along with the job, so the worker continues the same trace |
 | 4 | [29 Model gateways, policy as code, and guardrail services](../29_gateway_and_guardrails/README.en.md) | A model gateway handles routing and fallback; Cedar turns permissions into policy files and denies when evaluation fails (fail closed) |
-| 5 | [30 Async runtime and high-concurrency serving](../30_async_runtime/README.en.md) | One event loop runs hundreds of sessions concurrently; per-tenant bulkheads (KeyedLimiter) isolate noisy tenants |
+| 5 | [30 Async runtime and high-concurrency serving](../30_async_runtime/README.en.md) | Per-tenant bulkheads (KeyedLimiter) isolate noisy tenants; cancellation must propagate all the way to the model call and tool that are being awaited (the async basics are in Lesson 02) |
 | 6 | [31 Deployment and scaling](../31_deployment_and_scaling/README.en.md) | On SIGTERM, stop taking new jobs and finish or hand back the ones in hand; scale on queue depth rather than CPU |
 
 (README 1.6)
+</details>
+
+---
+
+### 17. (Single choice) One ITBuddy worker process needs to serve 200 sessions at once. Which statement about `await llm.chat(...)` is correct?
+
+- A. `await` starts a new thread for each session, so 200 sessions need 200 threads
+- B. `await` hands control back to the event loop: during the seconds spent waiting for the model's reply, the event loop drives other sessions forward; but if an `async def` tool calls `time.sleep(2)`, every session is stuck for those 2 seconds
+- C. `await` makes the model API itself respond faster
+- D. Inside an `async def` function, `time.sleep` and `requests.get` automatically become non-blocking
+
+<details>
+<summary>Answer</summary>
+
+**B.**
+
+- A is wrong: async concurrency comes from an event loop in a single thread; you don't need one thread per session (that's what synchronous code needs).
+- C is wrong: a single call is exactly as slow as before; what changes is what the process does while it waits.
+- D is wrong: this is the #1 async pitfall. A blocking call doesn't await and doesn't yield, so the whole event loop is stuck — and nothing reports an error. Measured with Lesson 02's `demo_async.py`: the tools of 10 sessions should run together and finish in 0.61 seconds; written with `time.sleep`, they ran one after another in 2.48 seconds, and the event loop stalled for 2 seconds. Fixes: `await asyncio.sleep`, async clients (`httpx.AsyncClient`, `asyncpg`), `await asyncio.to_thread(...)`, or write the tool as a plain `def` and let agentkit's thread pool run it.
+- One process still has a ceiling; beyond it, multiple worker processes share the work (`agentkit.distributed`, Lessons 12 and 13).
+
+([Lesson 02, section 1.7](../02_agent_loop/README.en.md))
 </details>
 
 ---

@@ -3,6 +3,9 @@
     python lessons/04_context_memory/demo.py            # 真实模型（读取 .env）
     python lessons/04_context_memory/demo.py --offline  # 离线剧本，无需 API key
 
+代码是 async 的：SummarizingCompactor.apply 要调一次模型做摘要，所以要 await；
+SlidingWindow.apply 是纯计算，仍然是普通方法；Agent.run 同样要 await。脚本入口是 asyncio.run(main())。
+
 你会看到 5 个实验：
   1. 一个采购 Agent 第 7 轮时，上下文里都装了什么、各占多少
   2. 同一段长对话：SlidingWindow（滑动窗口）vs SummarizingCompactor（摘要压缩）
@@ -14,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 import time
@@ -202,18 +206,18 @@ class RecordingLLM:
     def __init__(self, llm):
         self.llm, self.model, self.last_output = llm, llm.model, ""
 
-    def chat(self, messages, tools=None, **kwargs):
-        response = self.llm.chat(messages, tools, **kwargs)
+    async def chat(self, messages, tools=None, **kwargs):
+        response = await self.llm.chat(messages, tools, **kwargs)
         self.last_output = response.content or ""
         return response
 
 
-def run_compactor(label: str, llm, conv: list[dict], budget: int, max_summary_chars: int) -> None:
+async def run_compactor(label: str, llm, conv: list[dict], budget: int, max_summary_chars: int) -> None:
     recorder = RecordingLLM(llm)
     compactor = SummarizingCompactor(recorder, max_tokens=budget, keep_recent_tokens=budget // 3,
                                      max_summary_chars=max_summary_chars)
     t0 = time.time()
-    compacted = compactor.apply(conv)
+    compacted = await compactor.apply(conv)  # 要调模型写摘要：async
     after = estimate_tokens(compacted)
     print(f"\n  {label}\n    → {len(compacted)} 条，约 {after} tokens（摘要调用耗时 {time.time() - t0:.1f}s），保留的消息：")
     show_messages(compacted)
@@ -240,21 +244,21 @@ def run_compactor(label: str, llm, conv: list[dict], budget: int, max_summary_ch
           f"｜在预算 {budget} 以内吗？{'✅' if after <= budget else '❌'}")
 
 
-def demo_compaction(conv: list[dict], verbose_llm, brief_llm) -> None:
+async def demo_compaction(conv: list[dict], verbose_llm, brief_llm) -> None:
     section("实验 2：同一段长对话，SlidingWindow vs SummarizingCompactor")
     before = estimate_tokens(conv)
     budget = before * 45 // 100
     print(f"  原始对话：{len(conv)} 条消息，约 {before} tokens；把预算设为 {budget} tokens\n")
 
-    window = SlidingWindow(max_tokens=budget).apply(conv)
+    window = SlidingWindow(max_tokens=budget).apply(conv)  # 纯计算：普通方法，不用 await
     print(f"  ① SlidingWindow(max_tokens={budget}) → {len(window)} 条，约 {estimate_tokens(window)} tokens，保留的消息：")
     show_messages(window)
     kept = KEY_CONSTRAINT in text_of(window)
     print(f"\n    用户第 1 句提出的发票抬头「{KEY_CONSTRAINT}」还在吗？{'✅ 在' if kept else '❌ 丢了'}")
 
-    run_compactor("② SummarizingCompactor，但几乎不限摘要长度（max_summary_chars=100000，重现本课第一版踩过的坑）",
+    await run_compactor("② SummarizingCompactor，但几乎不限摘要长度（max_summary_chars=100000，重现本课第一版踩过的坑）",
                   verbose_llm, conv, budget, max_summary_chars=100_000)
-    run_compactor("③ SummarizingCompactor，摘要限长 200 字（提示词要求 + 代码硬截断）",
+    await run_compactor("③ SummarizingCompactor，摘要限长 200 字（提示词要求 + 代码硬截断）",
                   brief_llm, conv, budget, max_summary_chars=200)
     note(
         """滑动窗口：零成本、零延迟，但"最早说的硬性要求"最先被丢 —— 而它往往最重要。
@@ -285,7 +289,7 @@ def protocol_problems(msgs: list[dict]) -> list[str]:
     return problems
 
 
-def demo_orphans(llm, offline: bool) -> None:
+async def demo_orphans(llm, offline: bool) -> None:
     section("实验 3：孤立 tool 消息 —— 为什么天真的截断会让 API 返回 400")
     full = [
         {"role": "system", "content": "你是客服助手，回答不超过 30 字。"},
@@ -311,7 +315,7 @@ def demo_orphans(llm, offline: bool) -> None:
             continue
         t0 = time.time()
         try:
-            r = llm.chat(msgs, tools=tools)
+            r = await llm.chat(msgs, tools=tools)
             answer = (r.content or "").strip()[:60] or "（空回答）"
             print(f"      API 没有报错（{time.time() - t0:.1f}s），模型回答：{answer}")
             print("      ⚠️ 没报错不代表没问题：有些网关会静默丢弃/忽略这条消息，信息悄悄丢了，比 400 更难排查。")
@@ -382,7 +386,7 @@ def show_tool_flow(result) -> None:
     print(f"    🤖 回答：{(result.output or '').strip()}")
 
 
-def demo_memory(make_llm, offline: bool) -> MemoryStore:
+async def demo_memory(make_llm, offline: bool) -> MemoryStore:
     section("实验 4：长期记忆 —— 会话 1 记住偏好，会话 2 用全新的历史想起来")
     store = MemoryStore()  # 生产中是数据库/向量库；传 path= 可以落盘到 JSON 文件
     alice = {"tenant_id": "acme", "user_id": "alice"}
@@ -392,7 +396,7 @@ def demo_memory(make_llm, offline: bool) -> MemoryStore:
 
     q1 = "请记住：我吃素，而且对花生过敏。"
     print(f"\n  【会话 1】tenant=acme user=alice：{q1}")
-    r1 = agent(remember_script()).run(q1, metadata=alice)
+    r1 = await agent(remember_script()).run(q1, metadata=alice)
     show_tool_flow(r1)
     print("\n  记忆库现在的内容（注意每条都带着 tenant_id / user_id）：")
     for item in store.items:
@@ -400,7 +404,7 @@ def demo_memory(make_llm, offline: bool) -> MemoryStore:
 
     q2 = "下周五部门团建午餐，帮我推荐 3 道菜。"
     print(f"\n  【会话 2】全新的对话（history 为空），tenant=acme user=alice：{q2}")
-    r2 = agent(recall_script("饮食 忌口 过敏 素食 口味")).run(q2, metadata=alice)
+    r2 = await agent(recall_script("饮食 忌口 过敏 素食 口味")).run(q2, metadata=alice)
     show_tool_flow(r2)
     check_recall(r2, store, "acme", "alice")
     note(
@@ -412,7 +416,7 @@ def demo_memory(make_llm, offline: bool) -> MemoryStore:
     section("实验 5：记忆隔离与被遗忘权")
     bob = {"tenant_id": "acme", "user_id": "bob"}
     print(f"\n  【同租户的另一个用户】tenant=acme user=bob：{q2}")
-    r3 = agent(recall_script("饮食 忌口 过敏 素食 口味")).run(q2, metadata=bob)
+    r3 = await agent(recall_script("饮食 忌口 过敏 素食 口味")).run(q2, metadata=bob)
     show_tool_flow(r3)
 
     alice_items = scope_items(store, "acme", "alice")
@@ -438,7 +442,7 @@ def demo_memory(make_llm, offline: bool) -> MemoryStore:
 # ====================================================================== main
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--offline", action="store_true", help="使用 ScriptedLLM 剧本，不调用真实模型")
     args = parser.parse_args()
@@ -471,10 +475,14 @@ def main() -> None:
         make_llm = lambda script: real  # noqa: E731  真实模式下忽略剧本
         raw_llm = real
 
-    demo_anatomy(conv)
-    demo_compaction(conv, verbose_llm, brief_llm)
-    demo_orphans(raw_llm, args.offline)
-    demo_memory(make_llm, args.offline)
+    try:
+        demo_anatomy(conv)
+        await demo_compaction(conv, verbose_llm, brief_llm)
+        await demo_orphans(raw_llm, args.offline)
+        await demo_memory(make_llm, args.offline)
+    finally:
+        if raw_llm is not None:
+            await raw_llm.aclose()  # 关掉 HTTP 连接池
 
     section("小结")
     print(
@@ -487,7 +495,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except RuntimeError as e:
         if "LLM_API_KEY" not in str(e):
             raise

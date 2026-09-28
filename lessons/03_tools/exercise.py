@@ -18,6 +18,10 @@ TODO 清单：
 
 验证：make lesson N=03   或   .venv/bin/python -m pytest lessons/03_tools
 随时查看你的工具在模型眼中的样子：.venv/bin/python lessons/03_tools/exercise.py
+
+两个工具都写成普通 def 就好：它们只读写内存里的字典，不等任何 I/O，不需要 async
+（agentkit 会把同步工具放进线程池执行）。要调 HTTP API / 数据库的工具才值得写成 async def，见 README 2.7 节。
+测试里经过注册表和 Agent 的用例是 async 的：await registry.execute(...)、await agent.run(...)。
 """
 
 from __future__ import annotations

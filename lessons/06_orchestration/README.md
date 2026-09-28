@@ -29,13 +29,15 @@
 
 本课的 Demo 用真实模型把 5 种模式各跑了一遍，量出了它们的"价格"：
 
-| 模式 | 耗时 | 模型调用 | tokens | 流程由谁决定 |
-|---|---|---|---|---|
-| route 路由（3 张工单） | 7.4s | 3 | 1,566 | 代码（模型只做分类） |
-| parallel 并行投票 | 3.2s | 3 | 1,722 | 代码 |
-| orchestrator_workers | 19.1s | 5 | 2,859 | 模型拆解 + 代码执行 |
-| evaluator_optimizer | 8.5s | 3 | 1,417 | 代码循环 + 模型生成 / 评审 |
-| agent_as_tool 多 Agent | 26.6s | 7 | 5,082 | 模型（主管决定委派谁） |
+| 模式 | 耗时 | 模型调用 | 同时在途峰值 | tokens | 流程由谁决定 |
+|---|---|---|---|---|---|
+| route 路由（3 张工单） | 6.2s | 3 | 1 | 1,566 | 代码（模型只做分类） |
+| parallel 并行投票 | 3.4s | 3 | 3 | 1,706 | 代码 |
+| orchestrator_workers | 14.3s | 5 | 3 | 2,871 | 模型拆解 + 代码执行 |
+| evaluator_optimizer | 7.5s | 3 | 1 | 1,372 | 代码循环 + 模型生成 / 评审 |
+| agent_as_tool 多 Agent | 28.4s | 7 | 1 | 5,345 | 模型（主管决定委派谁） |
+
+（2026-09-28 实测：macOS 笔记本，经本地 OpenAI 兼容网关调用 gpt-5.5，单次运行，模型耗时每次都有几秒的波动。"同时在途峰值"是 Demo 的计量器数出来的：同一时刻有几个模型调用在等回复。）
 
 ## 1. 核心概念
 
@@ -82,11 +84,11 @@ HANDLERS[label]                       # KeyError！
 所以编排里几乎每一步都要求模型输出**可被代码校验的数据结构**。agentkit 的 `complete_json`（[agentkit/workflows.py](../../agentkit/workflows.py)）是所有编排模式的地基：
 
 ```python
-def complete_json(llm, prompt, model_cls, system=None, max_repairs=2):
+async def complete_json(llm, prompt, model_cls, system=None, max_repairs=2):
     schema = json.dumps(model_cls.model_json_schema(), ensure_ascii=False)
     messages = [...]  # 提示词末尾附上 JSON Schema，要求"只输出 JSON"
     for _ in range(max_repairs + 1):
-        text = llm.chat(messages).content or ""
+        text = (await llm.chat(messages)).content or ""  # 等模型时让出事件循环，别的请求照常推进
         try:
             return model_cls.model_validate_json(extract_json(text))   # ① 抠出 JSON ② Pydantic 校验
         except (ValidationError, ValueError) as e:
@@ -127,9 +129,9 @@ flowchart LR
 ```
 
 ```python
-def chain(steps, text, gate=None):
+async def chain(steps, text, gate=None):        # 每一步是 async 函数（背后是模型调用）
     for i, step in enumerate(steps):
-        text = step(text)
+        text = await step(text)
         if gate is not None and not gate(i, text):
             raise ValueError(f"第 {i + 1} 步的输出没有通过检查：{text[:200]}")
     return text
@@ -154,16 +156,16 @@ flowchart LR
 ```
 
 ```python
-def route(llm, text, routes: dict[str, str]) -> str:
+async def route(llm, text, routes: dict[str, str]) -> str:
     names = tuple(routes)
     Choice = create_model("RouteChoice", route=(Literal[names], ...), reason=(str, ""))
     options = "\n".join(f"- {k}: {v}" for k, v in routes.items())
-    result = complete_json(llm, f"请把下面的请求分到最合适的类别。\n\n可选类别：\n{options}\n\n请求：{text}", Choice)
+    result = await complete_json(llm, f"请把下面的请求分到最合适的类别。\n\n可选类别：\n{options}\n\n请求：{text}", Choice)
     return result.route
 ```
 
 - **适合**：输入有明显不同的类别、且分开处理效果更好的场景。经典例子是客服分流；另一个高价值用法是**按难度分流到不同模型**——简单常见的问题交给小而便宜的模型，难题交给更强的模型（Anthropic 在文章里专门提到了这种用法）。
-- **代价**：多一次分类调用（Demo 里 3 张工单共 7.4s）。
+- **代价**：多一次分类调用（Demo 里 3 张工单共 6.2s）。
 - **最大风险是分错类**：分错了，后面做得再好也白搭。企业做法：
   1. **规则优先**：能用关键词确定的（"退款""发票"）直接分，零成本、零延迟、可解释；规则拿不准的长尾才问模型——这就是练习 1 的 `hybrid_route`；
   2. **一定要有 other / 兜底类别**，模型报错或输出未知类别时降级，而不是崩溃；
@@ -188,17 +190,73 @@ flowchart LR
 ```
 
 ```python
-def parallel(fns, max_workers=4):
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(lambda f: f(), fns))
+async def parallel(fns, max_concurrency=8):
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def one(fn):
+        async with sem:                                   # 最多 max_concurrency 个同时在途：背压
+            return await fn()
+
+    tasks = [asyncio.ensure_future(one(f)) for f in fns]
+    try:
+        return list(await asyncio.gather(*tasks))         # 按输入顺序返回
+    except BaseException:
+        for t in tasks:                                   # 一个失败（或调用方被取消）：其余立刻取消，不在后台继续花钱
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)   # 等它们真正停下来再抛出
+        raise
 ```
 
-- **代价**：调用次数 × N，但**延迟取决于最慢的那一路，而不是总和**。Demo 实测：三个评审串行需要 8.1s，并行只要 3.2s。
+`fns` 是"调用后返回协程的函数"（例如 `lambda s=s: worker(s)`），不是协程本身：协程只能 await 一次，而且拿到信号量之后才创建。所有调用都在同一个事件循环、同一个线程里同时等模型，不需要线程池。
+
+- **代价**：调用次数 × N，但**延迟取决于最慢的那一路，而不是总和**。Demo 实测：三个评审各用了 1.9s、3.0s、3.4s，串行需要 8.3s，并行 3.4s，计量器数到的同时在途峰值是 3。
+- **并发是真的吗？量出来。** 真实模型的耗时波动太大，Demo 的"模式 2 附"用延迟可控的 `ScriptedLLM(latency=0.2)` 发 10 次调用，看 ScriptedLLM 自己数的在途峰值 `max_in_flight`：
+
+  | `max_concurrency` | 在途峰值 | 用时 | 理论值 |
+  |---|---|---|---|
+  | 1 | 1 | 2.02s | 10 波 × 0.2s |
+  | 4 | 4 | 0.61s | 3 波 × 0.2s |
+  | 10 | 10 | 0.20s | 1 波 × 0.2s |
+
+  峰值恰好等于上限：并发是真的，上限也是真的。在途峰值是确定性的证据（同一时刻有几个调用在等），耗时只是旁证。
+- **一个失败，其余立刻取消。** `asyncio.gather` 默认只把第一个异常抛出来，其余任务照跑、照样花钱。`parallel` 捕获到异常后取消其余任务，等它们真正停下来再抛出。Demo 实测：安全、性能两路的模型调用各要 1.0s，第三路 0.1s 时抛异常 → `parallel` 在 0.10s 时抛出，两路都收到了 `CancelledError`，此刻在途调用 0 个，发出的 2 次调用一次都没跑完。调用方自己被取消（用户断开）时也是同样的收尾。
+- **共享状态：计量器为什么不需要锁。** Demo 用一个全局 `Meter` 统计调用次数和 token，三路评审同时更新它。以前的线程版本必须加 `threading.Lock`：线程可能在任意两条字节码之间被切走，`calls += 1` 这种"读-改-写"会被打断。现在所有调用都在一个事件循环里，而事件循环**只在 await 处**切换协程，所以只要读和写之间没有 await，这段代码就不会被别的协程插进来：
+
+  ```python
+  async def chat(self, messages, tools=None, **kwargs):
+      m = self.meter
+      m.in_flight += 1                                   # ↓ 这两行之间没有 await
+      m.max_in_flight = max(m.max_in_flight, m.in_flight)
+      try:
+          response = await self.llm.chat(messages, tools, **kwargs)   # 唯一的 await：等模型时别的协程可以运行
+      finally:
+          m.in_flight -= 1
+      m.calls += 1                                       # ↓ 同样没有 await：不会被打断
+      m.usage = m.usage + response.usage
+      return response
+  ```
+
+  反例是读和写之间夹了一个 await（Demo "模式 2 附"的实测，1000 个协程各加 1）：
+
+  ```python
+  async def add_racy():
+      v = counter.value          # 读
+      await asyncio.sleep(0)     # 读和写之间 await 了一下（比如 await 写审计日志、await 查 Redis）
+      counter.value = v + 1      # 写：用的是 await 之前读到的旧值，别人在这期间的更新被覆盖
+  ```
+
+  | 写法 | 1000 次加 1 之后 |
+  |---|---|
+  | 读-改-写之间没有 await | 1000 |
+  | 读和写之间有一个 await | **1**（丢了 999 次更新） |
+  | 同样有 await，但用 `asyncio.Lock` 把整段包起来 | 1000 |
+
+  规则：读-改-写之间别 await；非要 await（比如写之前要先查一次外部状态），就用 `asyncio.Lock` 把整段包起来。这条规则只在一个进程的事件循环里成立：多个 worker 进程之间共享的计数，要靠数据库的原子更新（第 13 课）。
 - **汇总规则本身是业务决策**。Demo 里评审一段有 SQL 注入的代码：离线剧本中安全视角 REJECT、另外两个视角 APPROVE，**少数服从多数就把漏洞放行了**。安全、合规类检查应该**一票否决**；Anthropic 也提到内容审核可以用不同的投票阈值来平衡误报和漏报。
 - **没有共识时，承认没把握**：练习 2 的 `vote_with_quorum` 只有在多数票占比达到法定比例（quorum）时才返回答案，否则返回 None——在企业里，None 意味着转人工。
 - **生产中的坑**：
-  - **并发放大限流**：一个请求扇出成 5 个并行调用，高峰期更容易触发 429，要配合第 08 课的限流和重试；
-  - **一路失败怎么办**：agentkit 的 `parallel` 用 `pool.map`，任意一路抛异常整个调用就失败。生产中通常要允许部分失败（失败的一路按弃权处理）；
+  - **并发放大限流**：一个请求扇出成 5 个并行调用，高峰期更容易触发 429，要配合第 08 课的限流和重试；`max_concurrency` 是最朴素的背压；
+  - **一路失败怎么办**：`parallel` 默认一个失败、其余取消（结果反正拿不全了）。想要"部分失败也能汇总"，就让每一路自己 `try/except Exception` 返回 None——`parallel` 看不到异常，就不会取消别人；None 当弃权票交给 `vote_with_quorum`（Demo 实测拿到 `['REJECT', 'REJECT', None]`）。只捕获 `Exception`：`CancelledError` 要照常传出去；
   - **错误是相关的**：同一个模型、同样的提示词跑 5 次，犯的往往是同一个错。投票能降低随机错误，降不了系统性偏差——想要真正的"多视角"，要换提示词、换模型或换信息源。
 
 ### 2.4 编排者-执行者（Orchestrator-Workers）
@@ -218,20 +276,20 @@ flowchart LR
 ```
 
 ```python
-def orchestrator_workers(llm, task, worker, max_subtasks=5):
-    plan = complete_json(llm, f"把下面的任务拆解成最多 {max_subtasks} 个可以并行完成的独立子任务。\n\n任务：{task}", Plan)
+async def orchestrator_workers(llm, task, worker, max_subtasks=5):   # worker 是 async 函数
+    plan = await complete_json(llm, f"把下面的任务拆解成最多 {max_subtasks} 个可以并行完成的独立子任务。\n\n任务：{task}", Plan)
     subtasks = plan.subtasks[:max_subtasks]                      # 用代码再截一次：不信任模型会守规矩
-    results = parallel([lambda s=s: worker(s) for s in subtasks])
+    results = await parallel([lambda s=s: worker(s) for s in subtasks])
     parts = "\n\n".join(f"### 子任务 {i + 1}：{s}\n{r}" for i, (s, r) in enumerate(zip(subtasks, results)))
-    return complete(llm, f"原始任务：{task}\n\n以下是各子任务的结果，请整合成一份完整、连贯、不重复的最终答复：\n\n{parts}")
+    return await complete(llm, f"原始任务：{task}\n\n以下是各子任务的结果，请整合成一份完整、连贯、不重复的最终答复：\n\n{parts}")
 ```
 
 - **适合**：无法提前知道需要哪些子任务的复杂任务。Anthropic 的例子：需要改动多个文件的编程任务；需要从多个来源收集和分析信息的搜索任务。
-- **代价**：1（拆解）+ N（执行）+ 1（汇总）次调用；延迟 ≈ 拆解 + 最慢的执行者 + 汇总。
+- **代价**：1（拆解）+ N（执行）+ 1（汇总）次调用；延迟 ≈ 拆解 + 最慢的执行者 + 汇总（执行者同时在等模型，Demo 在途峰值 3）。
 - **两个必须设的上限**：
   1. **子任务数**：`max_subtasks` 限制 N，并且在代码里再截一次（`[:max_subtasks]`）；
-  2. **汇总长度**：这是我们跑 Demo 时踩到的真坑。第一次运行时任务里没写长度要求，汇总步骤写出了 255 行以上的"完整检查手册"，**这一个模式就耗时 64.3s、5,586 tokens**；在任务里加上"最终不超过 8 条，每条一句话"后，降到 **19.1s、2,859 tokens**。多步编排里，任何一步没有输出约束，都可能成为延迟和成本的黑洞。
-- **计划质量是瓶颈**：拆错了（子任务重叠、遗漏、互相依赖却被并行执行），执行得再好也没用。高风险场景可以让人审核计划后再执行。
+  2. **汇总长度**：这是我们跑 Demo 时踩到的真坑。任务里不写长度要求，汇总步骤就会写出一本"完整检查手册"。2026-09-28 重测：第一次运行时，汇总这一次调用超过了客户端默认的 60 秒超时，整个模式直接失败；把超时放宽到 240 秒再跑，汇总写出了 195 行，**这一个模式耗时 61.5s、5,438 tokens**；在任务里加上"最终不超过 8 条，每条一句话"后，是 **14.3s、2,871 tokens**。多步编排里，任何一步没有输出约束，都可能成为延迟和成本的黑洞，甚至直接超时。
+- **计划质量是瓶颈**：拆错了（子任务重叠、遗漏、互相依赖却被并行执行），执行得再好也没用。这次真实运行就出了一例：编排者拆出的第 3 个子任务是"汇总并去重所有检查项，压缩为不超过 8 条"——它依赖前两个子任务的结果，却被当成独立子任务和它们同时执行（执行者手里没有前两份结果，只能凭空写），最后一步又汇总了一遍。在拆解提示词里写明"子任务必须相互独立、汇总由最后一步完成"；高风险场景可以让人审核计划后再执行。
 
 ### 2.5 评估-优化（Evaluator-Optimizer）
 
@@ -247,11 +305,11 @@ flowchart LR
 ```
 
 ```python
-def evaluator_optimizer(generate, evaluate, task, max_rounds=3):
+async def evaluator_optimizer(generate, evaluate, task, max_rounds=3):   # generate / evaluate 都是 async 函数
     feedback, reviews, candidate = None, [], ""
     for _ in range(max_rounds):
-        candidate = generate(task, feedback)
-        review = evaluate(candidate)
+        candidate = await generate(task, feedback)
+        review = await evaluate(candidate)
         reviews.append(review)
         if review.passed:
             break
@@ -264,13 +322,13 @@ def evaluator_optimizer(generate, evaluate, task, max_rounds=3):
 - **最好的评审器是代码**。Demo 里写 slogan 的验收标准有两条：≤15 字、体现"续航长"卖点。字数用代码数（确定、免费、不会被说服），只有字数合格后才花钱让模型判断卖点：
 
   ```text
-  第 1 轮 · 代码检查（17 字） → ❌ 退回：当前 17 字，超过 15 字上限。请压缩到 15 字以内，并保留核心卖点……
-  第 2 轮 · 模型检查（11 字） → ✅ 通过
-  最终 slogan：「一充用30天，腕上更安心」
+  第 1 轮 · 代码检查（16 字） → ❌ 退回：当前 16 字，超过 15 字上限。请压缩到 15 字以内，并保留核心卖点……
+  第 2 轮 · 模型检查（9 字） → ✅ 通过
+  最终 slogan：「一充30天，健康随行」
   ```
 
   编程场景里同理：跑测试、跑类型检查、跑 linter，比让模型"看看代码对不对"可靠得多。
-- **反馈必须具体、可执行**："写得更好一点"会让循环原地打转；"当前 17 字，请压缩到 15 字以内"才能收敛。
+- **反馈必须具体、可执行**："写得更好一点"会让循环原地打转；"当前 16 字，请压缩到 15 字以内"才能收敛。
 - **max_rounds 是必需的刹车**：模型可能永远改不到合格，或者在两个版本之间来回摇摆。达到上限要有兜底，并把它记为一个需要关注的指标。
 
 ### 2.6 Agent：把流程交给模型（📖 选读）
@@ -325,24 +383,26 @@ OpenAI 的指南把前两种称为 **Manager 模式**（agents as tools）和 **
 agentkit 实现的是第一种（[agentkit/workflows.py](../../agentkit/workflows.py)）：
 
 ```python
-def agent_as_tool(agent, name: str, description: str) -> Tool:
-    def delegate(
+def agent_as_tool(agent, name: str, description: str, timeout_s: float = 300.0) -> Tool:
+    async def delegate(
         task: Annotated[str, Field(description="交给该专家的完整任务描述，要包含所有必要的上下文")],
         ctx: ToolContext,
     ) -> str:
         meta = {"tenant_id": ctx.tenant_id, "user_id": ctx.user_id, "roles": list(ctx.roles), "parent_run": ctx.run_id}
-        result = agent.run(task, metadata=meta)
+        result = await agent.run(task, metadata=meta)
         if not result.ok:
             return f"专家 {name} 未能完成任务（{result.status}）：{result.output}"
         return result.output or ""
-    return Tool(delegate, name=name, description=description)
+    # 专家要跑好几轮模型，给足时间；主管被取消时，专家的运行也会一起被取消（async 工具可以真取消）
+    return Tool(delegate, name=name, description=description, timeout_s=timeout_s)
 ```
 
-三个值得注意的设计：
+四个值得注意的设计：
 
 1. **参数描述写着"要包含所有必要的上下文"**：专家看不到用户的原话，只能看到主管写的 `task`。Demo 的主管提示词里专门强调了这一点，于是主管写出了"商品品类为耳机，签收日期 2026-09-22，今天 2026-09-27，已拆封"这样自包含的委派；
 2. **身份透传**：tenant_id / user_id / roles 通过 `ctx` 传给专家，专家的工具（Demo 里的 `get_order`）用它做订单归属校验。如果不透传，要么专家"失去身份"，要么被迫让模型传身份——那就是在邀请提示词注入；
 3. **专家失败不抛异常**：变成一段文字观察交还给主管，由主管决定怎么向用户解释（第 03 课"错误即观察"）。
+4. **它是 async 工具，取消会传进去**：专家的 `agent.run` 直接在主管的 task 里被 await。主管在同一步里委派给多个专家时（工具默认 `risk="read"`），Agent 会并发执行它们；主管被取消时（用户断开、`run_timeout` 到期），取消一路传进专家正在等的模型调用。Demo"模式 5 附"实测：专家的模型调用在途时取消主管，0.5ms 后主管的 `run()` 抛出 `CancelledError`，专家和主管的检查点都记为 `cancelled`，专家剧本里的第 2 次调用没有发生、`get_order` 也没有执行。`timeout_s=300` 是整次委派的上限：专家要跑好几轮模型，普通工具默认的 30 秒不够。
 
 #### 多 Agent 的代价
 
@@ -351,7 +411,7 @@ def agent_as_tool(agent, name: str, description: str) -> Tool:
 | **token × N** | 每个 Agent 都有自己的 system、工具定义和多轮循环 | Anthropic 的多 Agent 研究系统：Agent 约为普通聊天的 4 倍 token，多 Agent 约为 15 倍 |
 | **上下文割裂** | 专家不知道用户原话和其他专家的决定，各自做出互相冲突的假设 | Cognition 的《Don't Build Multi-Agents》：两个子 Agent 分头做 Flappy Bird 的背景和小鸟，风格对不上，最后没法拼 |
 | **错误传播** | 一个专家的错误结论被主管当成事实继续推理 | 下游越自信，错误越难被发现 |
-| **延迟** | 有依赖的委派只能串行 | Demo：主管先问订单、再带着订单事实问政策，共 7 次调用、26.6s |
+| **延迟** | 有依赖的委派只能串行 | Demo：主管先问订单、再带着订单事实问政策，共 7 次调用、28.4s |
 | **调试难** | 一次用户请求散落在多个 Agent 的多条链路里 | 必须让子 Agent 的 trace 挂到主管的 trace 下，见 §5.4 |
 
 Cognition 的文章把教训总结为两条原则：**共享上下文，而且要共享完整的 Agent 轨迹，而不只是单条消息；行动隐含着决策，相互冲突的决策会带来糟糕的结果。**
@@ -376,7 +436,7 @@ Anthropic 的经验是：多 Agent 擅长**可以大量并行**、信息量**超
 - 链路可追踪：一次用户请求的所有 Agent 调用，要能在一棵 trace 树里看全（Demo 里三个 Agent 共用一个 `Tracer`，见 §5.4 和第 10 课）；
 - 成本归因：主管 `agent.run` 上的 token 只统计它自己的模型调用，整次请求的成本要把子 Agent 的整棵子树加起来（Demo 用一个共享的计量器统计总数）。
 
-当多 Agent 系统要服务大量并发用户、跨进程甚至跨机器执行时，还会遇到任务队列、限流、状态共享、失败重试等分布式问题——这些在第 13 课 [高并发与分布式执行](../13_distributed_concurrency/README.md) 讲。
+一个进程里，async 的 Agent 已经能同时推进成百上千个会话（第 02 课）；当多 Agent 系统要跨进程甚至跨机器执行时，还会遇到任务队列、租约、限流、状态共享、失败重试等分布式问题。第 13 课 [高并发与分布式执行](../13_distributed_concurrency/README.md) 用 `agentkit.distributed` 真的起多个 worker 进程来讲这些问题（SQLite 租约队列、fencing、`kill -9` 之后由别的进程接手）。
 
 ### 2.8 选型决策树
 
@@ -408,79 +468,113 @@ python lessons/06_orchestration/demo.py            # 真实模型，约 1 分钟
 python lessons/06_orchestration/demo.py --offline  # 离线剧本，无需 API key
 ```
 
-真实模型运行节选：
+真实模型运行节选（gpt-5.5，2026-09-28；两节"附"用的是 ScriptedLLM，真实模式和离线模式输出相同）：
 
 ```text
 模式 2：parallel 并行 + 投票 —— 三个视角同时评审一段代码
-  [安全  ] REJECT  存在SQL注入风险   （2.0s）
-  [性能  ] REJECT  SELECT *且fetchall可能消耗过高   （3.2s）
-  [可读性] APPROVE 命名和结构清晰，易读   （2.9s）
+  [安全  ] REJECT  存在SQL注入风险   （1.9s）
+  [性能  ] REJECT  SELECT *且fetchall可能过量耗内存   （3.0s）
+  [可读性] APPROVE 命名清晰，结构简单易读   （3.4s）
 
-  串行需要约 8.1s，并行实际 3.2s —— 延迟取决于最慢的那个，而不是总和。
+  串行需要约 8.3s，并行实际 3.4s，同时在途的模型调用峰值 3 —— 延迟取决于最慢的那个，而不是总和。
   少数服从多数（majority_vote）：REJECT
   安全一票否决（业务规则）    ：REJECT
 
+模式 2 附：并行真的发生了吗？一路失败时其余怎么办？（ScriptedLLM 机制演示，不调用真实模型）
+  10 次调用，max_concurrency=1  → 同时在途峰值 1 ，用时 2.02s（理论值 10 波 × 0.2s = 2.0s）
+  10 次调用，max_concurrency=4  → 同时在途峰值 4 ，用时 0.61s（理论值 3 波 × 0.2s = 0.6s）
+  10 次调用，max_concurrency=10 → 同时在途峰值 10，用时 0.20s（理论值 1 波 × 0.2s = 0.2s）
+
+  三路并行：安全、性能两路的模型调用各要 1.0s；第三路 0.1s 时抛异常。
+  parallel 在 0.10s 时把异常抛给调用方：可读性评审的提示词模板渲染失败
+    · 安全：被取消（模型调用中途停下，不会在后台继续跑）
+    · 性能：被取消（模型调用中途停下，不会在后台继续跑）
+  此刻模型在途调用 0 个；发出过 2 次调用，一次都没有跑完
+
+  换一种写法：每一路自己兜底，失败 = 弃权票 None → ['REJECT', 'REJECT', None]（另外两路照常完成）
+
+模式 2 附：计量器为什么不需要锁 —— 以及什么时候会丢更新
+  1000 个协程各加 1：
+    读-改-写之间没有 await        → 1000
+    读和写之间有一个 await        → 1（丢了 999 次更新）❌
+    同样有 await，但用 asyncio.Lock → 1000
+
 模式 5：agent_as_tool 多 Agent —— 主管 + 订单专家 + 政策专家
-    → ask_order_expert(task='请查询订单 A1001 的售后相关事实信息：商品品类/商品名称、签收日期、是否拆封或使用。…')
+    → ask_order_expert(task='请查询订单 A1001 的售后相关事实信息：商品品类/商品名称、签收日期、是否已拆封。用户询问在今天 2026-09-27 是否还能退货。')
       ← - 签收日期：2026-09-22
-      ← - 是否拆封或使用：已拆封
-    → ask_policy_expert(task='请根据售后政策判断：商品品类为耳机，签收日期 2026-09-22，今天 2026-09-27，已拆封。…')
-      ← 根据售后政策判断：如果该耳机属于入耳式耳机等贴身商品，且已拆封，则不支持无理由退货。
+      ← - 是否已拆封：是
+    → ask_policy_expert(task='请根据售后政策判断：商品品类为耳机，签收日期为 2026-09-22，今天为 2026-09-27，商品已拆封。…')
+      ← 2. **贴身商品**：
+      ←    “入耳式耳机等贴身商品一经拆封，因卫生原因不支持无理由退货。”
   🤖 最终答复（status=completed）：
-    │ 今天距签收 5 天，虽在 7 天内，但入耳式耳机属贴身商品，拆封后因卫生原因不支持无理由退货。
-    │ 如存在性能故障，可在签收后 15 天内凭检测结果申请退/换货。
+    │ 订单 A1001 是入耳式降噪耳机，2026-09-22 签收，已拆封。
+    │ 虽然今天 2026-09-27 仍在 7 天内，但入耳式耳机属贴身商品，拆封后不支持无理由退货。
+    │ 如存在性能故障，可在签收后 15 天内凭检测结果申请退货或换货。
 
   一次请求的完整链路追踪（专家 Agent 的每一步都嵌套在主管对应的 tool span 下）：
-    agent.run  23701ms  tokens=2403→282  status=completed steps=3 cost=$0.00582
-    ├─ llm.chat  3095ms  tokens=578→114  → tool_calls: ask_order_expert
-    ├─ tool.ask_order_expert  4059ms  ok
-    │  └─ agent.run  4058ms  tokens=999→79  status=completed steps=2 cost=$0.00204
-    │     ├─ llm.chat  1488ms  tokens=461→21  → tool_calls: get_order
-    │     ├─ tool.get_order  1ms  ok
-    │     └─ llm.chat  2568ms  tokens=538→58  → final_answer
-    ├─ llm.chat  4136ms  tokens=714→73  → tool_calls: ask_policy_expert
-    ├─ tool.ask_policy_expert  9259ms  ok
-    │  └─ agent.run  9251ms  tokens=1044→360  status=completed steps=2 cost=$0.00490
-    │     ├─ llm.chat  1979ms  tokens=458→45  → tool_calls: search_policy
-    │     ├─ tool.search_policy  1ms  ok
-    │     └─ llm.chat  7265ms  tokens=586→315  → final_answer
-    └─ llm.chat  3145ms  tokens=1111→95  → final_answer
+    agent.run  28419ms  tokens=2393→283  status=completed steps=3 cost=$0.00582
+    ├─ llm.chat  3688ms  tokens=578→105  → tool_calls: ask_order_expert
+    ├─ tool.ask_order_expert  5454ms  ok
+    │  └─ agent.run  5453ms  tokens=991→75  status=completed steps=2 cost=$0.00199
+    │     ├─ llm.chat  1460ms  tokens=457→21  → tool_calls: get_order
+    │     ├─ tool.get_order  0ms  ok
+    │     └─ llm.chat  3991ms  tokens=534→54  → final_answer
+    ├─ llm.chat  2706ms  tokens=706→83  → tool_calls: ask_policy_expert
+    ├─ tool.ask_policy_expert  12880ms  ok
+    │  └─ agent.run  12879ms  tokens=1063→540  status=completed steps=2 cost=$0.00673
+    │     ├─ llm.chat  2324ms  tokens=468→47  → tool_calls: search_policy
+    │     ├─ tool.search_policy  0ms  ok
+    │     └─ llm.chat  10553ms  tokens=595→493  → final_answer
+    └─ llm.chat  3689ms  tokens=1109→95  → final_answer
 
-  ⏱ 耗时 23.7s ｜ 模型调用 7 次 ｜ tokens 5167
+  ⏱ 耗时 28.4s ｜ 模型调用 7 次（同时在途峰值 1）｜ tokens 5345
+
+模式 5 附：主管被取消，专家跟着停（ScriptedLLM 机制演示，不调用真实模型）
+  专家的模型调用在途 1 个 → 用户断开连接，取消主管的运行（task.cancel()）
+  0.5ms 后，主管的 run() 抛出 CancelledError（取消照常向外传播，没有被吞掉）
+    · 订单专家：status=cancelled，stop_reason=cancelled
+    · 主管：status=cancelled，stop_reason=cancelled
+  专家模型此刻在途 0 个；它一共被调用 1 次，剧本里的第 2 次调用没有发生，get_order 也没有执行
 ```
 
 **该观察什么：**
 
-1. 最后的对比表：从路由到多 Agent，调用次数和 token 一路上涨；
-2. 并行模式的"串行 vs 并行"耗时对比；离线模式固定复现了"多数票放行 SQL 注入"的情形——对比真实运行的结果，想想投票规则该怎么定；
-3. 评估-优化的每一轮是"代码检查"还是"模型检查"，以及第 1 轮为什么没花钱就被退回；
-4. 多 Agent 的委派是**串行**的：主管先拿到订单事实，才能写出给政策专家的自包含 task。trace 树里能看到每个专家内部又跑了 2 步；政策专家的最终回答写了 315 个 token，是整次请求里最慢的一步。再对比一下：主管 `agent.run` 上显示的 token（2403→282）只是它自己的，整次请求实际花了 5167；
-5. 试着改一改：把 `ORCH_TASK` 里的"最终不超过 8 条"删掉再跑，看看汇总步骤的耗时和 token 会变成多少。
+1. 最后的对比表：从路由到多 Agent，调用次数和 token 一路上涨；"峰值并发"一栏里，只有 parallel 和 orchestrator_workers 的执行者是同时在等模型的；
+2. 并行模式的"串行 vs 并行"耗时对比和在途峰值 3；离线模式固定复现了"多数票放行 SQL 注入"的情形——对比真实运行的结果，想想投票规则该怎么定；
+3. "模式 2 附"的两组数：在途峰值恰好等于 `max_concurrency`；一路失败时另外两路被取消、在途调用归零，而每一路自己兜底时拿到的是带弃权票的完整结果；
+4. 计量器不需要锁，但把一个 await 放进读和写之间，1000 次更新就只剩 1 次；
+5. 评估-优化的每一轮是"代码检查"还是"模型检查"，以及第 1 轮为什么没花钱就被退回；
+6. 多 Agent 的委派是**串行**的：主管先拿到订单事实，才能写出给政策专家的自包含 task。trace 树里能看到每个专家内部又跑了 2 步；政策专家的最终回答写了 493 个 token、用了 10.6s，是整次请求里最慢的一步。再对比一下：主管 `agent.run` 上显示的 token（2393→283）只是它自己的，整次请求实际花了 5345；
+7. "模式 5 附"：先收尾的是专家、再是主管——取消从最里层正在等的模型调用开始，一层层往外传；
+8. 试着改一改：把 `ORCH_TASK` 里的"最终不超过 8 条"删掉再跑，看看汇总步骤的耗时和 token 会变成多少（§2.4 有我们重测的结果：第一次直接超时）。
 
 ## 4. 练习
 
-打开 [`exercise.py`](exercise.py)，实现编排里最常用的三块"胶水代码"。模型被抽象成普通函数，所以测试完全离线、确定：
+打开 [`exercise.py`](exercise.py)，实现编排里最常用的三块"胶水代码"。模型被抽象成可注入的 async 函数，所以测试完全离线、确定。哪些要写成 `async def`，看它要不要 await 模型：`hybrid_route` 和 `run_with_gates` 要（它们调用模型 / async 步骤），`vote_with_quorum` 不要（只对拿到的答案计票，纯计算）。
 
-**任务 1：`hybrid_route(text, rules, llm_route, default="other") -> (类别, 来源)`**
+**任务 1：`async def hybrid_route(text, rules, llm_route, default="other") -> (类别, 来源)`**
 - 关键词规则优先（子串匹配、忽略大小写），命中多个类别时按 rules 顺序取第一个，规则命中时**不调用**模型；
-- 规则未命中才调用 `llm_route`，其输出去空白、忽略大小写后匹配已知类别；
-- 模型抛异常、返回未知类别或非字符串 → `(default, "default")`；空关键词必须忽略。
+- 规则未命中才 `await llm_route(text)`，其输出去空白、忽略大小写后匹配已知类别；
+- 模型抛异常、返回未知类别或非字符串 → `(default, "default")`；空关键词必须忽略；
+- 只捕获 `Exception`：调用方取消请求时的 `CancelledError` 必须原样传出去，不能降级成 default（有专门的测试）。
 
 **任务 2：`vote_with_quorum(answers, quorum) -> str | None`**
 - 归一化（去首尾空白、忽略大小写）后计票，返回获胜答案第一次出现时的写法；
 - None / 空白是弃权票：计入总数、不能胜出；并列第一或比例未达 quorum 返回 None；
 - quorum 不在 (0, 1] 抛 `ValueError`；注意"恰好等于"的浮点边界。
 
-**任务 3：`run_with_gates(steps, text, gates) -> GateResult`**
+**任务 3：`async def run_with_gates(steps, text, gates) -> GateResult`**
+- 每个步骤是 async 函数（`await fn(current)`），检查函数是普通函数；
 - 配置错误（步骤名重复、gate 指向不存在的步骤）在执行前抛 `ValueError`；
-- 运行时错误（步骤异常、检查不通过、检查函数自身异常）返回结构化失败信息，绝不向外抛；检查函数出错按不通过处理（fail closed）。
+- 运行时错误（步骤异常、检查不通过、检查函数自身异常）返回结构化失败信息，绝不向外抛；检查函数出错按不通过处理（fail closed）；
+- "绝不向外抛"只针对 `Exception`：取消照常向外传播，后面的步骤不再执行（有专门的测试）。
 
 这三个任务背后是同一组企业原则：**确定性优先于模型、失败要有兜底、没把握就转人工、配置错误要大声、运行错误要结构化**。
 
 验证：
 
 ```bash
-make lesson N=06                     # 全部通过即完成（共 20 个测试）
+make lesson N=06                     # 全部通过即完成（共 22 个测试）
 AGENTKIT_SOLUTION=1 make lesson N=06 # 用参考答案跑，确认测试本身没问题
 ```
 
@@ -488,7 +582,7 @@ AGENTKIT_SOLUTION=1 make lesson N=06 # 用参考答案跑，确认测试本身�
 
 ### 5.1 框架还是手写？
 
-Anthropic 的建议是先直接用 LLM API：很多模式几行代码就能实现（本课的 `workflows.py` 不到 200 行）；如果用框架，一定要理解它底层在做什么——框架的抽象层可能遮住真实的提示词和响应，让调试更难，也容易诱使你加上不必要的复杂度。当编排变复杂（几十个节点、分支、循环、人工节点、需要可视化）时，图编排框架（如 LangGraph）把流程显式表达成状态图，是有价值的；判断标准是：它帮你**看清**了流程，还是**藏起**了流程。
+Anthropic 的建议是先直接用 LLM API：很多模式几行代码就能实现（本课的 `workflows.py` 200 行左右）；如果用框架，一定要理解它底层在做什么——框架的抽象层可能遮住真实的提示词和响应，让调试更难，也容易诱使你加上不必要的复杂度。当编排变复杂（几十个节点、分支、循环、人工节点、需要可视化）时，图编排框架（如 LangGraph）把流程显式表达成状态图，是有价值的；判断标准是：它帮你**看清**了流程，还是**藏起**了流程。
 
 ### 5.2 长流程需要"持久化执行"
 
@@ -504,16 +598,16 @@ Anthropic 的建议是先直接用 LLM API：很多模式几行代码就能实�
 理想状态下，一次用户请求在一棵 trace 树里：`主管 agent.run → tool.ask_order_expert → 专家 agent.run → llm.chat / tool.get_order`（§3 的 Demo 输出就是这样）。要做到这一点需要两个条件，缺一不可：
 
 1. **共用同一个 Tracer**：agentkit 的 `Tracer` 用一个 `ContextVar` 记录"当前正在进行的 Span"，每个 Tracer 有自己独立的一份。三个 Agent 各用各的 Tracer，就会各自开一棵新树。
-2. **"当前 Span"要能跨线程传递**：`ToolRegistry.execute` 在线程池里执行工具（为了实现超时），而 Python 的 `ThreadPoolExecutor` 默认**不会**把调用方的 contextvars 带进工作线程。agentkit 在提交任务时用 `contextvars.copy_context().run` 包了一层（见 [agentkit/tools.py](../../agentkit/tools.py)），专家的 `agent.run` 才能找到自己的父 Span。
+2. **专家运行时要能看到主管的"当前 Span"**：它记在 `ContextVar` 里。`agent_as_tool` 生成的是 async 工具，专家的 `agent.run` 直接在主管的 task 里 await，ContextVar 天然可见；主管同一步并发执行多个工具时，每个工具跑在自己的 task 里，而 asyncio 创建 task 时会复制当前上下文，所以也看得见。同步工具在线程池里执行，线程默认**不会**继承调用方的 contextvars，agentkit 在提交时用 `contextvars.copy_context().run` 包了一层（见 [agentkit/tools.py](../../agentkit/tools.py)）。
 
-第 2 条是编写本课时真实踩到的坑：最初的实现没有 `copy_context`，即使共用 Tracer，专家的 trace 也会变成一棵新的根、拿到新的 trace_id——线上排查"这次请求为什么慢"时，你会看到三条互不相关的链路，只能靠时间戳去猜它们的关系。凡是"在线程池 / 协程 / 回调里干活"的代码都要检查这一点。跨进程、跨服务时（比如专家 Agent 部署成独立服务），就需要像 OpenTelemetry 那样把 trace 上下文放进请求头显式传播，第 10 课会深入。
+第 2 条是编写本课时真实踩到的坑：最初的实现（当时工具都在线程池里执行）没有 `copy_context`，即使共用 Tracer，专家的 trace 也会变成一棵新的根、拿到新的 trace_id——线上排查"这次请求为什么慢"时，你会看到三条互不相关的链路，只能靠时间戳去猜它们的关系。凡是"在线程池 / 新 task / 回调里干活"的代码都要检查这一点（`asyncio.create_task` 会复制上下文，`loop.run_in_executor` 不会）。跨进程、跨服务时（比如专家 Agent 部署成独立服务，或者委派变成队列里的一个任务），contextvars 带不过去，要把 trace 上下文显式放进请求头或任务 payload：第 28 课的 `agentkit.contrib.otel` 提供 `inject_context` / `continue_trace`，按 W3C `traceparent` 格式跨队列、跨进程传播（[第 28 课 §2.4](../28_production_observability/README.md#24-跨队列传播inject_context--continue_trace)），原理见第 10 课。
 
 ### 5.5 并行里的部分失败
 
-`parallel` 基于 `pool.map`：任意一路抛异常，整个结果就拿不到了，已经成功的几路也白花了钱。生产中常见的做法：
+`parallel` 的默认语义是"一个失败、其余立刻取消"：没完成的几路不再花钱，但已经完成的几路结果也拿不到了。生产中常见的做法：
 
-- 每一路单独 try/except，失败的一路返回 None（投票里当弃权票，正好对接 `vote_with_quorum`）；
-- 给每一路设超时，慢的那一路不能拖住整体；
+- 每一路单独 `try/except Exception`，失败的一路返回 None（投票里当弃权票，正好对接 `vote_with_quorum`）——`parallel` 看不到异常，就不会取消别人（Demo"模式 2 附"的第三组输出）；只捕获 `Exception`，`CancelledError` 要照常传出去；
+- 给每一路设超时，慢的那一路不能拖住整体。用 `agentkit.wait_for`，不要用 `asyncio.wait_for`：Python 3.12 之前后者在"刚完成 + 被取消"同时发生时会吞掉取消（原因见 [agentkit/timeouts.py](../../agentkit/timeouts.py)）；
 - 设最少成功数（比如 5 路里至少 3 路成功才汇总），否则整体失败或转人工。
 
 ### 5.6 多 Agent 之间传什么：摘要还是全量
@@ -572,7 +666,11 @@ MAST 共 **14 种失败模式，分 3 大类**。括号里的比例来自论文 
 | 路由没有 other / 兜底类别 | 模型输出未知类别或报错时整个请求失败 | 规则优先、模型兜底、失败降级（练习 1） |
 | 安全检查用多数票 | 多数视角"没问题"就放行了漏洞 | 安全、合规一票否决；没共识转人工（练习 2） |
 | 以为投票能消除所有错误 | 同一模型同一提示词的系统性错误依旧 | 换提示词 / 模型 / 信息源来获得真正独立的视角 |
-| 编排-执行不限子任务数和汇总长度 | 成本失控，汇总写出几百行（Demo 实测 64s） | `max_subtasks` + 代码截断 + 输出长度约束 |
+| 编排-执行不限子任务数和汇总长度 | 成本失控，汇总写出几百行（Demo 重测：61.5s，第一次直接超时） | `max_subtasks` + 代码截断 + 输出长度约束 |
+| 编排者拆出依赖其他子任务的"子任务" | 执行者拿不到依赖的结果，只能凭空写（Demo 真实运行里出现过"汇总并去重所有检查项"） | 拆解提示词里写明子任务相互独立、汇总由最后一步完成；高风险场景人工审核计划 |
+| 扇出不设并发上限 | 一个请求扇出几十个调用，一起打到网关上触发 429 | `parallel(..., max_concurrency=N)`（Demo：在途峰值恰好等于上限） |
+| 共享状态的读和写之间夹了 await | 丢更新（Demo：1000 个协程各加 1，结果是 1） | 读-改-写之间不 await；非 await 不可就用 `asyncio.Lock`；跨进程用数据库原子更新 |
+| `except BaseException` / 裸 `except` 把取消也吞了 | 用户断开了，编排还在后台继续跑、继续花钱 | 只捕获 `Exception`，`CancelledError` 原样向外传（练习 1、3 各有一个取消测试） |
 | 评估-优化没有轮数上限或反馈含糊 | 无限循环、原地打转 | 具体可执行的反馈、代码检查优先、max_rounds 兜底 |
 | 提示链检查失败直接抛异常 | 500 错误，丢失已完成的中间结果 | 返回结构化失败信息（练习 3） |
 | gate 名字拼错被静默忽略 | 一道安全检查被悄悄跳过 | 配置错误在启动时大声失败 |
@@ -662,6 +760,15 @@ MAST 共 **14 种失败模式，分 3 大类**。括号里的比例来自论文 
 - 同时在同一评估集上跑一个单 Agent 基线。MAST 论文开篇就指出，多 Agent 相对简单基线的提升常常很小；如果单 Agent 差不多甚至更好，就换回去（Neubig 的观点）。只有在权限隔离、代表不同的人、可大量并行这类场景下，多 Agent 才明显值得。
 </details>
 
+<details>
+<summary>Q10：asyncio 程序里，多个协程同时更新一个计数器，要不要加锁？</summary>
+
+- 看读和写之间有没有 await：事件循环只在 await 处切换协程。`x += 1`、先 await 拿到模型结果再更新统计，这些"读-改-写"中间没有 await，不会被打断，不需要锁；
+- 读和写之间有 await（先读余额、await 查一次风控、再写回）就会丢更新：别的协程在你等待时改了它，你写回的是旧值（本课 Demo：1000 次更新只剩 1 次）。要么重排成"先 await、再一口气读改写"，要么用 `asyncio.Lock` 把整段包起来；
+- 线程不一样：线程可能在任意两条字节码之间被切走，`+=` 也不安全，所以以前的线程并发版本必须加 `threading.Lock`；
+- 以上只在一个进程内成立：多个 worker 进程共享的状态要用数据库的原子更新、带版本号的条件更新或分布式锁（第 13 课）。
+</details>
+
 ## 8. 自测清单
 
 - [ ] 我能用一句话说清 Workflow 和 Agent 的区别，并画出复杂度阶梯
@@ -674,6 +781,8 @@ MAST 共 **14 种失败模式，分 3 大类**。括号里的比例来自论文 
 - [ ] 我能说出多 Agent 的至少四种代价，以及它什么时候值得
 - [ ] 我能说出 MAST 的三大类失败，并为每一类给出一种检测方法和一种缓解方法
 - [ ] 我能用决策树为一个新需求选出编排方案，并回答"为什么上一级不够用"
+- [ ] 我能用在途峰值（而不只是耗时）证明并行真的发生了，并说出 `parallel` 在一路失败时做了什么、怎么改成容忍部分失败
+- [ ] 我能解释为什么单个事件循环里"读-改-写之间没有 await"就不需要锁，并写出一个会丢更新的反例
 - [ ] 我完成了练习，`make lesson N=06` 全部通过
 
 ## 延伸阅读

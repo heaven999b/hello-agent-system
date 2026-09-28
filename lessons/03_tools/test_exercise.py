@@ -1,5 +1,8 @@
 """第 03 课练习测试。离线、确定性。
 
+你写的工具是普通函数，①②③ 直接调用它们；④⑤ 经过 ToolRegistry / Agent，这两者是 async 的，
+所以那几个测试写成 `async def test_...`（pytest-asyncio 的 auto 模式），里面 await。
+
 运行：make lesson N=03
 用参考答案验证测试本身：AGENTKIT_SOLUTION=1 .venv/bin/python -m pytest lessons/03_tools
 """
@@ -193,41 +196,41 @@ def reg():
     return ToolRegistry([ex.search_orders, ex.cancel_order])
 
 
-def test_registry_rejects_limit_out_of_range(reg):
-    r = reg.execute(ToolCall("c1", "search_orders", '{"limit": 100}'), ALICE)
+async def test_registry_rejects_limit_out_of_range(reg):
+    r = await reg.execute(ToolCall("c1", "search_orders", '{"limit": 100}'), ALICE)
     assert r.error_type == "invalid_args" and "limit" in r.content
 
 
-def test_registry_rejects_unknown_status(reg):
-    r = reg.execute(ToolCall("c1", "search_orders", '{"status": "unshipped"}'), ALICE)
+async def test_registry_rejects_unknown_status(reg):
+    r = await reg.execute(ToolCall("c1", "search_orders", '{"status": "unshipped"}'), ALICE)
     assert r.error_type == "invalid_args" and "status" in r.content
 
 
-def test_registry_rejects_identity_smuggling(reg):
-    r = reg.execute(ToolCall("c1", "search_orders", '{"user_id": "u_bob"}'), ALICE)
+async def test_registry_rejects_identity_smuggling(reg):
+    r = await reg.execute(ToolCall("c1", "search_orders", '{"user_id": "u_bob"}'), ALICE)
     assert r.error_type == "invalid_args"
-    r = reg.execute(ToolCall("c2", "cancel_order", '{"order_id": "B2001", "user_id": "u_bob"}'), ALICE)
+    r = await reg.execute(ToolCall("c2", "cancel_order", '{"order_id": "B2001", "user_id": "u_bob"}'), ALICE)
     assert r.error_type == "invalid_args"
     assert ex.ORDERS["B2001"]["status"] == "pending_shipment"
 
 
-def test_registry_missing_required_argument(reg):
-    r = reg.execute(ToolCall("c1", "cancel_order", "{}"), ALICE)
+async def test_registry_missing_required_argument(reg):
+    r = await reg.execute(ToolCall("c1", "cancel_order", "{}"), ALICE)
     assert r.error_type == "invalid_args" and "order_id" in r.content
 
 
-def test_registry_business_error_becomes_observation(reg):
-    r = reg.execute(ToolCall("c1", "cancel_order", '{"order_id": "A1002"}'), ALICE)
+async def test_registry_business_error_becomes_observation(reg):
+    r = await reg.execute(ToolCall("c1", "cancel_order", '{"order_id": "A1002"}'), ALICE)
     assert not r.ok and r.error_type == "tool_error" and "退货" in r.content
 
 
-def test_registry_missing_identity_is_tool_error(reg):
-    r = reg.execute(ToolCall("c1", "search_orders", "{}"))  # 没有传 ctx → 没有 user_id
+async def test_registry_missing_identity_is_tool_error(reg):
+    r = await reg.execute(ToolCall("c1", "search_orders", "{}"))  # 没有传 ctx → 没有 user_id
     assert r.error_type == "tool_error"
 
 
-def test_registry_success_returns_json(reg):
-    r = reg.execute(ToolCall("c1", "search_orders", '{"status": "shipped"}'), ALICE)
+async def test_registry_success_returns_json(reg):
+    r = await reg.execute(ToolCall("c1", "search_orders", '{"status": "shipped"}'), ALICE)
     assert r.ok
     data = json.loads(r.content)
     assert [o["order_id"] for o in data["orders"]] == ["A1002"]
@@ -236,22 +239,22 @@ def test_registry_success_returns_json(reg):
 # ================================================================== ⑤ 端到端：身份来自 Agent 的 metadata
 
 
-def test_agent_end_to_end_identity_from_metadata():
+async def test_agent_end_to_end_identity_from_metadata():
     llm = ScriptedLLM([
         call_tool("search_orders", status="pending_shipment"),
         call_tool("cancel_order", order_id="A1003"),
         reply("已为你取消订单 A1003（USB-C 扩展坞）。"),
     ])
-    res = Agent(llm, [ex.search_orders, ex.cancel_order]).run("取消我还没发货的扩展坞", metadata={"user_id": "u_alice"})
+    res = await Agent(llm, [ex.search_orders, ex.cancel_order]).run("取消我还没发货的扩展坞", metadata={"user_id": "u_alice"})
     assert res.ok and res.tools_called() == ["search_orders", "cancel_order"]
     assert ex.ORDERS["A1003"]["status"] == "cancelled"
     sent = json.dumps(llm.calls[0]["tools"], ensure_ascii=False)
     assert "ctx" not in sent and "user_id" not in sent
 
 
-def test_agent_cannot_cancel_someone_elses_order():
+async def test_agent_cannot_cancel_someone_elses_order():
     llm = ScriptedLLM([call_tool("cancel_order", order_id="A1003"), reply("抱歉，没有找到这个订单。")])
-    res = Agent(llm, [ex.search_orders, ex.cancel_order]).run("取消 A1003", metadata={"user_id": "u_bob"})
+    res = await Agent(llm, [ex.search_orders, ex.cancel_order]).run("取消 A1003", metadata={"user_id": "u_bob"})
     tool_msg = next(m for m in res.messages if m["role"] == "tool")
     expected = error_of(lambda: ex.cancel_order(order_id="A1003", ctx=BOB))  # 必须是 ToolError，而不是其他异常
     assert tool_msg["content"] == f"错误：{expected}"

@@ -295,18 +295,18 @@ Native constraints (③) and the repair loop aren't alternatives: the first mask
 **Why stream.** Models generate one token at a time. Without streaming you wait until everything is generated; with streaming you receive output as it's produced (usually over SSE, server-sent events). Section 4 of the demo measured:
 
 ```text
-TTFT (time to first token) = 1.74s, complete = 2.84s, 34 chunks
+TTFT (time to first token) = 1.58s, complete = 2.31s, 31 chunks
 ```
 
-**TTFT** is the time from sending the request to receiving the first token. Streaming **doesn't make the total faster**, but the user sees text in under two seconds instead of staring at a blank screen for almost three. The longer the answer, the bigger the difference. Agents get two more benefits: you can push progress updates such as "Checking the ticketing system…" in real time, and users can interrupt (though tokens already generated are usually still billed).
+**TTFT** is the time from sending the request to receiving the first token. Streaming **doesn't make the total faster**, but the user sees text after 1.6 seconds instead of staring at a blank screen for 2.3. The longer the answer, the bigger the difference. Agents get two more benefits: you can push progress updates such as "Checking the ticketing system…" in real time, and users can interrupt (though tokens already generated are usually still billed).
 
 **The classic trap: streamed tool-call arguments arrive in fragments.** Everyone knows streamed text must be concatenated. Tool calls work the same way, but it's easier to miss. Real output from demo 4b:
 
 ```text
-+1.95s index=0 id=call_PhR4DZOrO… name=create_ticket  arguments fragment=''
-+1.95s index=0 (no id, no name)                        arguments fragment='{"'
-+1.97s index=0 (no id, no name)                        arguments fragment='title'
-+1.97s index=0 (no id, no name)                        arguments fragment='":"'
++2.35s index=0 id=call_kJksQxgDU… name=create_ticket  arguments fragment=''
++2.35s index=0 (no id, no name)                        arguments fragment='{"'
++2.35s index=0 (no id, no name)                        arguments fragment='title'
++2.37s index=0 (no id, no name)                        arguments fragment='":"'
 ……
 the arguments for index=0 arrived in 59 fragments
 ❌ Classic bug: json.loads('{"') on the first fragment → JSONDecodeError: Unterminated string starting at
@@ -320,7 +320,7 @@ Three rules:
 
 One more observation worth remembering: on the same gateway, a **single** tool call had its arguments split into 59 fragments, while in demo 4c the arguments of each of two **parallel** calls arrived in one piece. How many fragments, and where the cuts fall, is up to the server. Your code can't assume anything about it.
 
-Other APIs use different names for the same idea: OpenAI's Responses API sends `response.function_call_arguments.delta` events keyed by `output_index`; Anthropic sends `input_json_delta` events carrying `partial_json`, and its docs likewise say to [accumulate first and parse afterwards](https://platform.claude.com/docs/en/build-with-claude/streaming). Exercise (a) is to write this accumulator.
+Other APIs use different names for the same idea: OpenAI's Responses API sends `response.function_call_arguments.delta` events keyed by `output_index`; Anthropic sends `input_json_delta` events carrying `partial_json`, and its docs likewise say to [accumulate first and parse afterwards](https://platform.claude.com/docs/en/build-with-claude/streaming). Exercise (a) is to write this accumulator; agentkit's production version is [`agentkit.llm.ToolCallAccumulator`](../../agentkit/llm.py), which `OpenAICompatLLM.stream()` uses to assemble complete tool calls.
 
 **Other streaming traps:**
 
@@ -500,55 +500,77 @@ Every point above maps to a concrete design decision in agentkit:
 
 | Topic | What agentkit does | Why |
 |---|---|---|
-| Providers differ (1.11) | Business code depends only on `LLM.chat(messages, tools) -> LLMResponse` | Switch models, providers or gateways without touching business code; swap in `ScriptedLLM` for tests |
+| Providers differ (1.11) | Business code depends only on `await llm.chat(messages, tools) -> LLMResponse` | Switch models, providers or gateways without touching business code; swap in `ScriptedLLM` for tests |
+| A single call takes seconds (1.6) | `chat` is `async def`: `OpenAICompatLLM` is built on `openai.AsyncOpenAI`, with a connection-pool cap, `max_connections` | While waiting on the model it yields the event loop, so one process serves many sessions at once ([Lesson 02](../02_agent_loop/README.en.md) section 1.7); the pool cap is this process's maximum concurrency toward the gateway |
+| Streaming + fragmented tool arguments (1.6) | `OpenAICompatLLM.stream()` yields `TextDelta`s, then a `StreamDone` carrying the full `LLMResponse`; tool arguments are assembled by `index` with `ToolCallAccumulator` | The production version of exercise (a); `include_usage` is on by default, so streaming calls can still be costed |
 | Arguments may be invalid JSON (1.4) | `ToolCall.arguments` is deliberately a `str`, not a `dict` | Forces parsing and validation in the tool layer instead of assuming it's valid |
 | Three prices (1.1) | `Usage` has `cached_input_tokens`; `PRICES` accepts an optional third "cached" price | Cache hit rate is a key driver of agent cost, so it has to be visible |
 | Estimates vs. reality (1.1) | `estimate_tokens` is only for context budgeting; cost comes from `usage` | Zero dependencies and errs high; exact counts need the model's own tokenizer |
 | Non-determinism (1.3) | `ScriptedLLM` replays a script and records every call | Unit tests cost nothing and are 100% reproducible |
 | Structured output (1.5) | `complete_json`: schema in prompt → extract JSON → Pydantic validation → repair | A fallback that doesn't depend on native support |
-| Error classes (1.12) | `LLMError(retryable=...)`; the SDK's own retries are disabled with `max_retries=0` | Retries live in a `ResilientLLM` you can see and control (Lesson 08) |
+| Error classes (1.12) | `LLMError(retryable=..., retry_after=...)`; the SDK's own retries are disabled with `max_retries=0` | Retries live in a `ResilientLLM` you can see and control (Lesson 08) |
 
-Here is the error classification, verbatim from [`agentkit/llm.py`](../../agentkit/llm.py):
+Here is the error classification, verbatim from [`agentkit/llm.py`](../../agentkit/llm.py) (`OpenAICompatLLM.chat` and the `map_openai_error` it calls):
 
 ```python
-try:
-    resp = self._client.chat.completions.create(**params)
-except self._openai.APIStatusError as e:
-    code = e.status_code
-    # 429 限流、408 超时、5xx 服务端错误：重试可能成功；400/401/403/404：重试没用
-    raise LLMError(str(e), status_code=code, retryable=code in (408, 409, 429) or code >= 500) from e
-except self._openai.APIConnectionError as e:  # 包含超时
-    raise LLMError(f"连接模型失败：{e}", retryable=True) from e
+async def chat(self, messages, tools=None, **kwargs) -> LLMResponse:
+    try:
+        resp = await self._client.chat.completions.create(**self._params(messages, tools, kwargs))
+    except (self._openai.APIStatusError, self._openai.APIConnectionError) as e:
+        raise map_openai_error(e, self._openai) from e
+    return response_from_openai(resp, self.model)
+
+
+def map_openai_error(e, openai_module) -> LLMError:
+    if isinstance(e, openai_module.APIStatusError):
+        code = e.status_code
+        # 429 限流、408 超时、5xx 服务端错误：重试可能成功；400/401/403/404：重试没用。
+        # 但 429 有两种：限流（等一等就好）和额度用完（insufficient_quota，重试一万次也没用）。
+        retryable = code in (408, 409, 429) or code >= 500
+        if code == 429 and "insufficient_quota" in str(e):
+            retryable = False
+        retry_after = None
+        try:
+            retry_after = float(e.response.headers.get("retry-after"))
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return LLMError(str(e), status_code=code, retryable=retryable, retry_after=retry_after)
+    return LLMError(f"连接模型失败：{e}", retryable=True)  # APIConnectionError，包含超时
 ```
 
-(The comments say: 429 rate limit, 408 timeout and 5xx may succeed on retry, while 400/401/403/404 won't; `APIConnectionError` includes timeouts.)
+(The comments say: 429 rate limit, 408 timeout and 5xx may succeed on retry, while 400/401/403/404 won't; but a 429 comes in two kinds — a rate limit, which clears if you wait, and an exhausted quota (`insufficient_quota`), which no amount of retrying will fix. `APIConnectionError` includes timeouts.)
 
-And here's how the cached-token count is pulled out of `usage`. The field is nested inside `prompt_tokens_details`, and some gateways don't return it at all, so every level guards against `None`:
+And here's how the cached-token and reasoning-token counts are pulled out of `usage`. The fields are nested inside `prompt_tokens_details` / `completion_tokens_details`, and some gateways don't return them at all, so every level guards against `None`:
 
 ```python
-if resp.usage:
-    details = getattr(resp.usage, "prompt_tokens_details", None)
+def usage_from_openai(raw_usage) -> Usage:
+    if not raw_usage:
+        return Usage()
+    details = getattr(raw_usage, "prompt_tokens_details", None)
     cached = (getattr(details, "cached_tokens", 0) or 0) if details else 0
-    usage = Usage(resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0, cached)
+    out_details = getattr(raw_usage, "completion_tokens_details", None)
+    reasoning = (getattr(out_details, "reasoning_tokens", 0) or 0) if out_details else 0
+    return Usage(raw_usage.prompt_tokens or 0, raw_usage.completion_tokens or 0, cached, reasoning)
 ```
 
 **Simplifications agentkit makes for teaching that a production system should fill in:**
 
-- **No streaming**: `LLM.chat` returns the complete result at once. User-facing products need a streaming interface, with fragment assembly like exercise (a);
-- **Reasoning tokens aren't recorded**: `usage.completion_tokens_details.reasoning_tokens` doesn't make it into `Usage`, so with a reasoning model you can't tell whether you paid for thinking or for talking;
-- **429s aren't split into rate limit vs. out of quota**, and `Retry-After` isn't read (Lesson 08 mentions this);
 - **No exact token counting**: the "will this fit in the window?" check before sending relies on estimates.
+
+(This list used to include "no streaming," "reasoning tokens aren't recorded," and "429s aren't split into rate limit vs. out of quota, and `Retry-After` isn't read." All three are now implemented in the core; see the table and code above.)
 
 ## 3. Hands-on: run the demo
 
 ```bash
-.venv/bin/python lessons/01_llm_essentials/demo.py            # real model (about 19 calls, roughly a minute)
+.venv/bin/python lessons/01_llm_essentials/demo.py            # real model (about 19 calls; independent requests go out together, about 30 seconds in our run)
 .venv/bin/python lessons/01_llm_essentials/demo.py --offline  # offline: scripts + simulated data, no API key needed
 ```
 
 The demo has six sections, each checking one idea from this lesson against reality. Both modes run **the same code**: offline mode just swaps the OpenAI client for a fake one that replays a script (`FakeOpenAIClient`), which is itself a small demonstration of why business code should depend only on an interface.
 
-Excerpts from a real-model run (translated):
+The demo code is async (`openai.AsyncOpenAI`, with `await` on every request): in Sections 1 and 2, independent requests are sent together with `asyncio.gather`, and an `asyncio.Semaphore` caps how many are in flight. For now it's enough to read `await` as "wait for this request to come back" and `gather` as "wait for these together"; [Lesson 02](../02_agent_loop/README.en.md) section 1.7 explains how it works from scratch.
+
+Excerpts from a real-model run (translated; re-run on 2026-09-28 with the async demo, model gpt-5.5, through this course's OpenAI-compatible gateway; the token counts match the earlier synchronous run exactly, while timings and sampled outputs differ on every run):
 
 ```text
 Section 1  Tokens and cost: estimates vs. real usage, and the input you can't see
@@ -560,8 +582,8 @@ Section 1  Tokens and cost: estimates vs. real usage, and the input you can't se
   💡 Two tool definitions alone added 118 input tokens. They're sent, and billed, on every request.
 
 Section 2  Sampling and non-determinism: what temperature actually changes
-     temperature=0 × 3: ['一楼咖啡', '楼下咖啡', '一楼咖啡馆']  → 3 distinct results
-     temperature=1 × 3: ['楼下咖啡', '楼下有啡', '楼下咖啡']  → 2 distinct results
+     temperature=0 × 3: ['一楼咖啡', '楼下咖啡', '楼下有咖啡']  → 3 distinct results
+     temperature=1 × 3: ['楼下咖啡', '楼下咖啡', '楼下咖啡']  → 1 distinct result
   💡 temperature=0 gave different results too. That's the point of this section: zero doesn't mean deterministic.
 
 Section 3  How function calling really works: the model proposes, your code executes
@@ -572,16 +594,16 @@ Section 3  How function calling really works: the model proposes, your code exec
      It's 22°C and sunny in Beijing right now. No umbrella needed, but consider sun protection.
 
 Section 4  Streaming: TTFT, and tool-call arguments arriving in fragments
-     TTFT = 1.74s, complete = 2.84s, 34 chunks
+     TTFT = 1.58s, complete = 2.31s, 31 chunks
   4b. the arguments for index=0 arrived in 59 fragments
      ❌ Classic bug: json.loads('{"') on the first fragment → JSONDecodeError: Unterminated string starting at
   4c. index=0 arrived in 2 fragments, index=1 arrived in 2 fragments
-        create_ticket({"title": "VPN报错809无法连接", ...})  ← id=call_1sOaGEzBiJZfPALN4eYe0R8n
-        get_weather({"city": "杭州"})  ← id=call_RGt2eERE7JoJlumFCquV7jtz
+        create_ticket({"title": "VPN报错809无法连接", ...})  ← id=call_4XIEunlxSGmYBLhiO7Mlsk2X
+        get_weather({"city": "杭州"})  ← id=call_TTHtLSlo3Wmh9vYjFbmHs0YW
 
 Section 5  Structured output: reliable data structures for downstream code, not prose
-  5a. raw output: {"category":"account","priority":"P2","summary":"OA登录提示密码错误","needs_human":true}
-  5b. attempt 1: {"category":"account","priority":"P1",...}  ✅ passed validation
+  5a. raw output: {"category":"account","priority":"P2","summary":"OA登录密码错误需处理","needs_human":true}
+  5b. attempt 1: {"category":"account","priority":"P2",...}  ✅ passed validation
 
 Section 6  Constrained decoding and logprobs: "only valid output allowed", and "how sure is it"
   6a. Unconstrained greedy picks the top score: '紧急' → not in the enum, validation fails
@@ -596,7 +618,7 @@ What to look for:
 2. **Run Section 2 a few times**: `temperature=0` results are sometimes identical and sometimes not. That's why tests can't assert exact output.
 3. **"Executed 0 times" in Section 3**: what the model returns is just a JSON proposal, typed as `str`.
 4. **Fragment counts in 4b vs. 4c**: on the same gateway, a single call was cut into 59 fragments while each parallel call came in 2. Your accumulator has to be correct for both.
-5. **5a and 5b disagree** (`P2` vs. `P1`): the same email, classified twice, got two priorities. Structured output guarantees the **format**, not **consistent judgment**. Which brings us back to Section 2.
+5. **5a and 5b are two independent classifications**: this run gave `P2` both times; in an earlier run, 5a said `P2` and 5b said `P1` — the same email got two priorities. Structured output guarantees the **format**, not **consistent judgment**. Which brings us back to Section 2.
 6. **Section 6**: 6a uses five made-up candidates to show how constrained decoding squeezes "what the model wants to say" into "what's allowed"; 6b gets no logprobs from the real gateway, so the demo prints fallback options. Offline mode simulates an API that does return logprobs: `account` gets 88.7%, below the 90% threshold, so the case goes to human review (the offline numbers are illustrative).
 
 ## 4. Exercises
@@ -611,7 +633,8 @@ Hints:
 
 - Each docstring spells out the rules in full, and the tests follow them exactly;
 - Run `demo.py` first: Section 4 prints real streaming fragments one by one, and `chunk.model_dump()` produces exactly the input format exercise (a) expects;
-- The key insight for (c): once you split by turns, `assistant(tool_calls)` and its tool results always land in the same turn, so trimming can never separate them.
+- The key insight for (c): once you split by turns, `assistant(tool_calls)` and its tool results always land in the same turn, so trimming can never separate them;
+- Once (a) works, compare it with the production version, [`agentkit.llm.ToolCallAccumulator`](../../agentkit/llm.py): it consumes the SDK's delta objects directly (not dicts), and when an `id` is missing it fills in a locally generated one instead of raising. Raise or fall back is a trade-off: the exercise chooses "fail loudly," the production version chooses "keep going if you can" (the generated id is only used for local pairing).
 
 Check your work:
 

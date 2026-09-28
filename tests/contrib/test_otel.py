@@ -1,18 +1,18 @@
 """agentkit.contrib.otel 的测试（第 28 课）。
 
-覆盖：GenAI 属性映射（纯函数）、OTel 双写与 ID 对齐、错误 / 暂停语义、内容采集开关、
-W3C traceparent 跨线程与跨进程传播、真实的 OTLP/HTTP 导出（本地接收端）、导出端故障不影响 Agent、
-Prometheus 指标（并发、重复注册、标签基数、多进程模式）。
+覆盖：GenAI 属性映射（纯函数）、OTel 双写与 ID 对齐、错误 / 暂停 / 取消 / 超时语义、内容采集开关、
+50 个并发运行（带并行工具）下的父子关系与指标、W3C traceparent 经队列（asyncio worker）与跨进程传播、
+真实的 OTLP/HTTP 导出（本地接收端）、导出端故障不影响 Agent、Prometheus 指标（重复注册、标签基数、多进程模式）。
 
 需要可选依赖 opentelemetry-sdk / prometheus-client（pip install -e ".[otel]"），缺失时相关测试自动跳过。
 """
 
 from __future__ import annotations
 
+import asyncio
 import http.server
 import json
 import os
-import queue
 import subprocess
 import sys
 import textwrap
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from agentkit import Agent, LLMError, PermissionPolicy, ScriptedLLM, ToolError, call_tool, render_tree, reply, tool
+from agentkit import Agent, LLMError, PermissionPolicy, ScriptedLLM, ToolError, call_tool, call_tools, render_tree, reply, tool
 from agentkit.contrib.otel import LabelGuard, genai_mapping, to_genai_attributes
 
 REPO = Path(__file__).resolve().parents[2]
@@ -139,24 +139,16 @@ def test_mapping_resume_does_not_double_count_cumulative_tokens_and_passes_user_
     assert name == "request" and attrs == {"agentkit.tenant.id": "acme", "app.feature": "faq"}
 
 
-def test_label_guard_caps_distinct_values_under_thread_contention():
+async def test_label_guard_caps_distinct_values_under_concurrent_sessions():
     guard = LabelGuard(max_values=5)
-    barrier = threading.Barrier(16)
     results: list[str] = []
-    lock = threading.Lock()
 
-    def worker(i: int) -> None:
-        barrier.wait()
+    async def session(i: int) -> None:  # 16 个会话交错打标签：每打一个就让出事件循环
         for j in range(50):
-            v = guard(f"tenant-{(i * 50 + j) % 40}")
-            with lock:
-                results.append(v)
+            results.append(guard(f"tenant-{(i * 50 + j) % 40}"))
+            await asyncio.sleep(0)
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(16)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    await asyncio.gather(*(session(i) for i in range(16)))
     admitted = set(results) - {LabelGuard.OVERFLOW}
     assert len(admitted) == 5 and LabelGuard.OVERFLOW in results
     assert LabelGuard(allowed={"acme"})("evil") == LabelGuard.OVERFLOW and LabelGuard()(None) == "unknown"
@@ -165,13 +157,13 @@ def test_label_guard_caps_distinct_values_under_thread_contention():
 # ---------------------------------------------------------------- 2. OTelTracer 双写
 
 
-def test_dual_write_keeps_agentkit_tree_and_aligns_ids(otel):
+async def test_dual_write_keeps_agentkit_tree_and_aligns_ids(otel):
     from agentkit.contrib.otel import OTelTracer
 
     provider, exporter = otel
     tracer = OTelTracer(provider)
     agent = Agent(ScriptedLLM([call_tool("lookup_order", order_id="A1"), reply("已发货")]), [lookup_order], name="support", tracer=tracer)
-    result = agent.run("A1 到哪了")
+    result = await agent.run("A1 到哪了")
 
     assert result.ok and "tool.lookup_order" in render_tree(result.trace)  # agentkit 这一侧完全不受影响
     spans = exporter.get_finished_spans()
@@ -184,7 +176,7 @@ def test_dual_write_keeps_agentkit_tree_and_aligns_ids(otel):
         assert child.span_id == hexid(s.context.span_id, 16) and s.parent.span_id == root.context.span_id
 
 
-def test_genai_attributes_kinds_and_hook_enrichment(otel):
+async def test_genai_attributes_kinds_and_hook_enrichment(otel):
     from opentelemetry.trace import SpanKind
 
     from agentkit.contrib.otel import OTelTracer
@@ -193,7 +185,7 @@ def test_genai_attributes_kinds_and_hook_enrichment(otel):
     tracer = OTelTracer(provider)
     llm = ScriptedLLM([call_tool("lookup_order", order_id="A1"), reply("ok")])
     agent = Agent(llm, [lookup_order], name="support", tracer=tracer, hooks=[tracer])
-    agent.run("hi", metadata={"conversation_id": "conv-9", "tenant_id": "acme", "user_id": "u-1"})
+    await agent.run("hi", metadata={"conversation_id": "conv-9", "tenant_id": "acme", "user_id": "u-1"})
 
     spans = by_name(exporter.get_finished_spans())
     root, tool_span, chat = spans["invoke_agent support"][0], spans["execute_tool lookup_order"][0], spans["chat scripted"][0]
@@ -209,7 +201,7 @@ def llm_first_call_id(agent: Agent) -> str:
     return agent.llm.calls[1]["messages"][-2]["tool_calls"][0]["id"]
 
 
-def test_tool_failure_is_error_but_policy_denial_is_not(otel):
+async def test_tool_failure_is_error_but_policy_denial_is_not(otel):
     from opentelemetry.trace import StatusCode
 
     from agentkit.contrib.otel import OTelTracer
@@ -218,7 +210,7 @@ def test_tool_failure_is_error_but_policy_denial_is_not(otel):
     tracer = OTelTracer(provider)
     llm = ScriptedLLM([call_tool("track_shipment", tracking_no="SF1"), call_tool("refund", order_id="A1"), reply("抱歉")])
     agent = Agent(llm, [track_shipment, refund], name="support", tracer=tracer, hooks=[PermissionPolicy(deny_tools={"refund"})])
-    assert agent.run("x").ok
+    assert (await agent.run("x")).ok
 
     spans = by_name(exporter.get_finished_spans())
     failed, denied = spans["execute_tool track_shipment"][0], spans["execute_tool refund"][0]
@@ -227,14 +219,14 @@ def test_tool_failure_is_error_but_policy_denial_is_not(otel):
     assert spans["invoke_agent support"][0].status.status_code == StatusCode.UNSET  # 运行本身完成了
 
 
-def test_llm_error_marks_span_error_with_redacted_exception(otel):
+async def test_llm_error_marks_span_error_with_redacted_exception(otel):
     from opentelemetry.trace import StatusCode
 
     from agentkit.contrib.otel import OTelTracer
 
     provider, exporter = otel
     agent = Agent(ScriptedLLM([LLMError("gateway 503, user 13812345678")]), [], name="support", tracer=OTelTracer(provider))
-    assert agent.run("x").status == "failed"
+    assert (await agent.run("x")).status == "failed"
 
     spans = by_name(exporter.get_finished_spans())
     chat, root = spans["chat scripted"][0], spans["invoke_agent support"][0]
@@ -245,7 +237,7 @@ def test_llm_error_marks_span_error_with_redacted_exception(otel):
     assert root.status.status_code == StatusCode.ERROR and root.attributes["error.type"] == "failed"
 
 
-def test_pause_is_not_an_error_and_resume_is_correlated_by_run_id(otel, registry):
+async def test_pause_is_not_an_error_and_resume_is_correlated_by_run_id(otel, registry):
     from opentelemetry.trace import StatusCode
 
     from agentkit.contrib.otel import OTelTracer, PrometheusHook
@@ -255,7 +247,7 @@ def test_pause_is_not_an_error_and_resume_is_correlated_by_run_id(otel, registry
     prom = PrometheusHook(registry)
     agent = Agent(ScriptedLLM([call_tool("refund", order_id="A1"), reply("已退款")]), [refund], name="support", tracer=tracer, hooks=[tracer, prom, PermissionPolicy()])
 
-    paused = agent.run("退款 A1")
+    paused = await agent.run("退款 A1")
     assert paused.status == "paused" and sample(registry, "agent_approvals_pending") == 1
     pause_spans = by_name(exporter.get_finished_spans())
     tool_span = pause_spans["execute_tool refund"][0]
@@ -263,7 +255,7 @@ def test_pause_is_not_an_error_and_resume_is_correlated_by_run_id(otel, registry
     assert pause_spans["invoke_agent support"][0].status.status_code == StatusCode.UNSET
 
     exporter.clear()
-    done = agent.approve(paused.run_id, True, by="lead")
+    done = await agent.approve(paused.run_id, True, by="lead")
     assert done.ok and sample(registry, "agent_approvals_pending") == 0
     roots = [s for s in exporter.get_finished_spans() if s.name == "invoke_agent support"]
     assert roots[0].attributes["agentkit.resumed"] is True and roots[0].attributes["agentkit.run_id"] == paused.run_id
@@ -272,25 +264,25 @@ def test_pause_is_not_an_error_and_resume_is_correlated_by_run_id(otel, registry
     assert sample(registry, "agent_runs_total", status="completed", reason="final_answer") == 1
 
 
-def test_content_capture_is_off_by_default_and_env_switch_turns_it_on_redacted(otel, monkeypatch):
+async def test_content_capture_is_off_by_default_and_env_switch_turns_it_on_redacted(otel, monkeypatch):
     from agentkit.contrib.otel import CAPTURE_CONTENT_ENV, OTelTracer
 
     provider, exporter = otel
 
-    def run_once():
+    async def run_once():
         exporter.clear()
         tracer = OTelTracer(provider)
         llm = ScriptedLLM([call_tool("lookup_order", order_id="A1"), reply("电话 13900001111 的订单已发货")])
-        Agent(llm, [lookup_order], name="s", tracer=tracer, hooks=[tracer]).run("我的手机 13812345678，查 A1")
+        await Agent(llm, [lookup_order], name="s", tracer=tracer, hooks=[tracer]).run("我的手机 13812345678，查 A1")
         return by_name(exporter.get_finished_spans())
 
     monkeypatch.delenv(CAPTURE_CONTENT_ENV, raising=False)
-    spans = run_once()
+    spans = await run_once()
     everything = json.dumps([dict(s.attributes) for group in spans.values() for s in group], ensure_ascii=False)
     assert "gen_ai.input.messages" not in everything and "gen_ai.tool.call.arguments" not in everything
 
     monkeypatch.setenv(CAPTURE_CONTENT_ENV, "SPAN_ONLY")
-    spans = run_once()
+    spans = await run_once()
     root = spans["invoke_agent s"][0].attributes
     assert "[手机号已脱敏]" in root["gen_ai.input.messages"] and "13812345678" not in root["gen_ai.input.messages"]
     assert "13900001111" not in root["gen_ai.output.messages"]
@@ -298,51 +290,7 @@ def test_content_capture_is_off_by_default_and_env_switch_turns_it_on_redacted(o
     assert "A1" in spans["execute_tool lookup_order"][0].attributes["gen_ai.tool.call.arguments"]
 
 
-def test_concurrent_runs_on_shared_tracer_and_hook_do_not_mix(otel, registry):
-    """8 个线程共用一个 OTelTracer 和一个 PrometheusHook 同时跑 Agent：span 不串台，计数不丢。"""
-    from agentkit.contrib.otel import OTelTracer, PrometheusHook
-
-    provider, exporter = otel
-    tracer = OTelTracer(provider)
-    prom = PrometheusHook(registry, tenant_label=True)
-    barrier = threading.Barrier(8)
-    trace_ids: dict[str, str] = {}
-    lock = threading.Lock()
-
-    def worker(i: int) -> None:
-        barrier.wait()
-        for j in range(5):
-            llm = ScriptedLLM([call_tool("lookup_order", order_id=f"A{i}{j}"), reply("ok")])
-            r = Agent(llm, [lookup_order], name="support", tracer=tracer, hooks=[prom]).run("x", metadata={"tenant_id": f"t{i % 2}"})
-            with lock:
-                trace_ids[r.run_id] = r.trace.trace_id
-
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    spans = exporter.get_finished_spans()
-    assert len(spans) == 40 * 4 and len(set(trace_ids.values())) == 40
-    by_trace: dict[int, list] = {}
-    for s in spans:
-        by_trace.setdefault(s.context.trace_id, []).append(s)
-    for group in by_trace.values():
-        root = next(s for s in group if s.name == "invoke_agent support")
-        assert len(group) == 4 and all(s.parent.span_id == root.context.span_id for s in group if s is not root)
-    assert sample(registry, "agent_runs_total", status="completed", reason="final_answer", tenant="t0") == 20
-    assert sample(registry, "agent_runs_total", status="completed", reason="final_answer", tenant="t1") == 20
-    assert sample(registry, "agent_tool_calls_total", tool="lookup_order", error_type="none") == 40
-    assert sample(registry, "agent_llm_tokens_total", direction="input", tenant="t0") == 20 * 2 * 20
-
-
-# ---------------------------------------------------------------- 2b. asyncio：真实的 AsyncAgent 高并发
-
-
-@pytest.fixture
-def aio():
-    return pytest.importorskip("agentkit.aio")
+# ---------------------------------------------------------------- 2b. 一个进程里的高并发：共用一个 Agent、一个 OTelTracer、一个 PrometheusHook
 
 
 def _consistency_probe(tracer, mismatches: list):
@@ -355,11 +303,9 @@ def _consistency_probe(tracer, mismatches: list):
         mismatches.append((ak.name if ak else None, otel_id))
 
 
-def test_async_agent_50_concurrent_runs_with_parallel_tools(otel, registry, aio):
-    """50 个并发运行共用一个 AsyncAgent；每个运行一轮里并行调用 3 个只读工具（async、async、同步线程池各一个）。"""
-    import asyncio
-
-    from agentkit import call_tools
+async def test_50_concurrent_runs_with_parallel_tools_do_not_mix(otel, registry):
+    """50 个并发运行共用一个 Agent；每个运行一轮里并行调用 3 个只读工具（async、async、同步线程池各一个）。
+    span 不串台（每条 trace 的父子关系各归各的），指标不丢（按租户的运行数、token 精确）。"""
     from agentkit.contrib.otel import OTelTracer, PrometheusHook
 
     provider, exporter = otel
@@ -402,14 +348,10 @@ def test_async_agent_50_concurrent_runs_with_parallel_tools(otel, registry, aio)
             return reply("好的")
         return call_tools(("lookup_order", {"order_id": "A1"}), ("track_shipment", {"tracking_no": "S1"}), ("get_policy", {"topic": "退货"}))
 
-    llm = aio.AsyncScriptedLLM(responder=responder, latency=lambda n: 0.001 * (n % 7))
-    agent = aio.AsyncAgent(llm, [lookup_order, get_policy, track_shipment], name="support", tracer=tracer, hooks=[tracer, prom])
-
-    async def main():
-        state["all_in"] = asyncio.Event()
-        return await asyncio.gather(*(agent.run(f"q{i}", metadata={"tenant_id": f"t{i % 3}"}) for i in range(50)))
-
-    results = asyncio.run(main())
+    llm = ScriptedLLM(responder=responder, latency=lambda n: 0.001 * (n % 7))
+    agent = Agent(llm, [lookup_order, get_policy, track_shipment], name="support", tracer=tracer, hooks=[tracer, prom])
+    state["all_in"] = asyncio.Event()
+    results = await asyncio.gather(*(agent.run(f"q{i}", metadata={"tenant_id": f"t{i % 3}"}) for i in range(50)))
     assert all(r.ok for r in results) and llm.max_in_flight > 1
     assert observed["in_flight"] == 50 and sample(registry, "agent_runs_in_flight") == 0
     assert mismatches == []
@@ -427,19 +369,18 @@ def test_async_agent_50_concurrent_runs_with_parallel_tools(otel, registry, aio)
         tools = [s for s in group if s.name.startswith("execute_tool")]
         assert sorted(t.name for t in tools) == ["execute_tool get_policy", "execute_tool lookup_order", "execute_tool track_shipment"]
         assert max(t.start_time for t in tools) < min(t.end_time for t in tools)  # 三个工具的时间区间有重叠：真的并行
-        assert roots[tid].attributes["agentkit.agent.runtime"] == "asyncio"
     for r in results:  # agentkit 这一侧：每个 tool.* 的父就是本次运行的 agent.run，ID 与 OTel 一致
         tool_spans = [c for c in r.trace.children if c.name.startswith("tool.")]
         assert len(tool_spans) == 3 and all(c.parent_id == r.trace.span_id and c.trace_id == r.trace.trace_id for c in tool_spans)
         assert int(r.trace.trace_id, 16) in roots
     assert sample(registry, "agent_tool_calls_total", tool="track_shipment", error_type="none") == 50
-    assert sum(sample(registry, "agent_runs_total", status="completed", reason="final_answer", tenant=f"t{i}") for i in range(3)) == 50
+    for tenant, runs in (("t0", 17), ("t1", 17), ("t2", 16)):  # i % 3 分租户：计数一个都不能丢
+        assert sample(registry, "agent_runs_total", status="completed", reason="final_answer", tenant=tenant) == runs
+        assert sample(registry, "agent_llm_tokens_total", direction="input", tenant=tenant) == runs * 2 * 20
 
 
-def test_async_agent_cancelled_and_timed_out_runs(otel, registry, aio):
+async def test_cancelled_and_timed_out_runs(otel, registry):
     """取消 = 客户端主动断开：不是错误，但在途数必须归零；超时 = 失败：根 span 标 ERROR。"""
-    import asyncio
-
     from opentelemetry.trace import StatusCode
 
     from agentkit.contrib.otel import OTelTracer, PrometheusHook
@@ -447,21 +388,17 @@ def test_async_agent_cancelled_and_timed_out_runs(otel, registry, aio):
     provider, exporter = otel
     tracer = OTelTracer(provider)
     prom = PrometheusHook(registry)
-    llm = aio.AsyncScriptedLLM(responder=lambda m: reply("ok"), latency=lambda n: 0.3)
-    agent = aio.AsyncAgent(llm, [], name="support", tracer=tracer, hooks=[tracer, prom])
-    slow = aio.AsyncAgent(llm, [], name="slow", tracer=tracer, hooks=[tracer, prom], run_timeout=0.05)
+    llm = ScriptedLLM(responder=lambda m: reply("ok"), latency=0.5)
+    agent = Agent(llm, [], name="support", tracer=tracer, hooks=[tracer, prom])
+    slow = Agent(llm, [], name="slow", tracer=tracer, hooks=[tracer, prom], run_timeout=0.05)
 
-    async def main():
-        tasks = [asyncio.create_task(agent.run(f"q{i}")) for i in range(20)]
-        timed_out = asyncio.create_task(slow.run("x"))
-        await asyncio.sleep(0.1)  # 20 个运行都卡在 0.3 秒的模型调用里；超时的那个在 0.05 秒时已经结束
-        observed = sample(registry, "agent_runs_in_flight")
-        for t in tasks[:10]:
-            t.cancel()  # 模拟 10 个 HTTP 客户端断开
-        done = await asyncio.gather(*tasks, return_exceptions=True)
-        return observed, done, await timed_out
-
-    in_flight_peak, done, timeout_result = asyncio.run(main())
+    tasks = [asyncio.create_task(agent.run(f"q{i}")) for i in range(20)]
+    timed_out = asyncio.create_task(slow.run("x"))
+    timeout_result = await timed_out  # 0.05 秒超时；此刻 20 个运行都还卡在 0.5 秒的模型调用里
+    in_flight_peak = sample(registry, "agent_runs_in_flight")
+    for t in tasks[:10]:
+        t.cancel()  # 模拟 10 个 HTTP 客户端断开
+    done = await asyncio.gather(*tasks, return_exceptions=True)
     assert in_flight_peak == 20
     assert sum(isinstance(d, asyncio.CancelledError) for d in done) == 10 and sum(getattr(d, "ok", False) for d in done) == 10
     assert timeout_result.status == "stopped" and timeout_result.stop_reason == "timeout"
@@ -483,27 +420,20 @@ def test_async_agent_cancelled_and_timed_out_runs(otel, registry, aio):
     assert all(s.status.status_code == StatusCode.UNSET for s in chats)
 
 
-def test_async_agent_concurrent_approvals_gauge(otel, registry, aio):
+async def test_concurrent_approvals_gauge(otel, registry):
     """10 个并发运行都停在高风险工具上等审批 → approvals_pending=10；并发批准后归零，在途数也归零。"""
-    import asyncio
-
     from agentkit.contrib.otel import OTelTracer, PrometheusHook
 
     provider, exporter = otel
     tracer = OTelTracer(provider)
     prom = PrometheusHook(registry)
-    llm = aio.AsyncScriptedLLM(
+    llm = ScriptedLLM(
         responder=lambda m: reply("已退款") if m[-1]["role"] == "tool" else call_tool("refund", order_id="A1"), latency=0.001
     )
-    agent = aio.AsyncAgent(llm, [refund], name="support", tracer=tracer, hooks=[tracer, prom, PermissionPolicy()])
-
-    async def main():
-        paused = await asyncio.gather(*(agent.run(f"退款 {i}") for i in range(10)))
-        mid = sample(registry, "agent_approvals_pending")
-        done = await asyncio.gather(*(agent.approve(r.run_id, True, by="lead") for r in paused))
-        return paused, mid, done
-
-    paused, mid, done = asyncio.run(main())
+    agent = Agent(llm, [refund], name="support", tracer=tracer, hooks=[tracer, prom, PermissionPolicy()])
+    paused = await asyncio.gather(*(agent.run(f"退款 {i}") for i in range(10)))
+    mid = sample(registry, "agent_approvals_pending")
+    done = await asyncio.gather(*(agent.approve(r.run_id, True, by="lead") for r in paused))
     assert all(r.status == "paused" for r in paused) and mid == 10
     assert all(r.ok for r in done)
     assert sample(registry, "agent_approvals_pending") == 0 and sample(registry, "agent_runs_in_flight") == 0
@@ -511,47 +441,47 @@ def test_async_agent_concurrent_approvals_gauge(otel, registry, aio):
     assert {s.attributes["agentkit.run_id"] for s in resumed} == {r.run_id for r in paused}
 
 
-def test_async_worker_continues_each_job_in_its_own_producer_trace(otel, aio):
-    """asyncio worker：50 个任务、并发 10，共用一个 AsyncAgent；每个任务在自己的 task 里 async with continue_trace。"""
-    import asyncio
-
+async def test_worker_continues_each_job_in_its_own_producer_trace(otel):
+    """asyncio worker：50 个任务经队列（JSON 序列化的 payload）交给 worker，并发 10，共用一个 Agent；
+    每个任务在自己的 task 里 async with continue_trace —— 接着生产者的 trace 继续，互不串线。"""
     from agentkit.contrib.otel import OTelTracer, continue_trace, inject_context
 
     provider, exporter = otel
     tracer = OTelTracer(provider)
-    llm = aio.AsyncScriptedLLM(
+    llm = ScriptedLLM(
         responder=lambda m: reply("ok") if m[-1]["role"] == "tool" else call_tool("lookup_order", order_id="A1"),
         latency=lambda n: 0.001 * (n % 5),
     )
-    agent = aio.AsyncAgent(llm, [lookup_order], name="worker", tracer=tracer)
+    agent = Agent(llm, [lookup_order], name="worker", tracer=tracer)
 
-    async def main():
-        q: asyncio.Queue = asyncio.Queue()
-        for i in range(50):
-            with tracer.span("send agent-tasks", **{"otel.kind": "producer", "job": i}):
-                await q.put({"id": i, "trace": inject_context({})})
-        sem = asyncio.Semaphore(10)
-        results = {}
+    q: asyncio.Queue = asyncio.Queue()
+    for i in range(50):
+        with tracer.span("send agent-tasks", **{"otel.kind": "producer", "messaging.destination.name": "agent-tasks", "job": i}):
+            await q.put(json.dumps({"id": i, "trace": inject_context({})}))  # 真实队列里 payload 是序列化过的字符串
+    sem = asyncio.Semaphore(10)
+    results = {}
 
-        async def handle(job):
-            async with sem, continue_trace(job["trace"]):
-                results[job["id"]] = await agent.run(f"job {job['id']}")
+    async def handle(raw: str):
+        job = json.loads(raw)
+        async with sem, continue_trace(job["trace"]):
+            results[job["id"]] = await agent.run(f"job {job['id']}")
 
-        await asyncio.gather(*[asyncio.create_task(handle(await q.get())) for _ in range(50)])
-        return results
+    await asyncio.gather(*[asyncio.create_task(handle(await q.get())) for _ in range(50)])
+    assert llm.max_in_flight > 1  # 任务真的并发处理了
 
-    results = asyncio.run(main())
     spans = exporter.get_finished_spans()
     sends = {s.attributes["job"]: s for s in spans if s.name == "send agent-tasks"}
     roots = {s.context.trace_id: s for s in spans if s.name == "invoke_agent worker"}
     assert len(sends) == len(roots) == 50
+    assert {s.kind.name for s in sends.values()} == {"PRODUCER"}
     for job, result in results.items():
         send = sends[job]
         root = roots[int(result.trace.trace_id, 16)]
         assert root.context.trace_id == send.context.trace_id and root.parent.span_id == send.context.span_id
+        assert root.parent.is_remote  # 父 span 来自 carrier（另一端），不是本地 context 里的
 
 
-# ---------------------------------------------------------------- 3. 传播：线程、队列、进程
+# ---------------------------------------------------------------- 3. 传播：carrier、进程
 
 
 def test_inject_extract_roundtrip_and_garbage_carrier_starts_new_trace(otel):
@@ -578,44 +508,7 @@ def test_inject_extract_roundtrip_and_garbage_carrier_starts_new_trace(otel):
                 assert hexid(span.get_span_context().trace_id, 32) != tid  # 格式非法 / 全零 trace-id：开新 trace，不抛异常
 
 
-def test_continue_trace_across_threads_through_a_queue(otel):
-    from agentkit.contrib.otel import OTelTracer, continue_trace, inject_context
-
-    provider, exporter = otel
-    tracer = OTelTracer(provider)
-    jobs: queue.Queue = queue.Queue()
-    results: list = []
-
-    def producer() -> None:
-        for i in range(3):
-            with tracer.span("send agent-tasks", **{"otel.kind": "producer", "messaging.destination.name": "agent-tasks"}):
-                jobs.put(json.dumps({"input": f"A{i}", "trace": inject_context({})}))
-        jobs.put(None)
-
-    def worker() -> None:
-        while (raw := jobs.get()) is not None:
-            job = json.loads(raw)
-            with continue_trace(job["trace"]):
-                llm = ScriptedLLM([call_tool("lookup_order", order_id=job["input"]), reply("ok")])
-                results.append(Agent(llm, [lookup_order], name="worker", tracer=tracer).run(job["input"]))
-
-    threads = [threading.Thread(target=producer), threading.Thread(target=worker)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    spans = exporter.get_finished_spans()
-    sends = [s for s in spans if s.name == "send agent-tasks"]
-    roots = [s for s in spans if s.name == "invoke_agent worker"]
-    assert len(sends) == len(roots) == 3
-    for send, root, result in zip(sends, roots, results):
-        assert root.context.trace_id == send.context.trace_id and root.parent.span_id == send.context.span_id
-        assert root.parent.is_remote and result.trace.trace_id == hexid(send.context.trace_id, 32)
-    assert {s.kind.name for s in sends} == {"PRODUCER"}
-
-
-def test_continue_trace_across_processes(otel):
+async def test_continue_trace_across_processes(otel):
     """traceparent 只是一个字符串：放进 payload 交给另一个操作系统进程，那边接着同一条 trace 继续。"""
     from agentkit.contrib.otel import OTelTracer, inject_context
 
@@ -626,27 +519,36 @@ def test_continue_trace_across_processes(otel):
 
     child = textwrap.dedent(
         """
-        import json, sys
+        import asyncio, json, os, sys
         from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
         from agentkit import Agent, ScriptedLLM, reply
         from agentkit.contrib.otel import OTelTracer, continue_trace, setup_tracing
         job = json.loads(sys.stdin.read())
         exporter = InMemorySpanExporter()
         tracer = OTelTracer(setup_tracing("worker", exporter=exporter, set_global=False))
-        with continue_trace(job["trace"]):
-            result = Agent(ScriptedLLM([reply("ok")]), [], name="worker", tracer=tracer).run(job["input"])
+
+        async def handle():
+            async with continue_trace(job["trace"]):
+                return await Agent(ScriptedLLM([reply("ok")]), [], name="worker", tracer=tracer).run(job["input"])
+
+        result = asyncio.run(handle())
         root = [s for s in exporter.get_finished_spans() if s.name == "invoke_agent worker"][0]
-        print(json.dumps({"trace_id": format(root.context.trace_id, "032x"),
+        print(json.dumps({"pid": os.getpid(), "trace_id": format(root.context.trace_id, "032x"),
                           "parent": format(root.parent.span_id, "016x"), "result_trace": result.trace.trace_id}))
         """
     )
-    proc = subprocess.run([sys.executable, "-c", child], input=payload, capture_output=True, text=True, cwd=REPO, timeout=60)
-    assert proc.returncode == 0, proc.stderr
-    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", child, cwd=REPO,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate(payload.encode())
+    assert proc.returncode == 0, stderr.decode()
+    out = json.loads(stdout.decode().strip().splitlines()[-1])
+    assert out["pid"] != os.getpid()
     assert out["trace_id"] == send.trace_id == out["result_trace"] and out["parent"] == send.span_id
 
 
-def test_sampling_ratio_zero_still_follows_a_sampled_upstream():
+async def test_sampling_ratio_zero_still_follows_a_sampled_upstream():
     """头部采样 0%：本服务自己发起的 trace 一条都不导出（agentkit 树照常生成）；但上游已采样的 trace 会被跟随。"""
     pytest.importorskip("opentelemetry.sdk")
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -656,12 +558,12 @@ def test_sampling_ratio_zero_still_follows_a_sampled_upstream():
     exporter = InMemorySpanExporter()
     tracer = OTelTracer(setup_tracing("svc", sample_ratio=0.0, exporter=exporter, set_global=False))
     agent = Agent(ScriptedLLM([reply("a"), reply("b")]), [], name="s", tracer=tracer)
-    local = agent.run("x")
+    local = await agent.run("x")
     assert exporter.get_finished_spans() == () and local.trace is not None and len(local.trace.trace_id) == 32
 
     upstream = {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}  # W3C 规范里的示例值
     with continue_trace(upstream):
-        agent.run("y")
+        await agent.run("y")
     assert {hexid(s.context.trace_id, 32) for s in exporter.get_finished_spans()} == {"4bf92f3577b34da6a3ce929d0e0e4736"}
     with pytest.raises(ValueError):
         setup_tracing("svc", sample_ratio=1.5, set_global=False)
@@ -687,7 +589,7 @@ class _OTLPReceiver(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def test_otlp_http_export_reaches_a_real_receiver():
+async def test_otlp_http_export_reaches_a_real_receiver():
     pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
     from agentkit.contrib.otel import OTelTracer, setup_tracing
 
@@ -697,7 +599,7 @@ def test_otlp_http_export_reaches_a_real_receiver():
     try:
         provider = setup_tracing("otlp-test", otlp_endpoint=f"http://127.0.0.1:{server.server_port}/", set_global=False)
         tracer = OTelTracer(provider)
-        Agent(ScriptedLLM([reply("ok")]), [], name="support", tracer=tracer).run("hi")
+        await Agent(ScriptedLLM([reply("ok")]), [], name="support", tracer=tracer).run("hi")
         assert tracer.force_flush()
         provider.shutdown()
     finally:
@@ -710,7 +612,7 @@ def test_otlp_http_export_reaches_a_real_receiver():
     assert sorted(names) == ["chat scripted", "invoke_agent support"]
 
 
-def test_dead_collector_never_breaks_the_agent(monkeypatch):
+async def test_dead_collector_never_breaks_the_agent(monkeypatch):
     """导出端挂了：Agent 照常完成（批量异步导出，失败只丢 span）。注意 force_flush 返回 True 也不代表导出成功。"""
     pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
     from agentkit.contrib.otel import OTelTracer, setup_tracing
@@ -718,7 +620,7 @@ def test_dead_collector_never_breaks_the_agent(monkeypatch):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT", "1")  # 默认 10 秒，测试里缩短
     provider = setup_tracing("dead", otlp_endpoint="http://127.0.0.1:9", set_global=False)
     tracer = OTelTracer(provider)
-    result = Agent(ScriptedLLM([reply("ok")]), [], name="s", tracer=tracer).run("hi")
+    result = await Agent(ScriptedLLM([reply("ok")]), [], name="s", tracer=tracer).run("hi")
     assert result.ok and result.trace is not None
     tracer.force_flush(1000)
     provider.shutdown()
@@ -727,12 +629,12 @@ def test_dead_collector_never_breaks_the_agent(monkeypatch):
 # ---------------------------------------------------------------- 5. Prometheus
 
 
-def test_prometheus_metrics_cover_runs_tokens_cost_tools_and_unknown_tools(registry):
+async def test_prometheus_metrics_cover_runs_tokens_cost_tools_and_unknown_tools(registry):
     from agentkit.contrib.otel import PrometheusHook
 
     prom = PrometheusHook(registry)
     llm = ScriptedLLM([call_tool("lookup_order", order_id="A1"), call_tool("hallucinated_tool_7f3a"), call_tool("track_shipment", tracking_no="x"), reply("ok")])
-    Agent(llm, [lookup_order, track_shipment], hooks=[prom]).run("x", metadata={"user_id": "u-1", "tenant_id": "acme"})
+    await Agent(llm, [lookup_order, track_shipment], hooks=[prom]).run("x", metadata={"user_id": "u-1", "tenant_id": "acme"})
 
     assert sample(registry, "agent_runs_total", status="completed", reason="final_answer") == 1
     assert sample(registry, "agent_run_duration_seconds_count", status="completed") == 1
@@ -744,12 +646,12 @@ def test_prometheus_metrics_cover_runs_tokens_cost_tools_and_unknown_tools(regis
     assert "hallucinated_tool_7f3a" not in text and "u-1" not in text and "acme" not in text  # 未开 tenant_label
 
 
-def test_tenant_label_is_bounded_and_hook_creation_is_idempotent(registry):
+async def test_tenant_label_is_bounded_and_hook_creation_is_idempotent(registry):
     from agentkit.contrib.otel import PrometheusHook
 
     for i in range(5):  # 模拟"每个请求 new 一个 Hook"：不能抛 Duplicated timeseries
         prom = PrometheusHook(registry, tenant_label=True, max_tenants=2)
-        Agent(ScriptedLLM([reply("ok")]), [], hooks=[prom]).run("x", metadata={"tenant_id": f"t{i}"})
+        await Agent(ScriptedLLM([reply("ok")]), [], hooks=[prom]).run("x", metadata={"tenant_id": f"t{i}"})
     tenants = {labels["tenant"] for m in registry.collect() if m.name == "agent_runs" for *_, labels in [(0, s.labels) for s in m.samples] if "tenant" in labels}
     assert "__other__" in tenants and len(tenants - {"__other__"}) <= 2
     with pytest.raises(ValueError):
@@ -759,11 +661,11 @@ def test_tenant_label_is_bounded_and_hook_creation_is_idempotent(registry):
     assert sample(registry, "agent_queue_oldest_job_age_seconds", queue="agent-tasks") == 42.0
 
 
-def test_start_metrics_server_serves_the_registry(registry):
+async def test_start_metrics_server_serves_the_registry(registry):
     from agentkit.contrib.otel import PrometheusHook, start_metrics_server
 
     prom = PrometheusHook(registry)
-    Agent(ScriptedLLM([reply("ok")]), [], hooks=[prom]).run("x")
+    await Agent(ScriptedLLM([reply("ok")]), [], hooks=[prom]).run("x")
     server, thread = start_metrics_server(0, registry=registry)
     try:
         body = urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}/metrics", timeout=5).read().decode()
@@ -781,11 +683,16 @@ def test_multiprocess_mode_aggregates_counters_from_concurrent_workers(tmp_path)
     env = {**os.environ, "PROMETHEUS_MULTIPROC_DIR": str(mp_dir)}  # 必须在导入 prometheus_client 之前设置
     worker = textwrap.dedent(
         """
+        import asyncio
         from agentkit import Agent, ScriptedLLM, reply
         from agentkit.contrib.otel import PrometheusHook
         hook = PrometheusHook()
-        for _ in range(25):
-            Agent(ScriptedLLM([reply("ok")]), [], hooks=[hook]).run("x")
+        agent = Agent(ScriptedLLM(responder=lambda m: reply("ok")), [], hooks=[hook])
+
+        async def main():
+            await asyncio.gather(*(agent.run("x") for _ in range(25)))  # 进程内也是并发的
+
+        asyncio.run(main())
         hook.set_queue_stats("agent-tasks", depth=3)
         """
     )
@@ -814,22 +721,22 @@ def test_multiprocess_mode_aggregates_counters_from_concurrent_workers(tmp_path)
 LESSON_CONFIGS = REPO / "lessons" / "28_production_observability" / "configs"
 
 
-def _exposed_metric_names(registry) -> set[str]:
+async def _exposed_metric_names(registry) -> set[str]:
     from agentkit.contrib.otel import PrometheusHook
 
     prom = PrometheusHook(registry, tenant_label=True)
     llm = ScriptedLLM([call_tool("lookup_order", order_id="A1"), reply("ok")])
-    Agent(llm, [lookup_order], hooks=[prom]).run("x", metadata={"tenant_id": "acme"})
+    await Agent(llm, [lookup_order], hooks=[prom]).run("x", metadata={"tenant_id": "acme"})
     prom.set_queue_stats("q", 1, 1.0)
     return {sample.name for metric in registry.collect() for sample in metric.samples}
 
 
-def test_prometheus_rules_parse_and_only_use_metrics_the_hook_exposes(registry):
+async def test_prometheus_rules_parse_and_only_use_metrics_the_hook_exposes(registry):
     import re
 
     yaml = pytest.importorskip("yaml")
     rules = yaml.safe_load((LESSON_CONFIGS / "prometheus-rules.yaml").read_text(encoding="utf-8"))
-    exposed = _exposed_metric_names(registry)
+    exposed = await _exposed_metric_names(registry)
     recorded = {r["record"] for g in rules["groups"] for r in g["rules"] if "record" in r}
     alerts = [r for g in rules["groups"] for r in g["rules"] if "alert" in r]
     assert {"AgentErrorBudgetBurn", "AgentErrorBudgetSlowBurn", "AgentLatencyP95High", "AgentCostPerRunSpike",
@@ -847,14 +754,14 @@ def test_prometheus_rules_parse_and_only_use_metrics_the_hook_exposes(registry):
                 assert rule["labels"]["severity"] in {"page", "ticket"}
 
 
-def test_grafana_dashboard_is_importable_json_and_queries_known_series(registry):
+async def test_grafana_dashboard_is_importable_json_and_queries_known_series(registry):
     import re
 
     yaml = pytest.importorskip("yaml")
     dashboard = json.loads((LESSON_CONFIGS / "grafana-dashboard.json").read_text(encoding="utf-8"))
     rules = yaml.safe_load((LESSON_CONFIGS / "prometheus-rules.yaml").read_text(encoding="utf-8"))
     recorded = {r["record"] for g in rules["groups"] for r in g["rules"] if "record" in r}
-    exposed = _exposed_metric_names(registry)
+    exposed = await _exposed_metric_names(registry)
     assert dashboard["id"] is None and dashboard["uid"] and dashboard["schemaVersion"] >= 36
     assert [v["name"] for v in dashboard["templating"]["list"]] == ["datasource"]
     exprs = [t["expr"] for p in dashboard["panels"] for t in p.get("targets", [])]

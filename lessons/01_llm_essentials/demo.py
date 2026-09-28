@@ -1,6 +1,6 @@
 """第 01 课 Demo：用真实模型把"写 Agent 之前必须懂的 LLM 知识"逐条验证一遍。
 
-    .venv/bin/python lessons/01_llm_essentials/demo.py            # 真实模型（读取 .env；约 19 次调用，约 1 分钟）
+    .venv/bin/python lessons/01_llm_essentials/demo.py            # 真实模型（读取 .env；约 19 次调用，实测约 30 秒）
     .venv/bin/python lessons/01_llm_essentials/demo.py --offline  # 离线：剧本 + 模拟数据，无需 API key
 
 六个小节：
@@ -12,18 +12,21 @@
     6. 约束解码与 logprobs：格式合法 ≠ 判断正确；让模型告诉你它有多确定（网关不支持时降级）
 
 两种模式走的是**同一套代码**：离线模式只是把 OpenAI 客户端换成了一个按剧本返回的假客户端。
+
+代码是 async 的（openai.AsyncOpenAI）：互不依赖的请求用 asyncio.gather 同时发出，Semaphore 限制同时在途的数量。
+async 是怎么回事，第 02 课 1.7 节从零讲；这里只要知道 `await` = "等这个请求回来"，`asyncio.gather` = "这几个一起等"。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import random
 import sys
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -54,9 +57,25 @@ def pad(text: str, width: int, right: bool = False) -> str:
     return fill + text if right else text + fill
 
 
-def workers(n: int) -> int:
-    """真实模式并发发请求省时间；离线模式单线程，保证每次输出完全一样。"""
+def concurrency(n: int) -> int:
+    """真实模式同时发出 n 个请求省时间；离线模式一次一个，保证每次输出完全一样。"""
     return 1 if OFFLINE else n
+
+
+async def gather_limited(fns: list[Callable[[], Awaitable[Any]]], limit: int) -> list[Any]:
+    """同时执行多个互不依赖的请求，最多 limit 个同时在途，结果按输入顺序返回。
+
+    fns 里每一项是"调用后返回协程"的函数。Semaphore 是一个"最多 limit 个人同时进"的闸门：
+    不加上限，一次发出几百个请求会把模型网关打出 429（第 08、12 课）。
+    agentkit.workflows.parallel(fns, max_concurrency=...) 是同一件事的框架版（一个失败其余立即取消，第 06 课）。
+    """
+    sem = asyncio.Semaphore(limit)
+
+    async def one(fn):
+        async with sem:
+            return await fn()
+
+    return list(await asyncio.gather(*(one(f) for f in fns)))
 
 
 def note(text: str) -> None:
@@ -68,10 +87,10 @@ def show_json(obj: Any, indent: int = 4) -> None:
     print("\n".join(" " * indent + line for line in text.splitlines()))
 
 
-def run_section(fn: Callable[[], None]) -> None:
+async def run_section(fn: Callable[[], Awaitable[None]]) -> None:
     """每一节独立运行：某一节失败（比如网关不支持某个参数）不影响后面几节。"""
     try:
-        fn()
+        await fn()
     except Exception as e:  # noqa: BLE001 —— Demo 里宁可打印原因继续跑，也不要整段崩掉
         say(f"⚠️  本节运行失败：{type(e).__name__}: {str(e)[:300]}")
         say("   （网关不支持某个参数时常见。可以先用 --offline 看完整流程。）")
@@ -86,12 +105,20 @@ class Backend:
     def __init__(self, client: Any, model: str, llm: Any):
         self.client, self.model, self.llm = client, model, llm
 
-    def create(self, **kwargs):
-        return self.client.chat.completions.create(model=self.model, **kwargs)
+    async def create(self, **kwargs):
+        return await self.client.chat.completions.create(model=self.model, **kwargs)
+
+    async def aclose(self) -> None:
+        close = getattr(self.client, "close", None)
+        if close is not None:
+            await close()
+        close = getattr(self.llm, "aclose", None)
+        if close is not None:
+            await close()
 
 
 def online_backend() -> Backend:
-    from openai import OpenAI
+    from openai import AsyncOpenAI
 
     from agentkit.llm import OpenAICompatLLM
 
@@ -101,7 +128,7 @@ def online_backend() -> Backend:
         sys.exit(1)
     model = env("LLM_MODEL", "gpt-5.5")
     # max_retries=0：Demo 里想看到真实的错误，而不是被 SDK 悄悄重试掉（重试策略见第 08 课）
-    client = OpenAI(base_url=env("LLM_BASE_URL"), api_key=api_key, timeout=90, max_retries=0)
+    client = AsyncOpenAI(base_url=env("LLM_BASE_URL"), api_key=api_key, timeout=90, max_retries=0)
     return Backend(client, model, OpenAICompatLLM(model=model))
 
 
@@ -145,7 +172,7 @@ SALES_TOOLS = [
 ]
 
 
-def section_1_tokens(b: Backend) -> None:
+async def section_1_tokens(b: Backend) -> None:
     banner("第 1 节  Token 与成本：估算值 vs 真实 usage，以及\"看不见的\"输入")
     cases = [
         ("基线：只有 system + \".\"", [{"role": "system", "content": SYSTEM_OK}, {"role": "user", "content": "."}], None),
@@ -154,15 +181,15 @@ def section_1_tokens(b: Backend) -> None:
         ("中文需求 + 2 个工具定义", [{"role": "system", "content": SYSTEM_OK}, {"role": "user", "content": TEXT_ZH}], SALES_TOOLS),
     ]
 
-    def call(case):
+    async def call(case):
         _, messages, tools = case
         kwargs = {"messages": messages}
         if tools:
             kwargs["tools"] = tools
-        return b.create(**kwargs).usage
+        return (await b.create(**kwargs)).usage
 
-    with ThreadPoolExecutor(max_workers=workers(4)) as pool:  # 4 个请求互不依赖，并发发出，省时间
-        usages = list(pool.map(call, cases))
+    # 4 个请求互不依赖，同时发出，省时间（真实模式约 1 次请求的耗时，而不是 4 次）
+    usages = await gather_limited([lambda c=c: call(c) for c in cases], concurrency(4))
 
     base_real = usages[0].prompt_tokens
     say(pad("请求", 28) + pad("字符数", 8, True) + pad("估算 token", 12, True) + pad("真实 prompt_tokens", 20, True) + pad("减去基线", 10, True))
@@ -204,7 +231,7 @@ def softmax(logits: dict[str, float], temperature: float) -> dict[str, float]:
     return {k: v / total for k, v in exps.items()}
 
 
-def section_2_sampling(b: Backend) -> None:
+async def section_2_sampling(b: Backend) -> None:
     banner("第 2 节  采样与非确定性：temperature 到底改变了什么")
     say("原理（纯本地计算）：模型每一步先给所有候选 token 打分（logits），再按概率抽一个。")
     say("假设\"起名字\"的第一步只有 5 个候选，看 temperature 如何改变抽中的概率：")
@@ -230,18 +257,17 @@ def section_2_sampling(b: Backend) -> None:
     say(f"实测：同一个问题 × temperature 0 / 1 各 3 次。问题：{NAME_PROMPT}")
     messages = [{"role": "user", "content": NAME_PROMPT}]
 
-    def ask(temperature: float) -> str:
-        r = b.create(messages=messages, temperature=temperature)
+    async def ask(temperature: float | None) -> str:
+        kwargs = {"messages": messages} if temperature is None else {"messages": messages, "temperature": temperature}
+        r = await b.create(**kwargs)
         return (r.choices[0].message.content or "").strip()
 
     try:
-        with ThreadPoolExecutor(max_workers=workers(6)) as pool:
-            results = list(pool.map(ask, [0, 0, 0, 1, 1, 1]))
+        results = await gather_limited([lambda t=t: ask(t) for t in (0, 0, 0, 1, 1, 1)], concurrency(6))
     except Exception as e:  # noqa: BLE001
         say(f"⚠️  这个模型 / 网关不接受 temperature 参数：{str(e)[:160]}")
         say("   推理模型常见这种情况（有的直接报 400，有的静默忽略）。改用默认参数跑 3 次：")
-        with ThreadPoolExecutor(max_workers=workers(3)) as pool:
-            results = list(pool.map(lambda _: (b.create(messages=messages).choices[0].message.content or "").strip(), range(3)))
+        results = await gather_limited([lambda: ask(None) for _ in range(3)], concurrency(3))
         say(f"   默认参数 × 3：{results}（{len(set(results))} 种不同结果）")
         return
     t0, t1 = results[:3], results[3:]
@@ -280,14 +306,14 @@ def get_weather(city: str) -> str:
     return json.dumps({"city": city, "temp_c": temp, "condition": cond}, ensure_ascii=False)
 
 
-def section_3_function_calling(b: Backend) -> None:
+async def section_3_function_calling(b: Backend) -> None:
     banner("第 3 节  Function calling 的真实机制：模型只会\"提议\"，执行的是你的代码")
     messages: list[dict] = [
         {"role": "system", "content": "你是出行助手。需要天气数据时调用工具，不要编造。回答不超过两句话。"},
         {"role": "user", "content": "北京现在天气怎么样？出门要带伞吗？"},
     ]
     say("① 把消息 + 工具定义（JSON Schema）发给模型，tool_choice=\"auto\"（让模型自己决定调不调）")
-    resp = b.create(messages=messages, tools=[WEATHER_TOOL], tool_choice="auto")
+    resp = await b.create(messages=messages, tools=[WEATHER_TOOL], tool_choice="auto")
     msg = resp.choices[0].message
     say(f"② 模型返回（finish_reason={resp.choices[0].finish_reason!r}），原始 JSON：")
     raw = msg.model_dump(exclude_none=True)
@@ -312,7 +338,7 @@ def section_3_function_calling(b: Backend) -> None:
         result = get_weather(**args)
         say(f"④ 🔧 我们的代码执行 get_weather({args}) → {result}")
         messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-    final = b.create(messages=messages, tools=[WEATHER_TOOL])
+    final = await b.create(messages=messages, tools=[WEATHER_TOOL])
     say(f"⑤ 把结果发回去（第二次请求，{len(messages)} 条消息，完整历史重发），模型据此回答：")
     say(f"   {final.choices[0].message.content}")
     note("整个过程模型调用了 2 次、工具执行了 1 次。每一次都是你的代码在做决定：执不执行、怎么执行、结果要不要给它看。")
@@ -340,7 +366,8 @@ TICKET_TOOL = {
 
 def merge_tool_call_deltas(chunks: list[dict]) -> list[dict]:
     """最小版拼接：按 index 分组，id/name 取第一次出现的值，arguments 按顺序拼接。
-    练习 (a) 要你写一个更健壮的版本（交错到达、None 值、缺 id 报错……）。"""
+    练习 (a) 要你写一个更健壮的版本（交错到达、None 值、缺 id 报错……）；
+    agentkit 里的生产版是 agentkit.llm.ToolCallAccumulator（OpenAICompatLLM.stream() 在用）。"""
     calls: dict[int, dict] = {}
     for chunk in chunks:
         for tc in ((chunk.get("choices") or [{}])[0].get("delta") or {}).get("tool_calls") or []:
@@ -352,22 +379,23 @@ def merge_tool_call_deltas(chunks: list[dict]) -> list[dict]:
     return [calls[i] for i in sorted(calls)]
 
 
-def open_stream(b: Backend, **kwargs):
-    """优先带 stream_options.include_usage（让最后一个 chunk 带上 usage）；网关不认这个参数就去掉重试。"""
+async def open_stream(b: Backend, **kwargs):
+    """优先带 stream_options.include_usage（让最后一个 chunk 带上 usage）；网关不认这个参数就去掉重试。
+    返回一个 async 迭代器：用 `async for chunk in stream` 逐片读取，每读一片都可能要等网络。"""
     try:
-        return b.create(stream=True, stream_options={"include_usage": True}, **kwargs)
+        return await b.create(stream=True, stream_options={"include_usage": True}, **kwargs)
     except Exception as e:  # noqa: BLE001
         say(f"   （网关不支持 stream_options：{str(e)[:80]}，改为不带它重试）")
-        return b.create(stream=True, **kwargs)
+        return await b.create(stream=True, **kwargs)
 
 
-def section_4_streaming(b: Backend) -> None:
+async def section_4_streaming(b: Backend) -> None:
     banner("第 4 节  流式输出：TTFT，以及\"工具调用参数是一片一片到达的\"")
     say("4a. 文本流：边生成边显示")
     start = time.perf_counter()
     ttft, n_chunks, usage = None, 0, None
     print("    ", end="")
-    for chunk in open_stream(b, messages=[{"role": "user", "content": "用三句话介绍杭州，每句不超过 25 个字。"}]):
+    async for chunk in await open_stream(b, messages=[{"role": "user", "content": "用三句话介绍杭州，每句不超过 25 个字。"}]):
         n_chunks += 1
         if chunk.usage:
             usage = chunk.usage
@@ -386,7 +414,7 @@ def section_4_streaming(b: Backend) -> None:
 
     say()
     say("4b. 单个工具调用的流：模型一边\"写\"参数，参数一边一片一片地到达")
-    chunks = stream_tool_calls(b, VPN_REQUEST, [TICKET_TOOL])
+    chunks = await stream_tool_calls(b, VPN_REQUEST, [TICKET_TOOL])
     if not chunks:
         return
     first_fragment = next(
@@ -403,7 +431,7 @@ def section_4_streaming(b: Backend) -> None:
 
     say()
     say("4c. 并行工具调用的流：两个调用靠 index 区分")
-    chunks = stream_tool_calls(b, VPN_REQUEST + "顺便查一下杭州天气。", [TICKET_TOOL, WEATHER_TOOL])
+    chunks = await stream_tool_calls(b, VPN_REQUEST + "顺便查一下杭州天气。", [TICKET_TOOL, WEATHER_TOOL])
     if chunks:
         show_merged(chunks)
     note("id 和 name 只在每个调用的第一片出现；多个调用靠 index 区分。分几片、怎么切，由服务端决定，")
@@ -413,12 +441,12 @@ def section_4_streaming(b: Backend) -> None:
 VPN_REQUEST = "我的笔记本连不上公司 VPN，报错 809，下午要给客户演示，很急。帮我建个工单。"
 
 
-def stream_tool_calls(b: Backend, user_text: str, tools: list[dict]) -> list[dict]:
+async def stream_tool_calls(b: Backend, user_text: str, tools: list[dict]) -> list[dict]:
     """发起一次流式请求，边收边打印工具调用分片，返回全部 chunk（转成 dict，和练习 (a) 的输入格式一致）。"""
     start = time.perf_counter()
     chunks: list[dict] = []
     shown: dict[int, int] = {}
-    for chunk in open_stream(b, messages=[{"role": "user", "content": user_text}], tools=tools):
+    async for chunk in await open_stream(b, messages=[{"role": "user", "content": user_text}], tools=tools):
         chunks.append(chunk.model_dump())
         for tc in (chunk.choices[0].delta.tool_calls or []) if chunk.choices else []:
             shown[tc.index] = shown.get(tc.index, 0) + 1
@@ -479,18 +507,18 @@ class RecordingLLM:
     def __init__(self, inner):
         self.inner, self.model, self.outputs = inner, getattr(inner, "model", "?"), []
 
-    def chat(self, messages, tools=None, **kwargs):
-        r = self.inner.chat(messages, tools, **kwargs)
+    async def chat(self, messages, tools=None, **kwargs):
+        r = await self.inner.chat(messages, tools, **kwargs)
         self.outputs.append(r.content or "")
         return r
 
 
-def section_5_structured_output(b: Backend) -> None:
+async def section_5_structured_output(b: Backend) -> None:
     banner("第 5 节  结构化输出：让下游代码拿到\"可靠的数据结构\"，而不是一段话")
     prompt = f"对下面这封 IT 求助邮件做分类，输出 JSON。\n\n邮件：{EMAIL}"
     say("5a. 原生结构化输出：response_format = json_schema（strict），由服务端约束解码")
     try:
-        r = b.create(messages=[{"role": "user", "content": prompt}], response_format={"type": "json_schema", "json_schema": TRIAGE_SCHEMA})
+        r = await b.create(messages=[{"role": "user", "content": prompt}], response_format={"type": "json_schema", "json_schema": TRIAGE_SCHEMA})
         content = r.choices[0].message.content or ""
         say(f"   原始输出：{content}")
         say(f"   Pydantic 校验：{TicketTriage.model_validate_json(content)!r}")
@@ -502,7 +530,7 @@ def section_5_structured_output(b: Backend) -> None:
     say()
     say("5b. agentkit.workflows.complete_json：提示词 + Pydantic 校验 + 失败时把错误发回去修复（最多 2 次）")
     rec = RecordingLLM(b.llm)
-    result = complete_json(rec, prompt, TicketTriage)
+    result = await complete_json(rec, prompt, TicketTriage)
     for i, out in enumerate(rec.outputs, 1):
         flat = out.replace("\n", " ")
         verdict = "✅ 通过校验" if i == len(rec.outputs) else "❌ 校验失败，错误信息被发回给模型"
@@ -522,7 +550,7 @@ CLASSIFY_PROMPT = f"把下面这条 IT 求助分类，只输出一个英文单�
 CONFIDENCE_THRESHOLD = 0.9  # 低于它就转人工复核。阈值要用标注数据校准，这里只是演示
 
 
-def section_6_decoding(b: Backend) -> None:
+async def section_6_decoding(b: Backend) -> None:
     banner("第 6 节  约束解码与 logprobs：\"只许说合法的话\"，以及\"它有多确定\"")
     say("6a. 约束解码的原理（纯本地计算，数字是为了演示编的；把每个候选值当成一个 token 是简化）")
     say("   模型要给工单填 priority，Schema 只允许 P1 / P2 / P3 / P4。假设第一步的候选打分如下：")
@@ -547,7 +575,7 @@ def section_6_decoding(b: Backend) -> None:
     say("6b. 请求 logprobs：让模型给出每个输出 token 的对数概率，当作分类的置信度")
     messages = [{"role": "user", "content": CLASSIFY_PROMPT}]
     try:
-        r = b.create(messages=messages, logprobs=True, top_logprobs=5)
+        r = await b.create(messages=messages, logprobs=True, top_logprobs=5)
     except Exception as e:  # noqa: BLE001 —— 有的网关 / 推理模型直接拒绝这个参数
         say(f"   ⚠️  这个模型 / 网关拒绝了 logprobs 参数：{str(e)[:140]}")
         show_logprob_fallback()
@@ -589,7 +617,7 @@ def show_logprob_fallback() -> None:
 
 
 class FakeOpenAIClient:
-    """假装自己是 openai.OpenAI：chat.completions.create(**kwargs) 返回真正的 SDK 对象，所以上面的代码一个字都不用改。
+    """假装自己是 openai.AsyncOpenAI：await chat.completions.create(**kwargs) 返回真正的 SDK 对象，所以上面的代码一个字都不用改。
 
     responder(kwargs) 返回：dict（非流式 ChatCompletion 的 message/usage 描述）或 list[dict]（流式 chunk 描述）。
     """
@@ -600,7 +628,7 @@ class FakeOpenAIClient:
         self._responder = responder
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
-    def _create(self, **kwargs):
+    async def _create(self, **kwargs):
         from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
         spec = self._responder(kwargs)
@@ -619,9 +647,9 @@ class FakeOpenAIClient:
         })
 
     @staticmethod
-    def _stream(chunks: list[dict], cls):
+    async def _stream(chunks: list[dict], cls):
         for delay, delta, finish in chunks:
-            time.sleep(delay)
+            await asyncio.sleep(delay)  # 模拟网络分片到达的间隔（等待时让出事件循环）
             chunk = {"id": "chatcmpl-offline", "object": "chat.completion.chunk", "created": 0, "model": "offline"}
             if delta is None:  # include_usage 的最后一个 chunk：choices 为空，只带 usage
                 prompt, completion = finish
@@ -716,13 +744,16 @@ def offline_backend() -> Backend:
 # ════════════════════════════════════════════════════════════════════ main
 
 
-def main() -> None:
+async def main() -> None:
     b = offline_backend() if OFFLINE else online_backend()
     mode = "离线模式：剧本 + 模拟数据（数字取自一次真实运行记录）" if OFFLINE else f"真实模型：{b.model}"
     print(f"第 01 课 Demo · LLM 与 Agent 开发必备知识 · {mode}")
-    for section in (section_1_tokens, section_2_sampling, section_3_function_calling, section_4_streaming,
-                    section_5_structured_output, section_6_decoding):
-        run_section(lambda: section(b))
+    try:
+        for section in (section_1_tokens, section_2_sampling, section_3_function_calling, section_4_streaming,
+                        section_5_structured_output, section_6_decoding):
+            await run_section(lambda: section(b))
+    finally:
+        await b.aclose()  # 关掉 HTTP 连接池（脚本退出前释放连接，避免 "Unclosed client" 警告）
     banner("小结")
     say("1. Token：按 token 计费和限流；估算只用于预算，算钱看 usage；工具定义和隐藏指令都算输入。")
     say("2. 采样：同一输入可能不同输出，temperature=0 也不例外 → 测试用剧本，评估看通过率。")
@@ -733,4 +764,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

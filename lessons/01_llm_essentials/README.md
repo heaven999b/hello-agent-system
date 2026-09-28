@@ -293,18 +293,18 @@ OpenAI 的文档原话是：两者都保证输出合法 JSON，[只有 Structure
 **为什么要用流式。** 模型是一个 token 一个 token 生成的。不开流式，要等全部生成完才返回；开了流式，生成一点就推一点（通常用 SSE，server-sent events）。Demo 第 4 节实测：
 
 ```text
-TTFT（首 token 时间）= 1.74s，全部完成 = 2.84s，共 34 个 chunk
+TTFT（首 token 时间）= 1.58s，全部完成 = 2.31s，共 31 个 chunk
 ```
 
-**TTFT**（Time To First Token）是从发出请求到收到第一个 token 的时间。流式**不会让总耗时变短**，但能让用户在不到 2 秒时就看到内容，而不是盯着空白屏幕等将近 3 秒。回答越长，差别越大。对 Agent 来说还有两个好处：可以把"正在查询工单系统…"这样的中间状态实时推给用户；用户可以中途打断（不过已经生成的 token 通常照样计费）。
+**TTFT**（Time To First Token）是从发出请求到收到第一个 token 的时间。流式**不会让总耗时变短**，但能让用户在 1.6 秒时就看到内容，而不是盯着空白屏幕等 2.3 秒。回答越长，差别越大。对 Agent 来说还有两个好处：可以把"正在查询工单系统…"这样的中间状态实时推给用户；用户可以中途打断（不过已经生成的 token 通常照样计费）。
 
 **经典坑：流式工具调用的参数是分片到达的。** 文本分片到达，大家都知道要拼起来。但工具调用也一样，而且更隐蔽。Demo 4b 的真实输出：
 
 ```text
-+1.95s index=0 id=call_PhR4DZOrO… name=create_ticket  arguments 片段=''
-+1.95s index=0 （无 id、无 name）                     arguments 片段='{"'
-+1.97s index=0 （无 id、无 name）                     arguments 片段='title'
-+1.97s index=0 （无 id、无 name）                     arguments 片段='":"'
++2.35s index=0 id=call_kJksQxgDU… name=create_ticket  arguments 片段=''
++2.35s index=0 （无 id、无 name）                     arguments 片段='{"'
++2.35s index=0 （无 id、无 name）                     arguments 片段='title'
++2.37s index=0 （无 id、无 name）                     arguments 片段='":"'
 ……
 index=0 的参数分了 59 片到达
 ❌ 经典错误：拿到第一片就 json.loads('{"') → JSONDecodeError: Unterminated string starting at
@@ -318,7 +318,7 @@ index=0 的参数分了 59 片到达
 
 还有一个值得记住的实测现象：同一个网关，**单个**工具调用时参数被切成 59 片；Demo 4c **并行**两个调用时，每个调用的参数却是一次性给出的。分几片、怎么切，由服务端决定，你的代码不能做任何假设。
 
-不同接口的名字不一样，原理完全相同：OpenAI Responses API 用 `response.function_call_arguments.delta` 事件和 `output_index`；Anthropic 用 `input_json_delta` 事件里的 `partial_json`，官方文档同样要求[攒齐再解析](https://platform.claude.com/docs/en/build-with-claude/streaming)。练习 (a) 就是实现这个拼接函数。
+不同接口的名字不一样，原理完全相同：OpenAI Responses API 用 `response.function_call_arguments.delta` 事件和 `output_index`；Anthropic 用 `input_json_delta` 事件里的 `partial_json`，官方文档同样要求[攒齐再解析](https://platform.claude.com/docs/en/build-with-claude/streaming)。练习 (a) 就是实现这个拼接函数；agentkit 里的生产版是 [`agentkit.llm.ToolCallAccumulator`](../../agentkit/llm.py)，`OpenAICompatLLM.stream()` 用它拼出完整的工具调用。
 
 **流式的其他坑：**
 
@@ -498,53 +498,75 @@ agentkit 的 [`OpenAICompatLLM`](../../agentkit/llm.py) 把错误统一包装成
 
 | 知识点 | agentkit 的做法 | 为什么这么写 |
 |---|---|---|
-| 厂商各不相同（1.11） | 业务代码只依赖 `LLM.chat(messages, tools) -> LLMResponse` 这一个接口 | 换模型、换厂商、接网关，业务代码不用改；测试时换成 `ScriptedLLM` |
+| 厂商各不相同（1.11） | 业务代码只依赖 `await llm.chat(messages, tools) -> LLMResponse` 这一个接口 | 换模型、换厂商、接网关，业务代码不用改；测试时换成 `ScriptedLLM` |
+| 一次调用要等好几秒（1.6） | `chat` 是 `async def`：`OpenAICompatLLM` 基于 `openai.AsyncOpenAI`，带连接池上限 `max_connections` | 等模型时让出事件循环，一个进程同时服务很多会话（[第 02 课](../02_agent_loop/README.md) 1.7 节）；连接池上限就是本进程对网关的最大并发 |
+| 流式 + 分片的工具参数（1.6） | `OpenAICompatLLM.stream()` 逐段产出 `TextDelta`，最后产出带完整 `LLMResponse` 的 `StreamDone`；工具参数用 `ToolCallAccumulator` 按 `index` 拼接 | 练习 (a) 的生产版；默认带 `include_usage`，流式时也能算钱 |
 | 参数 JSON 可能不合法（1.4） | `ToolCall.arguments` 刻意定义成 `str`，而不是 `dict` | 强迫你在工具层解析和校验，而不是假设它一定合法 |
 | 三种计价（1.1） | `Usage` 有 `cached_input_tokens`；`PRICES` 可以填第三个"缓存价" | 缓存命中率是 Agent 成本的关键变量，必须能看到 |
 | 估算 vs 真实（1.1） | `estimate_tokens` 只用于上下文预算，成本以 `usage` 为准 | 零依赖、偏保守；精确计数需要模型对应的 tokenizer |
 | 非确定性（1.3） | `ScriptedLLM` 按剧本返回，记录每一次调用 | 单元测试零成本、100% 可复现 |
 | 结构化输出（1.5） | `complete_json`：Schema 进提示词 → 抠 JSON → Pydantic 校验 → 修复 | 不依赖原生能力的通用兜底 |
-| 错误分类（1.12） | `LLMError(retryable=...)`，SDK 自带重试设为 `max_retries=0` | 重试放到自己看得见、管得住的 `ResilientLLM` 里（第 08 课） |
+| 错误分类（1.12） | `LLMError(retryable=..., retry_after=...)`，SDK 自带重试设为 `max_retries=0` | 重试放到自己看得见、管得住的 `ResilientLLM` 里（第 08 课） |
 
-以错误分类为例，这是 [`agentkit/llm.py`](../../agentkit/llm.py) 里的真实代码：
+以错误分类为例，这是 [`agentkit/llm.py`](../../agentkit/llm.py) 里的真实代码（`OpenAICompatLLM.chat` 和它调用的 `map_openai_error`）：
 
 ```python
-try:
-    resp = self._client.chat.completions.create(**params)
-except self._openai.APIStatusError as e:
-    code = e.status_code
-    # 429 限流、408 超时、5xx 服务端错误：重试可能成功；400/401/403/404：重试没用
-    raise LLMError(str(e), status_code=code, retryable=code in (408, 409, 429) or code >= 500) from e
-except self._openai.APIConnectionError as e:  # 包含超时
-    raise LLMError(f"连接模型失败：{e}", retryable=True) from e
+async def chat(self, messages, tools=None, **kwargs) -> LLMResponse:
+    try:
+        resp = await self._client.chat.completions.create(**self._params(messages, tools, kwargs))
+    except (self._openai.APIStatusError, self._openai.APIConnectionError) as e:
+        raise map_openai_error(e, self._openai) from e
+    return response_from_openai(resp, self.model)
+
+
+def map_openai_error(e, openai_module) -> LLMError:
+    if isinstance(e, openai_module.APIStatusError):
+        code = e.status_code
+        # 429 限流、408 超时、5xx 服务端错误：重试可能成功；400/401/403/404：重试没用。
+        # 但 429 有两种：限流（等一等就好）和额度用完（insufficient_quota，重试一万次也没用）。
+        retryable = code in (408, 409, 429) or code >= 500
+        if code == 429 and "insufficient_quota" in str(e):
+            retryable = False
+        retry_after = None
+        try:
+            retry_after = float(e.response.headers.get("retry-after"))
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return LLMError(str(e), status_code=code, retryable=retryable, retry_after=retry_after)
+    return LLMError(f"连接模型失败：{e}", retryable=True)  # APIConnectionError，包含超时
 ```
 
-再看 usage 是怎么取出缓存命中数的。字段藏在 `prompt_tokens_details` 里，而且有的网关根本不返回，所以每一层都要防 `None`：
+再看 usage 是怎么取出缓存命中数和思考 token 的。字段藏在 `prompt_tokens_details` / `completion_tokens_details` 里，而且有的网关根本不返回，所以每一层都要防 `None`：
 
 ```python
-if resp.usage:
-    details = getattr(resp.usage, "prompt_tokens_details", None)
+def usage_from_openai(raw_usage) -> Usage:
+    if not raw_usage:
+        return Usage()
+    details = getattr(raw_usage, "prompt_tokens_details", None)
     cached = (getattr(details, "cached_tokens", 0) or 0) if details else 0
-    usage = Usage(resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0, cached)
+    out_details = getattr(raw_usage, "completion_tokens_details", None)
+    reasoning = (getattr(out_details, "reasoning_tokens", 0) or 0) if out_details else 0
+    return Usage(raw_usage.prompt_tokens or 0, raw_usage.completion_tokens or 0, cached, reasoning)
 ```
 
 **agentkit 为了教学做了简化、生产系统值得补上的：**
 
-- **不支持流式**：`LLM.chat` 一次返回完整结果。面向用户的产品需要流式接口，以及练习 (a) 那样的分片拼接；
-- **没有记录思考 token**：`usage.completion_tokens_details.reasoning_tokens` 没有进入 `Usage`，用推理模型时看不出钱花在了"想"还是"说"上；
-- **429 不区分限流和额度用完**，也没有读取 `Retry-After`（第 08 课有说明）；
 - **没有精确 token 计数**：发送前的"会不会超窗口"检查只能靠估算。
+
+（这里以前还列着"不支持流式""没有记录思考 token""429 不区分限流和额度用完、不读 `Retry-After`"三条，现在都已经在核心里实现了，见上面的表和代码。）
 
 ## 3. 动手：运行 Demo
 
 ```bash
-.venv/bin/python lessons/01_llm_essentials/demo.py            # 真实模型（约 19 次调用，1 分钟左右）
+.venv/bin/python lessons/01_llm_essentials/demo.py            # 真实模型（约 19 次调用；互不依赖的请求同时发出，实测约 30 秒）
 .venv/bin/python lessons/01_llm_essentials/demo.py --offline  # 离线：剧本 + 模拟数据，无需 API key
 ```
 
 Demo 分 6 节，每节验证本课的一个知识点。两种模式走的是**同一套代码**：离线模式只是把 OpenAI 客户端换成了一个按剧本返回的假客户端（`FakeOpenAIClient`），这本身也说明了"业务代码只依赖接口"的好处。
 
-真实模型的输出节选：
+Demo 的代码是 async 的（`openai.AsyncOpenAI`，`await` 每一次请求）：第 1、2 节里互不依赖的请求用 `asyncio.gather` 同时发出，`asyncio.Semaphore` 限制同时在途的数量。现在只要知道 `await` 是"等这个请求回来"、`gather` 是"这几个一起等"就够了，原理在[第 02 课](../02_agent_loop/README.md) 1.7 节从零讲。
+
+真实模型的输出节选（2026-09-28 用 async 版 demo 重跑，模型 gpt-5.5，经本课程的 OpenAI 兼容网关；token 数和之前同步版的运行完全一致，耗时、采样结果每次都会不同）：
 
 ```text
 第 1 节  Token 与成本：估算值 vs 真实 usage，以及"看不见的"输入
@@ -556,8 +578,8 @@ Demo 分 6 节，每节验证本课的一个知识点。两种模式走的是**�
   💡 只是多带了 2 个工具定义，输入就多了 118 token —— 工具定义每次请求都要发、都要付钱。
 
 第 2 节  采样与非确定性：temperature 到底改变了什么
-     temperature=0 × 3：['一楼咖啡', '楼下咖啡', '一楼咖啡馆']  → 3 种不同结果
-     temperature=1 × 3：['楼下咖啡', '楼下有啡', '楼下咖啡']  → 2 种不同结果
+     temperature=0 × 3：['一楼咖啡', '楼下咖啡', '楼下有咖啡']  → 3 种不同结果
+     temperature=1 × 3：['楼下咖啡', '楼下咖啡', '楼下咖啡']  → 1 种不同结果
   💡 temperature=0 也给出了不同结果 —— 这正是本节的重点：0 不等于确定。
 
 第 3 节  Function calling 的真实机制：模型只会"提议"，执行的是你的代码
@@ -565,19 +587,19 @@ Demo 分 6 节，每节验证本课的一个知识点。两种模式走的是**�
      注意 arguments 的类型是 str：一段 JSON 文本，要你自己解析和校验。
   ④ 🔧 我们的代码执行 get_weather({'city': '北京'}) → {"city": "北京", "temp_c": 22, "condition": "晴"}
   ⑤ 把结果发回去（第二次请求，4 条消息，完整历史重发），模型据此回答：
-     北京现在22℃，天气晴。出门一般不用带伞，注意防晒即可。
+     北京现在22℃，天气晴。出门一般不需要带伞，注意防晒即可。
 
 第 4 节  流式输出：TTFT，以及"工具调用参数是一片一片到达的"
-     TTFT（首 token 时间）= 1.74s，全部完成 = 2.84s，共 34 个 chunk
+     TTFT（首 token 时间）= 1.58s，全部完成 = 2.31s，共 31 个 chunk
   4b. index=0 的参数分了 59 片到达
      ❌ 经典错误：拿到第一片就 json.loads('{"') → JSONDecodeError: Unterminated string starting at
   4c. index=0 的参数分了 2 片到达，index=1 的参数分了 2 片到达
-        create_ticket({"title": "VPN报错809无法连接", ...})  ← id=call_1sOaGEzBiJZfPALN4eYe0R8n
-        get_weather({"city": "杭州"})  ← id=call_RGt2eERE7JoJlumFCquV7jtz
+        create_ticket({"title": "VPN报错809无法连接", ...})  ← id=call_4XIEunlxSGmYBLhiO7Mlsk2X
+        get_weather({"city": "杭州"})  ← id=call_TTHtLSlo3Wmh9vYjFbmHs0YW
 
 第 5 节  结构化输出：让下游代码拿到"可靠的数据结构"，而不是一段话
-  5a. 原始输出：{"category":"account","priority":"P2","summary":"OA登录提示密码错误","needs_human":true}
-  5b. 第 1 次输出：{"category":"account","priority":"P1",...}  ✅ 通过校验
+  5a. 原始输出：{"category":"account","priority":"P2","summary":"OA登录密码错误需处理","needs_human":true}
+  5b. 第 1 次输出：{"category":"account","priority":"P2",...}  ✅ 通过校验
 
 第 6 节  约束解码与 logprobs："只许说合法的话"，以及"它有多确定"
   6a. 不加约束，贪心选最高分：'紧急' → 不在枚举里，校验失败
@@ -592,7 +614,7 @@ Demo 分 6 节，每节验证本课的一个知识点。两种模式走的是**�
 2. **第 2 节多跑几次**：`temperature=0` 的结果时而一致、时而不一致。这就是为什么测试不能断言精确输出。
 3. **第 3 节的"执行了 0 次"**：模型返回的只是一个 `str` 类型的 JSON 提议。
 4. **第 4 节 4b 和 4c 的分片数对比**：同一个网关，单个调用切成 59 片，并行调用每个只有 2 片。拼接代码必须对这两种情况都成立。
-5. **第 5 节 5a 和 5b 的结果不一样**（`P2` 和 `P1`）：同一封邮件分了两次，优先级不同。结构化输出保证的是**格式**，不是**判断的一致性**。这又回到了第 2 节。
+5. **第 5 节 5a 和 5b 是两次独立的分类**：这次运行两次都给了 `P2`；之前的一次运行里，5a 给了 `P2`、5b 给了 `P1` —— 同一封邮件，优先级不同。结构化输出保证的是**格式**，不是**判断的一致性**。这又回到了第 2 节。
 6. **第 6 节**：6a 用 5 个编造的候选演示约束解码怎样把"想说的"挤成"合法的"；6b 在真实网关上拿不到 logprobs，Demo 打印了降级方案。离线模式模拟了一个支持 logprobs 的接口：`account` 的概率是 88.7%，低于 90% 的阈值，于是转人工复核（离线数值是示意用的）。
 
 ## 4. 练习
@@ -607,7 +629,8 @@ Demo 分 6 节，每节验证本课的一个知识点。两种模式走的是**�
 
 - 每个函数的 docstring 里都写了完整的规则，测试就是按这些规则写的；
 - 先跑一遍 `demo.py`，第 4 节会把真实的流式分片一片一片打印出来，`chunk.model_dump()` 的结果就是练习 (a) 的输入格式；
-- (c) 的关键洞察：**按轮切分**以后，`assistant(tool_calls)` 和它的 tool 结果天然落在同一轮里，截断永远不会拆开它们。
+- (c) 的关键洞察：**按轮切分**以后，`assistant(tool_calls)` 和它的 tool 结果天然落在同一轮里，截断永远不会拆开它们；
+- 写完 (a) 之后，对照一下生产版 [`agentkit.llm.ToolCallAccumulator`](../../agentkit/llm.py)：它直接吃 SDK 的分片对象（不是 dict），而且缺 `id` 时会补一个本地生成的 id、而不是报错。报错还是兜底，是一个取舍：练习选了"大声失败"，生产版选了"能继续就继续"（补出来的 id 只在本地配对用）。
 
 验证：
 

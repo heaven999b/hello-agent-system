@@ -6,18 +6,24 @@
 依次演示：
   1. route                客服分流：先分类，再交给专门的处理器
   2. parallel + 投票       三个视角并行评审一段代码，再汇总决定
+     附：并发上限和"一个失败、其余取消"量给你看；共享计数器什么时候不需要锁、什么时候会丢更新
   3. orchestrator_workers 编排者动态拆解任务 → 执行者并行 → 汇总
   4. evaluator_optimizer  生成 slogan → 评审（代码检查 + 模型检查）→ 按意见修改
   5. agent_as_tool        主管 Agent 把子问题委派给两个专家 Agent
-每个模式结束时打印：耗时、模型调用次数、token 用量。最后给出对比表。
+     附：主管被取消，正在跑的专家跟着停
+每个模式结束时打印：耗时、模型调用次数、同时在途的模型调用峰值、token 用量。最后给出对比表。
+
+全部是 async：所有模型调用都在同一个事件循环里 await，parallel 用 asyncio 真并发，不开线程。
+离线模式下 ScriptedLLM 每次调用等 0.2 秒（asyncio.sleep），这样并行和串行的耗时差别也看得见。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import math
 import sys
-import threading
 import time
 import unicodedata
 from contextlib import contextmanager
@@ -25,7 +31,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
-from agentkit import Agent, ScriptedLLM, ToolContext, ToolError, Usage, call_tool, default_llm, reply, tool
+from agentkit import Agent, Hook, ScriptedLLM, ToolContext, ToolError, Usage, call_tool, default_llm, reply, tool
 from agentkit.tracing import Tracer, render_tree
 from agentkit.workflows import (
     Review,
@@ -43,10 +49,19 @@ from agentkit.workflows import (
 
 
 class Meter:
+    """全局计量器：调用次数、token、同时在途的调用数。
+
+    没有锁。所有模型调用都在同一个事件循环（同一个线程）里，事件循环只在 await 处切换协程；
+    下面 Metered.chat 里每一段"读-改-写"（+= 1、usage 相加、max）中间都没有 await，
+    所以不会有别的协程插进来 —— 这几行在事件循环眼里是原子的。
+    反过来，只要读和写之间夹了一个 await，就会丢更新（见 demo_shared_counter）。
+    """
+
     def __init__(self):
         self.calls = 0
         self.usage = Usage()
-        self.lock = threading.Lock()  # parallel 会在多个线程里同时调用模型
+        self.in_flight = 0
+        self.max_in_flight = 0
 
 
 class Metered:
@@ -55,27 +70,34 @@ class Metered:
     def __init__(self, llm, meter: Meter):
         self.llm, self.meter, self.model = llm, meter, llm.model
 
-    def chat(self, messages, tools=None, **kwargs):
-        response = self.llm.chat(messages, tools, **kwargs)
-        with self.meter.lock:
-            self.meter.calls += 1
-            self.meter.usage = self.meter.usage + response.usage
+    async def chat(self, messages, tools=None, **kwargs):
+        m = self.meter
+        m.in_flight += 1  # ↓ 这两行之间没有 await
+        m.max_in_flight = max(m.max_in_flight, m.in_flight)
+        try:
+            response = await self.llm.chat(messages, tools, **kwargs)  # 唯一的 await：在这里等模型时，别的协程可以运行
+        finally:
+            m.in_flight -= 1
+        m.calls += 1  # ↓ 同样没有 await：这三行不会被打断
+        m.usage = m.usage + response.usage
         return response
 
 
 METER = Meter()
-SUMMARY: list[tuple[str, float, int, int, str]] = []
+SUMMARY: list[tuple[str, float, int, int, int, str]] = []
+OFFLINE_LATENCY = 0.2  # 离线模式下 ScriptedLLM 每次调用的模拟耗时（秒）
 
 
 @contextmanager
 def measure(name: str, who_decides: str):
-    calls0, tokens0, cached0, t0 = METER.calls, METER.usage.total, METER.usage.cached_input_tokens, time.time()
+    calls0, tokens0, cached0, t0 = METER.calls, METER.usage.total, METER.usage.cached_input_tokens, time.perf_counter()
+    METER.max_in_flight = 0  # 各模式依次执行，所以每个模式开始时清零即可
     yield
-    elapsed, calls, tokens = time.time() - t0, METER.calls - calls0, METER.usage.total - tokens0
+    elapsed, calls, tokens = time.perf_counter() - t0, METER.calls - calls0, METER.usage.total - tokens0
     cached = METER.usage.cached_input_tokens - cached0
     cache_note = f"（其中 {cached} 个输入 token 命中提示词缓存）" if cached else ""
-    print(f"\n  ⏱ 耗时 {elapsed:.1f}s ｜ 模型调用 {calls} 次 ｜ tokens {tokens}{cache_note}")
-    SUMMARY.append((name, elapsed, calls, tokens, who_decides))
+    print(f"\n  ⏱ 耗时 {elapsed:.1f}s ｜ 模型调用 {calls} 次（同时在途峰值 {METER.max_in_flight}）｜ tokens {tokens}{cache_note}")
+    SUMMARY.append((name, elapsed, calls, METER.max_in_flight, tokens, who_decides))
 
 
 def section(title: str) -> None:
@@ -127,12 +149,12 @@ def offline_route(messages):
     return reply(json.dumps({"route": label, "reason": "（离线剧本）按关键词判断"}, ensure_ascii=False))
 
 
-def demo_route(llm) -> None:
+async def demo_route(llm) -> None:
     section("模式 1：route 路由 —— 客服工单分流")
     note("先用一次便宜的分类调用决定\"交给谁\"，每个处理器有自己专门的提示词和工具。流程由代码决定。")
     with measure("route 路由", "代码（模型只做分类）"):
-        for ticket in TICKETS:
-            label = route(llm, ticket, ROUTES)
+        for ticket in TICKETS:  # 三张工单代表三个独立的请求，这里依次处理
+            label = await route(llm, ticket, ROUTES)
             print(f"\n  📨 {ticket}\n     → 类别 {label!r} → {HANDLERS[label]}")
     note(
         """route() 内部用 complete_json + Literal 枚举：返回值保证是 ROUTES 的某个 key，下游 HANDLERS[label] 绝不会 KeyError。
@@ -169,26 +191,26 @@ def offline_reviewer(messages):
     return reply(json.dumps(v, ensure_ascii=False))
 
 
-def demo_parallel(llm) -> None:
+async def demo_parallel(llm) -> None:
     section("模式 2：parallel 并行 + 投票 —— 三个视角同时评审一段代码")
     print("  待评审的改动：")
     show_block(CODE_CHANGE, indent="    ┃ ")
     durations: dict[str, float] = {}
 
     def reviewer(name: str, focus: str):
-        def run() -> Verdict:
-            t0 = time.time()
+        async def run() -> Verdict:  # parallel 要的是"调用后返回协程的函数"
+            t0 = time.perf_counter()
             prompt = f"你是代码评审员，{focus}。请评审下面这段 Python 改动，决定能否合并。\n```python\n{CODE_CHANGE}\n```"
-            verdict = complete_json(llm, prompt, Verdict)
-            durations[name] = time.time() - t0
+            verdict = await complete_json(llm, prompt, Verdict)
+            durations[name] = time.perf_counter() - t0
             return verdict
 
         return run
 
     with measure("parallel 并行投票", "代码"):
-        t0 = time.time()
-        verdicts = parallel([reviewer(n, f) for n, f in PERSPECTIVES.items()])
-        wall = time.time() - t0
+        t0 = time.perf_counter()
+        verdicts = await parallel([reviewer(n, f) for n, f in PERSPECTIVES.items()])
+        wall = time.perf_counter() - t0
         print()
         for name, v in zip(PERSPECTIVES, verdicts):
             print(f"  [{pad(name, 6)}] {v.decision:<7} {v.reason}   （{durations[name]:.1f}s）")
@@ -196,7 +218,10 @@ def demo_parallel(llm) -> None:
         majority = majority_vote(decisions)
         security = verdicts[0].decision
         veto = "REJECT" if "REJECT" == security else majority
-        print(f"\n  串行需要约 {sum(durations.values()):.1f}s，并行实际 {wall:.1f}s —— 延迟取决于最慢的那个，而不是总和。")
+        print(
+            f"\n  串行需要约 {sum(durations.values()):.1f}s，并行实际 {wall:.1f}s，同时在途的模型调用峰值 {METER.max_in_flight}"
+            " —— 延迟取决于最慢的那个，而不是总和。"
+        )
         print(f"  少数服从多数（majority_vote）：{majority}")
         print(f"  安全一票否决（业务规则）    ：{veto}")
     if majority == "APPROVE" and veto == "REJECT":
@@ -204,6 +229,113 @@ def demo_parallel(llm) -> None:
     else:
         note("这次多数票和一票否决的结论一致，但别依赖运气：安全、合规类检查应该一票否决，而不是少数服从多数。")
     note("并行的两种用法：分片（sectioning，不同视角/不同数据片）和投票（voting，同一问题问多次取共识）。")
+
+
+# ====================================================================== 2 附：并行的两条承诺，量给你看
+
+
+async def demo_parallel_mechanics() -> None:
+    section("模式 2 附：并行真的发生了吗？一路失败时其余怎么办？（ScriptedLLM 机制演示，不调用真实模型）")
+    note("用延迟可控的 ScriptedLLM（每次调用 0.2s，asyncio.sleep）把 parallel 的承诺量出来。max_in_flight 是 ScriptedLLM 自己数的在途峰值。")
+    lat = 0.2
+    print()
+    for cap in (1, 4, 10):
+        llm = ScriptedLLM(responder=lambda m: reply("APPROVE"), latency=lat)
+        t0 = time.perf_counter()
+        await parallel([lambda i=i: complete(llm, f"评审第 {i} 个文件") for i in range(10)], max_concurrency=cap)
+        wall = time.perf_counter() - t0
+        print(
+            f"  10 次调用，max_concurrency={cap:<2} → 同时在途峰值 {llm.max_in_flight:<2}，用时 {wall:.2f}s"
+            f"（理论值 {math.ceil(10 / cap)} 波 × {lat}s = {math.ceil(10 / cap) * lat:.1f}s）"
+        )
+    note("峰值恰好等于上限：并发是真的，上限也是真的。上限就是背压 —— 一个请求扇出成几十个调用时，别一次全压到模型网关上。")
+
+    events: list[str] = []
+    slow = ScriptedLLM(responder=lambda m: reply("APPROVE"), latency=1.0)
+
+    def reviewer(name: str):
+        async def run() -> str:
+            try:
+                out = await complete(slow, f"从{name}角度评审")
+                events.append(f"{name}：完成")
+                return out
+            except asyncio.CancelledError:
+                events.append(f"{name}：被取消（模型调用中途停下，不会在后台继续跑）")
+                raise
+
+        return run
+
+    async def broken() -> str:
+        await asyncio.sleep(0.1)
+        raise ValueError("可读性评审的提示词模板渲染失败")
+
+    print("\n  三路并行：安全、性能两路的模型调用各要 1.0s；第三路 0.1s 时抛异常。")
+    t0 = time.perf_counter()
+    try:
+        await parallel([reviewer("安全"), reviewer("性能"), broken])
+    except ValueError as e:
+        print(f"  parallel 在 {time.perf_counter() - t0:.2f}s 时把异常抛给调用方：{e}")
+    for ev in events:
+        print(f"    · {ev}")
+    print(f"  此刻模型在途调用 {slow.in_flight} 个；发出过 {slow.call_count} 次调用，一次都没有跑完")
+
+    async def tolerant(fn):
+        try:
+            return await fn()
+        except Exception:  # noqa: BLE001  失败的一路当弃权票；CancelledError 是 BaseException，照常向外传播
+            return None
+
+    ok = ScriptedLLM(responder=lambda m: reply("REJECT"), latency=lat)
+    answers = await parallel([
+        lambda: tolerant(lambda: complete(ok, "安全")),
+        lambda: tolerant(lambda: complete(ok, "性能")),
+        lambda: tolerant(broken),
+    ])
+    print(f"\n  换一种写法：每一路自己兜底，失败 = 弃权票 None → {answers}（另外两路照常完成）")
+    note(
+        """parallel 的默认语义是"一个失败、其余立刻取消"：结果反正拿不全了，就别让其余几路在后台继续花钱。
+        想要"部分失败也能汇总"（投票里失败的一路算弃权），就让每一路自己 try/except Exception —— parallel 看不到异常，也就不会取消别人。
+        弃权票 None 正好交给练习 2 的 vote_with_quorum：它计入总票数、拉低把握程度。"""
+    )
+
+
+async def demo_shared_counter() -> None:
+    section("模式 2 附：计量器为什么不需要锁 —— 以及什么时候会丢更新")
+    note("Meter 被三路并行的评审同时更新，却没有加锁。原因：一个事件循环一次只运行一个协程，只在 await 处切换。")
+    n = 1000
+
+    class Counter:
+        value = 0
+
+    ok, racy, locked = Counter(), Counter(), Counter()
+    lock = asyncio.Lock()
+
+    async def add_ok():
+        await asyncio.sleep(0)  # 先 await（相当于等模型回复）……
+        ok.value += 1  # ……再读-改-写，中间没有 await：别的协程插不进来
+
+    async def add_racy():
+        v = racy.value  # 读
+        await asyncio.sleep(0)  # 读和写之间 await 了一下（比如 await 写一条审计日志、await 查一次 Redis）
+        racy.value = v + 1  # 写：用的是 await 之前读到的旧值，别的协程在这期间的更新被覆盖了
+
+    async def add_locked():
+        async with lock:  # 读和写之间非 await 不可时，用 asyncio.Lock 把整段包起来
+            v = locked.value
+            await asyncio.sleep(0)
+            locked.value = v + 1
+
+    await asyncio.gather(*(add_ok() for _ in range(n)))
+    await asyncio.gather(*(add_racy() for _ in range(n)))
+    await asyncio.gather(*(add_locked() for _ in range(n)))
+    print(f"\n  {n} 个协程各加 1：")
+    print(f"    读-改-写之间没有 await        → {ok.value}")
+    print(f"    读和写之间有一个 await        → {racy.value}（丢了 {n - racy.value} 次更新）❌")
+    print(f"    同样有 await，但用 asyncio.Lock → {locked.value}")
+    note(
+        """所以 Meter 不需要锁：Metered.chat 里每段"读-改-写"之间都没有 await。以前用线程并发时，+= 本身就可能被另一个线程打断，才必须加 threading.Lock。
+        这条规则只在一个事件循环（一个进程）里成立：多个 worker 进程之间共享计数，要靠数据库的原子更新（第 13 课）。"""
+    )
 
 
 # ====================================================================== 3. 编排者-执行者
@@ -230,17 +362,17 @@ def offline_orchestrator(messages):
     return reply("1. 每步记录 trace\n2. 建发票识别评估集\n3. 上线后抽检准确率")
 
 
-def demo_orchestrator(llm) -> None:
+async def demo_orchestrator(llm) -> None:
     section("模式 3：orchestrator_workers 编排者-执行者 —— 动态拆解任务")
     print(f"  任务：{ORCH_TASK}")
     received: list[str] = []
 
-    def worker(subtask: str) -> str:
+    async def worker(subtask: str) -> str:  # 执行者是 async 函数：orchestrator_workers 用 parallel 同时跑它们
         received.append(subtask)
-        return complete(llm, f"{subtask}\n\n要求：只给 3 条要点，每条不超过 30 字。", system="你是企业 AI 平台的资深工程师，回答务实、具体。")
+        return await complete(llm, f"{subtask}\n\n要求：只给 3 条要点，每条不超过 30 字。", system="你是企业 AI 平台的资深工程师，回答务实、具体。")
 
     with measure("orchestrator_workers", "模型（拆解）+ 代码（执行）"):
-        final = orchestrator_workers(llm, ORCH_TASK, worker, max_subtasks=3)
+        final = await orchestrator_workers(llm, ORCH_TASK, worker, max_subtasks=3)
         print("\n  编排者拆出的子任务（每个交给一个执行者并行处理）：")
         for s in received:
             print(f"    • {s}")
@@ -274,29 +406,29 @@ def offline_copywriter(messages):
     return reply("告别每天充电的焦虑，T1 一次充电陪你整整 30 天，心率血氧睡眠全都懂")
 
 
-def demo_evaluator(llm) -> None:
+async def demo_evaluator(llm) -> None:
     section("模式 4：evaluator_optimizer 评估-优化 —— 写一句产品 slogan")
     print(f"  产品：{PRODUCT}")
     print(f"  验收标准（在评审器里）：不超过 {MAX_CHARS} 字，且体现核心卖点「{SELLING_POINT}」")
     note("生成器只拿到产品介绍（模拟\"需求没写全\"的真实情况），看评审器如何把它拉回来。")
     checked_by: list[str] = []
 
-    def generate(task: str, feedback: str | None) -> str:
+    async def generate(task: str, feedback: str | None) -> str:
         prompt = f"为下面的产品写一句中文广告 slogan，只输出 slogan 本身。\n产品：{task}"
         if feedback:
             prompt += f"\n\n上一版评审意见：{feedback}\n请按意见重写。"
-        return complete(llm, prompt).strip().strip("\"'“”「」")
+        return (await complete(llm, prompt)).strip().strip("\"'“”「」")
 
-    def evaluate(candidate: str) -> Review:
+    async def evaluate(candidate: str) -> Review:
         n = count_chars(candidate)
         if n > MAX_CHARS:  # 能用代码判断的，就不要花钱问模型：确定、免费、不会被说服
             checked_by.append(f"代码检查（{n} 字）")
             return Review(passed=False, feedback=f"当前 {n} 字，超过 {MAX_CHARS} 字上限。请压缩到 {MAX_CHARS} 字以内，并保留核心卖点「{SELLING_POINT}」。")
         checked_by.append(f"模型检查（{n} 字）")
-        return complete_json(llm, f"你是广告评审。判断这句 slogan 是否清楚体现了核心卖点「{SELLING_POINT}」。没体现就给出具体修改意见。\nslogan：{candidate}", Review)
+        return await complete_json(llm, f"你是广告评审。判断这句 slogan 是否清楚体现了核心卖点「{SELLING_POINT}」。没体现就给出具体修改意见。\nslogan：{candidate}", Review)
 
     with measure("evaluator_optimizer", "代码（循环）+ 模型（生成/评审）"):
-        final, reviews = evaluator_optimizer(generate, evaluate, PRODUCT, max_rounds=3)
+        final, reviews = await evaluator_optimizer(generate, evaluate, PRODUCT, max_rounds=3)
         # evaluator_optimizer 只返回最终稿；为了展示过程，我们从评审记录里还原每一轮
         for i, (review, who) in enumerate(zip(reviews, checked_by), 1):
             status = "✅ 通过" if review.passed else f"❌ 退回：{review.feedback}"
@@ -396,12 +528,12 @@ def offline_multi_agent_scripts() -> dict[str, list]:
     }
 
 
-def demo_multi_agent(make_llm) -> None:
+async def demo_multi_agent(make_llm) -> None:
     section("模式 5：agent_as_tool 多 Agent —— 主管 + 订单专家 + 政策专家")
     print(f"  用户（tenant=shop, user=u_1001）：{QUESTION}")
     supervisor = build_agents(make_llm)
     with measure("agent_as_tool 多 Agent", "模型（主管决定委派谁）"):
-        result = supervisor.run(QUESTION, metadata={"tenant_id": "shop", "user_id": "u_1001"})
+        result = await supervisor.run(QUESTION, metadata={"tenant_id": "shop", "user_id": "u_1001"})
         print("\n  主管的委派过程：")
         calls = {c["id"]: c for m in result.messages if m.get("tool_calls") for c in m["tool_calls"]}
         for m in result.messages:
@@ -418,24 +550,70 @@ def demo_multi_agent(make_llm) -> None:
         """专家有独立的提示词、工具和上下文窗口：主管的上下文里只有"委派了什么、专家答了什么"，不会被专家的中间步骤撑爆。
         代价：专家看不到用户原话（上下文割裂），委派描述写漏了，专家就会答偏；调用次数和 token 成倍增加。
         身份（tenant/user）通过 ctx 透传给专家，get_order 用它做订单归属校验 —— 模型无法冒充别人查订单。
-        trace 能嵌套需要两个条件：三个 Agent 共用同一个 Tracer；工具线程继承调用方的 contextvars（记录着"当前 Span"）。
+        trace 能嵌套需要两个条件：三个 Agent 共用同一个 Tracer；专家运行时能看到主管的"当前 Span"（记在 contextvars 里）。
+        agent_as_tool 是 async 工具，直接在主管的 task 里 await，contextvars 自然跟着走；同步工具在线程池里跑，agentkit 用 copy_context 带过去。
         少了任何一个，每个专家都会变成一条孤立的 trace，线上排查时就拼不回"这次请求到底发生了什么"。"""
+    )
+
+
+# ====================================================================== 5 附：主管被取消，专家跟着停
+
+
+class RecordEnd(Hook):
+    """每次运行结束（包括被取消）时记下最终状态。on_run_end 在收尾阶段一定会被调用。"""
+
+    def __init__(self, who: str, log: list[str]):
+        self.who, self.log = who, log
+
+    def on_run_end(self, state) -> None:
+        self.log.append(f"{self.who}：status={state.status}，stop_reason={state.stop_reason}")
+
+
+async def demo_cancel_propagation() -> None:
+    section("模式 5 附：主管被取消，专家跟着停（ScriptedLLM 机制演示，不调用真实模型）")
+    note("agent_as_tool 生成的是 async 工具：专家的 agent.run 就在主管的 task 里被 await。取消主管，取消会一路传进专家正在等的那次模型调用。")
+    ends: list[str] = []
+    expert_llm = ScriptedLLM([call_tool("get_order", order_id="A1001"), reply("订单事实：……")], latency=1.0)
+    expert = Agent(expert_llm, [get_order], system_prompt=ORDER_EXPERT_PROMPT, name="order_expert",
+                   hooks=[RecordEnd("订单专家", ends)])
+    boss_llm = ScriptedLLM([call_tool("ask_order_expert", task="查询订单 A1001 的签收日期和是否拆封"), reply("（不会走到这里）")])
+    supervisor = Agent(boss_llm, [agent_as_tool(expert, "ask_order_expert", "订单专家：查询订单事实。")],
+                       system_prompt=SUPERVISOR_PROMPT, name="supervisor", hooks=[RecordEnd("主管", ends)])
+
+    task = asyncio.ensure_future(supervisor.run(QUESTION, metadata={"tenant_id": "shop", "user_id": "u_1001"}))
+    while expert_llm.in_flight == 0 and not task.done():  # 等到专家的第一次模型调用（要 1.0s）已经发出
+        await asyncio.sleep(0.01)
+    print(f"\n  专家的模型调用在途 {expert_llm.in_flight} 个 → 用户断开连接，取消主管的运行（task.cancel()）")
+    t0 = time.perf_counter()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        print(f"  {(time.perf_counter() - t0) * 1000:.1f}ms 后，主管的 run() 抛出 CancelledError（取消照常向外传播，没有被吞掉）")
+    for line in ends:
+        print(f"    · {line}")
+    print(f"  专家模型此刻在途 {expert_llm.in_flight} 个；它一共被调用 {expert_llm.call_count} 次，剧本里的第 2 次调用没有发生，get_order 也没有执行")
+    note(
+        """先结束的是专家，再是主管：取消从最里层的 await（专家正在等的模型调用）开始，一层层往外收尾，每一层都把检查点记为 cancelled。
+        同步写法里做不到这一点：专家在线程里跑，线程杀不掉，用户走了它还会把模型调用和工具调用跑完。"""
     )
 
 
 # ====================================================================== main
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--offline", action="store_true", help="使用 ScriptedLLM 剧本，不调用真实模型")
     args = parser.parse_args()
 
+    real = None
     if args.offline:
-        print("🧪 离线模式：使用 ScriptedLLM 剧本（输出是预先写好的，调用次数和数据流与真实运行一致）")
+        print(f"🧪 离线模式：使用 ScriptedLLM 剧本（输出是预先写好的，调用次数和数据流与真实运行一致；每次调用模拟耗时 {OFFLINE_LATENCY}s）")
+
         # 剧本项是函数：根据收到的提示词决定回什么 —— 这样并行调用的先后顺序不影响结果
         def scripted(brain, n: int = 20):
-            return Metered(ScriptedLLM([brain] * n), METER)
+            return Metered(ScriptedLLM([brain] * n, latency=OFFLINE_LATENCY), METER)
 
         llms = {
             "route": scripted(offline_route),
@@ -446,27 +624,36 @@ def main() -> None:
         agent_scripts = offline_multi_agent_scripts()
 
         def make_agent_llm(role: str):
-            return Metered(ScriptedLLM(agent_scripts[role]), METER)
+            return Metered(ScriptedLLM(agent_scripts[role], latency=OFFLINE_LATENCY), METER)
     else:
-        real = Metered(default_llm(), METER)
+        real = default_llm()
+        metered = Metered(real, METER)
         print(f"🌐 真实模型模式：{real.model}（如需离线运行，加 --offline）")
-        llms = dict.fromkeys(["route", "parallel", "orchestrator", "evaluator"], real)
+        llms = dict.fromkeys(["route", "parallel", "orchestrator", "evaluator"], metered)
 
         def make_agent_llm(role: str):
-            return real
+            return metered
 
-    demo_route(llms["route"])
-    demo_parallel(llms["parallel"])
-    demo_orchestrator(llms["orchestrator"])
-    demo_evaluator(llms["evaluator"])
-    demo_multi_agent(make_agent_llm)
+    try:
+        await demo_route(llms["route"])
+        await demo_parallel(llms["parallel"])
+        await demo_parallel_mechanics()
+        await demo_shared_counter()
+        await demo_orchestrator(llms["orchestrator"])
+        await demo_evaluator(llms["evaluator"])
+        await demo_multi_agent(make_agent_llm)
+        await demo_cancel_propagation()
+    finally:
+        if real is not None:
+            await real.aclose()
 
     section("对比：同样是\"用 LLM 完成任务\"，不同编排模式的价格")
-    print(f"  {pad('模式', 24)}{pad('耗时', 9)}{pad('调用', 7)}{pad('tokens', 9)}流程由谁决定")
-    for name, elapsed, calls, tokens, who in SUMMARY:
-        print(f"  {pad(name, 24)}{pad(f'{elapsed:.1f}s', 9)}{pad(str(calls), 7)}{pad(str(tokens), 9)}{who}")
+    print(f"  {pad('模式', 24)}{pad('耗时', 9)}{pad('调用', 7)}{pad('峰值并发', 10)}{pad('tokens', 9)}流程由谁决定")
+    for name, elapsed, calls, peak, tokens, who in SUMMARY:
+        print(f"  {pad(name, 24)}{pad(f'{elapsed:.1f}s', 9)}{pad(str(calls), 7)}{pad(str(peak), 10)}{pad(str(tokens), 9)}{who}")
     note(
         """从上到下，灵活性越来越高，调用次数、token、延迟和不确定性也越来越高。
+        峰值并发一栏：parallel 和 orchestrator_workers 的执行者是真的同时在等模型；多 Agent 这次是串行委派（第二次依赖第一次的结果）。
         选型原则：先用能解决问题的最简单模式；只有当简单模式明显不够用时，才往下走一级。"""
     )
     print("\n  下一步：完成 exercise.py，然后运行 make lesson N=06")
@@ -474,7 +661,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except RuntimeError as e:
         if "LLM_API_KEY" not in str(e):
             raise

@@ -105,7 +105,10 @@ class _Db:
         if self._owned and not self._opened:
             async with self._open_lock:
                 if not self._opened:
-                    await self.pool.open(wait=True)
+                    # wait=False：不在这里等连接建好。wait=True 时如果数据库此刻不可用，psycopg_pool 会在超时后
+                    # 把池关掉，之后每次调用都报 PoolClosed —— 长驻进程（API）在故障期间第一次用队列，就永远恢复不了。
+                    # 不等的话，池在后台重连；借连接时拿不到就抛 PoolTimeout（暂时性错误），数据库恢复后自然好转。
+                    await self.pool.open(wait=False)
                     self._opened = True
         async with self.pool.connection() as c:
             yield c
