@@ -8,7 +8,7 @@
 
 ## 0. 一句话讲清楚
 
-**教学版 agentkit 的局限**：`Checkpointer` 只负责"把状态存下来"。进程死了谁来发现、谁来调用 `resume`、两个进程同时 `resume` 同一个运行怎么办、审批等了三天谁来计时、发版时正在跑的运行怎么办 —— 这些都要你自己写。第 13 课用租约队列补了一部分，第 26 课把检查点换成了 Postgres，但"谁来驱动恢复"始终是你的代码。
+**教学版 agentkit 的局限**：`Checkpointer` 只负责"把状态存下来"。进程死了谁来发现、谁来调用 `resume`、两个进程同时 `resume` 同一个运行怎么办、审批等了三天谁来计时、发版时正在跑的运行怎么办 —— 这些都要你自己写。第 13 课的 `agentkit.distributed` 用租约队列 + fence 补上了"谁发现、谁接管、两个进程抢同一个运行怎么办"，第 26 课把同一套东西搬到 Postgres 上跑多机；但审批要等三天谁来计时、跨天的定时动作、发版时正在跑的运行怎么兼容，仍然要你自己拼。
 
 **持久化执行（durable execution）换了一个思路：把"执行到哪一步"交给一个专门的服务记账。你的代码随时可以崩，换一台机器把账本从头"重放"一遍，就回到了崩溃前的那一行。**
 
@@ -31,9 +31,9 @@
 | 能力 | agentkit 检查点（第 08 课） | + Postgres / 队列（第 13、26 课） | Temporal |
 |---|---|---|---|
 | 状态存哪儿 | 本机文件 / 内存 | Postgres，多机共享 | Temporal 服务的持久化层（Cassandra / MySQL / PostgreSQL） |
-| 进程死了谁发现 | 没人 | 租约过期 + 心跳（自己写） | Activity 的 start-to-close / heartbeat 超时，服务端判定 |
+| 进程死了谁发现 | 没人 | 租约过期 + 心跳（`run_worker` 负责） | Activity 的 start-to-close / heartbeat 超时，服务端判定 |
 | 谁触发恢复 | 人工调用 `resume` | 另一个 worker 领到过期任务 | 服务端把 workflow 任务派给任何一个活着的 worker |
-| 两个进程同时恢复 | 会互相覆盖 | fencing token / CAS（自己写） | 同一个 workflow 同一时刻只有一个 workflow 任务在执行 |
+| 两个进程同时恢复 | 会互相覆盖 | fence + 版本号 CAS（第 13、26 课） | 同一个 workflow 同一时刻只有一个 workflow 任务在执行 |
 | 审批超时计时 | 没有 | 定时扫描器（自己写） | 持久化定时器（`wait_condition` 的 `timeout`） |
 | 重试 | `ResilientLLM`（进程内，进程一死就丢） | 队列的 attempts | `RetryPolicy`，由服务端调度，worker 死了也照样重试 |
 | 看某个运行卡在哪 | 读 JSON 文件 | 查表 | Web UI / `temporal workflow describe` / 可见性查询 |
@@ -112,7 +112,7 @@ sequenceDiagram
 
 | 方案 | 怎么做 | 学习成本 | 运维成本 | 表达能力 | 厂商锁定 | 适用场景 |
 |---|---|---|---|---|---|---|
-| A. 自研检查点（第 02 / 08 / 26 课） | 每一步把 `RunState` 存进 Postgres；租约队列 + 心跳触发恢复；定时扫描处理审批超时 | 低：就是你已经会的代码 | 低：只有 Postgres | 中：什么都能写，但定时器、取消、版本兼容都得自己做 | 无 | 分钟级任务、团队小、恢复逻辑简单 |
+| A. 检查点 + 租约队列（第 08 / 13 / 26 课，`agentkit.distributed`） | 每一步把 `RunState` 存进 Postgres（fence 接管 + 版本号 CAS）；租约队列 + 心跳触发恢复；定时扫描处理审批超时 | 低：就是你已经会的代码 | 低：只有 Postgres | 中：什么都能写，但定时器、取消、版本兼容都得自己做 | 无 | 分钟级任务、团队小、恢复逻辑简单 |
 | B. Temporal（本课） | 编排写成 Workflow，IO 写成 Activity；服务端记录事件历史，崩溃后重放 | 高：确定性约束、重放、版本化都是新概念 | 高（自建：数据库 + 多个服务）/ 中（Temporal Cloud） | 高：任意代码逻辑、持久化定时器、signal/update/query、子 workflow | 低：开源（MIT），可自建也可托管 | 小时到天级、多步骤、有审批和补偿、失败代价高 |
 | C. AWS Step Functions | 用 Amazon States Language（JSON）或可视化设计器描述状态机；Standard 类型最长 1 年、"恰好一次"执行，审批用 `.waitForTaskToken` 回调 | 中：DSL 要学，但概念少 | 低：全托管 | 中：分支、并行、Map 都有，复杂逻辑写成 JSON 很痛苦 | 高：只在 AWS | 已经在 AWS、流程相对固定、要跟大量 AWS 服务集成 |
 | D. LangGraph checkpointer | 图的每个超步（super-step）存一次检查点；`interrupt()` 暂停、`Command(resume=...)` 恢复；有 `exit` / `async` / `sync` 三种持久化模式 | 中：要学图模型 | 低到中：检查点存进你的 Postgres，但恢复的触发仍然是你的事 | 中：擅长 Agent 图；`interrupt` 没有内置超时参数，恢复时被中断的节点**从头重跑** | 低：开源 | 已经用 LangGraph 写 Agent，需要人工介入和断点续跑 |
@@ -164,11 +164,11 @@ sequenceDiagram
 
 | 方案 | 怎么做 | 优点 | 缺点 | 适用场景 |
 |---|---|---|---|---|
-| A. 客户端重试 | SDK 的 `max_retries`、`ResilientLLM` / `AsyncResilientLLM` | 延迟最低，不需要额外基础设施 | 进程一死重试就没了；外层看不见（次数、原因都不在历史里） | 没有编排引擎时的默认做法 |
+| A. 客户端重试 | SDK 的 `max_retries`、`ResilientLLM` | 延迟最低，不需要额外基础设施 | 进程一死重试就没了；外层看不见（次数、原因都不在历史里） | 没有编排引擎时的默认做法 |
 | B. Activity RetryPolicy | 失败的 Activity 由服务端按指数退避重新调度；不可重试的错误标 `non_retryable` 或列进 `non_retryable_error_types` | worker 死了也会重试；每次尝试和失败原因都在事件历史里 | 最小粒度是整个 Activity；默认无限重试，必须自己设上限 | 用了 Temporal 之后的默认做法 |
 | C. 幂等键 | 下游在同一个事务里"执行 + 记录 key"，同一个 key 第二次来直接返回上次的结果 | 真正让重复执行变得无害 | 需要下游支持 | 所有有副作用的写操作，**不管重试放在哪一层都需要** |
 
-**怎么选**：**重试只放一层**。用了 Temporal，就把客户端重试关掉（`OpenAICompatLLM` / `AsyncOpenAICompatLLM` 本来就是 `max_retries=0`），由 RetryPolicy 统一负责；然后**所有写操作都要配 C**，因为 B 只保证"至少一次"。具体到工具：
+**怎么选**：**重试只放一层**。用了 Temporal，就把客户端重试关掉（`OpenAICompatLLM` 本来就是 `max_retries=0`），由 RetryPolicy 统一负责；然后**所有写操作都要配 C**，因为 B 只保证"至少一次"。具体到工具：
 
 | 工具 | `maximum_attempts` | 理由 |
 |---|---|---|
@@ -180,11 +180,11 @@ sequenceDiagram
 
 本课实测的三个细节：
 
-- **`AsyncResilientLLM` 不要直接套在 Temporal 里**：它在所有尝试都失败后统一抛出 `retryable=False` 的 `LLMError`，会让 `llm_step` 把一个本可重试的 429 标成 `non_retryable`，RetryPolicy 直接放弃。要用它的并发上限，就把它的 `max_attempts` 设成 1 并注意这个行为，或者直接用 `AsyncOpenAICompatLLM(max_connections=...)` 限制并发（本课的做法）。
+- **`ResilientLLM` 不要直接套在 Temporal 里**：两层重试次数相乘，内层的重试也不进事件历史。早期版本在所有尝试都失败后统一抛 `retryable=False`，会让 `llm_step` 把一个本可重试的 429 标成 `non_retryable`、RetryPolicy 直接放弃；现在的 `ResilientLLM.chat()` 在所有失败都是暂时性错误（限流、5xx、熔断中）时保留 `retryable=True`，但 `stream()` 在所有尝试都失败后仍然统一标成不可重试。要限制并发，直接用 `OpenAICompatLLM(max_connections=...)`（本课的做法）。
 - **失败的尝试也花钱，但不在用量里**：`AgentWorkflow` 只累计**成功**那次 `llm_step` 返回的 token。一次超时后重试成功的调用，实际花了两次钱。成本对账以网关账单为准（第 29 课）。
 - **本机开发服务器上，小于 1 秒的重试间隔被抬到了约 1 秒**：`initial_interval` 设 0.1 秒和 0.5 秒，两次重试都耗时约 2 秒；设 1.5 秒时约 4.5 秒（1.5 + 3.0），符合退避公式。所以别指望靠亚秒级重试"快速恢复"。
 
-**本课实现**：`retry_policy_for(risk, idempotent)`（练习 (a)）；`execute_tool` 把 registry 返回的 `exception` / `timeout` 类错误转成 `ApplicationError` 交给 RetryPolicy，参数错、业务错误原样返回给模型；重试用尽后，workflow 把失败变成一条"结果未知，请人工核实"的观察。`make_worker(idempotency_store=...)` 传入跨 worker 共享的幂等存储后，写工具才按"幂等"对待；在 async activity 里要用第 26 课的 `AsyncRedisIdempotencyStore`（同步版每次 get / put 都是一次阻塞的网络往返，会卡住事件循环），测试 `test_write_tool_retry_with_async_redis_idempotency_store` 验证了幂等键就是 `workflow_id:call_id`。Demo 场景 2：库存服务第一次断连接，第 2 次尝试成功，模型只看到成功的结果。
+**本课实现**：`retry_policy_for(risk, idempotent)`（练习 (a)）；`execute_tool` 把 registry 返回的 `exception` / `timeout` 类错误转成 `ApplicationError` 交给 RetryPolicy，参数错、业务错误原样返回给模型；重试用尽后，workflow 把失败变成一条"结果未知，请人工核实"的观察。`make_worker(idempotency_store=...)` 传入跨 worker 共享的幂等存储后，写工具才按"幂等"对待；多个 worker 共享的用第 26 课的 `RedisIdempotencyStore`（基于 `redis.asyncio`，get / put 都是 async 的，不卡事件循环；传同步的 `redis.Redis` 客户端会直接报 `TypeError`），测试 `test_write_tool_retry_with_redis_idempotency_store` 验证了幂等键就是 `workflow_id:call_id`。Demo 场景 2：库存服务第一次断连接，第 2 次尝试成功，模型只看到成功的结果。
 
 ### 问题 4：确定性约束的坑
 
@@ -244,29 +244,34 @@ Temporal 对单个 workflow 执行的事件历史有硬上限：**51,200 个事�
 
 **场景**：一个 5 人小团队做内部知识库问答 Agent：P99 20 秒，只读工具，没有审批，每周发布一次。有人提议"上 Temporal，一劳永逸"。
 
-**为什么难**：持久化执行的好处在任务长、要等人、失败代价高时才显现；它的成本（一套要运维的服务、确定性约束、每一步都多几次网络往返）却是从第一天就开始付的。本机实测：20 个 workflow、模型零延迟，光 Temporal 本身的开销就约 1 秒（每个 workflow 约 50 毫秒）。
+**为什么难**：持久化执行的好处在任务长、要等人、失败代价高时才显现；它的成本（一套要运维的服务、确定性约束、每一步都多几次网络往返）却是从第一天就开始付的。本机实测（Demo 场景 6）：20 个 workflow 串行执行，纯模型等待是 6.0 秒，总耗时 7.38 秒，多出来的约 1.4 秒是 Temporal 本身的开销（每个 workflow 约 70 毫秒）。
 
 | 方案 | 怎么做 | 适用场景 |
 |---|---|---|
-| A. 同步 Agent + 检查点（第 08 课） | 一个进程、一个请求，失败了用户重试 | 秒级任务、内部工具、原型 |
-| B. AsyncAgent + Postgres 检查点（[第 26 课](../26_state_and_queues/README.md)、[第 30 课](../30_async_runtime/README.md)） | 一个进程用 asyncio 并发推进几百个会话；每步检查点写 Postgres；租约队列负责崩溃接管 | 分钟级任务、高并发对话、团队不想多运维一套服务 |
-| C. 队列 + 无状态 worker（第 13、26 课） | 任务进队列，worker 领取、心跳、提交，失败进死信 | 批处理、异步任务，不需要复杂的中途等待 |
+| A. 进程内 Agent + 检查点（第 08 课） | 一个进程里用 asyncio 跑请求，失败了用户重试 | 秒级任务、内部工具、原型 |
+| B. `agentkit.distributed` + Postgres 检查点（[第 13 课](../13_distributed_concurrency/README.md)、[第 26 课](../26_state_and_queues/README.md)） | API 入队；每台机器跑 `python -m agentkit.distributed.worker --queue postgresql://...`，每个进程用 asyncio 同时推进几十个运行；每步检查点写 Postgres；租约过期后别的 worker 带着更大的 fence 从检查点接手 | 分钟级任务、高并发对话、团队不想多运维一套服务 |
+| C. 队列 + 无状态 worker，不存运行中的状态（第 13、26 课的队列） | 任务进队列，worker 领取、心跳、提交，失败了整个任务重跑，次数用尽进死信 | 批处理、短任务，重跑一遍的代价可以接受 |
 | D. Temporal（本课） | Workflow + Activity，服务端记账 | 小时到天级、有审批 / 定时 / 补偿、跨多个系统、失败代价高 |
 
-**Temporal 持久化工作流 vs AsyncAgent + Postgres 检查点**，两者都能"一个进程并发推进很多运行、崩了能接着跑"，区别在于**谁来保证**：
+**B（租约 / fence 队列 + 检查点）vs D（Temporal 的事件溯源 + 重放）**：两者在本仓库里都是真实跑起来的 —— B 在第 13 课（SQLite）和第 26 课（Postgres）用真实的 worker 进程做了 kill -9、SIGSTOP、网络分区，D 在本课场景 4 真的 kill -9 了一个 worker 子进程。它们都能"一个进程并发推进很多运行、崩了换一个进程接着跑"，区别在于**状态怎么存、谁来保证**：
 
-| | AsyncAgent + Postgres 检查点 | Temporal |
+| | B：`agentkit.distributed` + Postgres 检查点 | D：Temporal |
 |---|---|---|
-| 恢复的粒度 | 检查点：每个工具结果之后存一次 | 事件历史：每个 activity 的结果 |
-| 谁发现崩溃、谁接管 | 你写的租约 + 心跳 + 扫描 | 服务端的超时 + 任务派发 |
-| 定时器（审批超时） | 你写的扫描器 | 持久化定时器 |
-| 代码约束 | 几乎没有 | 确定性、版本化 |
-| 工具执行语义 | `AsyncToolExecutor` | **同一个** `AsyncToolExecutor`（本课的 `execute_tool` 直接用它） |
-| 额外基础设施 | 只有 Postgres | Temporal 服务（+ 它自己的数据库） |
+| 状态模型 | 快照：每一步覆盖写最新的 `RunState`（版本号 CAS） | 事件溯源：只追加的事件历史，重放得到内存状态 |
+| 恢复的粒度 | 最近一次检查点（每次模型回复、每个工具结果之后） | 每个 activity 的结果 |
+| 谁发现崩溃 | 租约没人续 → 下一次 `claim` 时回收（`run_worker` 的心跳协程） | 服务端：activity 的 heartbeat / start-to-close 超时 |
+| 谁接管 | 下一个领取它的 worker：fence 更大，`fenced(fence).load` 接管检查点 | 服务端把 workflow 任务 / activity 重试派给任何一个活着的 worker |
+| 僵尸（被冻结 / 断网的旧持有者）醒来后 | 心跳、提交、检查点写入都带 fence / 版本号，由存储端拒绝（第 13 课 SIGSTOP、第 26 课网络分区实测） | 同一个 workflow 同一时刻只有一个 workflow 任务在推进；activity 仍是至少一次，写操作照样要幂等键 |
+| 接手要等多久 | 由租约长度决定（第 26 课 demo 用 2 秒） | 由 heartbeat_timeout 决定（场景 4 用 2 秒） |
+| 定时器（审批超时） | 自己写扫描器（或用延迟任务 `run_at`） | 持久化定时器 |
+| 人工审批 | 检查点落盘为 paused → API 入队 resume 任务（第 26 课 demo 第 2 部分） | signal / update + `wait_condition(timeout=...)` |
+| 代码约束 | 几乎没有：普通的 async Python | 确定性、版本化、沙箱 |
+| 工具执行语义 | `agentkit.tools.ToolExecutor` | **同一个** `ToolExecutor`（本课的 `execute_tool` 直接用它） |
+| 额外基础设施 | 只有 Postgres（单机时 SQLite 也行，切换只是改 `--queue`） | Temporal 服务（+ 它自己的数据库） |
 
 **怎么选**：满足下面任意两条再考虑 Temporal：单次任务经常超过 30 分钟；要等人（审批、补充材料）；有定时动作（超时、提醒、定期重试）；一次失败要人工善后（涉及钱或对外承诺）；有专人或平台团队运维它（或者预算买 Temporal Cloud）。都不满足，就用 B 或 C —— 它们也是本课程第四部分的一等公民。
 
-**本课实现**：`execute_tool` 用 `agentkit.aio.AsyncToolExecutor` 执行工具 —— 和 `AsyncAgent` 是**同一套执行语义**（async 工具真正可取消、同步工具进有上限的线程池、`isolated(tool)` 在子进程里执行并在超时时 kill）。从 B 迁移到 D，工具代码一行不用改。
+**本课实现**：`execute_tool` 用 `agentkit.tools.ToolExecutor` 执行工具 —— 和 `Agent` 是**同一套执行语义**（async 工具真正可取消、同步工具进有上限的线程池、`isolated(tool)` 在子进程里执行并在超时时 kill）。从 B 迁移到 D，工具代码一行不用改。
 
 ### 问题 6：运维 —— Temporal 本身谁来管？
 
@@ -280,7 +285,7 @@ Temporal 对单个 workflow 执行的事件历史有硬上限：**51,200 个事�
 
 几个运维要点：
 
-- **worker 水平扩展**：worker 无状态，同一个 task queue 上加进程就是扩容。每个 worker 有两个并发旋钮（SDK 默认各 100 个槽位）：`max_concurrent_activities`（同时执行多少个 activity —— Agent 的时间几乎都花在等模型上，所以它通常要对齐模型网关的并发配额）和 `max_concurrent_workflow_tasks`（同时推进多少个 workflow 任务 —— 每个都很短，但 worker 刚启动、要为大量 workflow 重放历史时会成为瓶颈）。Demo 场景 6 实测：同一批 20 个 workflow，`max_concurrent_activities=4` 时模型调用的峰值并发正好是 4，耗时从 1.15 秒变成 2.18 秒。
+- **worker 水平扩展**：worker 无状态，同一个 task queue 上加进程就是扩容。每个 worker 有两个并发旋钮（SDK 默认各 100 个槽位）：`max_concurrent_activities`（同时执行多少个 activity —— Agent 的时间几乎都花在等模型上，所以它通常要对齐模型网关的并发配额）和 `max_concurrent_workflow_tasks`（同时推进多少个 workflow 任务 —— 每个都很短，但 worker 刚启动、要为大量 workflow 重放历史时会成为瓶颈）。Demo 场景 6 实测：同一批 20 个 workflow，`max_concurrent_activities=4` 时模型调用的峰值并发正好是 4，耗时从 0.65 秒变成 1.89 秒。
 - **可见性查询与 Web UI**：Web UI 能按 workflow 类型、状态、时间筛选，点进去就是完整的事件历史（每次 activity 的输入、输出、尝试次数、失败原因）。按业务字段（租户、订单号）查找需要自定义 Search Attributes。
 - **事件历史就是数据**：prompt、工具参数、工具结果（包括 `ToolResult.detail` 里的内部错误原文）都原样存在历史里，能看 Web UI 的人都能看到。敏感数据要用 Payload Codec 在 worker 和客户端加密（服务端只看到密文），再配一个 Codec Server 给 Web UI 解密；另外按合规要求设置 Namespace 的保留期（Temporal Cloud 可设 1–90 天）。
 - **workflow 代码的 bug 不会让 workflow 失败**：workflow 里抛出普通异常，默认只是让这个 workflow 任务失败并不断重试（UI 里显示 `WorkflowTaskFailed`），workflow 本身挂起。修好代码重新部署，它会自动继续 —— 这是特性，但要给 `WorkflowTaskFailed` 配告警，否则会有运行无声无息地卡着。另外，一次 workflow 激活超过 2 秒没有让出，Python SDK 会判定为死锁。
@@ -292,11 +297,11 @@ Temporal 对单个 workflow 执行的事件历史有硬上限：**51,200 个事�
 ### 3.1 四个函数
 
 ```python
-from agentkit.aio import default_async_llm
+from agentkit import default_llm
 from agentkit.contrib.temporal import agent_status, approve, make_worker, start_agent
 
 # worker 进程：承载 AgentWorkflow 和三个 activity。llm_factory 在 worker 启动时调用一次。
-worker = make_worker(client, "support-agents", lambda: default_async_llm(max_connections=20), tools)
+worker = make_worker(client, "support-agents", lambda: default_llm(max_connections=20), tools)
 await worker.run()
 
 # API 进程：启动一次运行（业务键做 workflow_id：同一张工单重复提交只会有一个 Agent 在跑）
@@ -340,10 +345,10 @@ flowchart LR
     SDK --> LLM["await llm.chat(...) 抛出 CancelledError<br/>httpx 中断 HTTP 请求，连接归还连接池"]
 ```
 
-- **为什么是 async**：Agent 的时间几乎都花在等模型上。async activity 等待时不占线程，一个 worker 进程就能同时推进很多 workflow。Demo 场景 6：同一个 worker 上 20 个 workflow（每个 2 次模型调用，模型延迟 0.15 秒），本机一次运行串行 7.9 秒、并发 1.15 秒，模型调用峰值并发 20（几次运行之间随机器负载波动：串行 7.9–9.5 秒，并发 1.15–1.6 秒）。
+- **为什么是 async**：Agent 的时间几乎都花在等模型上。async activity 等待时不占线程，一个 worker 进程就能同时推进很多 workflow。Demo 场景 6：同一个 worker 上 20 个 workflow（每个 2 次模型调用，模型延迟 0.15 秒），本机（Apple M1、8 GB，负载 4–7）一次运行串行 7.38 秒、并发 0.65 秒，模型调用峰值并发 20（三次运行：串行 7.38–7.39 秒，并发 0.62–0.65 秒）。
 - **取消只能通过心跳送达**：服务端不会主动推送取消，它在心跳的响应里告诉 worker。所以 `llm_step` 和 `execute_tool` 在运行期间每 `heartbeat_timeout / 2` 发一次心跳；`heartbeat_timeout`（默认 10 秒）同时决定了"worker 死了多久能被发现"—— 否则要等满 `start_to_close_timeout`（模型调用是 120 秒）。取消送达的延迟约等于心跳间隔：本机实测一个要 30 秒的模型调用，`heartbeat_timeout` 为 1 / 2 / 10 秒时，`handle.cancel()` 之后分别 0.19 / 0.7 / 4.7 秒被中断（测试 `test_cancel_reaches_the_inflight_llm_call`）。取消要一路传到 HTTP 请求，前提是**模型客户端本身是异步的**；同步客户端放在线程里，取消只能"不再等它"，请求会在后台跑完、照样计费。
-- **async activity 里绝不能阻塞**：async activity 运行在 worker 的事件循环上，一个 `requests.get` / `time.sleep` / 同步数据库驱动会卡住这个 worker 上**所有** activity、心跳和 workflow 任务的收发。Demo 场景 6 的最后一行：模型客户端在 async 里用 `time.sleep` 模拟阻塞 IO，20 个 workflow 耗时 7.05 秒，峰值并发 1 —— 和串行一样。本课还在真实模式下踩到了一个隐蔽的版本：最初模型客户端是在第一个 `llm_step` 里懒加载的，创建客户端要导入 openai / httpx（本机约 0.6 秒，机器忙时超过 2 秒），这段同步代码卡住了事件循环，`heartbeat_timeout=2` 秒的 `llm_step` 被判心跳超时并重试 —— 模型调用可能因此多付一次钱。修复：`make_worker` 在启动时就创建客户端。
-- **同步工具怎么办**：`execute_tool` 交给 `AsyncToolExecutor`：同步工具进有上限的线程池（不阻塞事件循环），async 工具直接 `await`。Temporal 自己也支持同步 activity，但要求 worker 配置 `activity_executor`（官方推荐 `ThreadPoolExecutor`）；Temporal 文档的默认建议甚至是"除非确定不会阻塞事件循环，否则 activity 写成同步的"。本课选择 async，是因为模型客户端和工具执行器都是真正异步的，并发和取消都能做实。
+- **async activity 里绝不能阻塞**：async activity 运行在 worker 的事件循环上，一个 `requests.get` / `time.sleep` / 同步数据库驱动会卡住这个 worker 上**所有** activity、心跳和 workflow 任务的收发。Demo 场景 6 的最后一行：模型客户端在 async 里用 `time.sleep` 模拟阻塞 IO，20 个 workflow 耗时 6.88 秒，峰值并发 1 —— 和串行差不多。本课还在真实模式下踩到了一个隐蔽的版本：最初模型客户端是在第一个 `llm_step` 里懒加载的，创建客户端要导入 openai / httpx（本机约 0.6 秒，机器忙时超过 2 秒），这段同步代码卡住了事件循环，`heartbeat_timeout=2` 秒的 `llm_step` 被判心跳超时并重试 —— 模型调用可能因此多付一次钱。修复：`make_worker` 在启动时就创建客户端。
+- **同步工具怎么办**：`execute_tool` 交给 `ToolExecutor`：同步工具进有上限的线程池（不阻塞事件循环），async 工具直接 `await`。Temporal 自己也支持同步 activity，但要求 worker 配置 `activity_executor`（官方推荐 `ThreadPoolExecutor`）；Temporal 文档的默认建议甚至是"除非确定不会阻塞事件循环，否则 activity 写成同步的"。本课选择 async，是因为模型客户端和工具执行器都是真正异步的，并发和取消都能做实。
 
 ### 3.4 哪些 agentkit Hook 能直接放进 workflow
 
@@ -364,7 +369,7 @@ flowchart LR
 ## 4. 动手：运行 Demo
 
 ```bash
-python lessons/27_durable_workflows/demo.py --offline          # 离线，约 50 秒
+python lessons/27_durable_workflows/demo.py --offline          # 离线，约 40 秒
 python lessons/27_durable_workflows/demo.py                    # 真实模型（gpt-5.5）
 python lessons/27_durable_workflows/demo.py --offline --hold 300   # 跑完保留服务器 5 分钟，去 Web UI 看事件历史
 ```
@@ -373,7 +378,8 @@ python lessons/27_durable_workflows/demo.py --offline --hold 300   # 跑完保�
 
 ```text
 场景 4：kill -9 worker 进程 —— 新 worker 从断点继续，已完成的 activity 不重跑
-  generate_report 正在 worker-A 上执行（第 2 步，已调用 ['lookup_order', 'generate_report']）→ kill -9 30819
+  worker-A 是一个独立的子进程（pid=54637），和本进程只通过 Temporal 服务器联系
+  generate_report 正在 worker-A 上执行（第 2 步，已调用 ['lookup_order', 'generate_report']）→ kill -9 54637
   worker-B 一共只调了 1 次模型：前面几步的模型回复都从事件历史里重放得到，没有重新花钱
     6  ActivityTaskStarted                describe_tools attempt=1 worker=worker-A
    12  ActivityTaskStarted                llm_step attempt=1 worker=worker-A
@@ -384,10 +390,10 @@ python lessons/27_durable_workflows/demo.py --offline --hold 300   # 跑完保�
 
 场景 6：异步并发 —— 一个 worker 同时推进 20 个 workflow（模型延迟 0.15 秒，离线模型）
   方式                                               总耗时          模型调用峰值并发
-  串行：一个接一个                                       7.90s             1
-  并发：max_concurrent_activities=100（默认）           1.15s            20
-  并发：max_concurrent_activities=4                 2.18s             4
-  并发，但模型客户端在 async 里阻塞（time.sleep）               7.05s             1
+  串行：一个接一个                                       7.38s             1
+  并发：max_concurrent_activities=100（默认）           0.65s            20
+  并发：max_concurrent_activities=4                 1.89s             4
+  并发，但模型客户端在 async 里阻塞（time.sleep）               6.88s             1
 ```
 
 该观察什么：
@@ -413,12 +419,12 @@ make lesson N=27
 # 或：.venv/bin/python -m pytest lessons/27_durable_workflows -v
 ```
 
-`test_integration.py` 会用 `start_local()` 真实跑一遍"查订单 → 退款 → 审批 → 执行"的完整流程（没装 temporalio 时自动跳过）。contrib 模块更完整的测试在 [`tests/contrib/test_temporal.py`](../../tests/contrib/test_temporal.py)（23 个，包括 worker 更换、取消传播、并发、重放、Redis 幂等存储）。
+`test_integration.py` 会用 `start_local()` 真实跑一遍"查订单 → 退款 → 审批 → 执行"的完整流程（没装 temporalio 时自动跳过）。contrib 模块更完整的测试在 [`tests/contrib/test_temporal.py`](../../tests/contrib/test_temporal.py)（22 个，包括 worker 更换、取消传播、并发、重放、Redis 幂等存储）。
 
 ## 6. 运维要点与常见坑
 
 1. **Activity 默认无限重试**。模型调用和写工具都必须设 `maximum_attempts`，不可重试的错误标 `non_retryable`。
-2. **两层重试叠加**。用了 RetryPolicy 就关掉客户端重试；`AsyncResilientLLM` 会把最终错误变成不可重试。
+2. **两层重试叠加**。用了 RetryPolicy 就关掉客户端重试，也不要再套 `ResilientLLM`：次数相乘，内层重试在事件历史里看不见。
 3. **写操作没有幂等键**。Activity 至少执行一次；幂等存储必须跨 worker 共享，进程内的 `IdempotencyStore` 在这里等于没有。
 4. **只设 start-to-close，不设心跳**。worker 死了要等满 start-to-close 才重试，取消也送不到。长 activity 一定要心跳。
 5. **在 async activity 里阻塞**，包括"第一次调用时才创建客户端"这种隐蔽的阻塞。
@@ -471,7 +477,7 @@ client = await Client.connect(**ClientConfig.load_client_connect_config())
 <details>
 <summary>3. 你的 Agent 同时用了 openai SDK 重试、ResilientLLM 和 Activity RetryPolicy，有什么问题？怎么改？</summary>
 
-次数相乘（2 × 3 × 5），故障期间放大对网关的压力；内层重试在事件历史里看不见；进程死了内层重试就丢了。只保留 RetryPolicy：客户端 `max_retries=0`，不套 ResilientLLM（或者只用它的并发限制、`max_attempts=1`，并注意它会把最终错误标成不可重试）；可重试 / 不可重试的分类在 activity 里转换成 `ApplicationError(non_retryable=...)`，`Retry-After` 转成 `next_retry_delay`。
+次数相乘（2 × 3 × 5），故障期间放大对网关的压力；内层重试在事件历史里看不见；进程死了内层重试就丢了。只保留 RetryPolicy：客户端 `max_retries=0`，不套 ResilientLLM（要限制并发就用 `OpenAICompatLLM(max_connections=...)`）；可重试 / 不可重试的分类在 activity 里转换成 `ApplicationError(non_retryable=...)`，`Retry-After` 转成 `next_retry_delay`。
 </details>
 
 <details>
@@ -495,7 +501,7 @@ client = await Client.connect(**ClientConfig.load_client_connect_config())
 <details>
 <summary>7. 你会在什么情况下反对引入 Temporal？</summary>
 
-任务是秒级到分钟级、没有人工等待、没有定时动作、失败了让用户重试就行、团队没有人能运维它也没有预算买云服务。这时 AsyncAgent + Postgres 检查点 + 租约队列更简单，工具执行语义完全一样，将来需要时可以平滑迁移。
+任务是秒级到分钟级、没有人工等待、没有定时动作、失败了让用户重试就行、团队没有人能运维它也没有预算买云服务。这时 `agentkit.distributed`（Postgres 租约队列 + fence 检查点，第 26 课）更简单：只多一个 Postgres，worker 是普通的 async 进程，工具执行语义完全一样，将来需要时可以平滑迁移。
 </details>
 
 <details>
@@ -514,7 +520,7 @@ activity 写成 async、模型客户端用异步 HTTP，等待模型时不占线
 - [ ] 我能用 `workflow.patched` 安全地修改一个正在运行的 workflow
 - [ ] 我能解释 Agent 的事件历史为什么是平方级增长，以及三种应对手段
 - [ ] 我知道 async activity 里阻塞的后果，以及取消是怎么一路传到模型调用的
-- [ ] 我能判断一个场景该用 Temporal、AsyncAgent + Postgres 检查点，还是队列 + worker
+- [ ] 我能判断一个场景该用 Temporal、`agentkit.distributed` + Postgres 检查点，还是队列 + worker，并说清"快照 + fence"和"事件历史 + 重放"各自由谁保证什么
 
 ## 延伸阅读
 

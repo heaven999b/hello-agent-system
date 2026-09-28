@@ -1,7 +1,7 @@
 """第 27 课 Demo：用 Temporal 持久化工作流运行 Agent。
 
-    python lessons/27_durable_workflows/demo.py                  # 真实模型（gpt-5.5，经 agentkit.aio 的异步客户端）
-    python lessons/27_durable_workflows/demo.py --offline        # 离线：AsyncScriptedLLM，不调模型
+    python lessons/27_durable_workflows/demo.py                  # 真实模型（gpt-5.5，agentkit 的异步 OpenAICompatLLM）
+    python lessons/27_durable_workflows/demo.py --offline        # 离线：ScriptedLLM（responder 模式），不调模型
     python lessons/27_durable_workflows/demo.py --offline --only 4,6
     python lessons/27_durable_workflows/demo.py --offline --hold 300   # 跑完后保留服务器 300 秒，去 Web UI 看事件历史
 
@@ -12,7 +12,7 @@ WorkflowEnvironment.start_local() 拉起一个真正的 Temporal 开发服务器
   1. 正常执行：LLM activity 与工具 activity 交替运行
   2. Activity 自动重试：库存服务第一次连接失败，RetryPolicy 1 秒后重试，模型只看到成功的结果
   3. 人工审批：dangerous 工具触发审批，workflow 挂起；稍后用 update 批准，workflow 继续
-  4. 中途 kill -9 worker 进程：新的 worker 从断点继续，已完成的 activity 不重跑（打印事件历史作为证据）
+  4. 中途 kill -9 worker 进程（一个真正的子进程）：新的 worker 从断点继续，已完成的 activity 不重跑（打印事件历史作为证据）
   5. 审批超时：没人批 → 定时器触发 → 自动拒绝；迟到的审批被拒收
   6. 异步并发：一个 worker 同时推进 20 个 workflow，对比串行、限流、以及"在 async 里阻塞"的反模式
   7. 改了 workflow 代码之后重放旧历史：直接改会失败，用 workflow.patched 版本化就能通过
@@ -49,7 +49,6 @@ def _deps_ok() -> bool:
     try:
         import temporalio  # noqa: F401
 
-        import agentkit.aio  # noqa: F401
         import agentkit.contrib.temporal  # noqa: F401
     except ImportError as e:
         print(f"缺少可选依赖（{e}）。请先安装：\n    {INSTALL_HINT}")
@@ -284,7 +283,7 @@ class Demo:
     # ------------------------------------------------------------------ 6
     async def s6_concurrency(self):
         banner("场景 6：异步并发 —— 一个 worker 同时推进 20 个 workflow（模型延迟 0.15 秒，离线模型）")
-        from agentkit.aio import AsyncScriptedLLM
+        from agentkit import ScriptedLLM
 
         n, latency = 20, 0.15
         sc = self.sc
@@ -297,7 +296,7 @@ class Demo:
             holder: list = []
 
             def factory():
-                llm = AsyncScriptedLLM(responder=blocking_brain if blocking else sc.offline_brain, latency=0 if blocking else latency)
+                llm = ScriptedLLM(responder=blocking_brain if blocking else sc.offline_brain, latency=0 if blocking else latency)
                 holder.append(llm)
                 return llm
 
@@ -390,7 +389,7 @@ async def main(args) -> None:
         except Exception:  # noqa: BLE001
             ui_url = None
             print("Temporal Web UI 没有响应（开发服务器的 UI 可能被禁用），不影响演示。")
-        print(f"gRPC 地址：{env.client.service_client.config.target_host}；模式：{'离线（AsyncScriptedLLM）' if args.offline else '真实模型'}")
+        print(f"gRPC 地址：{env.client.service_client.config.target_host}；模式：{'离线（ScriptedLLM）' if args.offline else '真实模型'}")
         demo = Demo(env, args.offline, ui_url)
         steps = [demo.s1_normal, demo.s2_retry, demo.s3_approval, demo.s4_crash, demo.s5_timeout, demo.s6_concurrency, demo.s7_replay]
         for i, step in enumerate(steps, 1):
@@ -403,7 +402,7 @@ async def main(args) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--offline", action="store_true", help="用 AsyncScriptedLLM，不调用真实模型")
+    parser.add_argument("--offline", action="store_true", help="用 ScriptedLLM（responder 模式），不调用真实模型")
     parser.add_argument("--only", default="", help="只运行这些场景，例如 1,3,4")
     parser.add_argument("--hold", type=int, default=0, help="跑完后保留开发服务器 N 秒，方便看 Web UI")
     parser.add_argument("--worker-process", nargs=2, metavar=("TARGET", "TASK_QUEUE"), help=argparse.SUPPRESS)

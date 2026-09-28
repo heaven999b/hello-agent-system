@@ -12,7 +12,6 @@ import uuid
 import pytest
 
 pytest.importorskip("temporalio")
-pytest.importorskip("agentkit.aio")
 
 from agentkit.testing import load_sibling  # noqa: E402
 
@@ -44,9 +43,9 @@ async def _approval_flow():
         return st, outcome, result, kt.activity_attempts(history)
 
 
-def test_refund_workflow_waits_for_approval_then_refunds_exactly_once():
+async def test_refund_workflow_waits_for_approval_then_refunds_exactly_once():
     before = set(sc.LEDGER)
-    st, outcome, result, attempts = asyncio.run(_approval_flow())
+    st, outcome, result, attempts = await _approval_flow()
     assert st.pending_approvals[0]["name"] == "refund" and st.tools_called == ["lookup_order", "refund"]
     assert outcome == "accepted" and result.status == "completed" and "已为订单 A1001 退款 99.0 元" in result.output
     new = [k for k in sc.LEDGER if k not in before]

@@ -110,25 +110,25 @@ def offline_brain(messages: list[Message]):
 
 
 def offline_llm_factory(latency: float = 0.0):
-    """每个 worker 一个 agentkit.aio.AsyncScriptedLLM（responder 模式）。"""
+    """每个 worker 一个 agentkit.ScriptedLLM（responder 模式；latency 用 asyncio.sleep 模拟模型耗时，可被取消）。"""
 
     def factory():
-        from agentkit.aio import AsyncScriptedLLM
+        from agentkit import ScriptedLLM
 
-        return AsyncScriptedLLM(responder=offline_brain, latency=latency)
+        return ScriptedLLM(responder=offline_brain, latency=latency)
 
     return factory
 
 
 def real_llm_factory():
-    """真实模型：异步 OpenAI 兼容客户端。max_connections=2 就是这个 worker 对网关的最大并发。
+    """真实模型：agentkit 的 OpenAICompatLLM（async，httpx 连接池）。max_connections=2 就是这个 worker 对网关的最大并发。
 
-    不在外面套 AsyncResilientLLM：重试已经交给 Temporal 的 RetryPolicy；而且它在所有尝试都失败后
-    统一抛 retryable=False 的 LLMError，会让 Temporal 以为"不可重试"而直接放弃。
+    不在外面套 ResilientLLM：重试已经交给 Temporal 的 RetryPolicy，两层都重试次数会相乘（3 × 5 = 15 次），
+    而且内层的重试不进事件历史，外面看不见。
     """
-    from agentkit.aio import default_async_llm
+    from agentkit import default_llm
 
-    return default_async_llm(max_connections=2)
+    return default_llm(max_connections=2)
 
 
 # ---------------------------------------------------------------------------------------------

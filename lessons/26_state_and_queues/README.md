@@ -2,7 +2,7 @@
 
 # 第 26 课：状态、队列与分布式协调 —— Postgres 与 Redis
 
-> 🕐 建议用时：30 分钟 ｜ 🎯 学完你能：把 Agent 的检查点、任务队列、幂等、限流、锁落到 Postgres 和 Redis 上，说清每一样为什么放在那里、出故障时由谁兜底；在自建、开源、托管方案之间做出有依据的选择；把同步 worker 换成单进程几十路并发的异步 worker，并配好连接池 ｜ 📦 对应源码：[`agentkit/contrib/postgres.py`](../../agentkit/contrib/postgres.py)、[`agentkit/contrib/redis_store.py`](../../agentkit/contrib/redis_store.py)、[`demo.py`](demo.py)
+> 🕐 建议用时：30 分钟 ｜ 🎯 学完你能：把 Agent 的检查点、任务队列、幂等、限流、锁落到 Postgres 和 Redis 上，说清每一样为什么放在那里、出故障时由谁兜底；在自建、开源、托管方案之间做出有依据的选择；用第 13 课同一条 worker 命令（只把 `--queue` 换成 `postgresql://`）在多机后端上跑 async worker 进程并配好连接池；用真实的网络分区验证 fence ｜ 📦 对应源码：[`agentkit/contrib/postgres.py`](../../agentkit/contrib/postgres.py)、[`agentkit/contrib/redis_store.py`](../../agentkit/contrib/redis_store.py)、[`agentkit/distributed/`](../../agentkit/distributed/__init__.py)、[`worker_app.py`](worker_app.py)、[`demo.py`](demo.py)
 >
 > 📖 必读：[Devious SQL: Message Queuing Using Native PostgreSQL](https://www.crunchydata.com/blog/message-queuing-using-native-postgresql)（David Christensen, 2021）—— 用十几行 SQL 从零搭出一个 `FOR UPDATE SKIP LOCKED` 队列，顺带讲了两件本课代码处处都有影子的事：事务回滚时任务自动回到队列；队列表更新频繁，会膨胀，需要调 autovacuum。读完再看 `PostgresJobQueue.claim`，每一行都能对上号。
 
@@ -10,7 +10,7 @@
 
 **教学版 agentkit 的局限**：`FileCheckpointer` 只在一台机器上有效，而且不认 fencing，旧 worker 醒来后能覆盖新 worker 写的检查点；`IdempotencyStore` 存在进程内存里，进程一死就没了，别的 worker 也看不见；第 12 课的令牌桶只在一个进程里计数；第 13 课的租约队列用的是单机 SQLite。这些实现把原理讲清楚了，但撑不起"多台机器、几十个 worker、上百个租户"。
 
-**这一课不发明新概念。第 13 课的租约、fencing token、CAS、幂等键全部保留，只是改由 Postgres 和 Redis 来承载，并且直接接到 agentkit 的接口上。比如 `Agent(checkpointer=PostgresCheckpointer(dsn))` 这一行改动，就能让检查点在机器之间共享，并且挡住僵尸 worker。**
+**这一课不发明新概念。第 13 课的租约、fencing token、CAS、幂等键全部保留，只是改由 Postgres 和 Redis 来承载；接口也一模一样：第 13 课在 SQLite 上跑的 `run_worker`、`AgentJobHandler`、worker 命令行一行不改，切换就是一个参数 —— `--queue sqlite:///runs/jobs.db` 换成 `--queue postgresql://...`，检查点从 `SQLiteCheckpointer` 换成 `PostgresCheckpointer(dsn)`。换来的是：检查点和队列在机器之间共享，僵尸 worker 照样被挡住 —— 本课用真实的网络分区（一个 worker 活着、却连不上数据库）验证这一点。**
 
 打个比方：第 13 课的后厨把订单写在墙上的一张单子上（SQLite 文件）。连锁店开到几十家以后，订单改由中央订单系统管理（Postgres：记账、不能丢），前台再配一台叫号机（Redis：计数、排号、限流，停电重启后重新叫号也没关系）。
 
@@ -18,11 +18,11 @@
 |---|---|---|---|
 | 检查点 | `FileCheckpointer`（第 08 课） | 只能单机；没有 fencing | `PostgresCheckpointer`：jsonb + 版本号 CAS + fence 接管 |
 | 任务队列 | SQLite `JobQueue`（第 13 课） | 单机，同一时刻只有一个写者 | `PostgresJobQueue`：SKIP LOCKED、服务器时钟、部分索引 |
-| worker | demo 里手写的循环（第 13 课） | 心跳、停机、错误分类都要自己拼 | `run_worker` / `run_async_worker` + `AgentJobHandler` |
+| worker | `agentkit.distributed` 的 `run_worker` + `AgentJobHandler`，`--queue sqlite:///`（第 13 课） | 所有进程必须在同一台机器上（共享一个 SQLite 文件） | 同一个 `run_worker`、同一条 worker 命令，`--queue postgresql://` |
 | 幂等 | 内存 `IdempotencyStore`（第 08 课） | 进程一死就丢；别的 worker 看不见 | `RedisIdempotencyStore`（缓存）+ 下游唯一约束（兜底） |
 | 限流 | `TokenBucket`（第 12 课） | 在进程内计数，N 个实例就放出 N 倍配额 | `RedisTokenBucket`（Lua 原子执行 + Redis 时钟）+ `RateLimitHook` |
 | 锁 | 第 13 课的时间线（只讲了概念） | — | `RedisLock`（带 fencing token）；以及什么时候该改用 advisory lock / etcd |
-| 并发模型 | 一个 worker 进程一次跑一个任务 | 等模型的时候整个进程都闲着 | 异步版：一个进程同时推进几十个任务，带背压 |
+| 故障注入 | kill -9 / SIGSTOP / SIGTERM（第 13 课，单机） | 多机部署最常见的故障 —— 网络分区 —— 没有演示 | `TcpProxy` 真实断网：心跳失败 → 租约过期 → 别人接手 → 恢复后迟到的写入被拒绝 |
 
 ## 1. 教学实现为什么不够
 
@@ -32,7 +32,7 @@
 flowchart LR
     API["API 服务<br/>鉴权 · 入队 · 审批"] -->|"enqueue（幂等键去重）"| JOBS[("Postgres<br/>agent_jobs 任务表")]
     API -->|"list_runs(status='paused')<br/>审批收件箱"| RUNS[("Postgres<br/>agent_runs 检查点表")]
-    subgraph W["worker（同步：多进程；异步：一个进程几十路并发）"]
+    subgraph W["worker 进程 × N（每个进程用 asyncio 同时推进几十个任务）"]
         H["AgentJobHandler<br/>run / resume"]
     end
     JOBS -->|"claim：SKIP LOCKED<br/>租约 + fence"| W
@@ -55,7 +55,7 @@ flowchart LR
 | 限流计数 | Redis | 短时间内多放行一些请求 | 每次模型调用都要读写，要求快；丢了只影响一小段时间 |
 | 短锁 | Redis（效率锁）/ Postgres、etcd（正确性锁） | 见问题 5 | 锁只能提高效率，正确性要靠 fencing |
 
-这张表可以当成本课的目录：检查点和队列看问题 1、2，幂等看问题 3，限流看问题 4，锁看问题 5，运维看问题 6，并发模型看问题 7。
+这张表可以当成本课的目录：检查点和队列看问题 1、2，幂等看问题 3，限流看问题 4，锁看问题 5，运维看问题 6，加并发、加进程、换后端看问题 7。
 
 ### 1.3 术语
 
@@ -66,12 +66,12 @@ flowchart LR
 | fence 接管 | 新持有者读检查点时顺手把版本号加一，旧持有者手里的版本号当场作废 | `PostgresCheckpointer.fenced(fence).load` |
 | 回收（reap） | 租约过期的任务改回"排队中"，次数用尽的直接进死信 | `PostgresJobQueue.reap_expired` |
 | Lua 脚本 | 在 Redis 服务器里原子执行的一小段程序，执行期间不会插入别的命令 | `TOKEN_BUCKET_LUA` |
-| 背压（backpressure） | 满载时停止领取新任务，让任务留在队列里给别人 | `run_async_worker` 的信号量 |
+| 背压（backpressure） | 满载时停止领取新任务，让任务留在队列里给别人 | `run_worker` 的信号量 |
 | 连接池 | 一组预先建好、反复借还的数据库连接；池的大小决定同时能有多少个数据库操作 | `psycopg_pool.AsyncConnectionPool` |
 
 ## 2. 企业问题卡片
 
-七张卡片。每张最后都有"从嵌入式换成托管服务"：本课 demo 和测试用的是嵌入式 Postgres（pip 包 pgserver 启动的真实 Postgres 16 进程，单机）和 fakeredis（Redis 协议的 Python 实现，不模拟持久化、主从切换和集群分片）。换成托管服务时，大多数情况下只需要换连接串。
+七张卡片。每张最后都有"从嵌入式换成托管服务"：本课 demo 和测试用的是 pgserver 自带的真实 Postgres 16（测试用它的 unix socket 实例；demo 另起一个监听 127.0.0.1 TCP 的实例，worker 通过网络连它，才能在中间插一个断网代理）和 fakeredis（Redis 协议的 Python 实现，不模拟持久化、主从切换和集群分片），全部在一台机器上。换成托管服务时，大多数情况下只需要换连接串。
 
 ### 问题 1：检查点放在哪？两个 worker 抢同一个 run 时，谁说了算？
 
@@ -109,7 +109,7 @@ sequenceDiagram
 
 **怎么选**：默认选 A，并且**让队列的 fence 驱动检查点接管**（`AgentJobHandler` 已经这样做了）。状态特别大（几百 KB 以上），或者需要"时间旅行"、分支，参考 LangGraph 把检查点拆成多张表、按版本增量写的做法。流程跨天、需要可靠定时器的，直接上第 27 课。
 
-**本课实现**：[`PostgresCheckpointer`](../../agentkit/contrib/postgres.py)，以及异步版 `AsyncPostgresCheckpointer`（给 `agentkit.aio.AsyncAgent` 用，语义完全一致）。测试 `test_plain_cas_is_first_writer_wins_but_fenced_takeover_makes_newest_holder_win` 把"先写者赢"和"新持有者赢"并排验证了一遍。Demo 第 1 部分（真实模型模式的一次运行）里，被冻结的 worker-3 醒来后写检查点，收到了 `检查点冲突：run job-6 期望版本 2，实际版本 7（最后写入者 worker-1）`。
+**本课实现**：[`PostgresCheckpointer`](../../agentkit/contrib/postgres.py)（async，和 `agentkit.distributed.SQLiteCheckpointer` 接口相同）。测试 `test_plain_cas_is_first_writer_wins_but_fenced_takeover_makes_newest_holder_win` 把"先写者赢"和"新持有者赢"并排验证了一遍。Demo 第 1 部分里，被 SIGSTOP 冻结的 worker-1 醒来后写检查点，收到了 `检查点冲突：run job-6 期望版本 2，实际版本 7（最后写入者 worker-2）`；第 5 部分里，断网的 far-0 恢复连接后写检查点，同样被拒绝（`期望版本 3，实际版本 7（最后写入者 near-0）`）。
 
 **从嵌入式换成托管**：`PostgresCheckpointer(os.environ["DATABASE_URL"])`，连接串换成 RDS、Cloud SQL、Aurora 或者自建集群的地址即可。建表用迁移工具在发布时做一次（问题 6）。
 
@@ -133,7 +133,7 @@ Celery、Dramatiq 这类**任务框架**不在同一个层次：它们本身不�
 
 **怎么选**：先用 A。队列和业务数据在同一个库里时，"创建工单 + 入队后续 Agent 任务"可以放进一个事务，这正是 outbox 模式（第 13 课问题 6）想要的效果，而且不用多维护一个系统。在 AWS 上、不想运维，就选 E（注意 SQS 旧的 receipt handle 做不到 fencing，第 13 课 3.9 节）。需要事件流时再加 D，两者不冲突。
 
-**本课实现**：[`PostgresJobQueue`](../../agentkit/contrib/postgres.py)，异步版是 `AsyncPostgresJobQueue`，SQL 在 3.3 节。**从嵌入式换成托管**：同样只换连接串。可以用 KEDA 的 `postgresql` scaler，按一条 SQL 的结果（比如可执行任务数）自动扩缩 worker（[文档](https://keda.sh/docs/2.21/scalers/postgresql/)，部署细节见[第 31 课](../31_deployment_and_scaling/README.md)）。
+**本课实现**：[`PostgresJobQueue`](../../agentkit/contrib/postgres.py)（async，和 `SQLiteJobQueue` 实现同一个 `JobQueue` 协议），SQL 在 3.3 节。**从嵌入式换成托管**：同样只换连接串。可以用 KEDA 的 `postgresql` scaler，按一条 SQL 的结果（比如可执行任务数）自动扩缩 worker（[文档](https://keda.sh/docs/2.21/scalers/postgresql/)，部署细节见[第 31 课](../31_deployment_and_scaling/README.md)）。
 
 ### 问题 3：幂等记录放在哪？Redis 一个 key 就够了吗？
 
@@ -168,7 +168,7 @@ sequenceDiagram
 
 **怎么选**：B 或 C 是底线，必须有；A 是可选的优化，可以少打一次下游；A' 只在"并发重复的代价很高、并且下游不支持幂等"时才用，而且要清楚它挡不住所有情况。
 
-**本课实现**：`RedisIdempotencyStore(client, namespace="idem", ttl_seconds=86400)` 直接传给 `Agent(idempotency_store=...)`，异步版是 `AsyncRedisIdempotencyStore`。Demo 第 1 部分里，被 `kill -9` 的那次调用没来得及写 Redis，接手的 worker 查 Redis 没有命中，最后是下游唯一约束拦住了重复：`♻️ 下游唯一约束命中：返回已有工单 T-1004`。
+**本课实现**：`RedisIdempotencyStore(client_or_url, namespace="idem", ttl_seconds=86400)` 直接传给 `Agent(idempotency_store=...)`；它只有 async 版本（基于 `redis.asyncio`，Agent 会 await 它的 get / put），传同步的 `redis.Redis` 客户端会直接报 `TypeError`。Demo 第 1 部分里，被 `kill -9` 的那次调用没来得及写 Redis，接手的 worker 查 Redis 没有命中，最后是下游唯一约束拦住了重复：`♻️ 下游唯一约束命中：返回已有工单 T-1003`。
 
 **从嵌入式换成托管**：`RedisIdempotencyStore(os.environ["REDIS_URL"])`（ElastiCache、Memorystore 或自建 Redis / Valkey）。key 用 hash tag 包裹，`idem:{run_id:call_id}`，Redis Cluster 下结果和"执行中"标记会落在同一个 slot。
 
@@ -191,11 +191,11 @@ sequenceDiagram
 
 还有两个 Lua 的坑，都实测过：① **Lua 的小数返回给 Redis 时会被截断成整数**，1.5 会变成 1，文档建议把小数当字符串返回（[Lua API](https://redis.io/docs/latest/develop/programmability/lua-api/)）；② Redis Cluster 下，脚本访问的 key 必须全部通过 `KEYS` 传入，并且落在同一个 slot 里（[文档](https://redis.io/docs/latest/develop/using-commands/multi-key-operations/)）。本课的桶一次只访问一个 key。
 
-**等不到令牌时怎么办？** `RateLimitHook` 最多等 `wait_timeout` 秒，还拿不到就 `StopRun("rate_limited")`。worker 在这里干等，会占着一个 worker 槽位，别的租户明明有配额也只能排在后面（队头阻塞）。`AgentJobHandler` 会把 `rate_limited` 变成 `RetryLater`：任务回到队列、过一会儿再来，并且**不消耗重试次数**，这不是任务本身的错。Demo 里免费套餐租户（每秒 1 次）的任务被推迟了 16 次，它的全部任务用时 19.6 秒；另外两个标准套餐租户一次都没被推迟，约 10.7 秒就全部完成了。
+**等不到令牌时怎么办？** `RateLimitHook` 最多等 `wait_timeout` 秒，还拿不到就 `StopRun("rate_limited")`。worker 在这里干等，会占着一个 worker 槽位，别的租户明明有配额也只能排在后面（队头阻塞）。`AgentJobHandler` 会把 `rate_limited` 变成 `RetryLater`：任务回到队列、过一会儿再来，并且**不消耗重试次数**，这不是任务本身的错。Demo 里免费套餐租户（每秒 1 次）的任务被推迟了 43 次，它的全部任务用时 19.7 秒；另外两个标准套餐租户一次都没被推迟，4.7 秒就全部完成了。
 
 **怎么选**：B 管住自己的总量（按租户、按套餐），C 管住公司的总出口，D 当作最后一道墙：收到 429 时按 `Retry-After` 退避（第 08 课）。Redis 挂了怎么办要**提前决定**：交互流量通常选择放行（fail open）并告警，批量任务选择暂停。
 
-**本课实现**：[`RedisTokenBucket`](../../agentkit/contrib/redis_store.py)（`try_acquire` / `acquire`，`overrides` 按租户覆盖速率和容量）和 `RateLimitHook`（`before_llm` 里拿令牌；`tokens_fn` 可以按 token 数计费，实现 TPM 限流）。异步版是 `AsyncRedisTokenBucket` 和 `AsyncRateLimitHook`：等令牌时用 `asyncio.sleep` 让出事件循环。**从嵌入式换成托管**：换 `REDIS_URL`。
+**本课实现**：[`RedisTokenBucket`](../../agentkit/contrib/redis_store.py)（`await try_acquire` / `await acquire`，`overrides` 按租户覆盖速率和容量）和 `RateLimitHook`（`before_llm` 里拿令牌；`tokens_fn` 可以按 token 数计费，实现 TPM 限流）。两者都只有 async 版本：等令牌时 `await asyncio.sleep`，让出事件循环，同一进程里别的会话照常推进。`RateLimitHook.before_llm` 是 `async def`，子类覆盖它也要写成 `async def` 并 `await super().before_llm(...)`（demo 的 `MeteredRateLimit` 就是这么做的，它顺便把每个租户的计数写进 Redis）。**从嵌入式换成托管**：换 `REDIS_URL`。
 
 ### 问题 5：分布式锁 —— Redis、Postgres advisory lock、etcd、ZooKeeper，怎么选？
 
@@ -215,17 +215,17 @@ sequenceDiagram
 
 ```python
 # 锁 + fencing 的正确用法：token 由存储校验，而不是由持有者自己判断"我还持有锁吗"
-with RedisLock(r, "weekly-report:acme", ttl_seconds=30) as fence:
-    report = build_report()                                   # 这里可能停顿很久
-    cur = pg.execute("UPDATE reports SET body = %s, fence = %s WHERE tenant = 'acme' AND fence < %s",
-                     (report, fence, fence))
+async with RedisLock(r, "weekly-report:acme", ttl_seconds=30) as fence:   # r 是 redis.asyncio.Redis
+    report = await build_report()                             # 这里可能停顿很久
+    cur = await conn.execute("UPDATE reports SET body = %s, fence = %s WHERE tenant = 'acme' AND fence < %s",
+                             (report, fence, fence))           # conn 是 psycopg.AsyncConnection
     if cur.rowcount == 0:
         raise RuntimeError("我已经不是持有者了：写入被拒绝")      # 存储在写入的那一刻做判断
 ```
 
 **怎么选**：资源就在 Postgres 里，用 B。需要跨系统、并且对正确性要求高的，用 C。只是为了效率，用 A；但正确性一定要靠存储端校验 fence，**不要用不带 fencing 的锁保证正确性**，也**不要让 Redis INCR 的 token 成为唯一防线**。
 
-**本课实现**：`RedisLock(client, name, ttl_seconds)`：`acquire()` 返回 fencing token，`release()` 和 `extend()` 都是"比较后再操作"。测试 `test_storage_rejects_a_paused_holders_stale_token` 复现了第 13 课的时间线。本课的 `setup()` 用 `pg_advisory_xact_lock` 让多个进程串行建表，这是 B 的一个小例子（为什么需要它，见第 6 节）。**从嵌入式换成托管**：A 换 `REDIS_URL`；B 不用换，就在你的 Postgres 里；C、D 需要单独部署（或使用云厂商的托管版）。
+**本课实现**：`RedisLock(client, name, ttl_seconds)`：`await acquire()` 返回 fencing token，`await release()` 和 `await extend()` 都是"比较后再操作"，也可以 `async with lock as fence:`。测试 `test_storage_rejects_a_paused_holders_stale_token` 复现了第 13 课的时间线。本课的 `setup()` 用 `pg_advisory_xact_lock` 让多个进程串行建表，这是 B 的一个小例子（为什么需要它，见第 6 节）。**从嵌入式换成托管**：A 换 `REDIS_URL`；B 不用换，就在你的 Postgres 里；C、D 需要单独部署（或使用云厂商的托管版）。
 
 ### 问题 6：运维 —— 连接池、迁移、备份与高可用、表膨胀、监控
 
@@ -237,8 +237,8 @@ with RedisLock(r, "weekly-report:acme", ttl_seconds=30) as fence:
 
 | 方案 | 做法 | 注意 |
 |---|---|---|
-| 应用内连接池（`psycopg_pool`） | `ConnectionPool` / `AsyncConnectionPool`；`with pool.connection()` 正常退出时提交、异常时回滚，然后归还（[文档](https://www.psycopg.org/psycopg3/docs/advanced/pool.html)） | 池的大小按"同时需要连接的线程 / 协程数"来定（问题 7）；**不要在持有一个连接的同时，再向同一个池借连接**：实测池大小为 2、两个协程都这么做，结果都在 `PoolTimeout` 超时后失败 |
-| 外部连接池（PgBouncer） | 事务池模式：只在事务期间占用一个服务端连接，几千个客户端连接可以复用几十个服务端连接（[文档](https://www.pgbouncer.org/features.html)） | 事务池模式下，`SET`、`LISTEN`、会话级 advisory lock 等**不能用**。协议级 prepared statement 从 1.21 开始支持，1.24 起默认开启（`max_prepared_statements=200`）。psycopg 默认执行 5 次后自动 prepare（`prepare_threshold=5`），中间件不支持时要设成 `None`（[psycopg 文档](https://www.psycopg.org/psycopg3/docs/advanced/prepare.html#using-prepared-statements-with-pgbouncer)）。本课的适配器可以通过 `connect_kwargs={"prepare_threshold": None}` 传进去 |
+| 应用内连接池（`psycopg_pool`） | `AsyncConnectionPool`（同步代码用 `ConnectionPool`）；`async with pool.connection()` 正常退出时提交、异常时回滚，然后归还（[文档](https://www.psycopg.org/psycopg3/docs/advanced/pool.html)） | 池的大小按"同时需要连接的线程 / 协程数"来定（问题 7）；**不要在持有一个连接的同时，再向同一个池借连接**：实测池大小为 2、两个协程都这么做，结果都在 `PoolTimeout` 超时后失败 |
+| 外部连接池（PgBouncer） | 事务池模式：只在事务期间占用一个服务端连接，几千个客户端连接可以复用几十个服务端连接（[文档](https://www.pgbouncer.org/features.html)） | 事务池模式下，`SET`、`LISTEN`、会话级 advisory lock 等**不能用**。协议级 prepared statement 从 1.21 开始支持，1.24 起默认开启（`max_prepared_statements=200`）。psycopg 默认执行 5 次后自动 prepare（`prepare_threshold=5`），中间件不支持时要设成 `None`（[psycopg 文档](https://www.psycopg.org/psycopg3/docs/advanced/prepare.html#using-prepared-statements-with-pgbouncer)）。本课的适配器可以通过 `pool_kwargs={"kwargs": {"prepare_threshold": None}}` 传给它自己建的连接池 |
 | 托管代理（RDS Proxy 等） | 同上，由云厂商运维 | 同样要关注 prepared statement 和会话状态 |
 
 **② 迁移：用 Alembic（SQLAlchemy 生态，[文档](https://alembic.sqlalchemy.org/)）或 Flyway（版本化的纯 SQL 脚本，[文档](https://documentation.red-gate.com/fd)），在发布流水线里执行一次**，不要让每个 worker 启动时都去建表。本课的 `setup()` 是为了教学和测试方便才写的，并且用 advisory lock 防止并发建表撞车：实测 8 个连接同时执行 `CREATE TABLE IF NOT EXISTS`，7 个报 `UniqueViolation`。
@@ -247,7 +247,7 @@ with RedisLock(r, "weekly-report:acme", ttl_seconds=30) as fence:
 
 | 组件 | 选项 | 要知道的数字 |
 |---|---|---|
-| Postgres | RDS Multi-AZ 实例 / Multi-AZ 集群 / Aurora / 自建（Patroni 等） | RDS Multi-AZ 实例切换通常 60–120 秒（[文档](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.Failover.html)）；Multi-AZ 集群通常 35 秒以内（[文档](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/multi-az-db-clusters-concepts-failover.html)）；Aurora 有副本时通常 60 秒以内（[文档](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Concepts.AuroraHighAvailability.html)）。worker 要能扛住这段时间：`run_worker` 在 claim 失败时退避重试，而不是直接崩溃 |
+| Postgres | RDS Multi-AZ 实例 / Multi-AZ 集群 / Aurora / 自建（Patroni 等） | RDS Multi-AZ 实例切换通常 60–120 秒（[文档](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.Failover.html)）；Multi-AZ 集群通常 35 秒以内（[文档](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/multi-az-db-clusters-concepts-failover.html)）；Aurora 有副本时通常 60 秒以内（[文档](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Concepts.AuroraHighAvailability.html)）。worker 要能扛住这段时间：`run_worker` 在 claim 遇到 `OperationalError` / `PoolTimeout` 时退避重试，而不是直接崩溃（测试 `test_worker_rides_out_a_database_outage_instead_of_crashing` 用 `TcpProxy` 真的断网验证过） |
 | Redis | RDB 快照 / AOF / 复制 + 哨兵或集群 / MemoryDB | RDB 通常几分钟做一次快照，崩溃可能丢几分钟的数据；AOF（要用 `appendonly yes` 开启）默认 `appendfsync everysec`，可能丢约 1 秒（[文档](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)）；复制是异步的，`WAIT` 也不能让 Redis 变成强一致（[文档](https://redis.io/docs/latest/commands/wait/)），主从切换可能丢掉已确认的写入。需要持久的 Redis 语义，可以考虑 MemoryDB：写入先落到多可用区事务日志，再返回（[文档](https://docs.aws.amazon.com/memorydb/latest/devguide/what-is-memorydb.html)） |
 
 这张表也解释了 1.2 节那条原则：Redis 在切换时可能丢掉最近约 1 秒的写入，所以**只能放丢了能重建的东西**。
@@ -261,82 +261,84 @@ with RedisLock(r, "weekly-report:acme", ttl_seconds=30) as fence:
 
 **⑤ 监控**：CPU 是绿的不等于用户没在等。比"队列里有多少个"更能说明问题的是**最老的可执行任务已经等了多久**：`stats()["oldest_queued_age_s"]`。另外几个值得告警的指标：`expired_leases`（过期了还没被回收的租约，说明 worker 死了或者全都卡住了）、`dead` 的增量、fence 拒绝次数（`on_event("fence_rejected")`）、检查点冲突次数。第 28 课会把 `run_worker` 的 `on_event` 接到 Prometheus。
 
-**从嵌入式换成托管**：连接串指向 PgBouncer / RDS Proxy 时，加上 `connect_kwargs={"prepare_threshold": None}`（除非确认中间件支持 prepared statement）；迁移交给发布流水线；Redis 选带复制和自动切换的托管版，并且接受"切换时可能丢约 1 秒"这个前提。
+**从嵌入式换成托管**：连接串指向 PgBouncer / RDS Proxy 时，加上 `pool_kwargs={"kwargs": {"prepare_threshold": None}}`（除非确认中间件支持 prepared statement）；迁移交给发布流水线；Redis 选带复制和自动切换的托管版，并且接受"切换时可能丢约 1 秒"这个前提。
 
-### 问题 7：同步 worker vs 异步 worker —— 一个进程到底能同时跑几个 Agent？
+### 问题 7：加并发、加进程、还是换数据库 —— 一个进程到底能同时跑几个 Agent？
 
-**场景**：客服 Agent 高峰期同时有 300 个会话在跑，每个会话 90% 的时间都在等模型。第 13 课的同步 worker 一个进程一次只能跑一个任务，于是团队开了 60 个 Pod，每个 Pod 5 个进程。账单上是 300 个 Python 进程的内存，外加 900 个 Postgres 连接，而 CPU 利用率只有 3%。
+**场景**：客服 Agent 高峰期同时有 300 个会话在跑，每个会话 90% 的时间都在等模型。一个团队的旧 worker 一个进程一次只跑一个任务，于是开了 60 个 Pod，每个 Pod 5 个进程。账单上是 300 个 Python 进程的内存，外加 900 个 Postgres 连接，而 CPU 利用率只有 3%。
 
 **为什么难**：Agent 是典型的 **IO 密集型**负载：一次模型调用 3–10 秒，这段时间里 CPU 什么都不做。解决办法是"等待的时候去干别的"，但具体怎么"去干别的"，有三种做法，各有各的坑。
 
 | 方案 | 怎么做 | 优点 | 缺点 | 适用 |
 |---|---|---|---|---|
-| A. 每个任务一个线程 | 进程内开 N 个线程，每个线程跑一个同步 Agent | 代码不用改（agentkit 同步版） | 线程栈占内存；GIL 下 CPU 部分串行；每个线程通常要自己的数据库连接；**取消做不到**（线程杀不掉） | 并发几十以内 |
-| B. 多进程（第 13 课、本课 `run_worker`） | 每个进程一次跑一个任务，靠加进程提速 | 隔离最好：一个进程崩了不影响别人；CPU 密集的工具也能并行 | 内存和连接数都随进程数线性增长；等模型时整个进程闲着 | CPU 密集的工具多；或作为异步 worker 外面的一层（每个核一个异步进程） |
-| C. asyncio（本课 `run_async_worker` + `AsyncAgent`） | 一个进程一个事件循环，同时推进几十上百个任务；等待模型、数据库、Redis 时让出控制权 | 几乎没有额外内存开销；连接池可以远小于并发数；取消可以一路传到 HTTP 请求（[第 30 课](../30_async_runtime/README.md)） | **任何一个同步阻塞调用都会卡住整个进程**；整条链路（模型客户端、数据库驱动、Redis 客户端、工具）都要是 async 的，或者被放进线程池 | IO 密集的 Agent —— 生产服务的默认选择 |
+| A. 每个任务一个线程 | 进程内开 N 个线程，每个线程跑一个同步的 Agent 循环（很多框架的默认做法） | 同步代码不用改 | 线程栈占内存；GIL 下 CPU 部分串行；每个线程通常要自己的数据库连接；**取消做不到**（线程杀不掉） | 并发几十以内、现有代码全是同步的 |
+| B. 多进程、每个进程一次一个任务 | `--concurrency 1`，靠加进程提速 | 隔离最好：一个进程崩了不影响别人；CPU 密集的工具也能并行 | 内存和连接数都随进程数线性增长；等模型时整个进程闲着 | CPU 密集的工具多 |
+| C. 每个进程一个事件循环 + 多进程（agentkit 的做法） | `run_worker(concurrency=16)`：一个进程同时推进十几到几十个任务，等模型、数据库、Redis 时让出控制权；再按 CPU 核数、容灾需要加进程 | 几乎没有额外内存开销；连接池可以远小于并发数；取消可以一路传到 HTTP 请求（[第 30 课](../30_async_runtime/README.md)） | **任何一个同步阻塞调用都会卡住整个进程**；整条链路（模型客户端、数据库驱动、Redis 客户端、工具）都要是 async 的，或者被放进线程池 | IO 密集的 Agent —— 生产服务的默认选择 |
 
-**背压**：`run_async_worker(queue, handler, concurrency=16)` 在领取之前，先拿一个 `asyncio.Semaphore` 的名额。满载时停在那里，**不再 claim**，任务留在队列里，别的 worker 可以领走。如果不这样做，一个进程会一口气领走几百个任务，自己又处理不过来，租约一个接一个过期，这些任务被别人重复执行。
+agentkit 只有 C 这一套实现（第 02、13 课）：`Agent` 是 async 的，`run_worker` 是 async 的，Postgres / Redis 适配器也只有 async 版本（传同步的 `redis.Redis` 客户端直接报 `TypeError`）。
 
-**连接池怎么和并发度匹配**：关键不是"同时有多少个任务"，而是"同时有多少个任务**正在用**数据库连接"。Agent 的一步里，连接只在写检查点的那几毫秒被借用，调模型的几秒钟里不占连接。所以 16 路并发、连接池 4 个连接也跑得动（见下面的实测）。但如果在等模型时一直占着连接（比如在事务里调模型、先 `pool.connection()` 再调 Agent），并发就被卡成了连接数。估算公式：`池大小 ≈ 并发度 × 每个任务持有连接的时间占比 + 余量（心跳、领取）`；所有进程加起来，不能超过数据库的 `max_connections`（再往上就需要 PgBouncer）。
+**背压**：`run_worker(queue, handler, concurrency=16)` 在领取之前，先拿一个 `asyncio.Semaphore` 的名额。满载时停在那里，**不再 claim**，任务留在队列里，别的 worker 可以领走。如果不这样做，一个进程会一口气领走几百个任务，自己又处理不过来，租约一个接一个过期，这些任务被别人重复执行。
 
-**为什么在 async 代码里调用同步阻塞 IO 会拖垮整个事件循环**：事件循环是单线程的，协程只能在 `await` 的时候让出控制权。在协程里调用 `time.sleep(0.05)`、`requests.get`、同步的 psycopg 或 redis-py，这 50 毫秒里其他所有协程都动不了，包括**所有任务的续租心跳**。心跳一停，租约就会过期，任务被别的 worker 接手。测试 `test_blocking_call_inside_an_async_handler_stalls_every_other_task` 数了"同时处在 sleep 里的任务数"：阻塞版永远是 1，交给线程池的同步版至少是 2。`run_async_worker` 发现 handler 是同步函数时，会自动用 `asyncio.to_thread` 执行它。同理，`RateLimitHook`（同步版）在异步 Agent 里等令牌会卡住整个进程，要用 `AsyncRateLimitHook`。
+**连接池怎么和并发度匹配**：关键不是"同时有多少个任务"，而是"同时有多少个任务**正在用**数据库连接"。Agent 的一步里，连接只在写检查点的那几毫秒被借用，调模型的几秒钟里不占连接。所以 16 路并发、检查点池 4 个连接也跑得动（见下面的实测）。但如果在等模型时一直占着连接（比如在事务里调模型、先 `pool.connection()` 再调 Agent），并发就被卡成了连接数。估算公式：`池大小 ≈ 并发度 × 每个任务持有连接的时间占比 + 余量（心跳、领取）`；所有进程加起来，不能超过数据库的 `max_connections`（再往上就需要 PgBouncer）。
 
-**怎么选**：Agent worker 默认用 C。每个 CPU 核跑一个异步进程（B 套 C），`concurrency` 从 16–64 开始，按模型配额和内存来调。连接池先按"并发度的 1/4"起步，然后看 `psycopg_pool` 的 `get_stats()` 里 `requests_queued`（因为池满而排队的请求数）是否持续增长。运行时的细节（取消、超时、舱壁、流式）见[第 30 课](../30_async_runtime/README.md)。
+**为什么在 async 代码里调用同步阻塞 IO 会拖垮整个事件循环**：事件循环是单线程的，协程只能在 `await` 的时候让出控制权。在协程里调用 `time.sleep(0.05)`、`requests.get`、同步的 psycopg 或 redis-py，这 50 毫秒里其他所有协程都动不了，包括**所有任务的续租心跳**。心跳一停，租约就会过期，任务被别的 worker 接手。测试 `test_blocking_call_inside_an_async_handler_stalls_every_other_task` 数了"同时处在 sleep 里的任务数"：阻塞版永远是 1，交给线程池（`asyncio.to_thread`）的同步版至少是 2。`run_worker` 直接拒绝同步的 handler（`TypeError`）；Redis 适配器拒绝同步客户端，也是同一个道理。
 
-**本课实现**：`AsyncPostgresCheckpointer`、`AsyncPostgresJobQueue`（两者可以共用一个 `AsyncConnectionPool`）、`run_async_worker`、`AsyncRedisIdempotencyStore`、`AsyncRedisTokenBucket`、`AsyncRateLimitHook`；`AgentJobHandler` 发现 checkpointer 是异步版时，会 `await agent.run / resume / approve`，并且整个进程只用**一个** `AsyncAgent`（也就只有一个工具线程池），每个任务带 fence 的检查点视图通过 `checkpointer=` 参数按次传入。Demo 第 3 部分给出了实测数字，第 4 部分演示了异步 worker 的优雅停机（第 4 节）。
+**SQLite 还是 Postgres**：第 13 课 `demo_scale.py` 的结论是"并发拉到 ×64 之后，瓶颈变成 SQLite 只有一个写者，再往上该换 Postgres"。本课在同一台机器上把同一个 worker 应用分别跑在两种后端上（Demo 第 3 部分），结果是：**一直到 8 个进程 × 并发 64，两者的吞吐都差不多**（约 570–630 任务/秒），而且都只有理论上限的三分之一左右 —— 这时卡住的已经不是哪一种数据库的写锁（本机 8 核，同时跑着 8 个 worker 进程和数据库进程；本课没有进一步拆解是 CPU 还是别的）。所以换 Postgres 的理由不是"单机更快"，而是：**多台机器能连同一个队列**（SQLite 文件不能跨机器安全共享）、行级锁和 `SKIP LOCKED` 让多个写者并行、所有 worker 以数据库服务器的时钟判断租约。代价也在同一张表里：8 × 64 时这个库上同时开着 171 个连接。
+
+**怎么选**：Agent worker 用 C。每个 CPU 核跑一个 worker 进程，`concurrency` 从 16–64 开始，按模型配额和内存来调。连接池先按"并发度的 1/4"起步，然后看 `psycopg_pool` 的 `get_stats()` 里 `requests_queued`（因为池满而排队的请求数）是否持续增长。运行时的细节（取消、超时、舱壁、流式）见[第 30 课](../30_async_runtime/README.md)。
+
+**本课实现**：`PostgresCheckpointer`、`PostgresJobQueue`（两者可以共用一个 `AsyncConnectionPool`）、`run_worker`、`RedisIdempotencyStore`、`RedisTokenBucket`、`RateLimitHook`，全部是 async 的；`AgentJobHandler` 让整个进程只用**一个** `Agent`（也就只有一个工具线程池、一个模型客户端连接池），每个任务带 fence 的检查点视图通过 `run / resume / approve` 的 `checkpointer=` 参数按次传入。Demo 第 3 部分给出了实测数字，第 4 部分演示了 worker 进程收到 SIGTERM 后的优雅停机（第 4 节）。
 
 ## 3. 本课适配器怎么接
 
 ### 3.1 公开 API 一览
 
+所有方法都是 async 的（`await`）；worker 循环、任务处理器、异常与第 13 课的 SQLite 版共用，来自 `agentkit.distributed`（`agentkit.contrib.postgres` 也一并导出）。
+
 | 模块 | 类 / 函数 | 主要方法 |
 |---|---|---|
-| `agentkit.contrib.postgres` | `PostgresCheckpointer(conninfo, table="agent_runs", *, fence=None, writer=None, connect_kwargs=None)` | `setup()`、`save(state)`、`load(run_id)`、`fenced(fence, writer=None)`、`get_run(run_id)`、`list_runs(status=None, tenant_id=None, limit=50)`、`version_of(run_id)`、`close()` |
-| | `AsyncPostgresCheckpointer(pool_or_dsn, table="agent_runs", *, fence=None, writer=None, pool_kwargs=None)` | 同上，全部 `async`；支持 `async with` |
-| | `PostgresJobQueue(conninfo, table="agent_jobs", *, max_attempts=5, base_backoff=1.0, max_backoff=300.0, connect_kwargs=None)` | `setup()`、`enqueue(kind, payload, *, tenant_id, idempotency_key=None, priority=0, run_at=None, delay_seconds=0, max_attempts=None) -> int`、`claim(worker_id, lease_seconds=30, kinds=None) -> Job \| None`、`heartbeat(job, lease_seconds)`、`complete(job, result)`、`fail(job, error, retryable=True) -> str`、`release(job, *, delay_seconds=0, reason=None, count_attempt=False)`、`reap_expired()`、`redrive(job_id)`、`stats()`、`purge_finished(older_than_seconds)`、`get(job_id)`、`find(tenant_id, key)` |
-| | `AsyncPostgresJobQueue(pool_or_dsn, ...)` | 同上，全部 `async` |
-| | `run_worker(queue, handler, *, worker_id, stop_event, lease_seconds=30, poll_interval=0.5, heartbeat_interval=None, kinds=None, on_event=None, max_jobs=None) -> dict` | 同步 worker 主循环 |
-| | `run_async_worker(queue, handler, *, worker_id, stop_event, concurrency=16, lease_seconds=30, poll_interval=0.5, heartbeat_interval=None, grace_period=25.0, kinds=None, on_event=None, max_jobs=None) -> dict` | 异步 worker 主循环 |
-| | `AgentJobHandler(make_agent 或 AsyncAgent 实例, checkpointer, *, defer_stop_reasons=("rate_limited",), defer_seconds=2.0)` | `handler(job) -> dict`（异步 checkpointer 时返回协程，`is_async=True`）；`agents_created`：工厂被调用的次数 |
+| `agentkit.contrib.postgres` | `PostgresCheckpointer(pool_or_dsn, table="agent_runs", *, fence=None, writer=None, pool_kwargs=None)` | `setup()`、`save(state)`、`load(run_id)`、`fenced(fence, writer=None)`、`get_run(run_id)`、`list_runs(status=None, tenant_id=None, limit=50)`、`version_of(run_id)`（同步）、`close()`；支持 `async with` |
+| | `PostgresJobQueue(pool_or_dsn, table="agent_jobs", *, max_attempts=5, base_backoff=1.0, max_backoff=300.0, pool_kwargs=None)` | `setup()`、`enqueue(kind, payload, *, tenant_id, idempotency_key=None, priority=0, run_at=None, delay_seconds=0, max_attempts=None) -> int`、`claim(worker_id, lease_seconds=30, kinds=None) -> Job \| None`、`heartbeat(job, lease_seconds)`、`complete(job, result)`、`fail(job, error, retryable=True) -> str`、`release(job, *, delay_seconds=0, reason=None, count_attempt=False)`、`reap_expired()`、`redrive(job_id)`、`stats()`、`purge_finished(older_than_seconds)`、`get(job_id)`、`find(tenant_id, key)`；`transient_errors`（连接错误、`PoolTimeout`） |
+| `agentkit.distributed` | `run_worker(queue, handler, *, worker_id, stop_event, concurrency=16, lease_seconds=30, poll_interval=0.5, heartbeat_interval=None, grace_period=25.0, kinds=None, on_event=None, max_jobs=None, transient_errors=None) -> dict` | worker 主循环（SQLite、Postgres 通用）：背压、心跳续租、带 fence 提交、停机时取消超时的任务 |
+| | `AgentJobHandler(agent 或 make_agent, checkpointer, *, defer_stop_reasons=("rate_limited",), defer_seconds=2.0)` | `await handler(job) -> dict`、`aclose()`；`agents_created`：工厂被调用的次数 |
+| | `python -m agentkit.distributed.worker --queue sqlite:///… \| postgresql://… --app file.py:factory [--concurrency --lease --grace --opt k=v]`；`WorkerPool(queue_url, app, n, ...)` | worker 进程入口；本机拉起 N 个这样的进程，`kill(i)` / `pause(i)` / `resume(i)` / `terminate(i)` / `add()` / `events()` |
+| | `TcpProxy(target_host, target_port)` | `start()`、`cut()`（断网：重置现有连接、拒绝新连接）、`heal()`、`latency`、`stats`、`close()` |
 | | `stop_on_signals(stop_event, signals=(SIGTERM, SIGINT))`；异常 `CheckpointConflict`、`LeaseLost`、`RetryLater`、`PermanentJobError`；数据类 `Job` | |
-| `agentkit.contrib.redis_store` | `RedisIdempotencyStore(client_or_url, namespace="idem", ttl_seconds=86400)` / `AsyncRedisIdempotencyStore` | `get(key)`、`put(key, result)`、`claim(key, ttl_seconds=60) -> bool`、`release(key)`、`in_flight(key)` |
-| | `RedisTokenBucket(client, rate_per_sec, capacity, prefix="tb", *, overrides=None)` / `AsyncRedisTokenBucket` | `take(key, tokens=1) -> (ok, wait_s, left)`、`try_acquire(key, tokens=1)`、`acquire(key, tokens=1, timeout=None)`、`limits(key)` |
-| | `RateLimitHook(bucket, key_fn=租户, tokens_fn=lambda s, m: 1, wait_timeout=5.0)` / `AsyncRateLimitHook` | agentkit Hook：`before_llm` |
-| | `RedisLock(client, name, ttl_seconds, *, prefix="lock")` | `acquire(blocking=True, timeout=None) -> fence \| None`、`release()`、`extend(ttl_seconds=None)`、`owned()`；支持 `with lock as fence:` |
+| `agentkit.contrib.redis_store` | `RedisIdempotencyStore(client_or_url, namespace="idem", ttl_seconds=86400)` | `get(key)`、`put(key, result)`、`claim(key, ttl_seconds=60) -> bool`、`release(key)`、`in_flight(key)` |
+| | `RedisTokenBucket(client, rate_per_sec, capacity, prefix="tb", *, overrides=None, sleep=asyncio.sleep)` | `take(key, tokens=1) -> (ok, wait_s, left)`、`try_acquire(key, tokens=1)`、`acquire(key, tokens=1, timeout=None)`、`limits(key)`（同步） |
+| | `RateLimitHook(bucket, key_fn=租户, tokens_fn=lambda s, m: 1, wait_timeout=5.0)` | agentkit Hook：`async def before_llm` |
+| | `RedisLock(client, name, ttl_seconds, *, prefix="lock")` | `acquire(blocking=True, timeout=None) -> fence \| None`、`release()`、`extend(ttl_seconds=None)`、`owned()`；`async with lock as fence:` |
 
-五行接上一个多 worker 的 Agent 服务：
+Redis 的 `client` 是 `redis.asyncio.Redis` 或 `redis://` URL；传同步的 `redis.Redis` 会报 `TypeError`（它每次调用都会卡住事件循环）。
+
+一个多机 Agent 服务的 worker 进程（每个 Pod 跑 `python -m agentkit.distributed.worker --queue $DATABASE_URL --app app.py:make_handler`）：
 
 ```python
+# app.py —— 和第 13 课的 worker_app.py 相比，只有检查点这一行换了
 from agentkit import Agent, PermissionPolicy, default_llm
-from agentkit.contrib.postgres import AgentJobHandler, PostgresCheckpointer, PostgresJobQueue, run_worker, stop_on_signals
+from agentkit.contrib.postgres import AgentJobHandler, PostgresCheckpointer
 from agentkit.contrib.redis_store import RateLimitHook, RedisIdempotencyStore, RedisTokenBucket
 
-queue, ckpt = PostgresJobQueue(DSN), PostgresCheckpointer(DSN)
-limiter = RateLimitHook(RedisTokenBucket(REDIS_URL, rate_per_sec=5, capacity=10), wait_timeout=2)
-
-def make_agent(checkpointer):                       # 必须用传进来的 checkpointer：它带着这次领取的 fence
-    return Agent(default_llm(), TOOLS, checkpointer=checkpointer, hooks=[PermissionPolicy(), limiter],
-                 idempotency_store=RedisIdempotencyStore(REDIS_URL))
-
-stop = threading.Event(); stop_on_signals(stop)     # SIGTERM → 做完手头的任务再退出
-run_worker(queue, AgentJobHandler(make_agent, ckpt), worker_id=os.environ["HOSTNAME"], stop_event=stop)
+async def make_handler(ctx):                              # ctx.queue：worker 命令行已经连好的 PostgresJobQueue
+    ckpt = PostgresCheckpointer(ctx.queue_url, pool_kwargs={"max_size": 8})
+    await ckpt.setup()                                    # 生产里交给迁移工具（问题 6）
+    limiter = RateLimitHook(RedisTokenBucket(REDIS_URL, rate_per_sec=5, capacity=10), wait_timeout=2)
+    agent = Agent(default_llm(max_connections=20), TOOLS, checkpointer=ckpt, hooks=[PermissionPolicy(), limiter],
+                  idempotency_store=RedisIdempotencyStore(REDIS_URL))   # 整个进程共用这一个 Agent
+    return AgentJobHandler(agent, ckpt)                   # 每个任务用这次领取的 fence 创建检查点视图
 ```
 
-异步版：一个进程一个 `AsyncAgent`，所有任务共用；每个任务带 fence 的视图由 handler 通过 `checkpointer=` 传进去。
+不用命令行、自己写主循环也行（比如和 API 放在同一个进程里做测试）：
 
 ```python
-from agentkit.aio import AsyncAgent, default_async_llm
-from agentkit.contrib.postgres import AsyncPostgresCheckpointer, AsyncPostgresJobQueue, run_async_worker
-
-pool = AsyncConnectionPool(DSN, max_size=8, kwargs={"autocommit": True})   # 队列和检查点共用一个池（问题 7）
-aqueue, ackpt = AsyncPostgresJobQueue(pool), AsyncPostgresCheckpointer(pool)
-agent = AsyncAgent(default_async_llm(max_connections=20), TOOLS, checkpointer=ackpt, hooks=[PermissionPolicy()])
-stop = asyncio.Event(); stop_on_signals(stop)       # 在事件循环里调用
-await run_async_worker(aqueue, AgentJobHandler(agent, ackpt), worker_id=os.environ["HOSTNAME"],
-                       stop_event=stop, concurrency=32, grace_period=25)
+async with AsyncConnectionPool(DSN, max_size=8, kwargs={"autocommit": True}) as pool:   # 队列和检查点共用一个池（问题 7）
+    queue, ckpt = PostgresJobQueue(pool), PostgresCheckpointer(pool)
+    stop = asyncio.Event(); stop_on_signals(stop)         # SIGTERM → 停止领取，在途任务最多等 grace_period 秒
+    await run_worker(queue, AgentJobHandler(agent, ckpt), worker_id=os.environ["HOSTNAME"],
+                     stop_event=stop, concurrency=32, grace_period=25)
 ```
 
-API 服务这一侧：`queue.enqueue("agent", {"op": "run", "input": text, "metadata": {...}}, tenant_id=..., idempotency_key=request_id)`；审批收件箱是 `ckpt.list_runs(status="paused", tenant_id=...)`；审批通过后入队 `{"op": "resume", "run_id", "approvals": {call_id: True}, "by": 审批人}`，幂等键用 `approve:{run_id}:{call_id}`，审批人连点两次也只会入队一次。
+API 服务这一侧：`await queue.enqueue("agent", {"op": "run", "input": text, "metadata": {...}}, tenant_id=..., idempotency_key=request_id)`；审批收件箱是 `await ckpt.list_runs(status="paused", tenant_id=...)`；审批通过后入队 `{"op": "resume", "run_id", "approvals": {call_id: True}, "by": 审批人}`，幂等键用 `approve:{run_id}:{call_id}`，审批人连点两次也只会入队一次。
 
 ### 3.2 检查点：CAS 和 fence 接管各是一条 SQL
 
@@ -385,7 +387,7 @@ RETURNING *;
 
 - **SKIP LOCKED**：PostgreSQL 文档明确说，跳过被锁住的行会得到一个不一致的数据视图，不适合一般用途，但适合"多个消费者访问一张类似队列的表"来避免锁争用（[文档](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)）。练习 (b) 的测试会拿着一行的锁不放：少了 `SKIP LOCKED`，你的实现就会排队等锁。
 - **为什么先回收成 `queued`，而不是让 claim 直接领取过期的行？** claim 只扫描 `status = 'queued'` 这一个部分索引 `(priority DESC, id) WHERE status = 'queued'`，积压再大也是一次索引扫描。代价是：一旦被回收，旧持有者的迟到提交就会被拒绝（它的所有权在回收那一刻就结束了）。在回收之前，迟到的提交仍然有效，这和第 13 课一致。
-- **排序键用 `id`，不用 `run_at`。** 最初写的是 `ORDER BY run_at, id`。结果 demo 里 worker 在第 1.7 秒被 kill，到第 10.6 秒才有人接手，而租约只有 2 秒：回收时 `run_at` 被设成"现在 + 退避"，任务排到了**队尾**，要等前面的积压全部消化完。它的用户已经等过一轮了，不该再排一次队。改成按入队顺序（`id`）排序之后，退避结束的任务会回到原来的位置：同样的场景，现在第 0.9 秒被 kill，第 3.2 秒就被接手了，差不多只等了 2 秒的租约；真实模式下第 11.6 秒被 kill，第 14.4 秒（租约 3 秒）被接手。
+- **排序键用 `id`，不用 `run_at`。** 最初写的是 `ORDER BY run_at, id`。结果 demo 里 worker 在第 1.7 秒被 kill，到第 10.6 秒才有人接手，而租约只有 2 秒：回收时 `run_at` 被设成"现在 + 退避"，任务排到了**队尾**，要等前面的积压全部消化完。它的用户已经等过一轮了，不该再排一次队。改成按入队顺序（`id`）排序之后，退避结束的任务会回到原来的位置：修复后同样的场景，第 0.9 秒被 kill，第 3.2 秒就被接手了，差不多只等了 2 秒的租约。现在的 demo 第 1 部分里，第 0.4 秒被 kill 的任务在第 3.3 秒被接手（租约 2 秒，加上回收后的随机退避）。
 - **所有时间都用数据库的 `now()`**：所有 worker 以同一个时钟判断租约。
 - **`attempts` 在领取时加一**，毒消息照样能进死信（第 13 课问题 3）；`release()`（优雅停机、被限流推迟）会把这一次还回去。
 - **`redrive` 不重置 fence**：fence 必须单调递增，否则旧持有者的 fence 可能"复活"。
@@ -398,21 +400,21 @@ RETURNING *;
 
 | handler 的结果 | 队列操作 | 为什么 |
 |---|---|---|
-| 正常返回 | `complete(job, result)` | 由存储端的 fence 做最终裁判：就算心跳线程已经发现租约丢了，也照样提交一次，让 fence 来判 |
+| 正常返回 | `complete(job, result)` | 由存储端的 fence 做最终裁判：就算心跳协程已经发现租约丢了，也照样提交一次，让 fence 来判 |
 | `RetryLater(delay)` | `release`，不计入尝试次数 | 限流、下游暂时不可用：不是任务的错 |
 | `PermanentJobError` | `fail(retryable=False)` → `failed` | 参数非法、租户不匹配：重试也没用 |
 | 其他异常 | `fail(retryable=True)` → 退避后重试，次数用尽进 `dead` | |
 | `CheckpointConflict` / `LeaseLost` | 什么都不做 | 所有权已经转移，任何提交都会被拒绝 |
 
-心跳由每个 worker 一个的后台线程负责，默认间隔是租约的 1/3，整个生命周期复用同一个数据库连接（最初每个任务开一个心跳线程，而线程局部连接不会随线程结束而关闭，跑 1000 个任务就会攒下 1000 个连接；测试 `test_sync_worker_uses_a_fixed_number_of_connections_however_many_jobs` 专门盯着这个问题）。
+心跳是每个在途任务一个的协程（和任务跑在同一个事件循环里），默认间隔是租约的 1/3，每次从进程的连接池里借一个连接用几毫秒。所以一个 worker 占用的数据库连接数只取决于连接池的上限，和在途任务数、心跳频率都无关（测试 `test_worker_connections_are_bounded_by_its_pool_not_by_jobs_or_heartbeats`：8 个在途任务、每 10 毫秒续一次租，连接数始终不超过池的 3 个）。心跳续租被拒（fence 过期）时置位 `job.lost`；续租时连不上数据库（`heartbeat_error`）只记一笔、下一轮再试 —— Demo 第 5 部分断网的 far-0 就是这样，租约在它还活着的时候过期了。
 
-**和 Kubernetes 的关系**：删除 Pod 时，K8s 先执行 preStop，然后向容器的 1 号进程发 SIGTERM，等 `terminationGracePeriodSeconds`（默认 30 秒，preStop 的耗时也算在内）之后发 SIGKILL（[文档](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)）。`stop_on_signals(stop)` 把 SIGTERM 接到 `stop_event` 上：同步 worker 做完手头的任务再退出；异步 worker 等在途任务最多 `grace_period` 秒（默认 25 秒，给取消和清理留出时间），超时的任务被**取消，不提交、不归还**。`AsyncAgent` 在被取消时会把检查点落盘为 `cancelled`：被打断的只读工具调用补上"未执行"，写 / 高危工具的调用**保持未回答**。等租约自然过期后，别的 worker 从这里 `resume`，未回答的写调用用**同一个 call_id** 重放，幂等键不变，由下游去重（测试 `test_cancelled_run_is_left_to_expire_and_resumed_by_another_worker`、`test_write_cancelled_at_shutdown_is_replayed_with_the_same_key_and_not_duplicated`，demo 第 4 部分）。宽限期不必覆盖最长的任务：做不完的任务由租约和检查点兜底。
+**和 Kubernetes 的关系**：删除 Pod 时，K8s 先执行 preStop，然后向容器的 1 号进程发 SIGTERM，等 `terminationGracePeriodSeconds`（默认 30 秒，preStop 的耗时也算在内）之后发 SIGKILL（[文档](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)）。`stop_on_signals(stop)` 把 SIGTERM 接到 `stop_event` 上（worker 命令行已经接好）：worker 停止领取，等在途任务最多 `grace_period` 秒（`--grace`，默认 25 秒，给取消和清理留出时间），超时的任务被**取消，不提交、不归还**。`Agent` 在被取消时会把检查点落盘为 `cancelled`：被打断的只读工具调用补上"未执行"，写 / 高危工具的调用**保持未回答**。等租约自然过期后，别的 worker 从这里 `resume`，未回答的写调用用**同一个 call_id** 重放，幂等键不变，由下游去重（测试 `test_cancelled_read_only_run_is_left_to_expire_and_resumed_by_the_next_worker`、`test_sigterm_cancels_a_hanging_write_and_the_next_process_replays_it_with_the_same_key`，demo 第 4 部分：两个真实的 worker 进程）。宽限期不必覆盖最长的任务：做不完的任务由租约和检查点兜底。
 
 ### 3.5 AgentJobHandler
 
 ```mermaid
 flowchart TB
-    J["领到任务<br/>fence = n"] --> V["ckpt.fenced(n)<br/>make_agent(视图)"]
+    J["领到任务<br/>fence = n"] --> V["ckpt.fenced(n)<br/>共享的 Agent，checkpointer=视图"]
     V --> OP{"payload.op"}
     OP -->|run| L{"load(run_id)<br/>有检查点吗？"}
     L -->|"没有"| RUN["agent.run(input, metadata + 任务的 tenant_id)"]
@@ -425,7 +427,7 @@ flowchart TB
 ```
 
 - **身份以任务为准**：`metadata["tenant_id"]` 一律覆盖成 `job.tenant_id`，payload 是调用方填的，不可信（第 09 课）；resume 别的租户的 run，会得到 `PermanentJobError`。
-- **异步版共用一个 Agent**：第一个参数推荐直接传一个 `AsyncAgent` 实例，整个进程共用它（也就共用它的工具线程池和模型客户端），handler 通过 `run / resume / approve` 的 `checkpointer=` 参数传入每个任务带 fence 的视图。传工厂 `make_agent(checkpointer)` 也行，异步版只调用一次：测试 `test_one_shared_async_agent_serves_many_concurrent_jobs` 里 20 个任务、8 路并发，只建了 1 个 Agent，每个任务写下的检查点仍然带着自己的 fence。最初的实现是每个任务新建一个 `AsyncAgent`，也就每个任务新建一个线程池；`AsyncAgent` 支持按次传入检查点之后，这就不需要了。同步 `Agent` 的检查点绑在实例上，所以同步版仍然每个任务调用一次工厂；`make_agent(checkpointer, job)` 总是每个任务一个，用来按任务定制（想共用线程池就给每个 `AsyncAgent` 传同一个 `executor=`）。不支持 `checkpointer=` 的 Agent 如果没用传进来的 checkpointer，handler 会直接报错，否则 fence 保护就形同虚设。
+- **整个进程共用一个 Agent**：第一个参数推荐直接传一个 `Agent` 实例，整个进程共用它（也就共用它的工具线程池和模型客户端的连接池），handler 通过 `run / resume / approve` 的 `checkpointer=` 参数传入每个任务带 fence 的视图（测试 `test_one_shared_agent_serves_many_concurrent_jobs`：很多任务并发，只有 1 个 Agent，每个任务写下的检查点仍然带着自己的 fence）。最初的实现是每个任务新建一个 Agent，也就每个任务新建一个线程池；Agent 支持按次传入检查点之后，这就不需要了。也可以传工厂 `make_agent(checkpointer, job)`（可以是 async 函数），每个任务调用一次，用来按任务定制（比如按租户选模型；想共用线程池就给每个 Agent 传同一个 `executor=`），工厂里必须用传进来的 checkpointer，否则 fence 保护就形同虚设。
 - handler 会给 Agent 加一个小钩子：心跳发现租约丢了，就在下一次调模型或工具之前 `StopRun("lease_lost")`，少做无用功。一个 Agent 只装一个，当前是哪个任务从 `ContextVar` 里取：共享 Agent 上并发的任务各自看到自己的 job，只有丢了租约的那个会停（测试 `test_lease_guard_stops_only_the_job_whose_lease_was_lost`）。最终的安全仍然靠 fence 和 CAS。
 
 ### 3.6 Redis 的三个 Lua 脚本
@@ -452,137 +454,191 @@ return 0
 ## 4. 动手：运行 Demo
 
 ```bash
-.venv/bin/python lessons/26_state_and_queues/demo.py --offline         # 离线：ScriptedLLM，约 50 秒
-.venv/bin/python lessons/26_state_and_queues/demo.py                   # 真实模型（7 个任务，模型并发 ≤ 2）
-.venv/bin/python lessons/26_state_and_queues/demo.py --offline --only 3   # 只跑同步 vs 异步对比
-.venv/bin/python lessons/26_state_and_queues/demo.py --offline --only 4   # 只跑异步 worker 优雅停机
+.venv/bin/python lessons/26_state_and_queues/demo.py --offline         # 离线：剧本模型，约 1 分钟
+.venv/bin/python lessons/26_state_and_queues/demo.py                   # 真实模型（第 1、2 部分 7 个任务；第 3–5 部分仍用剧本模型）
+.venv/bin/python lessons/26_state_and_queues/demo.py --offline --only 3   # 只跑 SQLite vs Postgres、加并发、加进程
+.venv/bin/python lessons/26_state_and_queues/demo.py --offline --only 5   # 只跑网络分区
 ```
 
-没装可选依赖时，demo 打印 `pip install -e ".[prod,prod-local]"` 后以退出码 0 结束。
-
-**第 1 部分：3 个 worker 进程 × 3 个租户 × 31 个任务**（离线模式实际输出，节选）
+没装可选依赖时，demo 打印 `pip install -e ".[prod,prod-local]"` 后以退出码 0 结束；某一部分的检查没通过时退出码为 1。所有 worker 都是 `WorkerPool` 拉起的真实进程，命令和第 13 课一样，只是 `--queue` 指向 Postgres：
 
 ```text
-   [+  0.8s] worker-2 │ 🧾 建工单 T-1004（幂等键 job-5:call_18115252a824）
-   [+  0.8s] worker-2 │ 工单建好了，但结果还没写进检查点……
-   [+  0.8s] worker-3 │ 🧾 建工单 T-1005（幂等键 job-6:call_3a21d26b8f73）
-   [+  0.8s] worker-3 │ 工单建好了，但结果还没写进检查点……
-   [+  0.9s] 调度器   │ 💥 kill -9 worker-2（pid 17903）：不释放租约、不写检查点、不留遗言
-   [+  0.9s] 调度器   │ 🔁 启动替补 worker-4（相当于 K8s 发现 Pod 挂了，拉起一个新的）
-   [+  1.0s] 调度器   │ 🧊 SIGSTOP worker-3：整个进程被冻结（心跳线程也停了），租约 2 秒后过期
-   [+  2.7s] worker-1 │ 😵 Agent 跑完了，提交结果之前进程被冻结（模拟 GC 停顿）
-   [+  2.8s] 调度器   │ 🧊 SIGSTOP worker-1：整个进程被冻结（心跳线程也停了），租约 2 秒后过期
-   [+  3.2s] worker-4 │ 接手任务 #5（第 2 次领取，fence=13）：发现前任 worker-2 的检查点（status=running，第 1 步）→ 从断点继续
-   [+  3.2s] worker-4 │ ♻️  下游唯一约束命中：返回已有工单 T-1004，没有重复创建
-   [+  3.4s] worker-4 │ 接手任务 #6（第 2 次领取，fence=14）：发现前任 worker-3 的检查点（status=running，第 1 步）→ 从断点继续
-   [+  3.4s] worker-4 │ ♻️  下游唯一约束命中：返回已有工单 T-1005，没有重复创建
-   [+  3.6s] 调度器   │ ▶️  SIGCONT worker-3：任务 #6 早已被别人完成，僵尸醒来
-   [+  3.6s] worker-3 │ 醒了！工具返回，Agent 继续往检查点里写……
-   [+  3.6s] worker-3 │ 💔 心跳被拒绝：任务 #6 的 fence 已经过期，租约早就不是我的了
-   [+  3.6s] worker-3 │ ❌ 检查点冲突（CheckpointConflict）：检查点冲突：run job-6 期望版本 2，实际版本 7（最后写入者 worker-4） —— 另一个 work…
-   [+  5.5s] worker-3 │ 接手任务 #7（第 2 次领取，fence=20）：发现前任 worker-1 的检查点（status=completed，第 2 步）→ 从断点继续
-   [+  5.6s] 调度器   │ ▶️  SIGCONT worker-1：任务 #7 早已被别人完成，僵尸醒来
-   [+  5.6s] worker-1 │ 醒了！以为自己还持有租约，继续提交结果……
-   [+  5.6s] worker-1 │ 💔 心跳被拒绝：任务 #7 的 fence 已经过期，租约早就不是我的了
-   [+  5.6s] worker-1 │ ❌ 提交被拒绝（LeaseLost）：任务 #7 已被重新领取：当前 fence=20（持有者 worker-3），你的 fence=7 已过期，提交被拒绝…
-
-▶ 所有任务结束 → 给每个 worker 发 SIGTERM（优雅停机：不再领取，手头的做完再退出）
-   退出码：worker-1=0，worker-2=-9，worker-3=0，worker-4=0（-9 = 被 kill -9；0 = 收到 SIGTERM 后正常退出）
-
-▶ 📊 结果（19.3 秒）
-   任务：31/31 成功，failed 0，dead 0；因崩溃 / 卡死被重新领取的：#5（第 2 次尝试完成，fence=13）、#6（第 2 次尝试完成，fence=14）、#7（第 2 次尝试完成，fence=20）；因限流被推迟 21 次（不计入尝试次数）
-   工单：18 张，幂等键 18 个 → 重复 0 张 ✅；下游唯一约束挡下了 2 次重放
-   fence：拒绝了僵尸 worker 的 1 次提交、2 次心跳 ✅
-   检查点：检测到 1 次冲突（僵尸在被接管之后还想写检查点）✅
-
-   租户      套餐            模型调用  等不到→推迟   等令牌总时长  全部完成用时
-   acme      标准（4/s）     21        0             0.0s          10.9s
-   globex    标准（4/s）     20        0             0.0s          10.9s
-   initech   免费（1/s）     20        21            27.4s         19.2s
+python -m agentkit.distributed.worker --queue postgresql://postgres@127.0.0.1:<端口>/helpdesk \
+    --app lessons/26_state_and_queues/worker_app.py:make_handler --concurrency 2 --lease 2 --opt redis=redis://127.0.0.1:<端口>/0
 ```
 
-真实模型模式（gpt-5.5）的一次运行：7 个任务、13 次模型调用，全部完成用时 19.3 秒；kill -9 在第 11.6 秒，第 14.4 秒（租约 3 秒）被接手；同样是 0 张重复工单、1 次提交被 fence 拒绝、1 次检查点冲突。真实模型每次调用要好几秒，免费套餐每秒 1 次的限额没有触发任何推迟。
+业务代码全在 [`worker_app.py`](worker_app.py)：一个共享的 Agent、三个工具、可选的 Redis 幂等缓存和限流。它和第 13 课的 `worker_app.py` 唯一和后端有关的一行是选检查点：`postgresql://` → `PostgresCheckpointer`，`sqlite:///` → `SQLiteCheckpointer`（第 3 部分就是用同一个文件分别跑两种后端）。剧本模型用 `ScriptedLLM(latency=0.15)`：每次调用 `asyncio.sleep` 0.15 秒，这是一个明确的"模型耗时"模型，不是真实模型的速度。Postgres 是 pgserver 自带的 initdb / pg_ctl 另起的一个监听 127.0.0.1 的实例（worker 走 TCP 连它），fakeredis 跑在单独的进程里。
+
+下面的输出都来自同一次离线运行（Apple M1、8 GB，运行时机器负载 8–14，总耗时 56 秒）。
+
+**第 1 部分：3 个 worker 进程 × 3 个租户 × 31 个任务**（节选）
+
+```text
+▶ 启动 3 个 worker 进程：python -m agentkit.distributed.worker --queue postgresql://… --concurrency 2 --lease 2（彼此不共享内存，只通过 Postgres 和 Redis 协作）
+   [+  0.4s] worker-0  │ 🧾 建工单 T-1003（幂等键 job-5:call_8d00871d4444）
+   [+  0.4s] worker-0  │ 工单建好了，但结果还没写进检查点……
+   [+  0.4s] worker-1  │ 🧾 建工单 T-1004（幂等键 job-6:call_1fc1f0667b0a）
+   [+  0.4s] worker-1  │ 工单建好了，但结果还没写进检查点……
+   [+  0.4s] 调度器    │ 💥 kill -9 worker-0（pid 63518，退出码 -9）：租约没还、检查点没写、不留遗言
+   [+  0.4s] 调度器    │ 🔁 启动替补 worker-3（pid 63539）
+   [+  0.4s] 调度器    │ 🧊 SIGSTOP worker-1：整个进程被冻结（心跳协程也停了），租约 2 秒后过期
+   [+  2.9s] worker-3  │ 接手任务 #3（第 2 次领取，fence=23）：发现前任 worker-1 的检查点（status=running，第 1 步）→ 从断点继续
+   [+  2.9s] worker-2  │ 接手任务 #6（第 2 次领取，fence=24）：发现前任 worker-1 的检查点（status=running，第 1 步）→ 从断点继续
+   [+  2.9s] worker-2  │ ♻️  下游唯一约束命中：返回已有工单 T-1004，没有重复创建
+   [+  3.0s] worker-3  │ 接手任务 #7（第 2 次领取，fence=25）：发现前任 worker-0 的检查点（status=running，第 0 步）→ 从断点继续
+   [+  3.2s] 调度器    │ ▶️  SIGCONT worker-1：任务 #6 早已被别人完成，僵尸醒来
+   [+  3.2s] worker-1  │ 醒了！工具返回，Agent 继续往检查点里写……
+   [+  3.2s] worker-1  │ 💔 心跳被拒绝：任务 #3 的 fence 已经过期，租约早就不是我的了
+   [+  3.2s] worker-1  │ 💔 心跳被拒绝：任务 #6 的 fence 已经过期，租约早就不是我的了
+   [+  3.2s] worker-1  │ ❌ 检查点冲突（CheckpointConflict）：检查点冲突：run job-3 期望版本 3，实际版本 7（最后写入者 worker-3） —— 另一个 wo…
+   [+  3.2s] worker-1  │ ❌ 检查点冲突（CheckpointConflict）：检查点冲突：run job-6 期望版本 2，实际版本 7（最后写入者 worker-2） —— 另一个 wo…
+   [+  3.3s] worker-3  │ 接手任务 #5（第 2 次领取，fence=29）：发现前任 worker-0 的检查点（status=running，第 1 步）→ 从断点继续
+   [+  3.3s] worker-3  │ ♻️  下游唯一约束命中：返回已有工单 T-1003，没有重复创建
+   [+ 16.5s] worker-3  │ 😵 Agent 跑完了，提交结果之前停顿（模拟 GC 停顿）
+   [+ 16.5s] 调度器    │ 🧊 SIGSTOP worker-3：整个进程被冻结（心跳协程也停了），租约 2 秒后过期
+   [+ 19.7s] worker-1  │ 接手任务 #7（第 3 次领取，fence=79）：发现前任 worker-3 的检查点（status=completed，第 2 步）→ 从断点继续
+   [+ 19.7s] 调度器    │ ▶️  SIGCONT worker-3：任务 #7 早已被别人完成，僵尸醒来
+   [+ 19.7s] worker-3  │ 醒了！以为自己还持有租约，继续提交结果……
+   [+ 19.8s] worker-3  │ 💔 心跳被拒绝：任务 #7 的 fence 已经过期，租约早就不是我的了
+   [+ 19.8s] worker-3  │ ❌ 提交被拒绝（LeaseLost）：任务 #7 已被重新领取：当前 fence=79（持有者 worker-1），你的 fence=75 已过期，提交被拒…
+
+▶ 所有任务结束 → 给每个 worker 发 SIGTERM（优雅停机：不再领取，手头的做完再退出）
+   退出码：worker-0=-9，worker-1=0，worker-2=0，worker-3=0（-9 = 被 kill -9；0 = 收到 SIGTERM 后正常退出）
+
+▶ 📊 结果（19.8 秒）
+   任务：31/31 成功，failed 0，dead 0；被重新领取的：#3（第 2 次尝试完成，fence=23）、#5（第 2 次尝试完成，fence=29）、#6（第 2 次尝试完成，fence=24）、#7（第 3 次尝试完成，fence=79）；因限流被推迟 43 次（不计入尝试次数）
+   工单：18 张，幂等键 18 个 → 重复 0 张 ✅；下游唯一约束挡下了 2 次重放
+   fence：拒绝了僵尸 worker 的 1 次提交、3 次心跳 ✅
+   检查点 / 租约：2 次"所有权已转移"（僵尸醒来后想写检查点被 CAS 拒绝，或心跳发现租约丢了主动停手）✅
+   故障注入：kill -9 worker-0（任务 #5）；SIGSTOP worker-1（任务 #6）；SIGSTOP worker-3（任务 #7）
+
+   租户      套餐            模型调用  等不到→推迟   等令牌总时长  全部完成用时
+   acme      标准（4/s）     21        0             2.4s          4.7s
+   globex    标准（4/s）     21        0             1.1s          4.7s
+   initech   免费（1/s）     21        43            43.9s         19.7s
+```
 
 该观察什么：
 
-1. **kill -9（任务 #5）**：工单已经建好，但结果没来得及进检查点。接手的 worker 从检查点重放**同一个**工具调用（同一个 `call_id`，因此同一个幂等键）。Redis 缓存没有命中（前任没来得及 `put`），拦住重复的是下游的唯一约束。第 0.9 秒被 kill，第 3.2 秒被接手：主要是在等 2 秒的租约过期，然后由当时唯一还在干活的替补 worker-4 领走（另外两个 worker 都被冻结了）。
-2. **跑到一半的僵尸（任务 #6）**：它醒来后要往检查点里写，得到的是 `CheckpointConflict`，期望版本 2，实际已经是 7；接管时的 +1 加上新 worker 的几次保存，都在它"睡着"的时候发生。它的心跳也被拒绝了。
-3. **提交阶段的僵尸（任务 #7）**：新 worker 读到的检查点已经是 `completed`，一次模型都没调，直接提交；僵尸醒来后的提交被 fence 拒绝。接手它的正是刚醒过来的 worker-3：僵尸醒来以后照样能领新任务，只是旧租约上的写入全部作废。
-4. **fence 的数值**：三个被接手的任务分别拿到 fence=13、14、20，不是"第 2 次领取所以是 2"；任务 #7 的僵尸手里是 fence=7。fence 取自整张队列表共用的序列（3.3），只保证后发的比先发的大。
-5. **限流**：免费租户的任务被推迟了 21 次（另外几次运行是 16 到 20 次），但**没有一次消耗重试次数**，也没有占着 worker 干等（每次最多等 1 秒）；另外两个租户几乎没有等过令牌。
-6. **SIGTERM**：替补 worker 和两个僵尸都正常退出（退出码 0），被 kill 的那个是 -9。
+1. **kill -9（任务 #5）**：工单已经建好，但结果没来得及进检查点。接手的 worker 从检查点重放**同一个**工具调用（同一个 `call_id`，因此同一个幂等键）。Redis 缓存没有命中（前任没来得及 `put`），拦住重复的是下游的唯一约束。
+2. **一个进程被冻结，它手上的所有任务一起变成僵尸**：每个 worker 并发 2，worker-1 被冻结时手上有任务 #3 和 #6，两个都被别人接手；它醒来后两个任务的心跳都被拒绝、检查点写入都撞上 `CheckpointConflict`（期望版本 2，实际已经是 7：接管时的 +1 加上新 worker 的几次保存，都在它"睡着"的时候发生）。同理，被 kill 的 worker-0 手上排队等令牌的任务 #7 也被接手了（"第 0 步"）。并发越高，一次故障波及的任务越多 —— 但靠租约 + fence，一个都没丢、一个都没重。
+3. **提交阶段的僵尸（任务 #7）**：新 worker 读到的检查点已经是 `completed`，一次模型都没调，直接提交；僵尸醒来后的提交被 fence 拒绝。
+4. **fence 的数值**：被接手的任务拿到 fence=23、24、29、79，不是"第 2 次领取所以是 2"；任务 #7 的僵尸手里是 fence=75。fence 取自整张队列表共用的序列（3.3），只保证后发的比先发的大。
+5. **限流**：免费租户的任务被推迟了 43 次，但**没有一次消耗重试次数**，也没有占着 worker 干等（每次最多等 1 秒）；另外两个租户几乎没有等过令牌，4.7 秒就全部完成。故障窗口"每个任务只开一次、每个进程只承受一次"由 worker 里一段 Redis Lua 决定（`worker_app.py` 的 `chaos_once`），不靠"第几次领取"。
+6. **SIGTERM**：替补 worker 和两个醒来的僵尸都正常退出（退出码 0），被 kill 的那个是 -9。
+
+真实模型模式（gpt-5.5，每个 worker 并发 1，本机所有 worker 共用 2 个模型并发名额）的一次运行：7 个任务，第 1 部分 13 次模型调用、第 2 部分 1 次，第 1 部分用时 16.3 秒；kill -9 在第 6.7 秒，第 12.3 秒被接手（租约 2 秒，但那时一个 worker 被冻结、另外两个都在忙，接手要等有人空出来）；同样是 0 张重复工单、1 次提交被 fence 拒绝、1 次检查点冲突。真实模型每次调用要好几秒，免费套餐每秒 1 次的限额没有触发任何推迟。
 
 **第 2 部分：审批 → 入队 resume → 一个全新的 worker 进程恢复执行**
 
 ```text
 ▶ 审批收件箱：ckpt.list_runs(status='paused')（按 (status, updated_at) 索引查询）
-   run job-2（租户 acme，用户 acme-zhang）等待审批：reset_password({"user": "zhang.san"})，最后写入者 worker-1
+   run job-2（租户 acme，用户 acme-zhang）等待审批：reset_password({"user": "zhang.san"})，最后写入者 worker-0
 ▶ 审批人 alice 点了“批准”——手抖点了两次；API 用 approve:<run_id>:<call_id> 作为幂等键入队 resume 任务
    两次入队返回的 job_id：#33、#33 → 同一个任务 ✅
-▶ 启动一个之前从没出现过的 worker-9 进程来处理它（状态全在 Postgres 里，任何进程都能接着跑）
-   [+  0.3s] worker-9 │ 领取任务 #33（op=resume，第 1 次尝试，fence=56）
-   [+  0.5s] worker-9 │ ✅ 完成 #33（acme）：密码已重置，新密码已发到你的企业邮箱。
-   resume 任务 #33：succeeded；run job-2 现在是 completed，最后写入者 worker-9
-   检查点的 fence：2 → 56（resume 是一个新任务，第一次领取就从全局序列拿到了更大的 fence，fenced load 接管成功）
-   审批记录：alice 于 04:45:04 批准 reset_password（已电话核实本人）
+▶ 启动一个之前从没出现过的 worker 进程 fresh-0（状态全在 Postgres 里，任何进程都能接着跑）
+   [+  0.2s] fresh-0   │ 领取任务 #33（第 1 次尝试，fence=80）
+   [+  0.4s] fresh-0   │ ✅ 完成 #33：密码已重置，新密码已发到你的企业邮箱。
+   resume 任务 #33：succeeded；run job-2 现在是 completed，最后写入者 fresh-0
+   检查点的 fence：2 → 80（resume 是一个新任务，第一次领取就从全局序列拿到了更大的 fence，fenced load 接管成功）
+   审批记录：alice 于 14:29:01 批准 reset_password（已电话核实本人）
 ```
 
-resume 任务 #33 第一次领取拿到的是 fence=56，不是 1。检查点上记着的 fence 是 2（run 任务 #2 领取时拿到的），56 比它大，所以 worker-9 的 fenced load 能接管。按任务计数的旧写法下，resume 任务第一次领取一定是 fence=1：这次 run 任务没被接手过，碰巧不出事；只要 run 任务被重新领取过一次，resume 任务就会被当成旧持有者拒绝（3.3）。
+resume 任务 #33 第一次领取拿到的是 fence=80，不是 1。检查点上记着的 fence 是 2（run 任务 #2 领取时拿到的），80 比它大，所以 fresh-0 的 fenced load 能接管。按任务计数的旧写法下，resume 任务第一次领取一定是 fence=1：这次 run 任务没被接手过，碰巧不出事；只要 run 任务被重新领取过一次，resume 任务就会被当成旧持有者拒绝（3.3）。
 
-**第 3 部分：同一批任务，同步 worker vs 单进程异步 worker**（24 个任务，每个调 2 次模型，模拟延迟 0.15 秒；真实模式下这一部分也用模拟模型，因为它测的是 worker 架构，不是模型速度）
+**第 3 部分：同一个 worker 应用、同一条命令 —— 只换 `--queue`**（每个任务调 2 次模型，每次 `asyncio.sleep` 0.15 秒，外加 1 次只读工具和约 5 次检查点写入；真实模式下这一部分也用剧本模型，因为它测的是 worker 架构，不是模型速度。每组都是真实的 worker 进程，计时从"开闸"算起：任务先带着很长的延迟入队，进程都启动完再一起放开）
 
 ```text
-   方案                            进程×并发  连接池      连接峰值  耗时     任务/秒  在途模型调用峰值
-   同步 · 1 进程                   1 × 1      -           5         7.91s    3.0      1
-   同步 · 3 进程                   3 × 1      -           11        2.82s    8.5      3
-   异步 · 1 进程 · 并发 16         1 × 16     16          10        0.65s    36.8     16
-   异步 · 并发 16 · 连接池 4       1 × 16     4           6         0.65s    37.1     16
-   异步 · 并发 16 · 全程占着连接   1 × 16     4（业务库） 11        1.93s    12.4     4
+   后端                          进程×并发  任务数  检查点池    连接峰值  耗时     任务/秒  理论上限  在途模型调用峰值
+   SQLite                        1 × 1      16      -           -         4.92s    3.3      3         1
+   Postgres                      1 × 1      16      16          7         4.98s    3.2      3         1
+   Postgres                      1 × 16     64      16          14        1.28s    49.8     53        16
+   Postgres                      3 × 16     96      16          37        0.68s    142.2    160       48
+   SQLite                        3 × 16     96      -           -         0.68s    140.9    160       48
+   SQLite                        8 × 64     512     -           -         0.89s    573.7    1707      350
+   Postgres                      8 × 64     512     16          171       0.82s    626.6    1707      349
+   Postgres · 检查点池 4         1 × 16     64      4           11        1.30s    49.1     53        16
+   Postgres · 等模型时占着连接   1 × 16     64      4（业务库） 15        5.13s    12.5     53        4
 ```
 
-（连接峰值是这个库上同时打开的连接数，包括父进程用来入队和统计的连接；同步那两行的"在途模型调用峰值"按进程数算，每个同步进程同一时刻只能有一个模型调用。）
+（理论上限 = 同时在跑的任务数 ÷ 每个任务等模型的 0.3 秒；在途模型调用峰值是把所有进程的模型调用区间放在一起数出来的；连接峰值是这个库上同时打开的连接数，含 worker 的队列池、检查点池和工单库池。这一部分另外单独跑过两次，同一行的耗时相差不到 5%。）
 
-1. 同步 worker 等模型的时候整个进程闲着，只能靠加进程来提速：3 个进程约 2.8 倍，连接数也跟着涨。
-2. 一个异步进程同时推进 16 个任务，吞吐是 3 个同步进程的 4 倍多。
-3. **池的上限是 16，但它只按需长到了 10 个连接**（另一次运行只长到 5 个）：Agent 的时间几乎都花在等模型上，检查点写入只借用连接几毫秒。池只给 4 个连接，吞吐也一样。
-4. 最后一行是反模式：每个任务在等模型的时候都占着一个（另一个库的）连接，并发就被卡成了连接数 4，吞吐掉到三分之一。
+1. **加并发**：同一个进程从并发 1 到并发 16，吞吐从 3.2 涨到 49.8 任务/秒，接近理论上限；在途模型调用峰值正好是 16 —— 并发是真的发生了，不是算出来的。
+2. **加进程**：3 个进程 × 16，吞吐再乘上去（142 任务/秒），峰值 48 = 3 × 16。
+3. **SQLite vs Postgres**：同一台机器上两者差不多，一直到 8 × 64 都是（574 对 627 任务/秒，都只有理论上限的三分之一左右）。这时卡住的不是某一种数据库的写锁（问题 7）。Postgres 换来的是"多台机器能连同一个队列"，代价之一在连接峰值那一列：8 × 64 时 171 个连接，再往上就要 PgBouncer（问题 6）。
+4. **检查点池只给 4 个连接，吞吐一样**（49.1 对 49.8）：Agent 的时间几乎都花在等模型上，检查点写入只借用连接几毫秒。
+5. 最后一行是反模式：每个任务在等模型的时候都占着一个（另一个库的）连接，并发就被卡成了连接数 4，吞吐掉到四分之一。
 
-**第 4 部分：异步 worker 优雅停机 —— 被取消的写操作，resume 后不重复**（离线模式实际输出；真实模式下这一部分也用模拟模型，要确定地卡在"下游已执行、响应未返回"这一刻）
+**第 4 部分：优雅停机 —— SIGTERM 时被取消的写操作，另一个进程 resume 后不重复**（真实模式下这一部分也用剧本模型，要确定地卡在"下游已执行、响应未返回"这一刻）
 
 ```text
-▶ pod-1 启动：并发 8，租约 2 秒，宽限期 0.5 秒
-   K8s 发来 SIGTERM：pod-1 不再领取新任务，等在途任务最多 0.5 秒
-   pod-1 退出：完成 5 个，宽限期后取消 1 个（不提交、不归还）
-   run job-5 的检查点：status=cancelled，最后一条是 assistant 的写工具调用 ['call_55243a0fba26']，没有补“未执行”（保持未回答）
-▶ 等租约自然过期（2 秒），pod-2 接手
-   pod-2 完成 1 个
+▶ pod-a 启动：一个进程、并发 8，租约 2 秒，宽限期 0.5 秒（--grace 0.5）
+   K8s 发来 SIGTERM：pod-a 不再领取新任务，等在途任务最多 0.5 秒
+   pod-a 退出（退出码 0）：完成 5 个，宽限期后取消 1 个（不提交、不归还）；事件顺序 draining → cancelled → stopped ✅
+   run job-5 的检查点：status=cancelled，最后一条是 assistant 的写工具调用 ['call_1eb84f0697f6']，没有补“未执行”（保持未回答）
+   任务 #5 在队列里：status=leased，持有者 pod-a0（没提交也没归还，等租约自然过期）
+▶ 另一个进程 pod-b 启动；2 秒租约过期后它领到任务 #5，从检查点接着跑
 ▶ 📊 结果
-   pod-1 执行 create_ticket，幂等键 job-5:call_55243a0fba26 → 新建
-   pod-2 执行 create_ticket，幂等键 job-5:call_55243a0fba26 → 唯一约束命中，返回已有工单
+   pod-a0（第 1 次领取）执行 create_ticket，幂等键 job-5:call_1eb84f0697f6 → 新建
+   pod-b0（第 2 次领取）执行 create_ticket，幂等键 job-5:call_1eb84f0697f6 → 唯一约束命中，返回已有工单
    两次执行用的是同一个幂等键 ✅
    工单 6 张，对应 6 个 run → 没有重复 ✅
 ```
 
-每个 Pod 只有一个共享的 `AsyncAgent`，6 个任务在上面并发。被取消的那一个，下游其实已经建好了工单；接手的 pod-2 重放的是检查点里**同一个** tool call，幂等键不变，下游唯一约束把第二次执行变成"返回已有结果"。为什么必须这样，见第 6 节第 1 条。
+pod-a 是一个真实的 worker 进程，SIGTERM 是真实的信号（`WorkerPool.terminate`）。它里面只有一个共享的 `Agent`，6 个任务在上面并发。被取消的那一个，下游其实已经建好了工单；接手的 pod-b（另一个进程）重放的是检查点里**同一个** tool call，幂等键不变，下游唯一约束把第二次执行变成"返回已有结果"。为什么必须这样，见第 6 节第 1 条。
+
+**第 5 部分：网络分区 —— worker 活着，但连不上数据库**（真实模式下这一部分也用剧本模型）
+
+两个 worker 进程都通过 TCP 连同一个 Postgres：far-0 的 `--queue` 指向 `TcpProxy` 的端口，near-0 直连。`TcpProxy`（[`agentkit/distributed/chaos.py`](../../agentkit/distributed/chaos.py)）是一个真实转发 TCP 字节流的代理，`cut()` 时重置所有经过它的连接、拒绝新连接，没有 mock 任何网络调用。far-0 执行完工具后，第二次模型调用停在一个 gate 文件上 —— 断网就发生在"工具已执行、检查点里有工具结果、模型调用进行中"这个确定的时刻，不靠 sleep 赌时间。
+
+```text
+   [+  0.2s] far-0     │ 领取任务 #1（第 1 次尝试，fence=1）
+   [+  0.4s] far-0     │ 🧾 建工单 T-1001（幂等键 job-1:call_7fc17ed64882）
+   [+  0.4s] 调度器    │ far-0 已经建好工单、检查点里有工具结果，正在等第二次模型调用返回
+   [+  0.6s] 调度器    │ ✂️  断网：TcpProxy.cut() 掐断 far-0 的 5 条数据库连接（队列池、检查点池、工单库池），之后的新连接一接上就被重置；far-0 进程本身活得好好的
+   [+  0.9s] far-0     │ 📡 心跳发不出去（任务 #1）：OperationalError: consuming input failed: server closed…
+   [+  1.6s] far-0     │ 📡 心跳发不出去（任务 #1）：OperationalError: consuming input failed: server closed…
+   [+  2.8s] near-0    │ 领取任务 #1（第 2 次尝试，fence=2）
+   [+  2.8s] near-0    │ 接手任务 #1（第 2 次领取，fence=2）：发现前任 far-0 的检查点（status=running，第 1 步）→ 从断点继续
+   [+  2.9s] near-0    │ ✅ 完成 #1：已为你创建工单 T-1001，IT 同事会尽快联系你。…
+   [+  2.9s] 调度器    │ 任务 #1 已由 near-0 完成（fence=2）；far-0 仍然存活：True
+   [+  2.9s] 调度器    │ 🔌 网络恢复 + far-0 的模型调用返回：它以为任务还归自己，要把最终答案写进检查点
+   [+  3.2s] far-0     │ 💔 心跳被拒绝：任务 #1 的 fence 已经过期，租约早就不是我的了
+   [+  4.1s] far-0     │ ❌ 检查点冲突（CheckpointConflict）：检查点冲突：run job-1 期望版本 3，实际版本 7（最后写入者 near-0） —— 另一个 work…
+
+▶ 📊 结果
+   领取记录：far-0 fence=1，near-0 fence=2（接手者的 fence 更大）
+   far-0 断网期间的心跳：2 次失败（heartbeat_error），租约因此没有续上；断网后 2.2 秒 near-0 领到它（租约 2 秒 + 回收后的退避）
+   任务最终：succeeded，完成者 near-0，fence=2；far-0 一次提交都没有发生（completed 事件 0 次）
+   检查点：far-0 恢复后写入被 CAS 拒绝，版本号仍是 7、最后写入者 near-0 —— 和 near-0 写完时一模一样 ✅
+   下游：工具体只执行过 1 次（far-0，断网前），工单 1 张；near-0 从检查点继续，没有重新调用工具
+   far-0 分区期间和之后一直活着（✅）：分区不是崩溃。
+```
+
+这就是第 13 课那条时间线的多机版，每一步都是真实发生的：far-0 的心跳发不出去（它自己只看到 `OperationalError`，并不知道别人已经接手）→ 租约在它**还活着**的时候过期 → near-0 的 `claim` 先回收过期租约，再以更大的 fence 领取，`fenced(2).load` 接管检查点（版本号 +1）→ near-0 从检查点继续，没有重新调用工具 → 网络恢复，far-0 的心跳被拒（fence 过期），它的模型调用返回后要保存检查点，被版本号 CAS 拒绝（`CheckpointConflict` → `ownership_lost`，什么都不提交）。和 SIGSTOP 冻结的僵尸（第 1 部分）不同，far-0 在分区期间一直在跑 —— 它的事件循环、定时器都正常，只是写不进数据库。
+
+**如实说明这个实验的局限**：① 所有进程都在同一台机器上，没有跨机器的时钟漂移和真实的网络延迟分布；② `TcpProxy.cut()` 用 RST 重置连接，客户端**立刻**收到错误，真实的分区更常见的是包被静默丢弃、要等 TCP 超时才发现 —— 生产环境要给数据库连接配 `connect_timeout`、TCP keepalive、`statement_timeout`，否则一个断掉的连接可能让协程挂很久；③ Redis 是 fakeredis，不模拟持久化、主从切换和集群分片，问题 6 里"Redis 切换时丢写入"只能靠读文档理解，本课没有实测。同一个场景在 [`tests/contrib/test_postgres.py`](../../tests/contrib/test_postgres.py) 的 `test_network_partition_isolated_worker_is_taken_over_and_its_late_writes_are_rejected` 里有断言版。
 
 ## 5. 练习
 
-打开 [`exercise.py`](exercise.py)，把第 13 课的三个核心动作用"生产写法"再写一遍：
+打开 [`exercise.py`](exercise.py)，把第 13 课的三个核心动作用"生产写法"再写一遍。和 agentkit 的适配器一样，全部是 async 的：`conn` 是 psycopg 的异步连接（`cur = await conn.execute(sql, params)`、`await cur.fetchone()`、`async with conn.transaction():`），Redis 客户端是 `redis.asyncio.Redis`（`await client.eval(...)`）。`cas_save`、`claim_one` 写成 `async def`（签名已经给好）；`refill` 是纯计算，保持普通函数。
 
 | 题目 | 要做什么 | 测试怎么验证 |
 |---|---|---|
-| (a) `cas_save(conn, run_id, expected_version, state_json) -> bool` | 写出 CAS 的 SQL：`expected_version == 0` 用 `INSERT ... ON CONFLICT DO NOTHING`，否则 `UPDATE ... WHERE version = ?` | 旧版本号被拒绝且数据不变；8 个线程并发自增 80 次，一次不丢 |
-| (b) `claim_one(conn, worker_id, lease_seconds) -> dict \| None` | 先回收过期租约（次数用尽进 `dead`），再用 `FOR UPDATE SKIP LOCKED` 领取 | 拿着一行的锁不放，检查你是跳过它还是排队等锁；租约过期后 fence 变大；8 个线程抢 40 个任务，没有一个被领两次 |
-| (c) `refill(...)` + `TOKEN_BUCKET_LUA` | 先写补充逻辑的纯函数，再把它搬进 Lua，时钟用 `TIME`，小数用 `tostring` | 突发之后拒绝；把 `ts` 改成 2 秒前，检查补充；小数不被截断；10 个线程抢 25 个令牌，恰好 25 个 |
+| (a) `async def cas_save(conn, run_id, expected_version, state_json) -> bool` | 写出 CAS 的 SQL：`expected_version == 0` 用 `INSERT ... ON CONFLICT DO NOTHING`，否则 `UPDATE ... WHERE version = ?` | 旧版本号被拒绝且数据不变；**8 个进程**同时对同一个 run 各自增 10 次，最后正好是 80、版本号 81，并且确实发生过冲突 |
+| (b) `async def claim_one(conn, worker_id, lease_seconds) -> dict \| None` | 先回收过期租约（次数用尽进 `dead`），再用 `FOR UPDATE SKIP LOCKED` 领取 | 另一个数据库会话拿着一行的锁不放，检查你是跳过它还是排队等锁；租约过期后 fence 变大；**8 个进程**抢 40 个任务，没有一个被领两次 |
+| (c) `refill(...)` + `TOKEN_BUCKET_LUA` | 先写补充逻辑的纯函数，再把它搬进 Lua，时钟用 `TIME`，小数用 `tostring` | 突发之后拒绝；把 `ts` 改成 2 秒前，检查补充；小数不被截断；**10 个进程**各试 10 次抢 25 个令牌，恰好放行 25 个 |
 
 ```bash
 make lesson N=26
 # 或者：.venv/bin/python -m pytest lessons/26_state_and_queues -v
 ```
 
+并发测试用 [`race.py`](race.py) 同时拉起 8~10 个**真实的 python 进程**（和第 13 课的 `race.py` 一样的做法）：每个进程加载你的实现、建好自己的连接，写一个"准备好了"的文件，等父进程创建"开跑"文件后一起开抢。进程之间不共享任何内存、没有 GIL，只能靠数据库和 Redis 的原子操作协作 —— 和多台机器上的 worker 一样。"先 SELECT 再 UPDATE"这类有竞态的写法在这里会稳定地暴露出来：本课试过把参考答案里的 `FOR UPDATE SKIP LOCKED` 去掉，8 个进程领了 116 次、只有 40 个不同的任务；把 CAS 的 `AND version = ?` 去掉，80 次自增最后只剩 11。
+
 本练习的 fence 按任务计数（`fence = fence + 1`），只在单个任务的范围内成立：练习里没有带 fence 的检查点接管，也没有一个 run 对应多个任务的情况。适配器用的是全局序列，原因见 3.3。
 
-测试用根目录 `conftest.py` 提供的 `pg_uri`（每个测试一个全新的数据库）和 `redis_client`（每个测试清空）。没装可选依赖时自动跳过。contrib 模块更完整的测试在 [`tests/contrib/test_postgres.py`](../../tests/contrib/test_postgres.py) 和 [`tests/contrib/test_redis_store.py`](../../tests/contrib/test_redis_store.py)，覆盖冲突、过期、重复、多线程和多协程并发、连接池、取消后恢复。
+测试用根目录 `conftest.py` 提供的 `pg_uri`（每个测试一个全新的数据库）和 `redis_url`（本课的 `aredis` fixture 在每个测试前清空它）。没装可选依赖时自动跳过。contrib 模块更完整的测试在 [`tests/contrib/test_postgres.py`](../../tests/contrib/test_postgres.py) 和 [`tests/contrib/test_redis_store.py`](../../tests/contrib/test_redis_store.py)，覆盖冲突、过期、重复、多进程和多协程并发、连接池、取消后恢复、kill -9 / SIGSTOP / SIGTERM 和网络分区。
 
 ## 6. 常见坑与真实运行中的发现
 
@@ -592,10 +648,10 @@ make lesson N=26
 | 每个 worker 启动时都 `CREATE TABLE IF NOT EXISTS` | **实测：8 个连接同时执行，7 个报 `UniqueViolation`（pg_class_relname_nsp_index）** | 迁移工具在发布时执行一次；实在要在启动时建表，就用 `pg_advisory_xact_lock` 串行化 |
 | 工具输出里有 NUL 字符 | **实测：`jsonb` 报 `UntranslatableCharacter`，整个检查点写入失败** | 写入前替换掉（适配器已经做了） |
 | 队列按 `run_at` 排序，回收时又把 `run_at` 设成"现在 + 退避" | **实测：被 kill 的任务排到队尾，租约 2 秒，却过了 9 秒才被接手** | 按入队顺序（`id`）排序，退避用 `run_at <= now()` 过滤 |
-| 每个任务开一个心跳线程，线程里用线程局部连接 | 连接随任务数线性增长，最终 `too many connections` | 每个 worker 一个心跳线程；线程结束前关闭它的连接 |
+| 心跳每次新建一个数据库连接（或者每个任务一个心跳线程、线程里用线程局部连接） | 连接随任务数线性增长，最终 `too many connections`（早期同步版 worker 实测踩到过） | 心跳从进程的连接池里借连接几毫秒：连接数只取决于池的上限（`run_worker` 的做法） |
 | 持有一个池连接的同时，再向同一个池借连接 | **实测：池大小为 2、两个协程都这么做，结果都等到 `PoolTimeout` 才失败** | 同一个操作只借一次；或者两件事用两个池 |
-| 在协程里调用 `time.sleep` / 同步驱动 | 整个事件循环停住，所有任务的心跳一起停 | 用 async 驱动；同步代码放进 `asyncio.to_thread`（`run_async_worker` 对同步 handler 会自动这么做） |
-| 异步 worker 满载时还在 claim | 进程囤了一堆任务处理不过来，租约过期，任务被重复执行 | 先拿信号量名额，再 claim（背压） |
+| 在协程里调用 `time.sleep` / 同步驱动 | 整个事件循环停住，所有任务的心跳一起停 | 用 async 驱动；同步代码放进 `asyncio.to_thread`（`run_worker` 直接拒绝同步 handler，Redis 适配器拒绝同步客户端，都是 `TypeError`） |
+| worker 满载时还在 claim | 进程囤了一堆任务处理不过来，租约过期，任务被重复执行 | 先拿信号量名额，再 claim（背压） |
 | 被限流时 worker 原地干等 | 队头阻塞：别的租户有配额也得排队 | 等一小会儿，然后 `RetryLater`，任务回到队列 |
 | 限流推迟、优雅停机归还也计入尝试次数 | 高峰期被限流的任务进了死信 | `release()` 不计入尝试次数 |
 | Lua 里直接 `return 1.5` | 客户端收到 1（小数被截断） | `tostring()` 后返回 |
@@ -605,16 +661,19 @@ make lesson N=26
 | fence 按任务计数（`fence = fence + 1`） | **实测（第 31 课压测）：run 任务被接手过以后，同一个 run 的 resume 任务第一次领取拿到 fence=1，被检查点当成旧持有者拒绝，卡到租约过期** | fence 取自整张队列表共用的序列（`nextval`），全局单调（3.3，已修复） |
 | 在 PgBouncer 事务池后面用会话级 advisory lock、`LISTEN`、`SET` | 锁、订阅、设置"串"到别的客户端上 | 用事务级 advisory lock；`LISTEN` 走直连 |
 | Celery + Redis broker 跑长任务 | 超过 `visibility_timeout`（默认 1 小时）的任务被投递两次 | 调大 `visibility_timeout`，或者换成自己可以续租的队列 |
-| 取消时给已经发出的写操作补上"未执行" | **实测：resume 后模型换了一个 call_id 重做，幂等键变了，副作用发生两次**（已在 `agentkit.aio` 修复，见下文第 1 条） | 取消 / 超时时写操作保持未回答，resume 用同一个 call_id 重放 |
-| 每个任务新建一个 `AsyncAgent` | 每个任务一个工具线程池；worker 的资源随任务数增长 | 一个进程共用一个 `AsyncAgent`，带 fence 的检查点视图通过 `checkpointer=` 按次传入 |
+| 取消时给已经发出的写操作补上"未执行" | **实测：resume 后模型换了一个 call_id 重做，幂等键变了，副作用发生两次**（已在 agentkit 核心修复，见下文第 1 条） | 取消 / 超时时写操作保持未回答，resume 用同一个 call_id 重放 |
+| 每个任务新建一个 `Agent` | 每个任务一个工具线程池；worker 的资源随任务数增长 | 一个进程共用一个 `Agent`，带 fence 的检查点视图通过 `checkpointer=` 按次传入 |
+| 网络恢复后直接用池里的旧连接 | 分区期间池里空闲的连接其实已经断了，恢复后的第一次写入撞上死连接，失败原因变成"网络错误"而不是"你已经不是持有者" | 池配 `check=AsyncConnectionPool.check_connection`（借出前先检查，[`worker_app.py`](worker_app.py) 的做法） |
+| 以为"换 Postgres 就能让单机更快" | **实测（Demo 第 3 部分）：同一台机器上一直到 8 × 64，SQLite 和 Postgres 吞吐差不多** | 换 Postgres 是为了多机共享队列、多写者、服务器时钟；单机吞吐先看是不是卡在别处 |
 
 **其他真实运行中的发现**：
 
-1. **实测发现 → 已修复：取消和崩溃留下的检查点曾经不一样，取消会让写操作重复执行**（`agentkit.aio.AsyncAgent`）。进程被 `kill -9` 时，正在执行的写工具调用在检查点里是"还没有结果"，恢复时会重放**同一个** `call_id`，幂等键不变，下游能去重。可最初的 `AsyncAgent` 在运行被**取消**时，会给这个调用补上"未执行：运行已取消"。如果下游其实已经处理了请求，恢复后模型看到"未执行"，就会发起一个**新的** `call_id`，于是幂等键变了，下游去重失效：本课复现过"写工具先产生副作用、在等待响应时被取消、恢复后副作用又发生一次"。**修复**（主维护者已合入 agentkit，回归测试 `tests/test_aio.py::test_cancel_keeps_in_flight_write_unanswered_and_resume_replays_same_call_id`）：取消或超时时，写 / 高危工具的调用**保持未回答**，只读工具照旧补"未执行"。原理有两层：① 被打断的写操作处于"不知道执行没执行"的状态，补上"未执行"等于替模型下了一个错误的结论；② 保持未回答，resume 时 `_run_pending_tools` 会先把它补完，重放的是检查点里那个 tool call，`call_id` 没变，幂等键 `run_id:call_id` 也就没变，下游的唯一约束或 Idempotency-Key 把第二次执行变成"返回已有结果"，这正是幂等键设计的前提（第 08、13 课）。`RunResult.history` 会给这种未回答的调用补一个占位结果，拿它开新对话时消息协议依然合法；要继续这次运行，就用 `resume`。本课的 `test_write_cancelled_at_shutdown_is_replayed_with_the_same_key_and_not_duplicated` 和 demo 第 4 部分从 worker 优雅停机的角度又验证了一遍：两次执行用的是同一个幂等键，工单只有一张。
+1. **实测发现 → 已修复：取消和崩溃留下的检查点曾经不一样，取消会让写操作重复执行**（当时的异步 Agent）。进程被 `kill -9` 时，正在执行的写工具调用在检查点里是"还没有结果"，恢复时会重放**同一个** `call_id`，幂等键不变，下游能去重。可最初的异步 Agent 在运行被**取消**时，会给这个调用补上"未执行：运行已取消"。如果下游其实已经处理了请求，恢复后模型看到"未执行"，就会发起一个**新的** `call_id`，于是幂等键变了，下游去重失效：本课复现过"写工具先产生副作用、在等待响应时被取消、恢复后副作用又发生一次"。**修复**（主维护者已合入 agentkit，回归测试 `tests/test_runtime.py::test_cancel_keeps_in_flight_write_unanswered_and_resume_replays_same_call_id`）：取消或超时时，写 / 高危工具的调用**保持未回答**，只读工具照旧补"未执行"。原理有两层：① 被打断的写操作处于"不知道执行没执行"的状态，补上"未执行"等于替模型下了一个错误的结论；② 保持未回答，resume 时 `_run_pending_tools` 会先把它补完，重放的是检查点里那个 tool call，`call_id` 没变，幂等键 `run_id:call_id` 也就没变，下游的唯一约束或 Idempotency-Key 把第二次执行变成"返回已有结果"，这正是幂等键设计的前提（第 08、13 课）。`RunResult.history` 会给这种未回答的调用补一个占位结果，拿它开新对话时消息协议依然合法；要继续这次运行，就用 `resume`。`tests/contrib/test_postgres.py` 的 `test_sigterm_cancels_a_hanging_write_and_the_next_process_replays_it_with_the_same_key` 和 demo 第 4 部分从 worker 进程优雅停机的角度又验证了一遍（两个真实进程、真实的 SIGTERM）：两次执行用的是同一个幂等键，工单只有一张。
 2. **fakeredis 的两个局限**（只在测试基础设施里出现，真实 Redis 没有）：它的 TCP 服务基于 Python `socketserver`，默认监听 backlog 只有 5，十几个线程同时建连接会被 reset（主维护者已在 `agentkit/testing.py` 调到 128）；很多线程同时走"EVALSHA 未命中 → SCRIPT LOAD"这条路径时，连接会被断开。适配器在构造时就 `SCRIPT LOAD` 预热脚本缓存，测试则先把连接逐个建好。另外，fakeredis 不模拟持久化、主从切换和集群分片，问题 6 里那些"会丢数据"的场景只能靠读文档来理解，本课没有实测。
 3. **`redis.asyncio` 的默认连接池（redis-py 8.1：上限 100）满了会直接抛 `MaxConnectionsError`，不会等**；需要"满了就排队"时用 `BlockingConnectionPool`（默认 50 个连接，等 20 秒）。
-4. **嵌入式 Postgres 是真的 Postgres，但只有一台**。SKIP LOCKED、advisory lock、MVCC、`now()` 的行为和生产完全一致；主从切换、复制延迟、PgBouncer 这些，本课没有实测。本机没有 Docker，也没有启动任何容器。
-5. `multiprocessing` 的 `Semaphore` 传给 spawn 出来的子进程时，**父进程必须一直持有它的引用**，否则子进程启动时会报 `FileNotFoundError`（demo 第一次运行时就踩到了）。
+4. **嵌入式 Postgres 是真的 Postgres，但只有一台，而且所有进程都在同一台机器上**。SKIP LOCKED、advisory lock、MVCC、`now()` 的行为和生产完全一致；网络分区用 `TcpProxy` 真实地断开了 TCP 连接，但它用的是 RST（客户端立刻报错），不是更常见的"静默丢包、等 TCP 超时"；主从切换、复制延迟、跨机器的时钟漂移、PgBouncer 这些，本课没有实测。本机没有 Docker，也没有启动任何容器。
+5. **一个进程被冻结或被杀，它手上的所有在途任务一起出事**（本课迁移到 async worker 后在 demo 第 1 部分看到的）：每个 worker 并发 2 时，SIGSTOP 一个进程，它手上两个任务都被别人接手、醒来后两次检查点写入都被拒绝。并发越高，一次故障波及的任务越多，接手的压力也越集中 —— 租约长度和每个进程的并发度要一起考虑。demo 的故障注入因此也不能按"第 1 次领取"触发（一个任务可能还没走到故障窗口就因为邻居出事被接手了），改成用一段 Redis Lua 保证"每个任务只触发一次、每个进程只承受一次"。
+6. **8 个进程 × 并发 64 时，一个数据库上同时开着 171 个连接**（demo 第 3 部分）：每个 worker 进程有队列、检查点、工单库各自的池。本课的 demo 为此把 Postgres 的 `max_connections` 调到了 500；生产里这是该上 PgBouncer、或者让队列和检查点共用一个池的信号（问题 6、7）。
 
 ## 7. 如何切换到托管服务
 
@@ -622,10 +681,10 @@ make lesson N=26
 
 | 组件 | 本课（嵌入式） | 托管 / 生产 | 要改什么 |
 |---|---|---|---|
-| Postgres | `pgserver`，unix socket | RDS / Aurora / Cloud SQL / 自建 + Patroni | `DATABASE_URL`；经过 PgBouncer / RDS Proxy 时加 `connect_kwargs={"prepare_threshold": None}`（除非确认支持）；建表交给 Alembic / Flyway |
-| 连接池 | 适配器自带（同步：线程局部连接；异步：从 DSN 建 `AsyncConnectionPool`） | 应用内 `psycopg_pool` + 外部 PgBouncer | 把一个 `AsyncConnectionPool` 同时传给队列和检查点；`max_size` 按问题 7 估算 |
-| Redis | fakeredis TCP 服务 | ElastiCache / Memorystore / 自建（Redis 或 Valkey），需要持久语义时用 MemoryDB | `REDIS_URL`；Cluster 模式下本课的 key 已经用 hash tag 分好了 slot |
-| worker | `multiprocessing` 子进程 | K8s Deployment，按 `stats()` 或 KEDA `postgresql` scaler 扩缩容 | 容器入口里调用 `stop_on_signals`；`terminationGracePeriodSeconds` 要大于 `grace_period`（[第 31 课](../31_deployment_and_scaling/README.md)） |
+| Postgres | `pgserver` 自带的 Postgres 16（测试：unix socket；demo：127.0.0.1 TCP） | RDS / Aurora / Cloud SQL / 自建 + Patroni | `DATABASE_URL`（也就是 worker 的 `--queue`）；经过 PgBouncer / RDS Proxy 时加 `pool_kwargs={"kwargs": {"prepare_threshold": None}}`（除非确认支持）；建表交给 Alembic / Flyway |
+| 连接池 | 适配器从 DSN 自己建 `AsyncConnectionPool`（或者传入现成的池） | 应用内 `psycopg_pool` + 外部 PgBouncer | 把一个 `AsyncConnectionPool` 同时传给队列和检查点；`max_size` 按问题 7 估算 |
+| Redis | fakeredis TCP 服务（单独的进程） | ElastiCache / Memorystore / 自建（Redis 或 Valkey），需要持久语义时用 MemoryDB | `REDIS_URL`；Cluster 模式下本课的 key 已经用 hash tag 分好了 slot |
+| worker | `WorkerPool` 拉起的 `python -m agentkit.distributed.worker` 进程 | K8s Deployment（每个 Pod 跑同一条命令），按 `stats()` 或 KEDA `postgresql` scaler 扩缩容 | 容器入口就是这条 worker 命令（它已经调用了 `stop_on_signals`）；`terminationGracePeriodSeconds` 要大于 `grace_period`（[第 31 课](../31_deployment_and_scaling/README.md)） |
 | 监控 | demo 打印 | Prometheus / OpenTelemetry | 把 `on_event` 和 `stats()` 接出去（[第 28 课](../28_production_observability/README.md)） |
 
 一个要**主动决定**的问题：Redis 不可用时，限流是放行还是拒绝？`RedisTokenBucket` 会把连接错误原样抛出：异常一路穿出 `agent.run`，`run_worker` 把这次尝试记为失败，退避后重试。交互流量更常见的做法是在 Hook 外面包一层"Redis 出错时放行并告警"，这是业务决定，不是技术默认值。
@@ -678,10 +737,10 @@ make lesson N=26
 </details>
 
 <details>
-<summary>6. 16 路并发的异步 worker，连接池应该设多大？</summary>
+<summary>6. 一个 worker 进程 16 路并发，连接池应该设多大？</summary>
 
 - 看的是"同时**正在用**连接的协程数"，不是并发度本身：池大小 ≈ 并发度 × 每个任务持有连接的时间占比 + 心跳和领取的余量；
-- Agent 的时间几乎都花在等模型上，检查点写入只借几毫秒：实测 16 路并发时池只长到 5–10 个连接，池只给 4 个吞吐也一样；
+- Agent 的时间几乎都花在等模型上，检查点写入只借几毫秒：实测 1 个进程 16 路并发，检查点池给 4 个连接和给 16 个，吞吐一样（49.1 对 49.8 任务/秒）；
 - 反模式：在等模型时占着连接（在事务里调模型）→ 并发被卡成连接数；持有一个连接的同时再借一个 → 池耗尽时互相等待，最后 PoolTimeout；
 - 所有进程的池加起来不能超过 `max_connections`，超过了就在前面加 PgBouncer（注意事务池模式的限制和 prepared statement）。
 </details>
@@ -690,7 +749,7 @@ make lesson N=26
 <summary>7. K8s 滚动发布时，正在跑 3 分钟 Agent 任务的 worker 会怎样？</summary>
 
 - K8s 先执行 preStop，再发 SIGTERM，等 terminationGracePeriodSeconds（默认 30 秒）后发 SIGKILL；
-- worker 收到 SIGTERM 就停止领取新任务：同步 worker 做完手头的任务再退出；异步 worker 等在途任务最多 grace_period 秒，超时的任务被取消（AsyncAgent 把检查点落盘为 cancelled，写 / 高危工具的调用保持未回答），不提交、不归还；
+- worker 收到 SIGTERM 就停止领取新任务，等在途任务最多 grace_period 秒，超时的任务被取消（Agent 把检查点落盘为 cancelled，写 / 高危工具的调用保持未回答），不提交、不归还；
 - 这些任务的租约自然过期后，被别的 worker 领取，从检查点接着跑；未回答的写调用用同一个 call_id 重放，幂等键不变，下游去重，所以不会重复；
 - 所以宽限期不必覆盖最长的任务；attempts 在领取时计数，要把 max_attempts 设得够用，或者让停机时的归还不计入次数。
 </details>
@@ -713,8 +772,10 @@ make lesson N=26
 - [ ] 我能解释 Redis 幂等缓存、SET NX 标记、下游唯一约束各挡住什么、挡不住什么
 - [ ] 我能解释令牌桶为什么必须用 Lua、为什么用 Redis 的 TIME，以及 Lua 返回小数的坑
 - [ ] 我能评审一个分布式锁方案：效率还是正确性、fencing token 从哪来、能不能不用锁
-- [ ] 我能估算异步 worker 的连接池大小，并解释背压和"async 里阻塞"的后果
-- [ ] 我能说清 SIGTERM 到来时同步 / 异步 worker 各做什么，做不完的任务由谁接手
+- [ ] 我能估算 worker 的连接池大小，并解释背压和"async 里阻塞"的后果
+- [ ] 我能说清 SIGTERM 到来时 worker 做什么，做不完的任务由谁接手
+- [ ] 我能讲清网络分区时的时间线：旧持有者为什么活着却丢了租约、恢复后它的写入为什么写不进去，以及 `TcpProxy` 这个实验和真实分区的差别
+- [ ] 我能说明从第 13 课的 SQLite 换到 Postgres 改了什么（`--queue` 和检查点这一行）、没改什么（`run_worker`、`AgentJobHandler`、worker 命令），以及换它是为了什么
 - [ ] 我完成了练习：`make lesson N=26` 全部通过
 
 ## 延伸阅读

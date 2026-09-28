@@ -2,7 +2,7 @@
 
 # Lesson 26: State, queues, and distributed coordination — Postgres and Redis
 
-> 🕐 Time: 30 min | 🎯 You'll be able to: put an agent's checkpoints, job queue, idempotency, rate limits, and locks on Postgres and Redis, and explain why each piece lives where it does and who picks up the pieces when something fails; choose between self-built, open-source, and managed options with a reason; replace sync workers with an async worker that runs dozens of tasks in one process, and size its connection pool | 📦 Source: [`agentkit/contrib/postgres.py`](../../agentkit/contrib/postgres.py), [`agentkit/contrib/redis_store.py`](../../agentkit/contrib/redis_store.py), [`demo.py`](demo.py)
+> 🕐 Time: 30 min | 🎯 You'll be able to: put an agent's checkpoints, job queue, idempotency, rate limits, and locks on Postgres and Redis, and explain why each piece lives where it does and who picks up the pieces when something fails; choose between self-built, open-source, and managed options with a reason; run async worker processes on a multi-machine backend with the same worker command as Lesson 13 (only `--queue` becomes `postgresql://`) and size their connection pools; verify fencing with a real network partition | 📦 Source: [`agentkit/contrib/postgres.py`](../../agentkit/contrib/postgres.py), [`agentkit/contrib/redis_store.py`](../../agentkit/contrib/redis_store.py), [`agentkit/distributed/`](../../agentkit/distributed/__init__.py), [`worker_app.py`](worker_app.py), [`demo.py`](demo.py)
 >
 > 📖 Primary reading: [Devious SQL: Message Queuing Using Native PostgreSQL](https://www.crunchydata.com/blog/message-queuing-using-native-postgresql) (David Christensen, 2021) — builds a `FOR UPDATE SKIP LOCKED` queue from scratch in about a dozen lines of SQL, and covers two things you will see all over this lesson's code: a rolled-back transaction puts the job back in the queue automatically, and a queue table updates so often that it bloats and needs autovacuum tuning. Read it, then look at `PostgresJobQueue.claim`: every line will look familiar.
 
@@ -10,7 +10,7 @@
 
 **Where the teaching version of agentkit falls short**: `FileCheckpointer` only works on one machine, and it knows nothing about fencing, so an old worker that wakes up can overwrite the checkpoint a new worker wrote. `IdempotencyStore` lives in process memory: it disappears when the process dies, and other workers can't see it. Lesson 12's token bucket counts inside one process. Lesson 13's lease queue runs on a single-machine SQLite file. They explain the principles, but none of them holds up for "many machines, dozens of workers, hundreds of tenants."
 
-**This lesson invents no new concepts. Lesson 13's leases, fencing tokens, CAS, and idempotency keys all stay; Postgres and Redis now carry them, and they plug straight into agentkit's interfaces. A one-line change, `Agent(checkpointer=PostgresCheckpointer(dsn))`, shares checkpoints across machines and keeps zombie workers out.**
+**This lesson invents no new concepts. Lesson 13's leases, fencing tokens, CAS, and idempotency keys all stay; Postgres and Redis now carry them. The interfaces are identical too: the `run_worker`, `AgentJobHandler`, and worker command line you ran on SQLite in Lesson 13 don't change by a single line, and the switch is one argument — `--queue sqlite:///runs/jobs.db` becomes `--queue postgresql://...`, and the checkpointer goes from `SQLiteCheckpointer` to `PostgresCheckpointer(dsn)`. What you get: checkpoints and the queue are shared across machines, and zombie workers are still kept out — this lesson verifies that with a real network partition (a worker that is alive but can't reach the database).**
 
 An analogy: Lesson 13's kitchen kept orders on a sheet taped to the wall (a SQLite file). Once the business grows into a chain of dozens of restaurants, orders move into a central order system (Postgres: the books, which must never be lost), and the front desk gets a ticket machine (Redis: counting, queue numbers, rate limiting; if it loses power, you just start calling numbers again).
 
@@ -18,11 +18,11 @@ An analogy: Lesson 13's kitchen kept orders on a sheet taped to the wall (a SQLi
 |---|---|---|---|
 | Checkpoints | `FileCheckpointer` (Lesson 08) | Single machine; no fencing | `PostgresCheckpointer`: jsonb + version CAS + fence takeover |
 | Job queue | SQLite `JobQueue` (Lesson 13) | Single machine; one writer at a time | `PostgresJobQueue`: SKIP LOCKED, server clock, partial index |
-| Worker | Hand-written loop in the demo (Lesson 13) | Heartbeats, shutdown, and error handling all hand-rolled | `run_worker` / `run_async_worker` + `AgentJobHandler` |
+| Worker | `agentkit.distributed`'s `run_worker` + `AgentJobHandler` with `--queue sqlite:///` (Lesson 13) | Every process must be on one machine (sharing one SQLite file) | The same `run_worker` and the same worker command with `--queue postgresql://` |
 | Idempotency | In-memory `IdempotencyStore` (Lesson 08) | Lost when the process dies; invisible to other workers | `RedisIdempotencyStore` (cache) + downstream unique constraint (the backstop) |
 | Rate limiting | `TokenBucket` (Lesson 12) | Counts inside one process; N instances allow N times the quota | `RedisTokenBucket` (atomic Lua + Redis clock) + `RateLimitHook` |
 | Locks | Lesson 13's timeline (concept only) | — | `RedisLock` (with a fencing token); and when to use an advisory lock or etcd instead |
-| Concurrency model | One task at a time per worker process | The whole process sits idle while it waits for the model | Async version: one process drives dozens of tasks, with backpressure |
+| Fault injection | kill -9 / SIGSTOP / SIGTERM (Lesson 13, one machine) | The most common failure in multi-machine deployments — a network partition — isn't shown | `TcpProxy` cuts the network for real: heartbeats fail → the lease expires → someone else takes over → late writes are rejected after the network heals |
 
 ## 1. Why the teaching implementation isn't enough
 
@@ -32,7 +32,7 @@ An analogy: Lesson 13's kitchen kept orders on a sheet taped to the wall (a SQLi
 flowchart LR
     API["API service<br/>auth · enqueue · approvals"] -->|"enqueue (dedupe by idempotency key)"| JOBS[("Postgres<br/>agent_jobs table")]
     API -->|"list_runs(status='paused')<br/>approval inbox"| RUNS[("Postgres<br/>agent_runs checkpoint table")]
-    subgraph W["workers (sync: many processes; async: dozens of tasks per process)"]
+    subgraph W["worker processes × N (each drives dozens of tasks with asyncio)"]
         H["AgentJobHandler<br/>run / resume"]
     end
     JOBS -->|"claim: SKIP LOCKED<br/>lease + fence"| W
@@ -55,7 +55,7 @@ flowchart LR
 | Rate-limit counters | Redis | A short burst of extra requests gets through | Read and written on every model call, so it has to be fast; a loss only affects a short window |
 | Short locks | Redis (efficiency locks) / Postgres, etcd (correctness locks) | See Problem 5 | A lock only buys efficiency; correctness comes from fencing |
 
-This table doubles as the lesson's table of contents: checkpoints and queues are Problems 1 and 2, idempotency is Problem 3, rate limiting is Problem 4, locks are Problem 5, operations is Problem 6, and the concurrency model is Problem 7.
+This table doubles as the lesson's table of contents: checkpoints and queues are Problems 1 and 2, idempotency is Problem 3, rate limiting is Problem 4, locks are Problem 5, operations is Problem 6, and adding concurrency, adding processes, or switching backends is Problem 7.
 
 ### 1.3 Terms
 
@@ -66,12 +66,12 @@ This table doubles as the lesson's table of contents: checkpoints and queues are
 | Fence takeover | When a new holder reads the checkpoint, it bumps the version, so the old holder's version number is void on the spot | `PostgresCheckpointer.fenced(fence).load` |
 | Reaping | Put jobs with expired leases back in the queue; jobs out of attempts go straight to the dead-letter state | `PostgresJobQueue.reap_expired` |
 | Lua script | A small program that runs atomically inside the Redis server; no other command runs in between | `TOKEN_BUCKET_LUA` |
-| Backpressure | Stop claiming new jobs when you're full, and leave them in the queue for others | The semaphore in `run_async_worker` |
+| Backpressure | Stop claiming new jobs when you're full, and leave them in the queue for others | The semaphore in `run_worker` |
 | Connection pool | A set of pre-opened database connections that get borrowed and returned; its size caps how many database operations can run at once | `psycopg_pool.AsyncConnectionPool` |
 
 ## 2. Enterprise problem cards
 
-Seven cards. Each ends with "switching from embedded to managed." This lesson's demo and tests use an embedded Postgres (a real Postgres 16 process started by the pip package pgserver, single machine) and fakeredis (a Python implementation of the Redis protocol that doesn't simulate persistence, failover, or cluster sharding). In most cases, moving to a managed service means changing a connection string.
+Seven cards. Each ends with "switching from embedded to managed." This lesson's demo and tests use the real Postgres 16 that ships with pgserver (the tests use its unix-socket instance; the demo starts a second instance listening on 127.0.0.1 TCP, so workers reach it over the network and a partition proxy can sit in between) and fakeredis (a Python implementation of the Redis protocol that doesn't simulate persistence, failover, or cluster sharding), all on one machine. In most cases, moving to a managed service means changing a connection string.
 
 ### Problem 1: Where do checkpoints live? When two workers fight over the same run, who wins?
 
@@ -109,7 +109,7 @@ The fence=1 and fence=2 in the diagram only show which came first. Real fences c
 
 **How to choose**: default to A, and **let the queue's fence drive checkpoint takeover** (`AgentJobHandler` already does). If the state is very large (hundreds of KB or more), or you need "time travel" and branching, look at how LangGraph splits checkpoints across tables and writes increments per version. If the process spans days and needs reliable timers, go straight to Lesson 27.
 
-**This lesson's implementation**: [`PostgresCheckpointer`](../../agentkit/contrib/postgres.py), plus the async `AsyncPostgresCheckpointer` (for `agentkit.aio.AsyncAgent`, identical semantics). The test `test_plain_cas_is_first_writer_wins_but_fenced_takeover_makes_newest_holder_win` checks "first writer wins" and "newest holder wins" side by side. In one real-model run of part 1 of the demo, the frozen worker-3 wakes up, tries to write the checkpoint, and gets `Checkpoint conflict: run job-6 expected version 2, actual version 7 (last writer worker-1)`.
+**This lesson's implementation**: [`PostgresCheckpointer`](../../agentkit/contrib/postgres.py) (async, same interface as `agentkit.distributed.SQLiteCheckpointer`). The test `test_plain_cas_is_first_writer_wins_but_fenced_takeover_makes_newest_holder_win` checks "first writer wins" and "newest holder wins" side by side. In part 1 of the demo, worker-1, frozen with SIGSTOP, wakes up, tries to write the checkpoint, and gets `Checkpoint conflict: run job-6 expected version 2, actual version 7 (last writer worker-2)`; in part 5, the partitioned far-0 reconnects, tries to write the checkpoint, and is rejected the same way (`expected version 3, actual version 7 (last writer near-0)`).
 
 **Switching from embedded to managed**: `PostgresCheckpointer(os.environ["DATABASE_URL"])`, pointing at RDS, Cloud SQL, Aurora, or your own cluster. Create tables once, with a migration tool at deploy time (Problem 6).
 
@@ -133,7 +133,7 @@ Task frameworks such as Celery and Dramatiq sit at a different layer: they aren'
 
 **How to choose**: start with A. With the queue in the same database as business data, "create the ticket + enqueue the follow-up agent job" fits in one transaction — exactly what the outbox pattern is after (Lesson 13, Problem 6) — without running another system. On AWS, if you don't want to operate anything, choose E (note that SQS's old receipt handles can't fence; Lesson 13, section 3.9). Add D when you need an event stream; the two don't conflict.
 
-**This lesson's implementation**: [`PostgresJobQueue`](../../agentkit/contrib/postgres.py), with the async `AsyncPostgresJobQueue`; the SQL is in section 3.3. **Switching from embedded to managed**: again, just the connection string. KEDA's `postgresql` scaler can scale workers on the result of a SQL query, such as the number of runnable jobs ([docs](https://keda.sh/docs/2.21/scalers/postgresql/); deployment details in [Lesson 31](../31_deployment_and_scaling/README.en.md)).
+**This lesson's implementation**: [`PostgresJobQueue`](../../agentkit/contrib/postgres.py) (async; implements the same `JobQueue` protocol as `SQLiteJobQueue`); the SQL is in section 3.3. **Switching from embedded to managed**: again, just the connection string. KEDA's `postgresql` scaler can scale workers on the result of a SQL query, such as the number of runnable jobs ([docs](https://keda.sh/docs/2.21/scalers/postgresql/); deployment details in [Lesson 31](../31_deployment_and_scaling/README.en.md)).
 
 ### Problem 3: Where do idempotency records live? Is one Redis key enough?
 
@@ -168,7 +168,7 @@ sequenceDiagram
 
 **How to choose**: B or C is the floor; you must have one. A is an optional optimization that saves a downstream call. Use A' only when concurrent duplicates are expensive and the downstream doesn't support idempotency, and know that it doesn't stop every case.
 
-**This lesson's implementation**: pass `RedisIdempotencyStore(client, namespace="idem", ttl_seconds=86400)` straight to `Agent(idempotency_store=...)`; the async version is `AsyncRedisIdempotencyStore`. In part 1 of the demo, the call that was `kill -9`ed never reached Redis, so the worker that took over missed the cache, and the downstream unique constraint stopped the duplicate: `♻️ Downstream unique constraint hit: returned existing ticket T-1004, no duplicate created`.
+**This lesson's implementation**: pass `RedisIdempotencyStore(client_or_url, namespace="idem", ttl_seconds=86400)` straight to `Agent(idempotency_store=...)`. It exists only in an async version (built on `redis.asyncio`; the agent awaits its get / put), and passing a synchronous `redis.Redis` client raises `TypeError`. In part 1 of the demo, the call that was `kill -9`ed never reached Redis, so the worker that took over missed the cache, and the downstream unique constraint stopped the duplicate: `♻️ Downstream unique constraint hit: returned existing ticket T-1003, no duplicate created`.
 
 **Switching from embedded to managed**: `RedisIdempotencyStore(os.environ["REDIS_URL"])` (ElastiCache, Memorystore, or your own Redis / Valkey). Keys are wrapped in a hash tag, `idem:{run_id:call_id}`, so on Redis Cluster the result and the "in progress" marker land in the same slot.
 
@@ -191,11 +191,11 @@ sequenceDiagram
 
 Two more Lua traps, both tested here: ① **a Lua number returned to Redis is truncated to an integer**, so 1.5 becomes 1; the docs recommend returning floats as strings ([Lua API](https://redis.io/docs/latest/develop/programmability/lua-api/)); ② on Redis Cluster, every key a script touches must be passed in `KEYS` and hash to the same slot ([docs](https://redis.io/docs/latest/develop/using-commands/multi-key-operations/)). This lesson's bucket touches one key per call.
 
-**What if no token comes?** `RateLimitHook` waits at most `wait_timeout` seconds, then raises `StopRun("rate_limited")`. A worker that waits here holds a worker slot, and other tenants with quota to spare queue behind it (head-of-line blocking). `AgentJobHandler` turns `rate_limited` into `RetryLater`: the job goes back to the queue, comes back a little later, and **doesn't consume a retry attempt** — it's not the job's fault. In the demo, the free-plan tenant (1 call per second) was deferred 16 times and needed 19.6 s for all its jobs; the two standard-plan tenants were never deferred and finished everything in about 10.7 s.
+**What if no token comes?** `RateLimitHook` waits at most `wait_timeout` seconds, then raises `StopRun("rate_limited")`. A worker that waits here holds a worker slot, and other tenants with quota to spare queue behind it (head-of-line blocking). `AgentJobHandler` turns `rate_limited` into `RetryLater`: the job goes back to the queue, comes back a little later, and **doesn't consume a retry attempt** — it's not the job's fault. In the demo, the free-plan tenant (1 call per second) was deferred 43 times and needed 19.7 s for all its jobs; the two standard-plan tenants were never deferred and finished everything in 4.7 s.
 
 **How to choose**: B caps your own total (per tenant, per plan), C caps the company's total egress, and D is the last wall: on a 429, back off according to `Retry-After` (Lesson 08). Decide **in advance** what happens when Redis is down: interactive traffic usually fails open and alerts; batch jobs pause.
 
-**This lesson's implementation**: [`RedisTokenBucket`](../../agentkit/contrib/redis_store.py) (`try_acquire` / `acquire`; `overrides` sets rate and capacity per tenant) and `RateLimitHook` (takes tokens in `before_llm`; `tokens_fn` can charge by token count for TPM limits). The async versions are `AsyncRedisTokenBucket` and `AsyncRateLimitHook`, which yield the event loop with `asyncio.sleep` while waiting. **Switching from embedded to managed**: change `REDIS_URL`.
+**This lesson's implementation**: [`RedisTokenBucket`](../../agentkit/contrib/redis_store.py) (`await try_acquire` / `await acquire`; `overrides` sets rate and capacity per tenant) and `RateLimitHook` (takes tokens in `before_llm`; `tokens_fn` can charge by token count for TPM limits). Both exist only in async versions: while waiting for a token they `await asyncio.sleep`, yielding the event loop so other sessions in the process keep moving. `RateLimitHook.before_llm` is an `async def`, so a subclass that overrides it must also be `async def` and `await super().before_llm(...)` (the demo's `MeteredRateLimit` does exactly that, and also records each tenant's counters in Redis). **Switching from embedded to managed**: change `REDIS_URL`.
 
 ### Problem 5: Distributed locks — Redis, Postgres advisory locks, etcd, or ZooKeeper?
 
@@ -215,17 +215,17 @@ Two more Lua traps, both tested here: ① **a Lua number returned to Redis is tr
 
 ```python
 # Locks + fencing, done right: the store checks the token; the holder doesn't decide "do I still hold the lock?"
-with RedisLock(r, "weekly-report:acme", ttl_seconds=30) as fence:
-    report = build_report()                                   # this may pause for a long time
-    cur = pg.execute("UPDATE reports SET body = %s, fence = %s WHERE tenant = 'acme' AND fence < %s",
-                     (report, fence, fence))
+async with RedisLock(r, "weekly-report:acme", ttl_seconds=30) as fence:   # r is a redis.asyncio.Redis
+    report = await build_report()                             # this may pause for a long time
+    cur = await conn.execute("UPDATE reports SET body = %s, fence = %s WHERE tenant = 'acme' AND fence < %s",
+                             (report, fence, fence))           # conn is a psycopg.AsyncConnection
     if cur.rowcount == 0:
         raise RuntimeError("I'm no longer the holder: write rejected")   # the store decides at write time
 ```
 
 **How to choose**: if the resource lives in Postgres, use B. For cross-system coordination with strict correctness, use C. For efficiency only, use A, but let the store check the fence for correctness: **never use a lock without fencing for correctness**, and **never let a Redis INCR token be your only line of defense**.
 
-**This lesson's implementation**: `RedisLock(client, name, ttl_seconds)`: `acquire()` returns a fencing token, and `release()` and `extend()` both compare before acting. The test `test_storage_rejects_a_paused_holders_stale_token` reproduces Lesson 13's timeline. This lesson's `setup()` uses `pg_advisory_xact_lock` to serialize table creation across processes, a small example of B (section 6 explains why it's needed). **Switching from embedded to managed**: A changes `REDIS_URL`; B changes nothing, since it's your Postgres; C and D need their own deployment (or a cloud provider's managed version).
+**This lesson's implementation**: `RedisLock(client, name, ttl_seconds)`: `await acquire()` returns a fencing token, `await release()` and `await extend()` both compare before acting, and `async with lock as fence:` works too. The test `test_storage_rejects_a_paused_holders_stale_token` reproduces Lesson 13's timeline. This lesson's `setup()` uses `pg_advisory_xact_lock` to serialize table creation across processes, a small example of B (section 6 explains why it's needed). **Switching from embedded to managed**: A changes `REDIS_URL`; B changes nothing, since it's your Postgres; C and D need their own deployment (or a cloud provider's managed version).
 
 ### Problem 6: Operations — connection pools, migrations, backup and HA, table bloat, monitoring
 
@@ -237,8 +237,8 @@ with RedisLock(r, "weekly-report:acme", ttl_seconds=30) as fence:
 
 | Option | How | Watch out for |
 |---|---|---|
-| In-app pool (`psycopg_pool`) | `ConnectionPool` / `AsyncConnectionPool`; `with pool.connection()` commits on normal exit, rolls back on an exception, then returns the connection ([docs](https://www.psycopg.org/psycopg3/docs/advanced/pool.html)) | Size the pool by "threads / coroutines that need a connection at the same time" (Problem 7); **never borrow a second connection from the same pool while holding one**: tested with a pool of 2 and two coroutines doing exactly that — both failed with `PoolTimeout` |
-| External pooler (PgBouncer) | Transaction pooling: a server connection is held only for the duration of a transaction, so thousands of client connections can share a few dozen server connections ([docs](https://www.pgbouncer.org/features.html)) | In transaction pooling mode, `SET`, `LISTEN`, session-level advisory locks, and more **don't work**. Protocol-level prepared statements are supported since 1.21 and on by default since 1.24 (`max_prepared_statements=200`). psycopg auto-prepares a query after 5 executions (`prepare_threshold=5`); set it to `None` when the middleware doesn't support it ([psycopg docs](https://www.psycopg.org/psycopg3/docs/advanced/prepare.html#using-prepared-statements-with-pgbouncer)). This lesson's adapters accept it via `connect_kwargs={"prepare_threshold": None}` |
+| In-app pool (`psycopg_pool`) | `AsyncConnectionPool` (`ConnectionPool` for sync code); `async with pool.connection()` commits on normal exit, rolls back on an exception, then returns the connection ([docs](https://www.psycopg.org/psycopg3/docs/advanced/pool.html)) | Size the pool by "threads / coroutines that need a connection at the same time" (Problem 7); **never borrow a second connection from the same pool while holding one**: tested with a pool of 2 and two coroutines doing exactly that — both failed with `PoolTimeout` |
+| External pooler (PgBouncer) | Transaction pooling: a server connection is held only for the duration of a transaction, so thousands of client connections can share a few dozen server connections ([docs](https://www.pgbouncer.org/features.html)) | In transaction pooling mode, `SET`, `LISTEN`, session-level advisory locks, and more **don't work**. Protocol-level prepared statements are supported since 1.21 and on by default since 1.24 (`max_prepared_statements=200`). psycopg auto-prepares a query after 5 executions (`prepare_threshold=5`); set it to `None` when the middleware doesn't support it ([psycopg docs](https://www.psycopg.org/psycopg3/docs/advanced/prepare.html#using-prepared-statements-with-pgbouncer)). This lesson's adapters pass it to the pool they create via `pool_kwargs={"kwargs": {"prepare_threshold": None}}` |
 | Managed proxy (RDS Proxy, etc.) | Same idea, operated by the cloud provider | Same caveats about prepared statements and session state |
 
 **② Migrations: use Alembic (SQLAlchemy ecosystem, [docs](https://alembic.sqlalchemy.org/)) or Flyway (versioned plain-SQL scripts, [docs](https://documentation.red-gate.com/fd)) and run them once in the release pipeline**, instead of having every worker create tables on startup. This lesson's `setup()` exists for teaching and tests, and uses an advisory lock so concurrent table creation doesn't collide: tested with 8 connections running `CREATE TABLE IF NOT EXISTS` at once, 7 failed with `UniqueViolation`.
@@ -247,7 +247,7 @@ with RedisLock(r, "weekly-report:acme", ttl_seconds=30) as fence:
 
 | Component | Options | Numbers to know |
 |---|---|---|
-| Postgres | RDS Multi-AZ instance / Multi-AZ cluster / Aurora / self-managed (Patroni, etc.) | RDS Multi-AZ instance failover typically takes 60–120 s ([docs](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.Failover.html)); Multi-AZ clusters typically under 35 s ([docs](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/multi-az-db-clusters-concepts-failover.html)); Aurora with a replica typically under 60 s ([docs](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Concepts.AuroraHighAvailability.html)). Workers must survive that window: `run_worker` backs off and retries when a claim fails instead of crashing |
+| Postgres | RDS Multi-AZ instance / Multi-AZ cluster / Aurora / self-managed (Patroni, etc.) | RDS Multi-AZ instance failover typically takes 60–120 s ([docs](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.Failover.html)); Multi-AZ clusters typically under 35 s ([docs](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/multi-az-db-clusters-concepts-failover.html)); Aurora with a replica typically under 60 s ([docs](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Concepts.AuroraHighAvailability.html)). Workers must survive that window: `run_worker` backs off and retries when a claim hits `OperationalError` / `PoolTimeout` instead of crashing (the test `test_worker_rides_out_a_database_outage_instead_of_crashing` checks this with a real network cut via `TcpProxy`) |
 | Redis | RDB snapshots / AOF / replication + Sentinel or Cluster / MemoryDB | RDB typically snapshots every few minutes, so a crash can lose minutes of data; AOF (enabled with `appendonly yes`) defaults to `appendfsync everysec`, which can lose about 1 second ([docs](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)); replication is asynchronous, and even `WAIT` doesn't make Redis strongly consistent ([docs](https://redis.io/docs/latest/commands/wait/)), so a failover can lose acknowledged writes. If you need durable Redis semantics, consider MemoryDB, which persists writes to a Multi-AZ transaction log before acknowledging them ([docs](https://docs.aws.amazon.com/memorydb/latest/devguide/what-is-memorydb.html)) |
 
 This table is also the reason behind the rule in section 1.2: a Redis failover can lose roughly the last second of writes, so **only put things there that you can rebuild**.
@@ -261,82 +261,84 @@ This table is also the reason behind the rule in section 1.2: a Redis failover c
 
 **⑤ Monitoring**: green CPU doesn't mean users aren't waiting. Better than "how many jobs are queued" is **how long the oldest runnable job has been waiting**: `stats()["oldest_queued_age_s"]`. Other metrics worth alerting on: `expired_leases` (leases that expired but haven't been reaped yet: workers died or are all stuck), growth in `dead`, fence rejections (`on_event("fence_rejected")`), and checkpoint conflicts. Lesson 28 wires `run_worker`'s `on_event` into Prometheus.
 
-**Switching from embedded to managed**: when the connection string points at PgBouncer or RDS Proxy, add `connect_kwargs={"prepare_threshold": None}` (unless you've confirmed the middleware supports prepared statements); hand migrations to the release pipeline; choose a managed Redis with replication and automatic failover, and accept that a failover may lose about 1 second.
+**Switching from embedded to managed**: when the connection string points at PgBouncer or RDS Proxy, add `pool_kwargs={"kwargs": {"prepare_threshold": None}}` (unless you've confirmed the middleware supports prepared statements); hand migrations to the release pipeline; choose a managed Redis with replication and automatic failover, and accept that a failover may lose about 1 second.
 
-### Problem 7: Sync workers vs async workers — how many agents can one process run at once?
+### Problem 7: Add concurrency, add processes, or change databases — how many agents can one process run at once?
 
-**Scenario**: at peak, a customer-service agent has 300 sessions running at once, each spending 90% of its time waiting for the model. Lesson 13's sync worker handles one task per process at a time, so the team runs 60 pods with 5 processes each. The bill shows memory for 300 Python processes plus 900 Postgres connections, while CPU utilization sits at 3%.
+**Scenario**: At peak, a customer-service agent has 300 sessions running at once, and each spends 90% of its time waiting on the model. One team's old workers ran one task at a time per process, so they ran 60 pods with 5 processes each. The bill shows memory for 300 Python processes plus 900 Postgres connections, while CPU utilization sits at 3%.
 
-**Why it's hard**: agents are a textbook **IO-bound** workload: a model call takes 3–10 seconds, and the CPU does nothing during that time. The fix is "do something else while waiting," and there are three ways to do something else, each with its own traps.
+**Why it's hard**: Agents are a textbook **IO-bound** workload: a model call takes 3–10 seconds, and the CPU does nothing in the meantime. The fix is "do something else while waiting", but there are three ways to do that, each with its own traps.
 
-| Option | How | Pros | Cons | Fits |
+| Option | How it works | Pros | Cons | When to use |
 |---|---|---|---|---|
-| A. One thread per task | N threads per process, each running a sync agent | No code changes (agentkit's sync version) | Thread stacks cost memory; CPU-bound parts serialize under the GIL; each thread usually needs its own database connection; **cancellation isn't possible** (threads can't be killed) | A few dozen concurrent tasks |
-| B. Multiple processes (Lesson 13; this lesson's `run_worker`) | Each process runs one task at a time; add processes to go faster | Best isolation: one crashing process doesn't affect the others; CPU-bound tools run in parallel | Memory and connections grow linearly with process count; the whole process idles while it waits for the model | Lots of CPU-bound tools, or as the outer layer around async workers (one async process per core) |
-| C. asyncio (this lesson's `run_async_worker` + `AsyncAgent`) | One event loop per process driving dozens to hundreds of tasks, yielding control while waiting on the model, database, or Redis | Almost no extra memory; the connection pool can be far smaller than the concurrency; cancellation can travel all the way to the HTTP request ([Lesson 30](../30_async_runtime/README.en.md)) | **Any single blocking call stalls the whole process**; the whole chain (model client, database driver, Redis client, tools) must be async or pushed into a thread pool | IO-bound agents — the default for production services |
+| A. One thread per task | N threads in a process, each running a synchronous agent loop (the default in many frameworks) | Synchronous code stays as is | Thread stacks cost memory; the CPU parts serialize under the GIL; each thread usually needs its own database connection; **cancellation is impossible** (threads can't be killed) | Concurrency under a few dozen, and all existing code is synchronous |
+| B. Many processes, one task each | `--concurrency 1`, scale by adding processes | Best isolation: one crashed process doesn't affect others; CPU-heavy tools run in parallel | Memory and connections grow linearly with processes; the whole process idles while waiting for the model | Lots of CPU-heavy tools |
+| C. One event loop per process + many processes (what agentkit does) | `run_worker(concurrency=16)`: one process drives a dozen to several dozen tasks, yielding while it waits on the model, the database, or Redis; add processes for CPU cores and fault tolerance | Almost no extra memory; the connection pool can be far smaller than the concurrency; cancellation reaches all the way to the HTTP request ([Lesson 30](../30_async_runtime/README.en.md)) | **Any single synchronous blocking call stalls the whole process**; the entire chain (model client, database driver, Redis client, tools) must be async, or be pushed onto a thread pool | IO-bound agents — the default for production services |
 
-**Backpressure**: `run_async_worker(queue, handler, concurrency=16)` takes an `asyncio.Semaphore` slot before it claims. When all slots are taken it waits there and **stops claiming**, so jobs stay in the queue for other workers. Without this, one process grabs hundreds of jobs it can't keep up with, their leases expire one after another, and other workers run them again.
+agentkit has only option C (Lessons 02, 13): `Agent` is async, `run_worker` is async, and the Postgres / Redis adapters exist only in async versions (passing a synchronous `redis.Redis` client raises `TypeError`).
 
-**Matching the pool to the concurrency**: what matters isn't "how many tasks run at once" but "how many tasks are **using** a database connection at once." In one agent step, a connection is borrowed only for the few milliseconds it takes to write the checkpoint, not for the seconds spent waiting on the model. That's why 16-way concurrency runs fine on a 4-connection pool (see the measurements below). But if a task holds a connection while it waits for the model (calling the model inside a transaction, or calling `pool.connection()` and then running the agent), concurrency collapses to the number of connections. A rule of thumb: `pool size ≈ concurrency × fraction of time each task holds a connection + headroom (heartbeats, claims)`; summed across all processes it must stay under the database's `max_connections` (beyond that you need PgBouncer).
+**Backpressure**: `run_worker(queue, handler, concurrency=16)` takes a slot from an `asyncio.Semaphore` before claiming. When it's full, it waits there and **stops claiming**; jobs stay in the queue for other workers. Without this, one process would grab hundreds of jobs it can't handle, their leases would expire one after another, and other workers would run them again.
 
-**Why a blocking call in async code drags down the whole event loop**: the event loop is single-threaded, and coroutines only yield at `await`. Call `time.sleep(0.05)`, `requests.get`, or the sync psycopg / redis-py inside a coroutine, and for those 50 ms no other coroutine can move — including **every task's lease heartbeat**. Once heartbeats stop, leases expire and other workers take the tasks over. The test `test_blocking_call_inside_an_async_handler_stalls_every_other_task` counts "how many tasks are inside sleep at the same time": always 1 for the blocking version, at least 2 for the sync version handed to the thread pool. When `run_async_worker` sees that the handler is a sync function, it runs it with `asyncio.to_thread` automatically. Likewise, the sync `RateLimitHook` waiting for tokens inside an async agent stalls the whole process; use `AsyncRateLimitHook`.
+**Matching the connection pool to the concurrency**: what matters isn't "how many tasks are running" but "how many tasks are **using** a database connection right now". Within an agent step, a connection is borrowed only for the few milliseconds of a checkpoint write; the seconds spent calling the model hold no connection. That's why 16-way concurrency runs fine with a 4-connection checkpoint pool (measured below). But if you hold a connection while waiting on the model (calling the model inside a transaction, or doing `pool.connection()` before calling the agent), concurrency collapses to the number of connections. Rule of thumb: `pool size ≈ concurrency × fraction of each task's time holding a connection + headroom (heartbeats, claims)`; across all processes, the total must stay under the database's `max_connections` (beyond that you need PgBouncer).
 
-**How to choose**: default to C for agent workers. Run one async process per CPU core (B wrapped around C), start `concurrency` at 16–64, and tune it against the model quota and memory. Start the pool at a quarter of the concurrency, then watch whether `requests_queued` in `psycopg_pool`'s `get_stats()` (requests queued because the pool was full) keeps growing. Runtime details (cancellation, timeouts, bulkheads, streaming) are in [Lesson 30](../30_async_runtime/README.en.md).
+**Why synchronous blocking IO in async code takes down the whole event loop**: the event loop is single-threaded, and a coroutine only yields at `await`. Call `time.sleep(0.05)`, `requests.get`, synchronous psycopg, or synchronous redis-py inside a coroutine, and for those 50 ms no other coroutine can move — including **every job's lease heartbeat**. Once heartbeats stop, leases expire and other workers take over the jobs. The test `test_blocking_call_inside_an_async_handler_stalls_every_other_task` counts "tasks sleeping at the same time": always 1 for the blocking version, at least 2 for the synchronous version pushed onto a thread pool (`asyncio.to_thread`). `run_worker` refuses synchronous handlers outright (`TypeError`); the Redis adapters refuse synchronous clients for the same reason.
 
-**This lesson's implementation**: `AsyncPostgresCheckpointer` and `AsyncPostgresJobQueue` (which can share one `AsyncConnectionPool`), `run_async_worker`, `AsyncRedisIdempotencyStore`, `AsyncRedisTokenBucket`, `AsyncRateLimitHook`; when `AgentJobHandler` sees an async checkpointer, it `await`s `agent.run / resume / approve`, and the whole process uses **one** `AsyncAgent` (and therefore one tool thread pool), passing each job's fenced checkpoint view per call via the `checkpointer=` argument. Part 3 of the demo gives measured numbers, and part 4 shows an async worker's graceful shutdown (section 4).
+**SQLite or Postgres**: Lesson 13's `demo_scale.py` concluded "once concurrency reaches ×64, the bottleneck becomes SQLite's single writer; beyond that, switch to Postgres". This lesson runs the same worker app on both backends on the same machine (demo part 3), and the result is: **all the way up to 8 processes × concurrency 64, both deliver about the same throughput** (roughly 570–630 jobs/s), both at only about a third of the theoretical ceiling — at that point what's holding things back is no longer either database's write lock (this machine has 8 cores running 8 worker processes plus the database; this lesson didn't break down further whether it's CPU or something else). So the reason to switch to Postgres isn't "faster on one machine", it's: **several machines can share one queue** (a SQLite file can't be shared safely across machines), row-level locks and `SKIP LOCKED` let many writers work in parallel, and every worker judges leases by the database server's clock. The cost is in the same table: at 8 × 64, this database had 171 connections open at once.
+
+**How to choose**: use C for agent workers. Run one worker process per CPU core, start `concurrency` at 16–64, and tune by model quota and memory. Start the connection pool at "a quarter of the concurrency", then watch `requests_queued` (requests queued because the pool was full) in `psycopg_pool`'s `get_stats()` for steady growth. Runtime details (cancellation, timeouts, bulkheads, streaming) are in [Lesson 30](../30_async_runtime/README.en.md).
+
+**This lesson's implementation**: `PostgresCheckpointer`, `PostgresJobQueue` (the two can share one `AsyncConnectionPool`), `run_worker`, `RedisIdempotencyStore`, `RedisTokenBucket`, and `RateLimitHook`, all async; `AgentJobHandler` lets the whole process use **one** `Agent` (and so one tool thread pool and one model-client connection pool), passing each job's fenced checkpoint view per call through the `checkpointer=` argument of `run / resume / approve`. Demo part 3 has the measurements, and part 4 shows a worker process shutting down gracefully on SIGTERM (section 4).
 
 ## 3. How this lesson's adapter plugs in
 
 ### 3.1 Public API at a glance
 
+Every method is async (`await` it); the worker loop, the job handler, and the exceptions are shared with Lesson 13's SQLite version and come from `agentkit.distributed` (`agentkit.contrib.postgres` re-exports them).
+
 | Module | Class / function | Main methods |
 |---|---|---|
-| `agentkit.contrib.postgres` | `PostgresCheckpointer(conninfo, table="agent_runs", *, fence=None, writer=None, connect_kwargs=None)` | `setup()`, `save(state)`, `load(run_id)`, `fenced(fence, writer=None)`, `get_run(run_id)`, `list_runs(status=None, tenant_id=None, limit=50)`, `version_of(run_id)`, `close()` |
-| | `AsyncPostgresCheckpointer(pool_or_dsn, table="agent_runs", *, fence=None, writer=None, pool_kwargs=None)` | Same as above, all `async`; supports `async with` |
-| | `PostgresJobQueue(conninfo, table="agent_jobs", *, max_attempts=5, base_backoff=1.0, max_backoff=300.0, connect_kwargs=None)` | `setup()`, `enqueue(kind, payload, *, tenant_id, idempotency_key=None, priority=0, run_at=None, delay_seconds=0, max_attempts=None) -> int`, `claim(worker_id, lease_seconds=30, kinds=None) -> Job \| None`, `heartbeat(job, lease_seconds)`, `complete(job, result)`, `fail(job, error, retryable=True) -> str`, `release(job, *, delay_seconds=0, reason=None, count_attempt=False)`, `reap_expired()`, `redrive(job_id)`, `stats()`, `purge_finished(older_than_seconds)`, `get(job_id)`, `find(tenant_id, key)` |
-| | `AsyncPostgresJobQueue(pool_or_dsn, ...)` | Same as above, all `async` |
-| | `run_worker(queue, handler, *, worker_id, stop_event, lease_seconds=30, poll_interval=0.5, heartbeat_interval=None, kinds=None, on_event=None, max_jobs=None) -> dict` | Sync worker main loop |
-| | `run_async_worker(queue, handler, *, worker_id, stop_event, concurrency=16, lease_seconds=30, poll_interval=0.5, heartbeat_interval=None, grace_period=25.0, kinds=None, on_event=None, max_jobs=None) -> dict` | Async worker main loop |
-| | `AgentJobHandler(make_agent or an AsyncAgent instance, checkpointer, *, defer_stop_reasons=("rate_limited",), defer_seconds=2.0)` | `handler(job) -> dict` (returns a coroutine with an async checkpointer; `is_async=True`); `agents_created`: how many times the factory was called |
+| `agentkit.contrib.postgres` | `PostgresCheckpointer(pool_or_dsn, table="agent_runs", *, fence=None, writer=None, pool_kwargs=None)` | `setup()`, `save(state)`, `load(run_id)`, `fenced(fence, writer=None)`, `get_run(run_id)`, `list_runs(status=None, tenant_id=None, limit=50)`, `version_of(run_id)` (sync), `close()`; supports `async with` |
+| | `PostgresJobQueue(pool_or_dsn, table="agent_jobs", *, max_attempts=5, base_backoff=1.0, max_backoff=300.0, pool_kwargs=None)` | `setup()`, `enqueue(kind, payload, *, tenant_id, idempotency_key=None, priority=0, run_at=None, delay_seconds=0, max_attempts=None) -> int`, `claim(worker_id, lease_seconds=30, kinds=None) -> Job \| None`, `heartbeat(job, lease_seconds)`, `complete(job, result)`, `fail(job, error, retryable=True) -> str`, `release(job, *, delay_seconds=0, reason=None, count_attempt=False)`, `reap_expired()`, `redrive(job_id)`, `stats()`, `purge_finished(older_than_seconds)`, `get(job_id)`, `find(tenant_id, key)`; `transient_errors` (connection errors, `PoolTimeout`) |
+| `agentkit.distributed` | `run_worker(queue, handler, *, worker_id, stop_event, concurrency=16, lease_seconds=30, poll_interval=0.5, heartbeat_interval=None, grace_period=25.0, kinds=None, on_event=None, max_jobs=None, transient_errors=None) -> dict` | The worker loop (same for SQLite and Postgres): backpressure, lease heartbeats, fenced commits, cancelling stragglers at shutdown |
+| | `AgentJobHandler(agent or make_agent, checkpointer, *, defer_stop_reasons=("rate_limited",), defer_seconds=2.0)` | `await handler(job) -> dict`, `aclose()`; `agents_created`: how many times the factory was called |
+| | `python -m agentkit.distributed.worker --queue sqlite:///… \| postgresql://… --app file.py:factory [--concurrency --lease --grace --opt k=v]`; `WorkerPool(queue_url, app, n, ...)` | The worker process entry point; start N such processes on this machine with `kill(i)` / `pause(i)` / `resume(i)` / `terminate(i)` / `add()` / `events()` |
+| | `TcpProxy(target_host, target_port)` | `start()`, `cut()` (partition: reset existing connections, refuse new ones), `heal()`, `latency`, `stats`, `close()` |
 | | `stop_on_signals(stop_event, signals=(SIGTERM, SIGINT))`; exceptions `CheckpointConflict`, `LeaseLost`, `RetryLater`, `PermanentJobError`; dataclass `Job` | |
-| `agentkit.contrib.redis_store` | `RedisIdempotencyStore(client_or_url, namespace="idem", ttl_seconds=86400)` / `AsyncRedisIdempotencyStore` | `get(key)`, `put(key, result)`, `claim(key, ttl_seconds=60) -> bool`, `release(key)`, `in_flight(key)` |
-| | `RedisTokenBucket(client, rate_per_sec, capacity, prefix="tb", *, overrides=None)` / `AsyncRedisTokenBucket` | `take(key, tokens=1) -> (ok, wait_s, left)`, `try_acquire(key, tokens=1)`, `acquire(key, tokens=1, timeout=None)`, `limits(key)` |
-| | `RateLimitHook(bucket, key_fn=tenant, tokens_fn=lambda s, m: 1, wait_timeout=5.0)` / `AsyncRateLimitHook` | agentkit hook: `before_llm` |
-| | `RedisLock(client, name, ttl_seconds, *, prefix="lock")` | `acquire(blocking=True, timeout=None) -> fence \| None`, `release()`, `extend(ttl_seconds=None)`, `owned()`; supports `with lock as fence:` |
+| `agentkit.contrib.redis_store` | `RedisIdempotencyStore(client_or_url, namespace="idem", ttl_seconds=86400)` | `get(key)`, `put(key, result)`, `claim(key, ttl_seconds=60) -> bool`, `release(key)`, `in_flight(key)` |
+| | `RedisTokenBucket(client, rate_per_sec, capacity, prefix="tb", *, overrides=None, sleep=asyncio.sleep)` | `take(key, tokens=1) -> (ok, wait_s, left)`, `try_acquire(key, tokens=1)`, `acquire(key, tokens=1, timeout=None)`, `limits(key)` (sync) |
+| | `RateLimitHook(bucket, key_fn=tenant, tokens_fn=lambda s, m: 1, wait_timeout=5.0)` | agentkit Hook: `async def before_llm` |
+| | `RedisLock(client, name, ttl_seconds, *, prefix="lock")` | `acquire(blocking=True, timeout=None) -> fence \| None`, `release()`, `extend(ttl_seconds=None)`, `owned()`; `async with lock as fence:` |
 
-A multi-worker agent service in five lines:
+The Redis `client` is a `redis.asyncio.Redis` or a `redis://` URL; passing a synchronous `redis.Redis` raises `TypeError` (every call on it would block the event loop).
+
+A worker process of a multi-machine agent service (every pod runs `python -m agentkit.distributed.worker --queue $DATABASE_URL --app app.py:make_handler`):
 
 ```python
+# app.py — compared with Lesson 13's worker_app.py, only the checkpointer line changed
 from agentkit import Agent, PermissionPolicy, default_llm
-from agentkit.contrib.postgres import AgentJobHandler, PostgresCheckpointer, PostgresJobQueue, run_worker, stop_on_signals
+from agentkit.contrib.postgres import AgentJobHandler, PostgresCheckpointer
 from agentkit.contrib.redis_store import RateLimitHook, RedisIdempotencyStore, RedisTokenBucket
 
-queue, ckpt = PostgresJobQueue(DSN), PostgresCheckpointer(DSN)
-limiter = RateLimitHook(RedisTokenBucket(REDIS_URL, rate_per_sec=5, capacity=10), wait_timeout=2)
-
-def make_agent(checkpointer):                       # must use the checkpointer passed in: it carries this claim's fence
-    return Agent(default_llm(), TOOLS, checkpointer=checkpointer, hooks=[PermissionPolicy(), limiter],
-                 idempotency_store=RedisIdempotencyStore(REDIS_URL))
-
-stop = threading.Event(); stop_on_signals(stop)     # SIGTERM → finish the current job, then exit
-run_worker(queue, AgentJobHandler(make_agent, ckpt), worker_id=os.environ["HOSTNAME"], stop_event=stop)
+async def make_handler(ctx):                              # ctx.queue: the PostgresJobQueue the worker command already connected
+    ckpt = PostgresCheckpointer(ctx.queue_url, pool_kwargs={"max_size": 8})
+    await ckpt.setup()                                    # in production, leave this to your migration tool (Problem 6)
+    limiter = RateLimitHook(RedisTokenBucket(REDIS_URL, rate_per_sec=5, capacity=10), wait_timeout=2)
+    agent = Agent(default_llm(max_connections=20), TOOLS, checkpointer=ckpt, hooks=[PermissionPolicy(), limiter],
+                  idempotency_store=RedisIdempotencyStore(REDIS_URL))   # one agent shared by the whole process
+    return AgentJobHandler(agent, ckpt)                   # every job gets a checkpoint view with this claim's fence
 ```
 
-The async version: one `AsyncAgent` per process, shared by every job; the handler passes each job's fenced view in via `checkpointer=`.
+You can skip the command line and write the main loop yourself (for example, in the same process as the API for tests):
 
 ```python
-from agentkit.aio import AsyncAgent, default_async_llm
-from agentkit.contrib.postgres import AsyncPostgresCheckpointer, AsyncPostgresJobQueue, run_async_worker
-
-pool = AsyncConnectionPool(DSN, max_size=8, kwargs={"autocommit": True})   # the queue and checkpoints share one pool (Problem 7)
-aqueue, ackpt = AsyncPostgresJobQueue(pool), AsyncPostgresCheckpointer(pool)
-agent = AsyncAgent(default_async_llm(max_connections=20), TOOLS, checkpointer=ackpt, hooks=[PermissionPolicy()])
-stop = asyncio.Event(); stop_on_signals(stop)       # call inside the event loop
-await run_async_worker(aqueue, AgentJobHandler(agent, ackpt), worker_id=os.environ["HOSTNAME"],
-                       stop_event=stop, concurrency=32, grace_period=25)
+async with AsyncConnectionPool(DSN, max_size=8, kwargs={"autocommit": True}) as pool:   # queue and checkpointer share one pool (Problem 7)
+    queue, ckpt = PostgresJobQueue(pool), PostgresCheckpointer(pool)
+    stop = asyncio.Event(); stop_on_signals(stop)         # SIGTERM → stop claiming, wait up to grace_period for in-flight jobs
+    await run_worker(queue, AgentJobHandler(agent, ckpt), worker_id=os.environ["HOSTNAME"],
+                     stop_event=stop, concurrency=32, grace_period=25)
 ```
 
-On the API side: `queue.enqueue("agent", {"op": "run", "input": text, "metadata": {...}}, tenant_id=..., idempotency_key=request_id)`; the approval inbox is `ckpt.list_runs(status="paused", tenant_id=...)`; after approval, enqueue `{"op": "resume", "run_id", "approvals": {call_id: True}, "by": approver}` with idempotency key `approve:{run_id}:{call_id}`, so an approver who double-clicks still enqueues only once.
+On the API side: `await queue.enqueue("agent", {"op": "run", "input": text, "metadata": {...}}, tenant_id=..., idempotency_key=request_id)`; the approval inbox is `await ckpt.list_runs(status="paused", tenant_id=...)`; after approval, enqueue `{"op": "resume", "run_id", "approvals": {call_id: True}, "by": approver}` with the idempotency key `approve:{run_id}:{call_id}`, so an approver who clicks twice still enqueues only once.
 
 ### 3.2 Checkpoints: CAS and fence takeover are one SQL statement each
 
@@ -385,7 +387,7 @@ RETURNING *;
 
 - **SKIP LOCKED**: the PostgreSQL docs say plainly that skipping locked rows gives an inconsistent view of the data, unsuitable for general use, but useful for avoiding lock contention when multiple consumers access a queue-like table ([docs](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)). The test for exercise (b) holds a row lock and doesn't let go: without `SKIP LOCKED`, your implementation queues up behind it.
 - **Why reap back to `queued` instead of letting claim take expired rows directly?** Claim then scans only one partial index, `(priority DESC, id) WHERE status = 'queued'`, which stays a single index scan however large the backlog gets. The price: once a job is reaped, the old holder's late commit is rejected (its ownership ended at the moment of reaping). Before reaping, a late commit still counts, as in Lesson 13.
-- **Order by `id`, not `run_at`.** The first version used `ORDER BY run_at, id`. In the demo, a worker was killed at 1.7 s and nobody took over until 10.6 s, with a lease of only 2 s: reaping set `run_at` to "now + backoff," which sent the job to the **back of the queue** behind the whole backlog. Its user had already waited once and shouldn't have to queue again. After switching to enqueue order (`id`), a job whose backoff has elapsed goes back to its original place: in the same scenario it is now killed at 0.9 s and taken over at 3.2 s, little more than the 2 s lease; in real-model mode, a worker killed at 11.6 s had its job taken over at 14.4 s (3 s lease).
+- **Order by `id`, not `run_at`.** The first version used `ORDER BY run_at, id`. In the demo, a worker was killed at 1.7 s and nobody took over until 10.6 s, with a lease of only 2 s: reaping set `run_at` to "now + backoff," which sent the job to the **back of the queue** behind the whole backlog. Its user had already waited once and shouldn't have to queue again. After switching to enqueue order (`id`), a job whose backoff has elapsed goes back to its original place: after the fix, the same scenario was killed at 0.9 s and taken over at 3.2 s, little more than the 2 s lease. In today's demo part 1, the job killed at 0.4 s is taken over at 3.3 s (2 s lease plus the random backoff after reaping).
 - **All times come from the database's `now()`**: every worker judges leases by the same clock.
 - **`attempts` is incremented on claim**, so poison messages still reach the dead-letter state (Lesson 13, Problem 3); `release()` (graceful shutdown, rate-limit deferral) gives that attempt back.
 - **`redrive` doesn't reset the fence**: fences must only go up, or an old holder's fence could come back to life.
@@ -398,21 +400,21 @@ How `run_worker` classifies outcomes:
 
 | Handler result | Queue operation | Why |
 |---|---|---|
-| Normal return | `complete(job, result)` | The store's fence is the final judge: even if the heartbeat thread already knows the lease is lost, commit once and let the fence decide |
+| Normal return | `complete(job, result)` | The store's fence is the final judge: even if the heartbeat coroutine already knows the lease is lost, commit once and let the fence decide |
 | `RetryLater(delay)` | `release`, not counted as an attempt | Rate limiting, a downstream temporarily down: not the job's fault |
 | `PermanentJobError` | `fail(retryable=False)` → `failed` | Invalid arguments, tenant mismatch: retrying won't help |
 | Any other exception | `fail(retryable=True)` → retry after backoff; `dead` when attempts run out | |
 | `CheckpointConflict` / `LeaseLost` | Nothing | Ownership has moved; any commit would be rejected |
 
-Heartbeats come from one background thread per worker, every third of the lease by default, reusing one database connection for the worker's lifetime. (The first version started a heartbeat thread per job, and thread-local connections don't close when their thread ends, so 1,000 jobs left 1,000 connections behind; the test `test_sync_worker_uses_a_fixed_number_of_connections_however_many_jobs` guards against this.)
+Heartbeats come from one coroutine per in-flight job (on the same event loop as the job), every third of the lease by default, each borrowing a connection from the process's pool for a few milliseconds. So the number of database connections a worker holds depends only on the pool's cap, not on in-flight jobs or heartbeat frequency (test `test_worker_connections_are_bounded_by_its_pool_not_by_jobs_or_heartbeats`: 8 in-flight jobs renewing every 10 ms never exceed the pool's 3 connections). When a renewal is rejected (stale fence), `job.lost` is set; when a renewal can't reach the database (`heartbeat_error`), it's recorded and retried next round — which is exactly what happens to the partitioned far-0 in demo part 5, whose lease expires while it's still alive.
 
-**How this relates to Kubernetes**: when a pod is deleted, Kubernetes runs the preStop hook, sends SIGTERM to PID 1 in the container, and sends SIGKILL after `terminationGracePeriodSeconds` (default 30 s, and preStop time counts against it) ([docs](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)). `stop_on_signals(stop)` wires SIGTERM to `stop_event`: the sync worker finishes its current job and exits; the async worker waits up to `grace_period` seconds (default 25 s, leaving time for cancellation and cleanup) for in-flight jobs and **cancels the rest without committing or releasing them**. `AsyncAgent` saves the checkpoint as `cancelled` on cancellation: interrupted read-only tool calls get a "not executed" result, while write / dangerous tool calls **stay unanswered**. Once the lease expires on its own, another worker `resume`s from there and replays each unanswered write call with the **same call_id**, so the idempotency key is unchanged and the downstream dedupes it (tests `test_cancelled_run_is_left_to_expire_and_resumed_by_another_worker` and `test_write_cancelled_at_shutdown_is_replayed_with_the_same_key_and_not_duplicated`, demo part 4). The grace period doesn't need to cover your longest job: whatever doesn't finish is covered by the lease and the checkpoint.
+**How this relates to Kubernetes**: when a pod is deleted, Kubernetes runs the preStop hook, sends SIGTERM to PID 1 in the container, and sends SIGKILL after `terminationGracePeriodSeconds` (default 30 s, and preStop time counts against it) ([docs](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)). `stop_on_signals(stop)` wires SIGTERM to `stop_event` (the worker command line already does this): the worker stops claiming, waits up to `grace_period` seconds (`--grace`, default 25 s, leaving time for cancellation and cleanup) for in-flight jobs, and **cancels the rest without committing or releasing them**. `Agent` saves the checkpoint as `cancelled` on cancellation: interrupted read-only tool calls get a "not executed" result, while write / dangerous tool calls **stay unanswered**. Once the lease expires on its own, another worker `resume`s from there and replays each unanswered write call with the **same call_id**, so the idempotency key is unchanged and the downstream dedupes it (tests `test_cancelled_read_only_run_is_left_to_expire_and_resumed_by_the_next_worker` and `test_sigterm_cancels_a_hanging_write_and_the_next_process_replays_it_with_the_same_key`, demo part 4: two real worker processes). The grace period doesn't need to cover your longest job: whatever doesn't finish is covered by the lease and the checkpoint.
 
 ### 3.5 AgentJobHandler
 
 ```mermaid
 flowchart TB
-    J["Claimed a job<br/>fence = n"] --> V["ckpt.fenced(n)<br/>make_agent(view)"]
+    J["Claimed a job<br/>fence = n"] --> V["ckpt.fenced(n)<br/>shared agent, checkpointer=view"]
     V --> OP{"payload.op"}
     OP -->|run| L{"load(run_id)<br/>checkpoint exists?"}
     L -->|"no"| RUN["agent.run(input, metadata + job's tenant_id)"]
@@ -425,7 +427,7 @@ flowchart TB
 ```
 
 - **Identity comes from the job**: `metadata["tenant_id"]` is always overwritten with `job.tenant_id`, since the payload is filled in by the caller and can't be trusted (Lesson 09); resuming another tenant's run raises `PermanentJobError`.
-- **The async version shares one agent**: the recommended first argument is an `AsyncAgent` instance, shared by the whole process (and with it the tool thread pool and model client); the handler passes each job's fenced view through the `checkpointer=` argument of `run / resume / approve`. A factory `make_agent(checkpointer)` works too, and in async mode it's called only once: in the test `test_one_shared_async_agent_serves_many_concurrent_jobs`, 20 jobs at concurrency 8 built just 1 agent, and every job's checkpoint still carries its own fence. The first implementation built a new `AsyncAgent` — and therefore a new thread pool — for every job; once `AsyncAgent` accepted a per-call checkpointer, that was no longer necessary. A sync `Agent` has its checkpointer bound to the instance, so the sync version still calls the factory once per job; `make_agent(checkpointer, job)` always builds one per job, for per-job customization (to share a thread pool, give every `AsyncAgent` the same `executor=`). If an agent that doesn't accept `checkpointer=` also ignores the checkpointer passed in, the handler errors out, since otherwise fencing would protect nothing.
+- **The whole process shares one agent**: the recommended first argument is an `Agent` instance, shared by the whole process (and with it the tool thread pool and the model client's connection pool); the handler passes each job's fenced view through the `checkpointer=` argument of `run / resume / approve` (test `test_one_shared_agent_serves_many_concurrent_jobs`: many concurrent jobs, one agent, and every job's checkpoint still carries its own fence). The first implementation built a new agent — and therefore a new thread pool — for every job; once the agent accepted a per-call checkpointer, that was no longer necessary. You can also pass a factory `make_agent(checkpointer, job)` (it may be async), called once per job for per-job customization (say, picking a model per tenant; to share a thread pool, give every agent the same `executor=`). The factory must use the checkpointer passed in, or fencing protects nothing.
 - The handler adds a small hook to the agent: once the heartbeat learns the lease is lost, it raises `StopRun("lease_lost")` before the next model or tool call, to cut wasted work. Each agent gets exactly one, and it reads the current job from a `ContextVar`: concurrent jobs on a shared agent each see their own job, and only the one that lost its lease stops (test `test_lease_guard_stops_only_the_job_whose_lease_was_lost`). Safety still rests on the fence and CAS.
 
 ### 3.6 Redis's three Lua scripts
@@ -452,137 +454,191 @@ return 0
 ## 4. Hands-on: run the demo
 
 ```bash
-.venv/bin/python lessons/26_state_and_queues/demo.py --offline         # offline: ScriptedLLM, about 50 s
-.venv/bin/python lessons/26_state_and_queues/demo.py                   # real model (7 jobs, model concurrency ≤ 2)
-.venv/bin/python lessons/26_state_and_queues/demo.py --offline --only 3   # only the sync vs async comparison
-.venv/bin/python lessons/26_state_and_queues/demo.py --offline --only 4   # only the async worker's graceful shutdown
+.venv/bin/python lessons/26_state_and_queues/demo.py --offline         # offline: scripted model, about 1 minute
+.venv/bin/python lessons/26_state_and_queues/demo.py                   # real model (7 jobs in parts 1–2; parts 3–5 still use the scripted model)
+.venv/bin/python lessons/26_state_and_queues/demo.py --offline --only 3   # only SQLite vs Postgres, more concurrency, more processes
+.venv/bin/python lessons/26_state_and_queues/demo.py --offline --only 5   # only the network partition
 ```
 
-Without the optional dependencies, the demo prints `pip install -e ".[prod,prod-local]"` and exits with code 0.
-
-**Part 1: 3 worker processes × 3 tenants × 31 jobs** (actual offline output, excerpt; demo output translated from Chinese.)
+Without the optional dependencies, the demo prints `pip install -e ".[prod,prod-local]"` and exits with code 0; if any part's checks fail, it exits with code 1. Every worker is a real process started by `WorkerPool`, with the same command as in Lesson 13, just with `--queue` pointing at Postgres:
 
 ```text
-   [+  0.8s] worker-2 │ 🧾 Created ticket T-1004 (idempotency key job-5:call_18115252a824)
-   [+  0.8s] worker-2 │ Ticket created, but the result isn't in the checkpoint yet…
-   [+  0.8s] worker-3 │ 🧾 Created ticket T-1005 (idempotency key job-6:call_3a21d26b8f73)
-   [+  0.8s] worker-3 │ Ticket created, but the result isn't in the checkpoint yet…
-   [+  0.9s] scheduler │ 💥 kill -9 worker-2 (pid 17903): no lease release, no checkpoint, no last words
-   [+  0.9s] scheduler │ 🔁 Started replacement worker-4 (like Kubernetes restarting a dead pod)
-   [+  1.0s] scheduler │ 🧊 SIGSTOP worker-3: the whole process is frozen (heartbeat thread too); lease expires in 2 s
-   [+  2.7s] worker-1 │ 😵 Agent finished; process frozen before committing the result (simulated GC pause)
-   [+  2.8s] scheduler │ 🧊 SIGSTOP worker-1: the whole process is frozen (heartbeat thread too); lease expires in 2 s
-   [+  3.2s] worker-4 │ Taking over job #5 (claim #2, fence=13): found predecessor worker-2's checkpoint (status=running, step 1) → resuming
-   [+  3.2s] worker-4 │ ♻️  Downstream unique constraint hit: returned existing ticket T-1004, no duplicate created
-   [+  3.4s] worker-4 │ Taking over job #6 (claim #2, fence=14): found predecessor worker-3's checkpoint (status=running, step 1) → resuming
-   [+  3.4s] worker-4 │ ♻️  Downstream unique constraint hit: returned existing ticket T-1005, no duplicate created
-   [+  3.6s] scheduler │ ▶️  SIGCONT worker-3: job #6 was finished by someone else long ago; the zombie wakes up
-   [+  3.6s] worker-3 │ Awake! The tool returns, and the agent goes on writing to the checkpoint…
-   [+  3.6s] worker-3 │ 💔 Heartbeat rejected: job #6's fence is stale; the lease stopped being mine a while ago
-   [+  3.6s] worker-3 │ ❌ Checkpoint conflict (CheckpointConflict): run job-6 expected version 2, actual version 7 (last writer worker-4) — another work…
-   [+  5.5s] worker-3 │ Taking over job #7 (claim #2, fence=20): found predecessor worker-1's checkpoint (status=completed, step 2) → resuming
-   [+  5.6s] scheduler │ ▶️  SIGCONT worker-1: job #7 was finished by someone else long ago; the zombie wakes up
-   [+  5.6s] worker-1 │ Awake! Still thinks it holds the lease, so it goes on committing the result…
-   [+  5.6s] worker-1 │ 💔 Heartbeat rejected: job #7's fence is stale; the lease stopped being mine a while ago
-   [+  5.6s] worker-1 │ ❌ Commit rejected (LeaseLost): job #7 was reclaimed: current fence=20 (holder worker-3), your fence=7 is stale, commit rejected…
-
-▶ All jobs done → SIGTERM every worker (graceful shutdown: stop claiming, finish the current job, exit)
-   Exit codes: worker-1=0, worker-2=-9, worker-3=0, worker-4=0 (-9 = killed with kill -9; 0 = exited normally after SIGTERM)
-
-▶ 📊 Results (19.3 s)
-   Jobs: 31/31 succeeded, failed 0, dead 0; reclaimed after a crash / freeze: #5 (finished on attempt 2, fence=13), #6 (finished on attempt 2, fence=14), #7 (finished on attempt 2, fence=20); deferred by rate limiting 21 times (not counted as attempts)
-   Tickets: 18, idempotency keys 18 → 0 duplicates ✅; the downstream unique constraint stopped 2 replays
-   Fence: rejected 1 commit and 2 heartbeats from zombie workers ✅
-   Checkpoints: 1 conflict detected (a zombie trying to write after being taken over) ✅
-
-   Tenant    Plan               Model calls  Deferred  Token wait total  Time to finish all
-   acme      standard (4/s)     21           0         0.0s              10.9s
-   globex    standard (4/s)     20           0         0.0s              10.9s
-   initech   free (1/s)         20           21        27.4s             19.2s
+python -m agentkit.distributed.worker --queue postgresql://postgres@127.0.0.1:<port>/helpdesk \
+    --app lessons/26_state_and_queues/worker_app.py:make_handler --concurrency 2 --lease 2 --opt redis=redis://127.0.0.1:<port>/0
 ```
 
-One real-model run (gpt-5.5): 7 jobs, 13 model calls, 19.3 s to finish everything; kill -9 at 11.6 s, taken over at 14.4 s (3 s lease); likewise 0 duplicate tickets, 1 commit rejected by the fence, 1 checkpoint conflict. Each real model call takes several seconds, so the free plan's 1 call per second never caused a deferral.
+All the business code lives in [`worker_app.py`](worker_app.py): one shared agent, three tools, and an optional Redis idempotency cache and rate limiter. The only backend-specific line, compared with Lesson 13's `worker_app.py`, picks the checkpointer: `postgresql://` → `PostgresCheckpointer`, `sqlite:///` → `SQLiteCheckpointer` (part 3 runs the same file against both backends). The scripted model is `ScriptedLLM(latency=0.15)`: every call does `asyncio.sleep(0.15)`, an explicit model-latency model, not the speed of a real model. Postgres is a separate instance started with pgserver's bundled initdb / pg_ctl, listening on 127.0.0.1 (workers reach it over TCP), and fakeredis runs in its own process.
+
+All the output below comes from one offline run (Apple M1, 8 GB, machine load 8–14 during the run, 56 s total). (Demo output translated from Chinese.)
+
+**Part 1: 3 worker processes × 3 tenants × 31 jobs** (excerpt)
+
+```text
+▶ Starting 3 worker processes: python -m agentkit.distributed.worker --queue postgresql://… --concurrency 2 --lease 2 (no shared memory; they cooperate only through Postgres and Redis)
+   [+  0.4s] worker-0  │ 🧾 Created ticket T-1003 (idempotency key job-5:call_8d00871d4444)
+   [+  0.4s] worker-0  │ Ticket created, but the result isn't in the checkpoint yet…
+   [+  0.4s] worker-1  │ 🧾 Created ticket T-1004 (idempotency key job-6:call_1fc1f0667b0a)
+   [+  0.4s] worker-1  │ Ticket created, but the result isn't in the checkpoint yet…
+   [+  0.4s] scheduler │ 💥 kill -9 worker-0 (pid 63518, exit code -9): lease not returned, checkpoint not written, no last words
+   [+  0.4s] scheduler │ 🔁 Started replacement worker-3 (pid 63539)
+   [+  0.4s] scheduler │ 🧊 SIGSTOP worker-1: the whole process is frozen (heartbeat coroutines too); its leases expire in 2 s
+   [+  2.9s] worker-3  │ Took over job #3 (claim 2, fence=23): found predecessor worker-1's checkpoint (status=running, step 1) → resuming from there
+   [+  2.9s] worker-2  │ Took over job #6 (claim 2, fence=24): found predecessor worker-1's checkpoint (status=running, step 1) → resuming from there
+   [+  2.9s] worker-2  │ ♻️  Downstream unique constraint hit: returned existing ticket T-1004, no duplicate created
+   [+  3.0s] worker-3  │ Took over job #7 (claim 2, fence=25): found predecessor worker-0's checkpoint (status=running, step 0) → resuming from there
+   [+  3.2s] scheduler │ ▶️  SIGCONT worker-1: job #6 was finished by someone else long ago; the zombie wakes up
+   [+  3.2s] worker-1  │ Awake! The tool returns, and the agent goes on writing to the checkpoint…
+   [+  3.2s] worker-1  │ 💔 Heartbeat rejected: job #3's fence has expired; the lease hasn't been mine for a while
+   [+  3.2s] worker-1  │ 💔 Heartbeat rejected: job #6's fence has expired; the lease hasn't been mine for a while
+   [+  3.2s] worker-1  │ ❌ Checkpoint conflict (CheckpointConflict): run job-3 expected version 3, actual version 7 (last writer worker-3) — another wo…
+   [+  3.2s] worker-1  │ ❌ Checkpoint conflict (CheckpointConflict): run job-6 expected version 2, actual version 7 (last writer worker-2) — another wo…
+   [+  3.3s] worker-3  │ Took over job #5 (claim 2, fence=29): found predecessor worker-0's checkpoint (status=running, step 1) → resuming from there
+   [+  3.3s] worker-3  │ ♻️  Downstream unique constraint hit: returned existing ticket T-1003, no duplicate created
+   [+ 16.5s] worker-3  │ 😵 The agent finished; pausing before committing the result (simulated GC pause)
+   [+ 16.5s] scheduler │ 🧊 SIGSTOP worker-3: the whole process is frozen (heartbeat coroutines too); its leases expire in 2 s
+   [+ 19.7s] worker-1  │ Took over job #7 (claim 3, fence=79): found predecessor worker-3's checkpoint (status=completed, step 2) → resuming from there
+   [+ 19.7s] scheduler │ ▶️  SIGCONT worker-3: job #7 was finished by someone else long ago; the zombie wakes up
+   [+ 19.7s] worker-3  │ Awake! Thinks it still holds the lease and goes on to commit the result…
+   [+ 19.8s] worker-3  │ 💔 Heartbeat rejected: job #7's fence has expired; the lease hasn't been mine for a while
+   [+ 19.8s] worker-3  │ ❌ Commit rejected (LeaseLost): job #7 was claimed again: current fence=79 (holder worker-1), your fence=75 is stale, commit rejected…
+
+▶ All jobs done → SIGTERM to every worker (graceful shutdown: stop claiming, finish in-flight work, exit)
+   Exit codes: worker-0=-9, worker-1=0, worker-2=0, worker-3=0 (-9 = kill -9; 0 = exited normally after SIGTERM)
+
+▶ 📊 Results (19.8 s)
+   Jobs: 31/31 succeeded, failed 0, dead 0; claimed again: #3 (done on attempt 2, fence=23), #5 (done on attempt 2, fence=29), #6 (done on attempt 2, fence=24), #7 (done on attempt 3, fence=79); deferred 43 times by rate limiting (not counted as attempts)
+   Tickets: 18, idempotency keys 18 → 0 duplicates ✅; the downstream unique constraint blocked 2 replays
+   Fence: rejected 1 zombie commit and 3 zombie heartbeats ✅
+   Checkpoint / lease: 2 "ownership moved on" events (a zombie's checkpoint write rejected by CAS, or a heartbeat noticing the lease was lost) ✅
+   Fault injection: kill -9 worker-0 (job #5); SIGSTOP worker-1 (job #6); SIGSTOP worker-3 (job #7)
+
+   Tenant    Plan             Model calls  Deferred   Token wait   All done in
+   acme      standard (4/s)   21           0          2.4s         4.7s
+   globex    standard (4/s)   21           0          1.1s         4.7s
+   initech   free (1/s)       21           43         43.9s        19.7s
+```
 
 What to look for:
 
-1. **kill -9 (job #5)**: the ticket was created, but the result never reached the checkpoint. The worker that takes over replays the **same** tool call from the checkpoint (same `call_id`, therefore the same idempotency key). The Redis cache misses (the predecessor never got to `put`), and it's the downstream unique constraint that stops the duplicate. Killed at 0.9 s, taken over at 3.2 s: mostly waiting for the 2 s lease to expire, after which the replacement worker-4, the only worker still running at that point (the other two were frozen), picked it up.
-2. **A zombie in mid-run (job #6)**: when it wakes up and writes to the checkpoint, it gets `CheckpointConflict`: expected version 2, actual already 7. The +1 from the takeover plus the new worker's saves all happened while it was "asleep." Its heartbeat is rejected too.
-3. **A zombie at commit time (job #7)**: the new worker finds the checkpoint already `completed`, makes no model call at all, and commits directly; the zombie's commit after waking up is rejected by the fence. The worker that took it over is worker-3, itself just woken up: a zombie that wakes up can still claim new jobs; only the writes under its old lease are void.
-4. **The fence values**: the three jobs that were taken over got fence=13, 14, and 20, not "claim #2, so 2"; job #7's zombie holds fence=7. Fences come from a sequence shared by the whole queue table (section 3.3), which only guarantees that a later fence is larger than an earlier one.
-5. **Rate limiting**: the free tenant's jobs were deferred 21 times (16 to 20 in other runs), yet **none of that consumed a retry attempt**, and no worker sat idle waiting (at most 1 s each time); the other two tenants barely waited for tokens at all.
-6. **SIGTERM**: the replacement worker and both zombies exit normally (exit code 0); the killed one shows -9.
+1. **kill -9 (job #5)**: the ticket was created, but the result never made it into the checkpoint. The worker that takes over replays the **same** tool call from the checkpoint (same `call_id`, so the same idempotency key). The Redis cache misses (the predecessor never got to `put`); the downstream unique constraint is what stops the duplicate.
+2. **Freeze one process and every job it holds becomes a zombie**: each worker runs 2 jobs at a time, and worker-1 held jobs #3 and #6 when it was frozen; both were taken over. When it wakes, both heartbeats are rejected and both checkpoint writes hit `CheckpointConflict` (expected version 2, actual already 7: the +1 from the takeover plus the new worker's saves all happened while it "slept"). Likewise, job #7, waiting for a token on the killed worker-0, was taken over too ("step 0"). The higher the concurrency, the more jobs one failure touches — but with leases + fencing, none is lost and none is duplicated.
+3. **The zombie at commit time (job #7)**: the new worker reads a checkpoint that is already `completed`, calls the model zero times, and commits directly; the zombie's commit after waking is rejected by the fence.
+4. **The fence values**: the taken-over jobs got fence=23, 24, 29, 79, not "2 because it's the second claim"; job #7's zombie holds fence=75. Fences come from one sequence shared by the whole queue table (3.3), which only guarantees that later ones are larger.
+5. **Rate limiting**: the free tenant's jobs were deferred 43 times, but **not one deferral consumed a retry attempt**, and no worker sat idle waiting (at most 1 second per wait); the other two tenants barely waited for tokens and finished everything in 4.7 s. Whether a fault window opens ("once per job, once per process") is decided by a small Redis Lua script in the worker (`chaos_once` in `worker_app.py`), not by "which claim is this".
+6. **SIGTERM**: the replacement worker and the two woken zombies all exit normally (exit code 0); the killed one is -9.
+
+One real-model run (gpt-5.5, concurrency 1 per worker, all workers on this machine sharing 2 model-concurrency slots): 7 jobs, 13 model calls in part 1 and 1 in part 2, part 1 took 16.3 s; kill -9 at 6.7 s, taken over at 12.3 s (2 s lease, but by then one worker was frozen and the other two were busy, so the takeover waited for someone to free up); likewise 0 duplicate tickets, 1 commit rejected by the fence, 1 checkpoint conflict. Real model calls take seconds each, so the free plan's 1-call-per-second limit caused no deferrals.
 
 **Part 2: approval → enqueue resume → a brand-new worker process resumes the run**
 
 ```text
-▶ Approval inbox: ckpt.list_runs(status='paused') (served by the (status, updated_at) index)
-   run job-2 (tenant acme, user acme-zhang) awaiting approval: reset_password({"user": "zhang.san"}), last writer worker-1
-▶ Approver alice clicked "approve" — twice, by accident; the API enqueues the resume job with idempotency key approve:<run_id>:<call_id>
-   job_ids returned by the two enqueues: #33, #33 → same job ✅
-▶ Start worker-9, a process that has never existed before (all state is in Postgres, so any process can continue)
-   [+  0.3s] worker-9 │ Claimed job #33 (op=resume, attempt 1, fence=56)
-   [+  0.5s] worker-9 │ ✅ Finished #33 (acme): Password reset; the new password was sent to your corporate email.
-   resume job #33: succeeded; run job-2 is now completed, last writer worker-9
-   Checkpoint fence: 2 → 56 (resume is a new job; on its very first claim it got a larger fence from the global sequence, so the fenced load took over)
-   Approval log: alice approved reset_password at 04:45:04 (verified by phone)
+▶ Approval inbox: ckpt.list_runs(status='paused') (queried through the (status, updated_at) index)
+   run job-2 (tenant acme, user acme-zhang) awaiting approval: reset_password({"user": "zhang.san"}), last writer worker-0
+▶ Approver alice clicked "approve" — twice by accident; the API enqueues the resume job with approve:<run_id>:<call_id> as the idempotency key
+   job_ids returned by the two enqueues: #33, #33 → the same job ✅
+▶ Starting a worker process that has never existed before, fresh-0 (all state is in Postgres; any process can continue)
+   [+  0.2s] fresh-0   │ Claimed job #33 (attempt 1, fence=80)
+   [+  0.4s] fresh-0   │ ✅ Finished #33: Password reset; the new password has been sent to your company email.
+   resume job #33: succeeded; run job-2 is now completed, last writer fresh-0
+   Checkpoint fence: 2 → 80 (resume is a new job; its first claim already took a larger fence from the global sequence, so the fenced load took over)
+   Approval log: alice approved reset_password at 14:29:01 (verified by phone)
 ```
 
-The resume job #33 got fence=56 on its first claim, not 1. The checkpoint's recorded fence was 2 (what run job #2 got when it was claimed); 56 is larger, so worker-9's fenced load can take over. With the old per-job counting, a resume job's first claim always got fence=1: in this run the run job was never taken over, so it happened to work; had the run job been claimed even once more, the resume job would have been rejected as an older holder (section 3.3).
+Resume job #33 got fence=80 on its first claim, not 1. The checkpoint records fence 2 (from run job #2's claim); 80 is larger, so fresh-0's fenced load can take over. With the old per-job counting, a resume job's first claim was always fence=1: this time the run job was never taken over, so nothing broke by luck; had the run job been claimed again even once, the resume job would have been rejected as a stale holder (3.3).
 
-**Part 3: the same batch of jobs, sync workers vs one async worker process** (24 jobs, 2 model calls each, 0.15 s simulated latency; in real-model mode this part still uses the simulated model, because it measures the worker architecture, not the model's speed)
+**Part 3: the same worker app, the same command — only `--queue` changes** (each job makes 2 model calls, each an `asyncio.sleep` of 0.15 s, plus 1 read-only tool and about 5 checkpoint writes; in real-model mode this part also uses the scripted model, because it measures worker architecture, not model speed. Every row is real worker processes, timed from "opening the gate": jobs are enqueued with a long delay and released together once all processes are up)
 
 ```text
-   Setup                                   Procs×conc  Pool          Peak conns  Time     Jobs/s  Peak in-flight model calls
-   sync · 1 process                        1 × 1       -             5           7.91s    3.0     1
-   sync · 3 processes                      3 × 1       -             11          2.82s    8.5     3
-   async · 1 process · concurrency 16      1 × 16      16            10          0.65s    36.8    16
-   async · concurrency 16 · pool 4         1 × 16      4             6           0.65s    37.1    16
-   async · concurrency 16 · holds a conn   1 × 16      4 (biz DB)    11          1.93s    12.4    4
+   Backend                       Procs×conc  Jobs  Ckpt pool     Peak conns  Time     Jobs/s   Ceiling  Peak in-flight model calls
+   SQLite                        1 × 1       16    -             -           4.92s    3.3      3        1
+   Postgres                      1 × 1       16    16            7           4.98s    3.2      3        1
+   Postgres                      1 × 16      64    16            14          1.28s    49.8     53       16
+   Postgres                      3 × 16      96    16            37          0.68s    142.2    160      48
+   SQLite                        3 × 16      96    -             -           0.68s    140.9    160      48
+   SQLite                        8 × 64      512   -             -           0.89s    573.7    1707     350
+   Postgres                      8 × 64      512   16            171         0.82s    626.6    1707     349
+   Postgres · ckpt pool 4        1 × 16      64    4             11          1.30s    49.1     53       16
+   Postgres · hold conn on model 1 × 16      64    4 (business)  15          5.13s    12.5     53       4
 ```
 
-(Peak conns counts the connections open on this database at the same time, including the parent process's connections for enqueueing and stats; for the two sync rows, peak in-flight model calls equals the number of processes, since each sync process can only have one model call in flight.)
+(Ceiling = tasks running at once ÷ the 0.3 s each task spends waiting on the model; the in-flight peak is counted by putting every process's model-call intervals together; peak connections is how many connections were open on this database at once, including each worker's queue, checkpoint, and ticket-database pools. This part was also run twice on its own; the same row's time differed by less than 5%.)
 
-1. A sync worker sits idle while it waits for the model, so the only way to go faster is more processes: 3 processes give about 2.8×, and the connection count climbs with them.
-2. One async process drives 16 jobs at once, for more than 4× the throughput of 3 sync processes.
-3. **The pool's cap is 16, but it only grew to 10 connections on demand** (5 in another run): an agent spends nearly all its time waiting for the model, and checkpoint writes borrow a connection for a few milliseconds. With a 4-connection pool, throughput is the same.
-4. The last row is the anti-pattern: every job holds a connection (to another database) while it waits for the model, so concurrency collapses to the 4 connections and throughput drops to a third.
+1. **More concurrency**: going from concurrency 1 to 16 in one process takes throughput from 3.2 to 49.8 jobs/s, close to the ceiling; the in-flight peak is exactly 16 — the concurrency really happened; it isn't a calculated figure.
+2. **More processes**: 3 processes × 16 multiply it again (142 jobs/s), with a peak of 48 = 3 × 16.
+3. **SQLite vs Postgres**: on the same machine they're about the same, all the way to 8 × 64 (574 vs 627 jobs/s, both at about a third of the ceiling). What's holding things back there isn't either database's write lock (Problem 7). What Postgres buys is "several machines can share one queue"; one cost is in the peak-connections column: 171 connections at 8 × 64, beyond which you want PgBouncer (Problem 6).
+4. **A 4-connection checkpoint pool gives the same throughput** (49.1 vs 49.8): agents spend nearly all their time waiting on the model, and checkpoint writes borrow a connection for only a few milliseconds.
+5. The last row is the anti-pattern: every task holds a connection (to another database) while waiting on the model, so concurrency collapses to the 4 connections and throughput drops to a quarter.
 
-**Part 4: graceful shutdown of an async worker — a cancelled write doesn't run twice after resume** (actual offline output; in real-model mode this part still uses the simulated model, so that it stops deterministically at the moment "the downstream has executed, the response hasn't come back")
+**Part 4: graceful shutdown — a write cancelled at SIGTERM isn't duplicated when another process resumes it** (in real-model mode this part also uses the scripted model, to land deterministically on "downstream done, response not yet back")
 
 ```text
-▶ pod-1 starts: concurrency 8, 2 s lease, 0.5 s grace period
-   Kubernetes sends SIGTERM: pod-1 stops claiming and waits at most 0.5 s for in-flight jobs
-   pod-1 exits: 5 finished, 1 cancelled after the grace period (not committed, not released)
-   run job-5's checkpoint: status=cancelled; the last message is the assistant's write-tool call ['call_55243a0fba26'], with no "not executed" filled in (left unanswered)
-▶ Waiting for the lease to expire on its own (2 s); pod-2 takes over
-   pod-2 finished 1
+▶ pod-a starts: one process, concurrency 8, 2 s lease, 0.5 s grace period (--grace 0.5)
+   Kubernetes sends SIGTERM: pod-a stops claiming new jobs and waits at most 0.5 s for in-flight jobs
+   pod-a exits (exit code 0): 5 finished, 1 cancelled after the grace period (not committed, not released); event order draining → cancelled → stopped ✅
+   Checkpoint of run job-5: status=cancelled, the last message is the assistant's write-tool call ['call_1eb84f0697f6'], with no "not executed" filled in (left unanswered)
+   Job #5 in the queue: status=leased, holder pod-a0 (neither committed nor released; waiting for the lease to expire)
+▶ Another process, pod-b, starts; once the 2 s lease expires it claims job #5 and continues from the checkpoint
 ▶ 📊 Results
-   pod-1 ran create_ticket, idempotency key job-5:call_55243a0fba26 → created
-   pod-2 ran create_ticket, idempotency key job-5:call_55243a0fba26 → unique constraint hit, returned the existing ticket
+   pod-a0 (claim 1) runs create_ticket, idempotency key job-5:call_1eb84f0697f6 → created
+   pod-b0 (claim 2) runs create_ticket, idempotency key job-5:call_1eb84f0697f6 → unique constraint hit, existing ticket returned
    Both executions used the same idempotency key ✅
    6 tickets for 6 runs → no duplicates ✅
 ```
 
-Each pod has a single shared `AsyncAgent`, with 6 jobs running on it concurrently. For the cancelled one, the downstream had in fact already created the ticket; pod-2, taking over, replays the **same** tool call from the checkpoint, the idempotency key stays the same, and the downstream unique constraint turns the second execution into "return the existing result." Why it has to work this way: item 1 in section 6.
+pod-a is a real worker process and SIGTERM is a real signal (`WorkerPool.terminate`). Inside it, 6 jobs run concurrently on one shared `Agent`. For the cancelled one, the downstream had actually created the ticket already; pod-b (another process) replays the **same** tool call from the checkpoint, the idempotency key doesn't change, and the downstream unique constraint turns the second execution into "return the existing result". Section 6, item 1, explains why it must work this way.
+
+**Part 5: network partition — the worker is alive but can't reach the database** (in real-model mode this part also uses the scripted model)
+
+Two worker processes both reach the same Postgres over TCP: far-0's `--queue` points at a `TcpProxy` port, near-0 connects directly. `TcpProxy` ([`agentkit/distributed/chaos.py`](../../agentkit/distributed/chaos.py)) really forwards the TCP byte stream; `cut()` resets every connection through it and refuses new ones — no network call is mocked. After far-0 runs the tool, its second model call waits on a gate file, so the cut lands at a known moment — "tool executed, tool result in the checkpoint, model call in progress" — instead of betting on a sleep.
+
+```text
+   [+  0.2s] far-0     │ Claimed job #1 (attempt 1, fence=1)
+   [+  0.4s] far-0     │ 🧾 Created ticket T-1001 (idempotency key job-1:call_7fc17ed64882)
+   [+  0.4s] scheduler │ far-0 has created the ticket, the checkpoint holds the tool result, and it's waiting on its second model call
+   [+  0.6s] scheduler │ ✂️  Partition: TcpProxy.cut() drops far-0's 5 database connections (queue pool, checkpoint pool, ticket-db pool); new connections get reset as soon as they connect; the far-0 process itself is perfectly alive
+   [+  0.9s] far-0     │ 📡 Heartbeat can't get through (job #1): OperationalError: consuming input failed: server closed…
+   [+  1.6s] far-0     │ 📡 Heartbeat can't get through (job #1): OperationalError: consuming input failed: server closed…
+   [+  2.8s] near-0    │ Claimed job #1 (attempt 2, fence=2)
+   [+  2.8s] near-0    │ Took over job #1 (claim 2, fence=2): found predecessor far-0's checkpoint (status=running, step 1) → resuming from there
+   [+  2.9s] near-0    │ ✅ Finished #1: Ticket T-1001 has been created for you; IT will contact you shortly.…
+   [+  2.9s] scheduler │ Job #1 finished by near-0 (fence=2); is far-0 still alive: True
+   [+  2.9s] scheduler │ 🔌 Network healed + far-0's model call returns: it thinks the job is still its own and goes to write the final answer into the checkpoint
+   [+  3.2s] far-0     │ 💔 Heartbeat rejected: job #1's fence has expired; the lease hasn't been mine for a while
+   [+  4.1s] far-0     │ ❌ Checkpoint conflict (CheckpointConflict): run job-1 expected version 3, actual version 7 (last writer near-0) — another work…
+
+▶ 📊 Results
+   Claims: far-0 fence=1, near-0 fence=2 (the taker's fence is larger)
+   far-0's heartbeats during the partition: 2 failures (heartbeat_error), so its lease was never renewed; near-0 claimed the job 2.2 s after the cut (2 s lease + backoff after reaping)
+   Final job: succeeded, finished by near-0, fence=2; far-0 committed nothing (0 completed events)
+   Checkpoint: far-0's write after reconnecting was rejected by CAS; the version is still 7 and the last writer is near-0 — exactly as near-0 left it ✅
+   Downstream: the tool body ran exactly once (far-0, before the cut), 1 ticket; near-0 continued from the checkpoint without calling the tool again
+   far-0 stayed alive during and after the partition (✅): a partition is not a crash.
+```
+
+This is the multi-machine version of Lesson 13's timeline, and every step really happened: far-0's heartbeats can't get through (all it sees is `OperationalError`; it has no idea anyone took over) → its lease expires while it is **still alive** → near-0's `claim` reaps the expired lease first and then claims with a larger fence, and `fenced(2).load` takes over the checkpoint (version +1) → near-0 continues from the checkpoint without calling the tool again → the network heals, far-0's heartbeat is rejected (stale fence), and when its model call returns and it tries to save the checkpoint, the version CAS rejects it (`CheckpointConflict` → `ownership_lost`, nothing committed). Unlike the SIGSTOP zombie in part 1, far-0 kept running the whole time — its event loop and timers were fine; it just couldn't write to the database.
+
+**Being honest about this experiment's limits**: ① every process is on the same machine, so there's no cross-machine clock drift and no realistic network-latency distribution; ② `TcpProxy.cut()` resets connections with an RST, so the client gets an error **immediately**, whereas real partitions more often drop packets silently and are noticed only after a TCP timeout — in production, configure `connect_timeout`, TCP keepalive, and `statement_timeout` on database connections, or a dead connection can hang a coroutine for a long time; ③ Redis is fakeredis, which doesn't simulate persistence, failover, or cluster sharding, so "Redis loses writes on failover" from Problem 6 can only be understood from the docs and wasn't measured here. The same scenario, with assertions, is `test_network_partition_isolated_worker_is_taken_over_and_its_late_writes_are_rejected` in [`tests/contrib/test_postgres.py`](../../tests/contrib/test_postgres.py).
 
 ## 5. Exercises
 
-Open [`exercise.py`](exercise.py) and redo Lesson 13's three core moves the "production way":
+Open [`exercise.py`](exercise.py) and rewrite Lesson 13's three core moves the "production way". Like agentkit's adapters, everything is async: `conn` is a psycopg async connection (`cur = await conn.execute(sql, params)`, `await cur.fetchone()`, `async with conn.transaction():`), and the Redis client is a `redis.asyncio.Redis` (`await client.eval(...)`). Write `cas_save` and `claim_one` as `async def` (the signatures are given); `refill` is pure computation and stays a plain function.
 
 | Exercise | What to do | How the tests check it |
 |---|---|---|
-| (a) `cas_save(conn, run_id, expected_version, state_json) -> bool` | Write the CAS SQL: `INSERT ... ON CONFLICT DO NOTHING` when `expected_version == 0`, otherwise `UPDATE ... WHERE version = ?` | A stale version is rejected and the data is unchanged; 8 threads doing 80 concurrent increments lose none |
-| (b) `claim_one(conn, worker_id, lease_seconds) -> dict \| None` | Reap expired leases first (out of attempts → `dead`), then claim with `FOR UPDATE SKIP LOCKED` | Holds a row lock and checks whether you skip it or queue behind it; the fence grows after a lease expires; 8 threads racing for 40 jobs never claim one twice |
-| (c) `refill(...)` + `TOKEN_BUCKET_LUA` | Write the refill logic as a pure function first, then move it into Lua, using `TIME` for the clock and `tostring` for floats | Denies after the burst; rewinds `ts` by 2 s to check the refill; floats aren't truncated; 10 threads racing for 25 tokens get exactly 25 |
+| (a) `async def cas_save(conn, run_id, expected_version, state_json) -> bool` | Write the CAS SQL: `INSERT ... ON CONFLICT DO NOTHING` when `expected_version == 0`, otherwise `UPDATE ... WHERE version = ?` | A stale version is rejected and the data is unchanged; **8 processes** each increment the same run 10 times, ending at exactly 80 with version 81, and conflicts really happened |
+| (b) `async def claim_one(conn, worker_id, lease_seconds) -> dict \| None` | Reap expired leases first (out of attempts → `dead`), then claim with `FOR UPDATE SKIP LOCKED` | Another database session holds a row lock, checking whether you skip it or queue behind it; the fence grows after a lease expires; **8 processes** race for 40 jobs and none is claimed twice |
+| (c) `refill(...)` + `TOKEN_BUCKET_LUA` | Write the refill logic as a pure function first, then move it into Lua, using `TIME` for the clock and `tostring` for fractions | Denies after a burst; set `ts` to 2 seconds ago and check the refill; fractions aren't truncated; **10 processes**, 10 tries each, race for 25 tokens and exactly 25 get through |
 
 ```bash
 make lesson N=26
 # or: .venv/bin/python -m pytest lessons/26_state_and_queues -v
 ```
 
-This exercise counts fences per job (`fence = fence + 1`), which holds only within a single job: the exercise has no fenced checkpoint takeover and no run that maps to several jobs. The adapter uses a global sequence; section 3.3 explains why.
+The concurrency tests use [`race.py`](race.py) to start 8–10 **real python processes** at once (the same approach as Lesson 13's `race.py`): each process loads your implementation, opens its own connection, writes a "ready" file, and waits for the parent to create a "go" file before everyone races. The processes share no memory and no GIL; they can only cooperate through the atomic operations of the database and Redis — just like workers on separate machines. Racy code such as "SELECT, then UPDATE" shows up here reliably: we tried removing `FOR UPDATE SKIP LOCKED` from the reference solution, and 8 processes made 116 claims covering only 40 distinct jobs; removing `AND version = ?` from the CAS left 80 increments at 11.
 
-The tests use the `pg_uri` (a fresh database per test) and `redis_client` (flushed per test) fixtures from the root `conftest.py`, and skip automatically without the optional dependencies. More complete tests for the contrib modules are in [`tests/contrib/test_postgres.py`](../../tests/contrib/test_postgres.py) and [`tests/contrib/test_redis_store.py`](../../tests/contrib/test_redis_store.py), covering conflicts, expiry, duplicates, multi-thread and multi-coroutine concurrency, connection pools, and resuming after cancellation.
+This exercise counts fences per job (`fence = fence + 1`), which only holds within a single job: there's no fenced checkpoint takeover here, and no run spans several jobs. The adapter uses a global sequence; see 3.3 for why.
+
+The tests use `pg_uri` (a fresh database per test) and `redis_url` (this lesson's `aredis` fixture flushes it before each test) from the root `conftest.py`. They're skipped automatically when the optional dependencies aren't installed. The contrib modules' fuller tests live in [`tests/contrib/test_postgres.py`](../../tests/contrib/test_postgres.py) and [`tests/contrib/test_redis_store.py`](../../tests/contrib/test_redis_store.py), covering conflicts, expiry, duplicates, multi-process and multi-coroutine concurrency, connection pools, recovery after cancellation, kill -9 / SIGSTOP / SIGTERM, and a network partition.
 
 ## 6. Common pitfalls and findings from real runs
 
@@ -592,10 +648,10 @@ The tests use the `pg_uri` (a fresh database per test) and `redis_client` (flush
 | Every worker runs `CREATE TABLE IF NOT EXISTS` on startup | **Tested: 8 connections at once, 7 failed with `UniqueViolation` (pg_class_relname_nsp_index)** | Run migrations once at deploy time; if you must create tables on startup, serialize with `pg_advisory_xact_lock` |
 | A NUL character in tool output | **Tested: `jsonb` raises `UntranslatableCharacter` and the whole checkpoint write fails** | Replace it before writing (the adapter does) |
 | The queue orders by `run_at`, and reaping sets `run_at` to "now + backoff" | **Tested: the killed worker's job went to the back of the queue; with a 2 s lease it took 9 s to be taken over** | Order by enqueue order (`id`) and filter backoff with `run_at <= now()` |
-| One heartbeat thread per job, each with a thread-local connection | Connections grow linearly with jobs, ending in `too many connections` | One heartbeat thread per worker; close a thread's connection before it ends |
+| Opening a new database connection per heartbeat (or one heartbeat thread per job, each with a thread-local connection) | Connections grow linearly with jobs, ending in `too many connections` (the early sync worker actually hit this) | Heartbeats borrow a connection from the process's pool for a few milliseconds, so the connection count depends only on the pool's cap (what `run_worker` does) |
 | Borrowing from a pool while holding a connection from the same pool | **Tested: pool of 2, two coroutines doing this — both waited until `PoolTimeout`** | Borrow once per operation, or use two pools for two things |
-| `time.sleep` / sync drivers inside a coroutine | The whole event loop stalls, and every task's heartbeat stops with it | Use async drivers; push sync code into `asyncio.to_thread` (`run_async_worker` does this for sync handlers automatically) |
-| An async worker keeps claiming when it's full | The process hoards jobs it can't handle, leases expire, jobs run twice | Take a semaphore slot before claiming (backpressure) |
+| `time.sleep` / sync drivers inside a coroutine | The whole event loop stalls, and every task's heartbeat stops with it | Use async drivers; push sync code into `asyncio.to_thread` (`run_worker` refuses sync handlers and the Redis adapters refuse sync clients, both with `TypeError`) |
+| A worker keeps claiming when it's full | The process hoards jobs it can't handle, leases expire, jobs run twice | Take a semaphore slot before claiming (backpressure) |
 | A worker waits in place when rate limited | Head-of-line blocking: other tenants with quota queue behind it | Wait briefly, then `RetryLater` so the job goes back to the queue |
 | Rate-limit deferrals and shutdown releases count as attempts | Jobs throttled at peak end up dead-lettered | `release()` doesn't count an attempt |
 | `return 1.5` straight from Lua | The client receives 1 (truncated) | Return `tostring()` |
@@ -605,16 +661,19 @@ The tests use the `pg_uri` (a fresh database per test) and `redis_client` (flush
 | Counting fences per job (`fence = fence + 1`) | **Tested (Lesson 31 load test): after a run job had been taken over, the same run's resume job got fence=1 on its first claim, was rejected by the checkpoint as an older holder, and stayed stuck until its lease expired** | Take the fence from a sequence shared by the whole queue table (`nextval`), so it goes up globally (section 3.3; fixed) |
 | Session-level advisory locks, `LISTEN`, or `SET` behind PgBouncer transaction pooling | Locks, subscriptions, and settings leak onto other clients | Use transaction-level advisory locks; run `LISTEN` on a direct connection |
 | Long jobs on Celery + a Redis broker | Tasks running past `visibility_timeout` (default 1 hour) are delivered twice | Raise `visibility_timeout`, or use a queue where you can renew leases yourself |
-| Filling in "not executed" for a write that was already sent when the run is cancelled | **Tested: after resume the model retried with a new call_id, the idempotency key changed, and the side effect happened twice** (fixed in `agentkit.aio`; see item 1 below) | On cancellation or timeout, leave write calls unanswered and replay them with the same call_id on resume |
-| A new `AsyncAgent` per job | A tool thread pool per job; the worker's resources grow with the number of jobs | One `AsyncAgent` per process, with the fenced checkpoint view passed per call via `checkpointer=` |
+| Filling in "not executed" for a write that was already sent when the run is cancelled | **Tested: after resume the model retried with a new call_id, the idempotency key changed, and the side effect happened twice** (fixed in agentkit's core; see item 1 below) | On cancellation or timeout, leave write calls unanswered and replay them with the same call_id on resume |
+| A new `Agent` per job | A tool thread pool per job; the worker's resources grow with the number of jobs | One `Agent` per process, with the fenced checkpoint view passed per call via `checkpointer=` |
+| Reusing the pool's old connections right after the network heals | During the partition, the pool's idle connections actually died; the first write after healing hits a dead connection, and the failure reads as "network error" instead of "you're no longer the holder" | Give the pool `check=AsyncConnectionPool.check_connection` (check before lending, as [`worker_app.py`](worker_app.py) does) |
+| Assuming "switching to Postgres makes one machine faster" | **Measured (demo part 3): on the same machine, SQLite and Postgres deliver about the same throughput all the way to 8 × 64** | Switch to Postgres for a queue shared across machines, many writers, and a server clock; on one machine, first check where you're actually stuck |
 
 **More findings from real runs**:
 
-1. **Found in testing → fixed: cancellation used to leave a different checkpoint than a crash, and made writes run twice** (`agentkit.aio.AsyncAgent`). When a process is `kill -9`ed, a write-tool call that was executing is "still without a result" in the checkpoint, so recovery replays the **same** `call_id` with the same idempotency key, and the downstream can dedupe. But the original `AsyncAgent`, when a run was **cancelled**, filled that call in with "not executed: run cancelled." If the downstream had actually processed the request, the model saw "not executed" after recovery and issued a **new** `call_id`, so the idempotency key changed and downstream dedup stopped working: this lesson reproduced "a write tool causes its side effect, is cancelled while waiting for the response, and the side effect happens again after recovery." **The fix** (merged into agentkit by the maintainer; regression test `tests/test_aio.py::test_cancel_keeps_in_flight_write_unanswered_and_resume_replays_same_call_id`): on cancellation or timeout, write / dangerous tool calls **stay unanswered**, while read-only calls still get "not executed." There are two layers to why: ① an interrupted write is in an "unknown whether it ran" state, and filling in "not executed" hands the model a wrong conclusion; ② left unanswered, `_run_pending_tools` completes it first on resume, replaying the tool call stored in the checkpoint; the `call_id` hasn't changed, so neither has the idempotency key `run_id:call_id`, and the downstream unique constraint or Idempotency-Key turns the second execution into "return the existing result" — exactly the premise the idempotency-key design rests on (Lessons 08 and 13). `RunResult.history` fills such unanswered calls with a placeholder result, so starting a new conversation from it still yields a valid message protocol; to continue this run, use `resume`. This lesson's `test_write_cancelled_at_shutdown_is_replayed_with_the_same_key_and_not_duplicated` and demo part 4 verify it again from the angle of a worker's graceful shutdown: both executions use the same idempotency key, and there's only one ticket.
+1. **Found in testing → fixed: cancellation used to leave a different checkpoint than a crash, and made writes run twice** (the async agent of the time). When a process is `kill -9`ed, a write-tool call that was executing is "still without a result" in the checkpoint, so recovery replays the **same** `call_id` with the same idempotency key, and the downstream can dedupe. But the original async agent, when a run was **cancelled**, filled that call in with "not executed: run cancelled." If the downstream had actually processed the request, the model saw "not executed" after recovery and issued a **new** `call_id`, so the idempotency key changed and downstream dedup stopped working: this lesson reproduced "a write tool causes its side effect, is cancelled while waiting for the response, and the side effect happens again after recovery." **The fix** (merged into agentkit by the maintainer; regression test `tests/test_runtime.py::test_cancel_keeps_in_flight_write_unanswered_and_resume_replays_same_call_id`): on cancellation or timeout, write / dangerous tool calls **stay unanswered**, while read-only calls still get "not executed." There are two layers to why: ① an interrupted write is in an "unknown whether it ran" state, and filling in "not executed" hands the model a wrong conclusion; ② left unanswered, `_run_pending_tools` completes it first on resume, replaying the tool call stored in the checkpoint; the `call_id` hasn't changed, so neither has the idempotency key `run_id:call_id`, and the downstream unique constraint or Idempotency-Key turns the second execution into "return the existing result" — exactly the premise the idempotency-key design rests on (Lessons 08 and 13). `RunResult.history` fills such unanswered calls with a placeholder result, so starting a new conversation from it still yields a valid message protocol; to continue this run, use `resume`. `test_sigterm_cancels_a_hanging_write_and_the_next_process_replays_it_with_the_same_key` in `tests/contrib/test_postgres.py` and demo part 4 verify it again from the angle of a worker process's graceful shutdown (two real processes, a real SIGTERM): both executions use the same idempotency key, and there's only one ticket.
 2. **Two fakeredis limitations** (test infrastructure only; real Redis doesn't have them): its TCP server is built on Python's `socketserver`, with a default listen backlog of only 5, so a dozen threads connecting at once get reset (the maintainer has raised it to 128 in `agentkit/testing.py`); and many threads taking the "EVALSHA miss → SCRIPT LOAD" path at once get disconnected. The adapters warm the script cache with `SCRIPT LOAD` at construction, and the tests open connections one at a time first. fakeredis also doesn't simulate persistence, failover, or cluster sharding, so the "can lose data" scenarios in Problem 6 come from the docs and weren't tested in this lesson.
 3. **`redis.asyncio`'s default connection pool (redis-py 8.1: cap 100) raises `MaxConnectionsError` immediately when full instead of waiting**; use `BlockingConnectionPool` (default 50 connections, 20 s wait) when you want "queue up when full."
-4. **The embedded Postgres is real Postgres, but only one of it.** SKIP LOCKED, advisory locks, MVCC, and `now()` behave exactly as in production; failover, replication lag, and PgBouncer weren't tested in this lesson. This machine has no Docker, and no containers were started.
-5. When you pass a `multiprocessing` `Semaphore` to a spawned child process, **the parent must keep a reference to it**; otherwise the child fails at startup with `FileNotFoundError` (the demo hit this on its first run).
+4. **The embedded Postgres is real Postgres, but only one of it, and every process runs on the same machine.** SKIP LOCKED, advisory locks, MVCC, and `now()` behave exactly as in production; the network partition really cuts TCP connections with `TcpProxy`, but with an RST (the client errors immediately) rather than the more common "packets silently dropped, noticed after a TCP timeout"; failover, replication lag, cross-machine clock drift, and PgBouncer weren't tested in this lesson. This machine has no Docker, and no containers were started.
+5. **When a process freezes or dies, every job it has in flight goes with it** (seen in demo part 1 after moving to async workers): with 2 jobs per worker, SIGSTOP one process and both of its jobs are taken over, and after it wakes, both checkpoint writes are rejected. The higher the concurrency, the more jobs one failure touches and the more concentrated the takeover load — lease length and per-process concurrency have to be chosen together. For the same reason, the demo's fault injection can't trigger on "first claim" (a job may be taken over because a neighbor failed before it ever reaches its fault window); a small Redis Lua script guarantees "once per job, once per process" instead.
+6. **At 8 processes × concurrency 64, one database had 171 connections open at once** (demo part 3): every worker process has its own pools for the queue, the checkpoints, and the ticket database. The demo raises Postgres's `max_connections` to 500 for this; in production it's the signal to add PgBouncer, or to let the queue and the checkpointer share one pool (Problems 6 and 7).
 
 ## 7. Switching to a managed service
 
@@ -622,10 +681,10 @@ No code changes, only configuration:
 
 | Component | This lesson (embedded) | Managed / production | What to change |
 |---|---|---|---|
-| Postgres | `pgserver`, unix socket | RDS / Aurora / Cloud SQL / self-managed + Patroni | `DATABASE_URL`; through PgBouncer / RDS Proxy, add `connect_kwargs={"prepare_threshold": None}` (unless you've confirmed support); hand table creation to Alembic / Flyway |
-| Connection pool | Built into the adapters (sync: thread-local connections; async: an `AsyncConnectionPool` built from the DSN) | In-app `psycopg_pool` + external PgBouncer | Pass one `AsyncConnectionPool` to both the queue and the checkpointer; size `max_size` per Problem 7 |
-| Redis | fakeredis TCP server | ElastiCache / Memorystore / self-managed (Redis or Valkey); MemoryDB when you need durable semantics | `REDIS_URL`; for Cluster mode, this lesson's keys already use hash tags to pin slots |
-| Workers | `multiprocessing` children | A Kubernetes Deployment, scaled on `stats()` or KEDA's `postgresql` scaler | Call `stop_on_signals` in the container entrypoint; `terminationGracePeriodSeconds` must exceed `grace_period` ([Lesson 31](../31_deployment_and_scaling/README.en.md)) |
+| Postgres | The Postgres 16 bundled with `pgserver` (tests: unix socket; demo: 127.0.0.1 TCP) | RDS / Aurora / Cloud SQL / self-managed + Patroni | `DATABASE_URL` (that is, the worker's `--queue`); through PgBouncer / RDS Proxy, add `pool_kwargs={"kwargs": {"prepare_threshold": None}}` (unless you've confirmed support); hand table creation to Alembic / Flyway |
+| Connection pool | The adapters build an `AsyncConnectionPool` from the DSN (or take one you pass in) | In-app `psycopg_pool` + external PgBouncer | Pass one `AsyncConnectionPool` to both the queue and the checkpointer; size `max_size` per Problem 7 |
+| Redis | fakeredis TCP server (in its own process) | ElastiCache / Memorystore / self-managed (Redis or Valkey); MemoryDB when you need durable semantics | `REDIS_URL`; for Cluster mode, this lesson's keys already use hash tags to pin slots |
+| Workers | `python -m agentkit.distributed.worker` processes started by `WorkerPool` | A Kubernetes Deployment (every pod runs the same command), scaled on `stats()` or KEDA's `postgresql` scaler | The container entrypoint is that worker command (it already calls `stop_on_signals`); `terminationGracePeriodSeconds` must exceed `grace_period` ([Lesson 31](../31_deployment_and_scaling/README.en.md)) |
 | Monitoring | Demo printouts | Prometheus / OpenTelemetry | Export `on_event` and `stats()` ([Lesson 28](../28_production_observability/README.en.md)) |
 
 One question you must **decide deliberately**: when Redis is unavailable, does rate limiting allow or deny? `RedisTokenBucket` raises connection errors as is: the exception propagates out of `agent.run`, and `run_worker` records the attempt as failed and retries it after a backoff. For interactive traffic, a more common choice is to wrap the hook with "on a Redis error, allow and alert." That's a business decision, not a technical default.
@@ -678,10 +737,10 @@ One question you must **decide deliberately**: when Redis is unavailable, does r
 </details>
 
 <details>
-<summary>6. How big should the connection pool be for an async worker with concurrency 16?</summary>
+<summary>6. How big should the connection pool be for a worker process with concurrency 16?</summary>
 
 - What matters is "coroutines **using** a connection at the same time," not the concurrency itself: pool size ≈ concurrency × fraction of time each task holds a connection + headroom for heartbeats and claims;
-- agents spend nearly all their time waiting for the model, and checkpoint writes borrow a connection for milliseconds: measured, 16-way concurrency only grew the pool to 5–10 connections, and a 4-connection pool gave the same throughput;
+- agents spend nearly all their time waiting for the model, and checkpoint writes borrow a connection for milliseconds: measured with one process at concurrency 16, a 4-connection checkpoint pool gave the same throughput as a 16-connection one (49.1 vs 49.8 jobs/s);
 - anti-patterns: holding a connection while waiting for the model (calling the model inside a transaction) → concurrency collapses to the connection count; borrowing a second connection while holding one → when the pool runs dry, everyone waits on everyone until PoolTimeout;
 - the pools of all processes combined must stay under `max_connections`; beyond that, put PgBouncer in front (mind the transaction-pooling limits and prepared statements).
 </details>
@@ -690,7 +749,7 @@ One question you must **decide deliberately**: when Redis is unavailable, does r
 <summary>7. During a Kubernetes rolling deploy, what happens to a worker that's 3 minutes into an agent job?</summary>
 
 - Kubernetes runs preStop, then sends SIGTERM, then SIGKILL after terminationGracePeriodSeconds (default 30 s);
-- on SIGTERM the worker stops claiming: a sync worker finishes its current job and exits; an async worker waits up to grace_period for in-flight jobs and cancels the rest (AsyncAgent saves the checkpoint as cancelled, leaving write / dangerous tool calls unanswered) without committing or releasing them;
+- on SIGTERM the worker stops claiming, waits up to grace_period for in-flight jobs, and cancels the rest (the agent saves the checkpoint as cancelled, leaving write / dangerous tool calls unanswered) without committing or releasing them;
 - once those leases expire, other workers claim the jobs and continue from the checkpoints; unanswered write calls are replayed with the same call_id, so the idempotency key is unchanged and the downstream dedupes them — no duplicates;
 - so the grace period doesn't have to cover your longest job; since attempts are counted on claim, set max_attempts high enough, or make shutdown releases not count as attempts.
 </details>
@@ -713,8 +772,10 @@ One question you must **decide deliberately**: when Redis is unavailable, does r
 - [ ] I can explain what a Redis idempotency cache, a SET NX marker, and a downstream unique constraint each stop and don't stop
 - [ ] I can explain why the token bucket must be Lua, why it uses Redis's TIME, and the Lua float trap
 - [ ] I can review a distributed-lock design: efficiency or correctness, where the fencing token comes from, whether a lock is needed at all
-- [ ] I can size an async worker's connection pool, and explain backpressure and the cost of blocking inside async code
-- [ ] I can explain what sync and async workers do when SIGTERM arrives, and who picks up unfinished jobs
+- [ ] I can size a worker's connection pool, and explain backpressure and the cost of blocking inside async code
+- [ ] I can explain what a worker does when SIGTERM arrives, and who picks up unfinished jobs
+- [ ] I can walk through a network partition's timeline: why the old holder loses its lease while still alive, why its writes can't land after the network heals, and how the `TcpProxy` experiment differs from a real partition
+- [ ] I can say what changed moving from Lesson 13's SQLite to Postgres (`--queue` and the checkpointer line), what didn't (`run_worker`, `AgentJobHandler`, the worker command), and what the switch is actually for
 - [ ] I finished the exercises: `make lesson N=26` passes
 
 ## Further reading

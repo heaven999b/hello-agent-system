@@ -2,7 +2,7 @@
 
 # Lesson 28: Production observability — OpenTelemetry, Prometheus, and LLM observability platforms
 
-> 🕐 Time: 25 min | 🎯 You'll be able to: wire agentkit's tracing into OpenTelemetry and any OTLP backend, expose run metrics to Prometheus, and make well-reasoned trade-offs on backend choice, sampling, privacy, label cardinality, SLO alerting, and propagation across queues | 📦 Source: [`agentkit/contrib/otel.py`](../../agentkit/contrib/otel.py), [`configs/`](configs/) (Collector config, alert rules, Grafana dashboard)
+> 🕐 Time: 25 min | 🎯 You'll be able to: wire agentkit's tracing into OpenTelemetry and any OTLP backend, expose run metrics to Prometheus, and make well-reasoned trade-offs on backend choice, sampling, privacy, label cardinality, SLO alerting, and propagation across queues | 📦 Source: [`agentkit/contrib/otel.py`](../../agentkit/contrib/otel.py), [`configs/`](configs/) (Collector config, alert rules, Grafana dashboard), [`demo.py`](demo.py) + [`worker_app.py`](worker_app.py) (worker processes) + [`otlp_receiver.py`](otlp_receiver.py) (OTLP receiver process)
 >
 > 📖 Primary reading: [Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/) (Steven Thurgood et al., 2018) — a chapter of Google's *Site Reliability Workbook* and the source of this lesson's burn-rate alerts. Focus on how it evolves from "Approach 1: alert when the error rate crosses the SLO threshold" to "Approach 6: multiwindow, multi-burn-rate alerts", and which weakness each step fixes (precision, recall, detection time, reset time). Then read the section on low-traffic services: agent traffic has sharp peaks and troughs, which is exactly where this bites.
 
@@ -42,7 +42,7 @@ Lesson 10's `Tracer` already gets three things right: the span tree lives in `co
 ```mermaid
 flowchart LR
     subgraph SVC["Agent service (multi-process / multi-instance)"]
-        A["Agent / AsyncAgent<br/>tracer=OTelTracer"] --> B["OTel SDK<br/>BatchSpanProcessor"]
+        A["Agent (async)<br/>tracer=OTelTracer"] --> B["OTel SDK<br/>BatchSpanProcessor"]
         A --> M["PrometheusHook<br/>/metrics"]
     end
     Q["traceparent in the<br/>task payload"] -.-> SVC
@@ -89,7 +89,7 @@ start_metrics_server(9464, addr="0.0.0.0")                     # in a container,
 agent = Agent(llm, tools, tracer=tracer, hooks=[tracer, metrics, *other_hooks])
 ```
 
-Not a single line of agent code changes: `tracer=` was already agentkit's extension point, and `PrometheusHook` is an ordinary Hook. `AsyncAgent` ([Lesson 30](../30_async_runtime/README.en.md)) is used exactly the same way.
+Not a single line of agent code changes: `tracer=` was already agentkit's extension point, and `PrometheusHook` is an ordinary Hook. The agent is async (`await agent.run(...)`), and one instance can drive many runs concurrently in a process ([Lesson 30](../30_async_runtime/README.en.md)); the parent-child relationships and metrics below hold under that concurrency.
 
 ### 2.2 `OTelTracer`: dual-write, with the same IDs on both sides
 
@@ -124,9 +124,9 @@ The key design decisions:
 4. **Content is off by default.** With `capture_content=True` or the environment variable set, content still goes through `redact_pii` before truncation (Lesson 10: truncating first can cut a phone number in half so the regex no longer matches).
 5. **Optional Hook role**: put `tracer` in `hooks` as well (first is best) and it adds what agentkit's core spans don't record: `gen_ai.tool.call.id`, `gen_ai.conversation.id` (from `metadata["conversation_id"]`), and a normalized stop reason (`llm_error: 503 …` becomes `llm_error`).
 
-**Threads and asyncio.** Both agentkit's span stack and the current OTel span live in `contextvars`, and they are set and restored together in the same `with` block. Every thread and every asyncio task has its own copy of the context (a task copies its parent's context at creation), so interleaved concurrent runs and parallel tool tasks within one round never mix up parent-child relationships. The one requirement is that a span is exited in the same task that entered it; ordinary `with` blocks and async functions satisfy that naturally. This isn't just reasoning: [`tests/contrib/test_otel.py`](../../tests/contrib/test_otel.py) verifies three scenarios with a real `AsyncAgent`:
+**Threads and asyncio.** Both agentkit's span stack and the current OTel span live in `contextvars`, and they are set and restored together in the same `with` block. Every thread and every asyncio task has its own copy of the context (a task copies its parent's context at creation), so interleaved concurrent runs and parallel tool tasks within one round never mix up parent-child relationships. The one requirement is that a span is exited in the same task that entered it; ordinary `with` blocks and async functions satisfy that naturally. This isn't just reasoning: [`tests/contrib/test_otel.py`](../../tests/contrib/test_otel.py) verifies three scenarios with a real `Agent`:
 
-- 50 concurrent runs share one `AsyncAgent`, and each calls 3 tools in parallel in one round (two async tools and one sync tool running in the thread pool). The result: 50 distinct traces; every tool span's parent is that run's `invoke_agent`; the three tool spans' time ranges really overlap (they ran in parallel); and inside every tool, agentkit's stack top and the current OTel span are always the same span.
+- 50 concurrent runs share one `Agent`, and each calls 3 tools in parallel in one round (two async tools and one sync tool running in the thread pool). The result: 50 distinct traces; every tool span's parent is that run's `invoke_agent`; the three tool spans' time ranges really overlap (they ran in parallel); and inside every tool, agentkit's stack top and the current OTel span are always the same span.
 - Of 21 runs, 10 are cancelled and 1 times out: cancelled runs have status UNSET and carry `agentkit.interrupted=CancelledError`; the timed-out run is ERROR with `error.type=timeout`; the in-flight gauge returns to zero.
 - 10 concurrent runs all stop for approval: `agent_approvals_pending` reads 10, and returns to zero after concurrent approvals.
 
@@ -146,19 +146,18 @@ setup_tracing(service_name, otlp_endpoint=None, sample_ratio=1.0, console=False,
 ```python
 # Producer (API process)
 with tracer.span("send agent-tasks", **{"otel.kind": "producer", "messaging.destination.name": "agent-tasks"}):
-    queue.put({"input": text, "trace": inject_context({})})   # {"traceparent": "00-<trace_id>-<span_id>-03"}
+    await queue.enqueue("agent", {"input": text, "trace": inject_context({})}, tenant_id=tenant)
+    # payload["trace"] == {"traceparent": "00-<trace_id>-<span_id>-03"}
 
-# Sync worker (another process)
-with continue_trace(job["trace"]):
-    agent.run(job["input"])
-
-# asyncio worker: one task per job, each enters continue_trace on its own, no cross-talk
+# Worker process (the handler loaded by python -m agentkit.distributed.worker): run_worker gives every job its own
+# asyncio task, each enters continue_trace on its own, and concurrent jobs never cross-talk
 async def handle(job):
-    async with continue_trace(job["trace"]):
-        await async_agent.run(job["input"])
+    async with continue_trace(job.payload["trace"]):
+        with tracer.span("process agent-tasks", **{"otel.kind": "consumer", "messaging.destination.name": "agent-tasks"}):
+            await agent.run(job.payload["input"])
 ```
 
-`continue_trace` works with both `with` and `async with`. On entry it attaches the extracted context to the **current** thread's or task's context, and detaches it on exit. Lesson 26's Postgres queue and Lesson 30's async workers use it directly.
+`continue_trace` works with both `with` and `async with`. On entry it attaches the extracted context to the **current** thread's or task's context, and detaches it on exit. The worker processes in this lesson's demo part 2 ([`worker_app.py`](worker_app.py)), Lesson 26's Postgres queue, and Lesson 30's async workers use it directly.
 
 ### 2.5 `PrometheusHook`: unsampled, low-cardinality, safe under asyncio
 
@@ -173,7 +172,7 @@ async def handle(job):
 | `agent_runs_in_flight` | Gauge | — | Runs currently executing (concurrency) |
 | `agent_queue_depth`, `agent_queue_oldest_job_age_seconds` | Gauge | `queue` | Backlog; written via `set_queue_stats()` |
 
-Every callback is a synchronous in-memory counter update (prometheus_client uses its own locks), so it can be used with `AsyncAgent` as is. **But never do blocking IO in this hook (or in any synchronous hook)**: synchronous hooks run on the event-loop thread, so one 50 ms blocking call stalls every concurrent run in the process for 50 ms. Metrics that need a database query (approval backlog, queue depth) belong in a separate periodic job that writes them with `set_pending_approvals()` / `set_queue_stats()`.
+Every callback is a plain method (not `async def`) that only updates in-memory counters (prometheus_client uses its own locks), and the agent calls them directly. **But never do blocking IO in this hook (or in any hook written with plain methods)**: those methods run on the event-loop thread, so one 50 ms blocking call stalls every concurrent run in the process for 50 ms. Metrics that need a database query (approval backlog, queue depth) belong in a separate periodic job that writes them with `set_pending_approvals()` / `set_queue_stats()`.
 
 ## 3. Enterprise problem cards
 
@@ -330,7 +329,7 @@ flowchart TD
 
 ### Problem 6: How do traces connect across services and queues?
 
-**Scenario**: The API process receives a request and writes it into Lesson 26's Postgres queue; a worker process picks it up and calls `AsyncAgent`; the agent calls another team's retrieval service over HTTP. While investigating a complaint, the backend shows three unrelated traces.
+**Scenario**: The API process receives a request and writes it into Lesson 26's Postgres queue; a worker process picks it up and calls `Agent`; the agent calls another team's retrieval service over HTTP. While investigating a complaint, the backend shows three unrelated traces.
 
 **Why it's hard**: For HTTP, auto-instrumentation forwards the headers for you; for queue payloads, nobody does. A task may sit in the queue for seconds, or for hours (during a backlog or an approval). If a task that waited hours stays under the original trace, that trace spans hours, and the Collector made its decision on the first half long ago, after `decision_wait`. The worker's part becomes "late spans".
 
@@ -356,7 +355,7 @@ flowchart LR
     S -- "payload.trace = traceparent" --> C
 ```
 
-**This lesson's implementation**: `inject_context` / `extract_context` / `continue_trace`. Demo part 2 hands the payload to a separate OS process (spawn), and both sides print the same trace_id. It then runs an asyncio worker built on `AsyncAgent` with 20 concurrent jobs, cancels 3 of them midway, and finds zero cross-talk. The tests cover thread, process, and asyncio workers, plus malformed carriers (a new trace starts; nothing is raised). Option C can use the OTel API directly: `tracer.start_as_current_span("process", links=[Link(get_current_span(extract_context(carrier)).get_span_context())])`.
+**This lesson's implementation**: `inject_context` / `extract_context` / `continue_trace`. Demo part 2 is a real multi-process pipeline: this process (the API) enqueues 6 jobs inside `send agent-tasks` spans (a SQLite queue, traceparent in the payload); `WorkerPool` starts 2 worker processes (`python -m agentkit.distributed.worker`, the same command as in Lessons 13 and 26), which pick up the jobs and `continue_trace`; all 3 processes send their spans over OTLP/HTTP to a 4th process, the mini receiver [`otlp_receiver.py`](otlp_receiver.py). Result: for all 6 jobs, the producer's trace_id equals the trace_id of the agent run in the worker, the jobs were split across 2 different worker processes, and the tree the receiver assembles is one trace from `send` (API process) → `process` → `invoke_agent` (worker process). It then runs one `Agent` in this process on 20 concurrent jobs, cancels 3 of them midway, and finds zero cross-talk. The tests cover process and asyncio workers, plus malformed carriers (a new trace starts; nothing is raised). Option C can use the OTel API directly: `tracer.start_as_current_span("process", links=[Link(get_current_span(extract_context(carrier)).get_span_context())])`.
 
 > ⚠️ A pitfall we hit: the traceparent generated by OTel Python 1.45 ends in `03`, not the `01` many tutorials show. It also sets the "random" flag bit (0x02) added in W3C Trace Context Level 2. If your own code checks `flags == "01"` to decide "sampled", it will be wrong; test the bit with `int(flags, 16) & 0x01` instead. Also, `baggage` is passed verbatim to every downstream service, including third parties, so never put user IDs in it.
 
@@ -369,8 +368,8 @@ flowchart LR
 ## 4. Hands-on: run the demo
 
 ```bash
-python lessons/28_production_observability/demo.py --offline   # offline script, about 2 s
-python lessons/28_production_observability/demo.py             # real model, about 40 s (about 17 model calls, sequential)
+python lessons/28_production_observability/demo.py --offline   # offline script, about 2 s (including starting 3 subprocesses)
+python lessons/28_production_observability/demo.py             # real model, about 37 s (about 20 model calls; sequential in this process, at most 1 in flight per worker process)
 ```
 
 If optional dependencies are missing, the demo prints `pip install -e ".[prod,prod-local]"` and exits normally. Offline output excerpt (Demo output translated from Chinese.):
@@ -386,11 +385,22 @@ If optional dependencies are missing, the demo prints `pip install -e ".[prod,pr
   └─ chat scripted  client  ...
   RunResult.trace.trace_id = e06c4040a0058d360b1a0dec010c7a63  ← same as the OTel trace_id above
 
-  producer span trace_id       = 872a88f4bdd71ce4da6d704a091b2ada
-  worker (pid 21551) trace_id  = 872a88f4bdd71ce4da6d704a091b2ada   ✅ same trace
-  send agent-tasks  producer  [pid 21548]
-  └─ process agent-tasks  consumer  [pid 21551]
-     └─ invoke_agent support  internal  [pid 21551]
+  API process pid 57098; worker process pids [57100, 57101] (python -m agentkit.distributed.worker --queue sqlite:///…)
+  Job   Producer (API process) trace_id       Handled by              trace_id of the agent run in the worker
+  #1    cda8b63c4a99fd97c37f89d7304bf880    worker-1 (pid 57101)   cda8b63c4a99fd97c37f89d7304bf880  ✅
+  #2    56a1cebc0776a0b89bef2ad864e00cb6    worker-1 (pid 57101)   56a1cebc0776a0b89bef2ad864e00cb6  ✅
+  #3    1715dfca6b2a521259a7ae6c24539157    worker-0 (pid 57100)   1715dfca6b2a521259a7ae6c24539157  ✅
+  … (#4–#6 also ✅)
+  6 jobs handled by 2 different worker processes; worker exit codes [0, 0] (0 = exited normally after SIGTERM)
+
+  Receiver process (pid 57099) got 48 spans in total from 3 processes: hello-agent-api[pid 57098], hello-agent-worker[pid 57100], hello-agent-worker[pid 57101]
+  trace cda8b63c4a99fd97c37f89d7304bf880
+  send agent-tasks  producer  messaging.destination.name=agent-tasks  [pid 57098]
+  └─ process agent-tasks  consumer  messaging.destination.name=agent-tasks  [pid 57101]
+     └─ invoke_agent support  internal  usage.input_tokens=60  usage.output_tokens=30  [pid 57101]
+        ├─ chat scripted  client  ...  [pid 57101]
+        …
+  Multi-process metrics: 4 metric files (each process writes its own, e.g. counter_57100.db); after MultiProcessCollector aggregates them, agent_runs_total{status=completed} = 6 (6 jobs)
 
   17 completed, 3 cancelled; peak concurrent model calls 10, in-flight gauge sampled mid-run 10
   Cancelled runs: OTel status ['UNSET'], agentkit.interrupted=CancelledError (cancellation is not an error, no alert)
@@ -400,7 +410,7 @@ If optional dependencies are missing, the demo prints `pip install -e ".[prod,pr
     agent_runs_total{reason="final_answer",status="completed",tenant="__other__"} 1.0
     agent_tool_calls_total{error_type="tool_error",tool="track_shipment"} 1.0
 
-    POST /v1/traces  Content-Type: application/x-protobuf  2844 bytes
+    POST /v1/traces  Content-Type: application/x-protobuf  3008 bytes
       resource: service.name=hello-agent-demo  deployment.environment.name=demo  telemetry.sdk.version=1.45.0
 ```
 
@@ -408,8 +418,8 @@ If optional dependencies are missing, the demo prints `pip install -e ".[prod,pr
 
 1. **A tool failure turns only `execute_tool` red, not the root span**: the model absorbed the error and the run completed (as OTel's recording-errors conventions prescribe).
 2. **Before and after approval are two traces**, correlated by `agentkit.run_id`; the resumed root span has no `usage.*_tokens`. agentkit records the whole run's cumulative totals on the resume root span, and copying them would be double-counted by backends that sum per span, so they are renamed `agentkit.run.cumulative_*_tokens`.
-3. **The trace_id is identical across processes**, and the worker's root span sits under `process agent-tasks`.
-4. **With the real model, one trace reached the receiver in two batches**: 4 spans first, then a `chat` span and the root. `BatchSpanProcessor` sends when a batch fills up or a timer fires, not per trace, and real model calls take seconds, so a trace gets split and the root span arrives last. That's exactly why the Collector's tail sampling needs `decision_wait`.
+3. **The trace_id is identical across processes**: the traceparent the API process wrote into the payload is picked up by a worker in another process, and the worker's root span sits under `process agent-tasks`. Each process sent its own spans to the receiver process over OTLP; the only thing stitching them into one tree is the trace_id and parent span_id. On SIGTERM, once `run_worker` returns, the handler's `aclose()` explicitly calls `provider.shutdown()` to send whatever is still in its `BatchSpanProcessor` (the SDK also flushes on a normal interpreter exit by default; a kill -9'd process gets neither, and its last batch of spans dies with it).
+4. **With the real model, one trace reached the receiver in two batches** (part 4): 2 spans (`chat`, `execute_tool lookup_order`) first, then the remaining 4, including the root. `BatchSpanProcessor` sends when a batch fills up or a timer fires, not per trace, and real model calls take seconds, so a trace gets split and the root span arrives last. That's exactly why the Collector's tail sampling needs `decision_wait`.
 5. **With content capture on, the phone number is replaced but the name "张伟" is kept**: Problem 3, live.
 
 To see it in a UI: this machine has no Docker, so the commands below were not actually run here. Try them on a machine with Docker:
@@ -447,7 +457,7 @@ One test runs a real agent that produces 13 spans and compares your `to_genai_at
 5. **Using the old exporter names.** Since v0.144.0 the Collector renamed the `otlp` exporter to `otlp_grpc` and `otlphttp` to `otlp_http`; the old names are deprecated aliases (the receiver is still called `otlp`). Most examples online still use the old names.
 6. **Configuring Langfuse with gRPC.** It supports OTLP/HTTP only.
 7. **`user_id` or `run_id` as metric labels; a new Hook per request.** See Problem 4.
-8. **Blocking IO in a synchronous hook**, which slows every asyncio run in the process. See section 2.5.
+8. **Blocking IO in a hook written with plain methods**, which slows every asyncio run in the process. See section 2.5.
 9. **Treating cancellation as an error.** A client disconnect is normal; marking it ERROR fires error-rate alerts, and tail sampling keeps all those traces.
 10. **Redaction key patterns like `.*token.*`**, which also hit `gen_ai.usage.*_tokens`. See Problem 3.
 11. **`le="60"`**: in Prometheus 3, write `le="60.0"`.
@@ -493,12 +503,12 @@ Switching steps:
 </details>
 
 <details>
-<summary>Q3: After swapping the synchronous Tracer for OTel, why are parent-child relationships still right under heavy asyncio concurrency? How do you prove it?</summary>
+<summary>Q3: After swapping the Tracer for OTel, why are parent-child relationships still right under heavy asyncio concurrency? How do you prove it?</summary>
 
 - agentkit's span stack and the current OTel span both live in contextvars and are set and restored together in the same with block;
 - An asyncio task copies the context at creation, so parallel tool tasks each get a copy of the parent span;
 - The precondition is that a span exits in the same task it entered;
-- Proof: 50 concurrent AsyncAgent runs with parallel tools, asserting 50 traces, a correct parent for every tool span, and matching contexts inside each tool; plus cancellation and timeout scenarios.
+- Proof: 50 concurrent Agent runs with parallel tools, asserting 50 traces, a correct parent for every tool span, and matching contexts inside each tool; plus cancellation and timeout scenarios.
 </details>
 
 <details>
@@ -552,7 +562,7 @@ Switching steps:
 - [ ] I can design three layers of PII protection and name each layer's blind spot
 - [ ] I can judge whether a dimension can be a Prometheus label, and I know what multiprocess mode requires
 - [ ] I can write multiwindow, multi-burn-rate alert rules and explain where 14.4 and 6 come from
-- [ ] I can carry a trace across a queue (sync and async workers) and know when to switch to span links
+- [ ] I can carry a trace across a queue into another worker process (with concurrent asyncio jobs never cross-talking) and know when to switch to span links
 - [ ] I finished the exercise: `make lesson N=28` passes
 
 ## Further reading

@@ -2,7 +2,7 @@
 
 # 第 28 课：生产可观测性 —— OpenTelemetry、Prometheus 与 LLM 观测平台
 
-> 🕐 建议用时：25 分钟 ｜ 🎯 学完你能：把 agentkit 的追踪接到 OpenTelemetry 和任意 OTLP 后端、把运行指标接到 Prometheus，并在后端选型、采样、隐私、标签基数、SLO 告警和跨队列传播上做出有依据的取舍 ｜ 📦 对应源码：[`agentkit/contrib/otel.py`](../../agentkit/contrib/otel.py)、[`configs/`](configs/)（Collector 配置、告警规则、Grafana 看板）
+> 🕐 建议用时：25 分钟 ｜ 🎯 学完你能：把 agentkit 的追踪接到 OpenTelemetry 和任意 OTLP 后端、把运行指标接到 Prometheus，并在后端选型、采样、隐私、标签基数、SLO 告警和跨队列传播上做出有依据的取舍 ｜ 📦 对应源码：[`agentkit/contrib/otel.py`](../../agentkit/contrib/otel.py)、[`configs/`](configs/)（Collector 配置、告警规则、Grafana 看板）、[`demo.py`](demo.py) + [`worker_app.py`](worker_app.py)（worker 进程）+ [`otlp_receiver.py`](otlp_receiver.py)（OTLP 接收端进程）
 >
 > 📖 必读：[Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/)（Steven Thurgood 等, 2018）—— Google《SRE Workbook》中的一章，本课燃烧率告警的出处。重点读它怎样从"方案 1：错误率超过 SLO 阈值就告警"一步步演进到"方案 6：多窗口多燃烧率"，每一步修掉上一步在精确率、召回率、检测时间、重置时间上的哪个缺点；再读"低流量服务"一节，Agent 流量的波峰波谷很明显，最容易在这里踩坑。
 
@@ -42,7 +42,7 @@
 ```mermaid
 flowchart LR
     subgraph SVC["Agent 服务（多进程 / 多实例）"]
-        A["Agent / AsyncAgent<br/>tracer=OTelTracer"] --> B["OTel SDK<br/>BatchSpanProcessor"]
+        A["Agent（async）<br/>tracer=OTelTracer"] --> B["OTel SDK<br/>BatchSpanProcessor"]
         A --> M["PrometheusHook<br/>/metrics"]
     end
     Q["任务 payload 里的<br/>traceparent"] -.-> SVC
@@ -89,7 +89,7 @@ start_metrics_server(9464, addr="0.0.0.0")                     # 容器里给 Pr
 agent = Agent(llm, tools, tracer=tracer, hooks=[tracer, metrics, *other_hooks])
 ```
 
-Agent 的代码一行没改：`tracer=` 本来就是 agentkit 的扩展点，`PrometheusHook` 是一个普通的 Hook。`AsyncAgent`（[第 30 课](../30_async_runtime/README.md)）的用法完全一样。
+Agent 的代码一行没改：`tracer=` 本来就是 agentkit 的扩展点，`PrometheusHook` 是一个普通的 Hook。Agent 是 async 的（`await agent.run(...)`），同一个实例可以在一个进程里并发跑很多运行（[第 30 课](../30_async_runtime/README.md)），下面的父子关系、指标在这种并发下都成立。
 
 ### 2.2 `OTelTracer`：双写，而且两边的 ID 一致
 
@@ -124,9 +124,9 @@ flowchart TD
 4. **内容默认关闭。** `capture_content=True` 或环境变量打开后，也会先经过 `redact_pii` 再截断（第 10 课：先截断会把手机号切成半截，正则就匹配不到了）。
 5. **可选的 Hook 身份**：把 `tracer` 也放进 `hooks`（建议放第一个），它会补上 agentkit 核心 span 里没有的 `gen_ai.tool.call.id`、`gen_ai.conversation.id`（取自 `metadata["conversation_id"]`）和归一化的停止原因（`llm_error: 503 …` 变成 `llm_error`）。
 
-**线程与 asyncio。** agentkit 的 span 栈和 OTel 的当前 span 都存在 `contextvars` 里，而且在同一个 `with` 块里一起设置、一起还原。每个线程、每个 asyncio task 都有自己的 context 副本（task 在创建时复制父 context），所以并发交错的运行、同一轮里并行的工具 task，父子关系都互不干扰。唯一的要求是：span 在哪个 task 里进入，就在哪个 task 里退出。普通的 `with` 块和 async 函数写法天然满足这一点。这不是推理出来的结论，[`tests/contrib/test_otel.py`](../../tests/contrib/test_otel.py) 用真实的 `AsyncAgent` 验证了三种情况：
+**线程与 asyncio。** agentkit 的 span 栈和 OTel 的当前 span 都存在 `contextvars` 里，而且在同一个 `with` 块里一起设置、一起还原。每个线程、每个 asyncio task 都有自己的 context 副本（task 在创建时复制父 context），所以并发交错的运行、同一轮里并行的工具 task，父子关系都互不干扰。唯一的要求是：span 在哪个 task 里进入，就在哪个 task 里退出。普通的 `with` 块和 async 函数写法天然满足这一点。这不是推理出来的结论，[`tests/contrib/test_otel.py`](../../tests/contrib/test_otel.py) 用真实的 `Agent` 验证了三种情况：
 
-- 50 个并发运行共用一个 `AsyncAgent`，每个运行在一轮里并行调用 3 个工具（两个 async 工具、一个跑在线程池里的同步工具）。结果是 50 条互不相同的 trace；每个工具 span 的父 span 都是本运行的 `invoke_agent`；三个工具 span 的时间区间确实重叠（真的并行了）；在每个工具内部检查，agentkit 的栈顶和 OTel 的当前 span 始终是同一个。
+- 50 个并发运行共用一个 `Agent`，每个运行在一轮里并行调用 3 个工具（两个 async 工具、一个跑在线程池里的同步工具）。结果是 50 条互不相同的 trace；每个工具 span 的父 span 都是本运行的 `invoke_agent`；三个工具 span 的时间区间确实重叠（真的并行了）；在每个工具内部检查，agentkit 的栈顶和 OTel 的当前 span 始终是同一个。
 - 21 个运行里取消 10 个、1 个超时：被取消的运行状态为 UNSET，并带 `agentkit.interrupted=CancelledError`；超时的运行标 ERROR，`error.type=timeout`；在途运行数最后归零。
 - 10 个并发运行同时停在审批上：`agent_approvals_pending` 等于 10，并发批准后归零。
 
@@ -146,19 +146,18 @@ setup_tracing(service_name, otlp_endpoint=None, sample_ratio=1.0, console=False,
 ```python
 # 生产者（API 进程）
 with tracer.span("send agent-tasks", **{"otel.kind": "producer", "messaging.destination.name": "agent-tasks"}):
-    queue.put({"input": text, "trace": inject_context({})})   # {"traceparent": "00-<trace_id>-<span_id>-03"}
+    await queue.enqueue("agent", {"input": text, "trace": inject_context({})}, tenant_id=tenant)
+    # payload["trace"] == {"traceparent": "00-<trace_id>-<span_id>-03"}
 
-# 同步 worker（另一个进程）
-with continue_trace(job["trace"]):
-    agent.run(job["input"])
-
-# asyncio worker：每个任务一个 task，各自进入 continue_trace，互不串线
+# worker 进程（python -m agentkit.distributed.worker 加载的 handler）：run_worker 给每个任务一个 asyncio task，
+# 各自进入 continue_trace，并发的任务互不串线
 async def handle(job):
-    async with continue_trace(job["trace"]):
-        await async_agent.run(job["input"])
+    async with continue_trace(job.payload["trace"]):
+        with tracer.span("process agent-tasks", **{"otel.kind": "consumer", "messaging.destination.name": "agent-tasks"}):
+            await agent.run(job.payload["input"])
 ```
 
-`continue_trace` 同时支持 `with` 和 `async with`。进入时把提取出的上下文 attach 到**当前**线程或 task 的 context，退出时 detach。第 26 课的 Postgres 队列、第 30 课的 async worker 都直接用它。
+`continue_trace` 同时支持 `with` 和 `async with`。进入时把提取出的上下文 attach 到**当前**线程或 task 的 context，退出时 detach。本课 Demo 第 2 节的 worker 进程（[`worker_app.py`](worker_app.py)）、第 26 课的 Postgres 队列、第 30 课的 async worker 都直接用它。
 
 ### 2.5 `PrometheusHook`：全量、低基数、可在 asyncio 下用
 
@@ -173,7 +172,7 @@ async def handle(job):
 | `agent_runs_in_flight` | Gauge | — | 正在执行的运行数（并发度） |
 | `agent_queue_depth`、`agent_queue_oldest_job_age_seconds` | Gauge | `queue` | 积压；由 `set_queue_stats()` 写入 |
 
-所有回调都是同步的内存计数（prometheus_client 自带锁），可以直接给 `AsyncAgent` 用。**但不要在这个 Hook（或任何同步 Hook）里做阻塞 IO**：同步 Hook 在事件循环线程里执行，一次 50ms 的阻塞会让同一进程里所有并发运行一起卡 50ms。需要查数据库的指标（审批积压、队列深度）请放到独立的定时任务里，用 `set_pending_approvals()` / `set_queue_stats()` 写入。
+所有回调都是普通方法（不是 `async def`），只做内存计数（prometheus_client 自带锁），Agent 直接调用。**但不要在这个 Hook（或任何写成普通方法的 Hook）里做阻塞 IO**：这些方法在事件循环线程里执行，一次 50ms 的阻塞会让同一进程里所有并发运行一起卡 50ms。需要查数据库的指标（审批积压、队列深度）请放到独立的定时任务里，用 `set_pending_approvals()` / `set_queue_stats()` 写入。
 
 ## 3. 企业问题卡片
 
@@ -330,7 +329,7 @@ flowchart TD
 
 ### 问题 6：跨服务、跨队列的 trace 怎么串起来？
 
-**场景**：API 进程收到请求，写入第 26 课的 Postgres 队列；worker 进程取出任务，调用 `AsyncAgent`；Agent 通过 HTTP 调用另一个团队的检索服务。排查一次投诉时，后端里是三条互不相关的 trace。
+**场景**：API 进程收到请求，写入第 26 课的 Postgres 队列；worker 进程取出任务，调用 `Agent`；Agent 通过 HTTP 调用另一个团队的检索服务。排查一次投诉时，后端里是三条互不相关的 trace。
 
 **为什么难**：HTTP 有自动埋点帮忙透传 header；队列 payload 没人帮你。任务在队列里可能等几秒，也可能等几个小时（遇上积压或审批）。等了几小时的任务如果还挂在原 trace 下，trace 就会跨越几个小时，而 Collector 早在 `decision_wait` 之后就对前半段做了决定，worker 这一段成了"迟到的 span"。
 
@@ -356,7 +355,7 @@ flowchart LR
     S -- "payload.trace = traceparent" --> C
 ```
 
-**本课实现**：`inject_context` / `extract_context` / `continue_trace`。Demo 第 2 节把 payload 交给另一个操作系统进程（spawn），两边打印同一个 trace_id；再用 `AsyncAgent` 写一个 asyncio worker，20 个任务并发执行，其中 3 个中途取消，结果 0 条串线。测试覆盖了线程、进程、asyncio 三种 worker，以及格式错误的 carrier（开新 trace，不抛异常）。方案 C 可以直接用 OTel API：`tracer.start_as_current_span("process", links=[Link(get_current_span(extract_context(carrier)).get_span_context())])`。
+**本课实现**：`inject_context` / `extract_context` / `continue_trace`。Demo 第 2 节是真实的多进程链路：本进程（API）在 `send agent-tasks` span 里入队 6 个任务（SQLite 队列，payload 带 traceparent）；`WorkerPool` 拉起 2 个 worker 进程（`python -m agentkit.distributed.worker`，和第 13、26 课同一条命令），它们取出任务后 `continue_trace` 接着执行；3 个进程都用 OTLP/HTTP 把 span 发给第 4 个进程 —— 迷你接收端 [`otlp_receiver.py`](otlp_receiver.py)。结果：6 个任务里，生产者的 trace_id 和 worker 里 Agent 的 trace_id 全部相同，任务分给了 2 个不同的 worker 进程，接收端拼出的树里 `send`（API 进程）→ `process` → `invoke_agent`（worker 进程）是一条 trace。随后在本进程里用一个 `Agent` 并发处理 20 个任务，其中 3 个中途取消，结果 0 条串线。测试覆盖了进程、asyncio 两种 worker，以及格式错误的 carrier（开新 trace，不抛异常）。方案 C 可以直接用 OTel API：`tracer.start_as_current_span("process", links=[Link(get_current_span(extract_context(carrier)).get_span_context())])`。
 
 > ⚠️ 实测踩到的坑：OTel Python 1.45 生成的 traceparent 最后两位是 `03`，而不是很多教程里写的 `01`。它同时置上了 W3C Trace Context Level 2 新增的 "random" 标志位（0x02）。如果你自己写代码判断 `flags == "01"` 来认定"已采样"，就会出错。应该按位判断 `int(flags, 16) & 0x01`。另外，`baggage` 会原样传给所有下游，包括第三方服务，不要往里放用户 ID。
 
@@ -369,8 +368,8 @@ flowchart LR
 ## 4. 动手：运行 Demo
 
 ```bash
-python lessons/28_production_observability/demo.py --offline   # 离线剧本，约 2 秒
-python lessons/28_production_observability/demo.py             # 真实模型，约 40 秒（约 17 次模型调用，依次执行）
+python lessons/28_production_observability/demo.py --offline   # 离线剧本，约 2 秒（含拉起 3 个子进程）
+python lessons/28_production_observability/demo.py             # 真实模型，约 37 秒（约 20 次模型调用；本进程依次调用，两个 worker 进程各自最多 1 个在途请求）
 ```
 
 缺少可选依赖时，Demo 会打印 `pip install -e ".[prod,prod-local]"` 并正常退出。离线模式输出节选：
@@ -386,11 +385,22 @@ python lessons/28_production_observability/demo.py             # 真实模型，
   └─ chat scripted  client  ...
   RunResult.trace.trace_id = e06c4040a0058d360b1a0dec010c7a63  ← 与上面 OTel 的 trace_id 相同
 
-  生产者 span 的 trace_id      = 872a88f4bdd71ce4da6d704a091b2ada
-  worker（pid 21551）的 trace_id = 872a88f4bdd71ce4da6d704a091b2ada   ✅ 同一条 trace
-  send agent-tasks  producer  [pid 21548]
-  └─ process agent-tasks  consumer  [pid 21551]
-     └─ invoke_agent support  internal  [pid 21551]
+  API 进程 pid 57098；worker 进程 pid [57100, 57101]（python -m agentkit.distributed.worker --queue sqlite:///…）
+  任务    生产者（API 进程）的 trace_id               处理它的 worker           worker 里 Agent 的 trace_id
+  #1    cda8b63c4a99fd97c37f89d7304bf880    worker-1（pid 57101）   cda8b63c4a99fd97c37f89d7304bf880  ✅
+  #2    56a1cebc0776a0b89bef2ad864e00cb6    worker-1（pid 57101）   56a1cebc0776a0b89bef2ad864e00cb6  ✅
+  #3    1715dfca6b2a521259a7ae6c24539157    worker-0（pid 57100）   1715dfca6b2a521259a7ae6c24539157  ✅
+  ……（#4–#6 同样 ✅）
+  6 个任务由 2 个不同的 worker 进程处理；worker 退出码 [0, 0]（0 = 收到 SIGTERM 后正常退出）
+
+  接收端进程（pid 57099）一共收到 48 个 span，来自 3 个进程：hello-agent-api[pid 57098]、hello-agent-worker[pid 57100]、hello-agent-worker[pid 57101]
+  trace cda8b63c4a99fd97c37f89d7304bf880
+  send agent-tasks  producer  messaging.destination.name=agent-tasks  [pid 57098]
+  └─ process agent-tasks  consumer  messaging.destination.name=agent-tasks  [pid 57101]
+     └─ invoke_agent support  internal  usage.input_tokens=60  usage.output_tokens=30  [pid 57101]
+        ├─ chat scripted  client  ...  [pid 57101]
+        ……
+  多进程指标：4 个指标文件（每个进程各写各的，例如 counter_57100.db），MultiProcessCollector 汇总后 agent_runs_total{status=completed} = 6（6 个任务）
 
   完成 17 个、取消 3 个；模型调用最高并发 10，运行中途采样的在途数 10
   被取消的运行：OTel 状态 ['UNSET']，agentkit.interrupted=CancelledError（取消不是错误，不触发告警）
@@ -400,7 +410,7 @@ python lessons/28_production_observability/demo.py             # 真实模型，
     agent_runs_total{reason="final_answer",status="completed",tenant="__other__"} 1.0
     agent_tool_calls_total{error_type="tool_error",tool="track_shipment"} 1.0
 
-    POST /v1/traces  Content-Type: application/x-protobuf  2844 字节
+    POST /v1/traces  Content-Type: application/x-protobuf  3008 字节
       resource: service.name=hello-agent-demo  deployment.environment.name=demo  telemetry.sdk.version=1.45.0
 ```
 
@@ -408,8 +418,8 @@ python lessons/28_production_observability/demo.py             # 真实模型，
 
 1. **工具失败只让 `execute_tool` 变红，根 span 不红**：模型"消化"了错误，运行照常完成（对应 OTel 的记录错误约定）。
 2. **审批前后是两条 trace**，靠 `agentkit.run_id` 关联；恢复后的根 span 上没有 `usage.*_tokens`。因为 agentkit 在 resume 的根 span 上记的是整个 run 的累计值，照搬过来会被按 span 求和的后端重复计数，所以改名成了 `agentkit.run.cumulative_*_tokens`。
-3. **跨进程的 trace_id 完全一致**，worker 的根 span 挂在 `process agent-tasks` 下面。
-4. **真实模型模式下，同一条 trace 分两批到达接收端**：4 个 span 先到，`chat` 和根 span 后到。`BatchSpanProcessor` 按"攒够一批或到时间"发送，而不是按 trace 发送，真实模型调用又要好几秒，所以一条 trace 会被拆开，根 span 最后才到。这正是 Collector 尾部采样需要 `decision_wait` 的原因。
+3. **跨进程的 trace_id 完全一致**：API 进程写进 payload 的 traceparent 被另一个进程里的 worker 接上，worker 的根 span 挂在 `process agent-tasks` 下面；两边的 span 是各自的进程分别用 OTLP 发到接收端进程的，拼成一棵树靠的只是 trace_id 和 parent span_id。worker 收到 SIGTERM、`run_worker` 退出后，handler 的 `aclose()` 显式调用 `provider.shutdown()`，把 `BatchSpanProcessor` 里还没发出去的 span 发完（SDK 默认也会在解释器正常退出时 flush；被 kill -9 的进程两样都来不及，最后一批 span 就跟着丢了）。
+4. **真实模型模式下，同一条 trace 分两批到达接收端**（第 4 节）：2 个 span（`chat`、`execute_tool lookup_order`）先到，剩下 4 个（含根 span）后到。`BatchSpanProcessor` 按"攒够一批或到时间"发送，而不是按 trace 发送，真实模型调用又要好几秒，所以一条 trace 会被拆开，根 span 最后才到。这正是 Collector 尾部采样需要 `decision_wait` 的原因。
 5. **内容采集打开后，手机号被替换了，"张伟"原样保留**：问题 3 的现场演示。
 
 想在界面里看：本机没有 Docker，下面的命令没有实际运行过，请在有 Docker 的机器上试：
@@ -447,7 +457,7 @@ make lesson N=28
 5. **导出器名字写旧的。** Collector 自 v0.144.0 起把 `otlp` 导出器改名为 `otlp_grpc`，`otlphttp` 改名为 `otlp_http`，旧名是已弃用的别名（接收器仍叫 `otlp`）。网上大量示例还是旧名。
 6. **Langfuse 配成 gRPC。** 它只支持 OTLP/HTTP。
 7. **`user_id`、`run_id` 当指标标签；每个请求 new 一个 Hook。** 见问题 4。
-8. **在同步 Hook 里做阻塞 IO**，拖慢同一进程里所有 asyncio 运行。见 2.5 节。
+8. **在写成普通方法的 Hook 里做阻塞 IO**，拖慢同一进程里所有 asyncio 运行。见 2.5 节。
 9. **把取消当错误。** 客户端断开是正常行为，标成 ERROR 会触发错误率告警，尾部采样还会把这些 trace 全部留下。
 10. **`.*token.*` 这类脱敏键模式**会误伤 `gen_ai.usage.*_tokens`，见问题 3。
 11. **`le="60"`**：Prometheus 3 里要写 `le="60.0"`。
@@ -493,12 +503,12 @@ make lesson N=28
 </details>
 
 <details>
-<summary>Q3：同步 Tracer 换成 OTel 以后，在 asyncio 高并发下父子关系为什么还是对的？怎么证明？</summary>
+<summary>Q3：Tracer 换成 OTel 以后，在 asyncio 高并发下父子关系为什么还是对的？怎么证明？</summary>
 
 - agentkit 的 span 栈和 OTel 的当前 span 都存在 contextvars 里，并且在同一个 with 块里一起设置、一起还原；
 - asyncio task 在创建时复制 context，并行工具 task 各自拿到父 span 的副本；
 - 前提是 span 在哪个 task 里进入就在哪个 task 里退出；
-- 证明：50 个并发 AsyncAgent 运行加并行工具，断言 50 条 trace、每个工具 span 的父 span 正确、工具内部两套上下文一致；再加上取消和超时的场景。
+- 证明：50 个并发 Agent 运行加并行工具，断言 50 条 trace、每个工具 span 的父 span 正确、工具内部两套上下文一致；再加上取消和超时的场景。
 </details>
 
 <details>
@@ -552,7 +562,7 @@ make lesson N=28
 - [ ] 我能设计三层 PII 防护，并说出每一层的盲区
 - [ ] 我能判断一个维度能不能当 Prometheus 标签，并知道多进程模式要做哪几件事
 - [ ] 我能写出多窗口多燃烧率的告警规则，并解释 14.4 和 6 这两个数是怎么来的
-- [ ] 我能让 trace 穿过队列（同步和 async worker 都行），并知道什么时候该改用 span link
+- [ ] 我能让 trace 穿过队列、进入另一个 worker 进程（并发的 asyncio 任务之间互不串线），并知道什么时候该改用 span link
 - [ ] 我完成了练习：`make lesson N=28` 全部通过
 
 ## 延伸阅读

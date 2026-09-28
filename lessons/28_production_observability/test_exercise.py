@@ -102,7 +102,7 @@ def test_resume_renames_cumulative_tokens_and_unknown_spans_keep_user_attrs():
     assert name == "request" and attrs == {"agentkit.tenant.id": "acme", "app.feature": "faq", "agentkit.x": 1}
 
 
-def test_mapping_matches_contrib_on_spans_from_a_real_agent_run():
+async def test_mapping_matches_contrib_on_spans_from_a_real_agent_run():
     """用真实 Agent 跑一遍（查询成功、工具失败、权限拒绝、达到步数上限），逐个 span 与 agentkit.contrib.otel 对比。"""
     from agentkit.contrib.otel import to_genai_attributes as reference  # 纯 Python，不需要 opentelemetry
 
@@ -123,10 +123,9 @@ def test_mapping_matches_contrib_on_spans_from_a_real_agent_run():
 
     tracer = Tracer()
     llm = ScriptedLLM([call_tool("lookup", order_id="A1"), call_tool("track", no="S1"), call_tool("refund", order_id="A1"), reply("好")])
-    Agent(llm, [lookup, track, refund], name="support", tracer=tracer, hooks=[PermissionPolicy(deny_tools={"refund"})]).run(
-        "x", metadata={"tenant_id": "acme", "user_id": "u-1"}
-    )
-    Agent(ScriptedLLM([call_tool("nope"), call_tool("nope")]), [], name="looper", tracer=tracer, max_steps=2).run("y")
+    await Agent(llm, [lookup, track, refund], name="support", tracer=tracer,
+                hooks=[PermissionPolicy(deny_tools={"refund"})]).run("x", metadata={"tenant_id": "acme", "user_id": "u-1"})
+    await Agent(ScriptedLLM([call_tool("nope"), call_tool("nope")]), [], name="looper", tracer=tracer, max_steps=2).run("y")
     spans = [s for root in tracer.traces for s in root.walk()]
     assert len(spans) == 8 + 5
     for s in spans:

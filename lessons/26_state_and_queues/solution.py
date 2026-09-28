@@ -3,11 +3,19 @@
 原练习说明：把第 13 课的三个核心动作，用 Postgres 和 Redis 的"生产写法"再写一遍。
 
   (a) cas_save        检查点的乐观并发：一条带 version 条件的 SQL（CAS）
-  (b) claim_one       任务领取：回收过期租约 + FOR UPDATE SKIP LOCKED 原子领取（8 个线程同时抢，不能领重）
+  (b) claim_one       任务领取：回收过期租约 + FOR UPDATE SKIP LOCKED 原子领取（8 个进程同时抢，不能领重）
   (c) refill + TOKEN_BUCKET_LUA   令牌桶：先写纯函数想清楚补充逻辑，再把它搬进 Redis 的 Lua 脚本
 
+和 agentkit 的 PostgresCheckpointer / PostgresJobQueue 一样，这里全部是 async 的：
+  - conn 是 psycopg 的**异步**连接：await psycopg.AsyncConnection.connect(uri, autocommit=True, row_factory=dict_row)
+    执行 SQL 写 `cur = await conn.execute(sql, params)`，取结果写 `await cur.fetchone()`；
+    事务写 `async with conn.transaction(): ...`；
+  - Redis 客户端是 redis.asyncio.Redis：`await client.eval(...)`；
+  - cas_save、claim_one 要写成 `async def`（已经给好了签名）；refill 是纯计算，保持普通函数。
+
 测试用的是真实的 Postgres（嵌入式，pgserver）和 fakeredis（支持 Lua），由仓库根目录 conftest.py 提供；
-没装可选依赖时测试会自动跳过：pip install -e ".[prod,prod-local]"
+并发测试用 race.py 同时拉起 8~10 个**真实的 python 进程**，各自连数据库去抢 —— 进程之间不共享任何内存，只能靠
+数据库 / Redis 的原子操作协作，和多台机器上的 worker 一样。没装可选依赖时测试会自动跳过：pip install -e ".[prod,prod-local]"
 
 把每个 `raise NotImplementedError("TODO: ...")` 换成你的实现，然后运行：
 
@@ -44,26 +52,27 @@ CREATE TABLE IF NOT EXISTS jobs (
 """
 
 
-def setup(conn) -> None:
-    """建表。conn 是 psycopg.connect(..., autocommit=True, row_factory=dict_row) 打开的连接。"""
-    conn.execute(SCHEMA)
+async def setup(conn) -> None:
+    """建表。conn 是 await psycopg.AsyncConnection.connect(..., autocommit=True, row_factory=dict_row) 打开的异步连接。"""
+    await conn.execute(SCHEMA)
 
 
-def load_run(conn, run_id: str) -> dict | None:
+async def load_run(conn, run_id: str) -> dict | None:
     """读一条检查点：{"run_id", "version", "state"}，不存在返回 None。"""
-    return conn.execute("SELECT run_id, version, state FROM runs WHERE run_id = %s", (run_id,)).fetchone()
+    cur = await conn.execute("SELECT run_id, version, state FROM runs WHERE run_id = %s", (run_id,))
+    return await cur.fetchone()
 
 
-def enqueue(conn, payload: dict | None = None, *, delay_seconds: float = 0, max_attempts: int = 3) -> int:
+async def enqueue(conn, payload: dict | None = None, *, delay_seconds: float = 0, max_attempts: int = 3) -> int:
     """入队一个任务，返回 id。delay_seconds > 0 表示"这么多秒之后才能被领取"（延迟任务 / 退避中）。"""
     import json
 
-    row = conn.execute(
+    cur = await conn.execute(
         "INSERT INTO jobs (payload, max_attempts, run_at) VALUES (%s::jsonb, %s, now() + make_interval(secs => %s)) "
         "RETURNING id",
         (json.dumps(payload or {}), max_attempts, float(delay_seconds)),
-    ).fetchone()
-    return row["id"]
+    )
+    return (await cur.fetchone())["id"]
 
 
 # =====================================================================
@@ -71,7 +80,7 @@ def enqueue(conn, payload: dict | None = None, *, delay_seconds: float = 0, max_
 # =====================================================================
 
 
-def cas_save(conn, run_id: str, expected_version: int, state_json: str) -> bool:
+async def cas_save(conn, run_id: str, expected_version: int, state_json: str) -> bool:
     """把 state_json（JSON 文本）写进 runs 表，**只有**数据库里的版本号还是 expected_version 时才写。
 
     返回 True 表示写进去了，False 表示冲突（在你读完之后有人写过 / 别人抢先创建了它）。
@@ -82,18 +91,19 @@ def cas_save(conn, run_id: str, expected_version: int, state_json: str) -> bool:
             更新了 0 行 → 版本号对不上 → 返回 False（什么都不改）
 
     提示：
+      - 这是 async 函数：`cur = await conn.execute(sql, params)`；
       - state_json 是字符串，SQL 里写 %s::jsonb 转成 jsonb；
-      - 判断写没写进去：cursor.rowcount（conn.execute 返回的就是 cursor），或者加 RETURNING 看有没有返回行；
+      - 判断写没写进去：cur.rowcount（await conn.execute(...) 返回的就是 cursor），或者加 RETURNING 看有没有返回行；
       - 为什么不能"先 SELECT 看版本号对不对，再 UPDATE"？两步之间别人可能已经写了 —— 检查必须放进
         UPDATE 的 WHERE 里，由数据库在写入的那一刻完成（第 13 课 3.4 节）。
     """
     if expected_version == 0:
-        cur = conn.execute(
+        cur = await conn.execute(
             "INSERT INTO runs (run_id, version, state) VALUES (%s, 1, %s::jsonb) ON CONFLICT (run_id) DO NOTHING",
             (run_id, state_json),
         )
     else:
-        cur = conn.execute(
+        cur = await conn.execute(
             "UPDATE runs SET state = %s::jsonb, version = version + 1, updated_at = now() "
             "WHERE run_id = %s AND version = %s",
             (state_json, run_id, expected_version),
@@ -106,8 +116,9 @@ def cas_save(conn, run_id: str, expected_version: int, state_json: str) -> bool:
 # =====================================================================
 
 
-def claim_one(conn, worker_id: str, lease_seconds: float) -> dict | None:
-    """领取一个任务，返回领取后的整行（dict），没有可领取的任务返回 None。分两步（可以放进同一个事务）：
+async def claim_one(conn, worker_id: str, lease_seconds: float) -> dict | None:
+    """领取一个任务，返回领取后的整行（dict），没有可领取的任务返回 None。分两步（可以放进同一个事务：
+    `async with conn.transaction(): ...`）：
 
     第 1 步：回收过期租约。status='leased' 且 lease_until < now() 的任务，持有者大概率已经崩溃：
         - attempts >= max_attempts → status='dead'（毒消息：每次都把 worker 弄崩，别再发给下一个了）
@@ -124,19 +135,20 @@ def claim_one(conn, worker_id: str, lease_seconds: float) -> dict | None:
       - 只写 SELECT ... LIMIT 1 再 UPDATE：两个 worker 可能选中同一行，都更新成功 → 一个任务被执行两次；
       - 只写 FOR UPDATE（不跳过）：第二个 worker 会**排队等**第一个 worker 的行锁，所有 worker 被串行化；
       - FOR UPDATE SKIP LOCKED：被别人锁住的行直接跳过，去拿下一个。测试会拿着一行的锁不放，
-        检查你的实现是跳过它（正确），还是卡住等锁（测试给连接设了 lock_timeout，卡住会报错）。
+        检查你的实现是跳过它（正确），还是卡住等锁（测试给连接设了 lock_timeout，卡住会报错）；
+        另一个测试让 8 个进程同时抢 40 个任务，有竞态的写法会把同一个任务发给两个进程。
     时间一律用数据库的 now()，不要用 Python 的 time.time()：所有 worker 以同一个时钟判断租约。
     """
-    with conn.transaction():
+    async with conn.transaction():
         # 第 1 步：回收。子查询里也用 SKIP LOCKED：别的 worker 正在回收的行，跳过就好
-        conn.execute(
+        await conn.execute(
             """UPDATE jobs SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
                                lease_until = NULL
                WHERE id IN (SELECT id FROM jobs WHERE status = 'leased' AND lease_until < now()
                             FOR UPDATE SKIP LOCKED)"""
         )
         # 第 2 步：领取
-        return conn.execute(
+        cur = await conn.execute(
             """UPDATE jobs SET status = 'leased', worker_id = %(worker)s,
                                lease_until = now() + make_interval(secs => %(lease)s),
                                attempts = attempts + 1, fence = fence + 1
@@ -145,7 +157,8 @@ def claim_one(conn, worker_id: str, lease_seconds: float) -> dict | None:
                            FOR UPDATE SKIP LOCKED)
                RETURNING *""",
             {"worker": worker_id, "lease": float(lease_seconds)},
-        ).fetchone()
+        )
+        return await cur.fetchone()
 
 
 # =====================================================================
@@ -197,9 +210,9 @@ return {allowed, tostring(tokens)}
 """
 
 
-def take(client, key: str, rate: float, capacity: float, requested: float = 1) -> tuple[bool, float]:
-    """执行 TOKEN_BUCKET_LUA，返回 (是否放行, 剩余令牌数)。已经写好，不用改。"""
+async def take(client, key: str, rate: float, capacity: float, requested: float = 1) -> tuple[bool, float]:
+    """执行 TOKEN_BUCKET_LUA，返回 (是否放行, 剩余令牌数)。client 是 redis.asyncio.Redis。已经写好，不用改。"""
     if TOKEN_BUCKET_LUA is None:
         raise NotImplementedError("TODO: 练习 (c) —— 写出 TOKEN_BUCKET_LUA")
-    allowed, left = client.eval(TOKEN_BUCKET_LUA, 1, key, rate, capacity, requested)
+    allowed, left = await client.eval(TOKEN_BUCKET_LUA, 1, key, rate, capacity, requested)
     return bool(allowed), float(left.decode() if isinstance(left, bytes) else left)

@@ -53,7 +53,7 @@ Workflow，让持久化执行引擎替你记住"执行到哪一步"。
 - 并发旋钮：worker 的 max_concurrent_activities（同时执行多少个 activity，通常要对齐模型网关的并发配额）
   与 max_concurrent_workflow_tasks（同时推进多少个 workflow 任务，大量 workflow 需要重放时会成为瓶颈），SDK 默认各 100。
   async activity 在等模型时不占线程，一个 worker 就能同时推进很多 workflow（第 27 课 Demo 场景 6：20 个 workflow
-  串行 7.9 秒 → 并发 1.15 秒）。
+  串行约 7.4 秒 → 并发约 0.65 秒，实测见该课讲义）。
 - 阻塞 IO 的后果：async activity 跑在 worker 的事件循环上，一个同步的 requests / time.sleep / 同步数据库驱动
   会卡住这个 worker 上所有 activity、心跳和 workflow 任务的收发，并发退化成 1；心跳发不出去还会被判超时重试。
   同步工具交给 agentkit.tools.ToolExecutor（有上限的线程池，和 Agent 执行工具是同一套）；

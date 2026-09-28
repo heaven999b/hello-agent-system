@@ -8,7 +8,7 @@
 
 ## 0. In one sentence
 
-**Where the teaching version of agentkit falls short**: a `Checkpointer` only *saves* state. Who notices that a process died, who calls `resume`, what happens when two processes `resume` the same run, who keeps time on an approval that has been pending for three days, what happens to in-flight runs during a deploy — all of that is your code. Lesson 13 filled some of it in with a lease queue and Lesson 26 moved checkpoints into Postgres, but "who drives recovery" is still up to you.
+**Where the teaching version of agentkit falls short**: a `Checkpointer` only *saves* state. Who notices that a process died, who calls `resume`, what happens when two processes `resume` the same run, who keeps time on an approval that has been pending for three days, what happens to in-flight runs during a deploy — all of that is your code. Lesson 13's `agentkit.distributed` covers "who notices, who takes over, and what happens when two processes grab the same run" with a lease queue and fencing, and Lesson 26 runs the same machinery on Postgres across machines; but who keeps time on a three-day approval, timed actions that span days, and keeping in-flight runs compatible across a deploy are still yours to assemble.
 
 **Durable execution takes a different approach: hand the bookkeeping of "how far did we get" to a dedicated service. Your code can crash at any moment; another machine replays the ledger from the start and ends up exactly where the crash happened.**
 
@@ -31,9 +31,9 @@ An analogy. The project manager (the Workflow) only makes decisions and never do
 | Capability | agentkit checkpoints (Lesson 08) | + Postgres / queue (Lessons 13, 26) | Temporal |
 |---|---|---|---|
 | Where state lives | Local file / memory | Postgres, shared across machines | The Temporal service's persistence layer (Cassandra / MySQL / PostgreSQL) |
-| Who notices a dead process | Nobody | Lease expiry + heartbeats (you write it) | Activity start-to-close / heartbeat timeouts, judged by the server |
+| Who notices a dead process | Nobody | Lease expiry + heartbeats (`run_worker` does it) | Activity start-to-close / heartbeat timeouts, judged by the server |
 | Who triggers recovery | A human calls `resume` | Another worker claims the expired task | The server hands the workflow task to any live worker |
-| Two processes recovering at once | They overwrite each other | Fencing token / CAS (you write it) | Only one workflow task runs for a given workflow at a time |
+| Two processes recovering at once | They overwrite each other | Fence + version CAS (Lessons 13, 26) | Only one workflow task runs for a given workflow at a time |
 | Timing an approval | Nothing | A periodic scanner (you write it) | Durable timer (the `timeout` of `wait_condition`) |
 | Retries | `ResilientLLM` (in-process, lost when the process dies) | Queue attempts | `RetryPolicy`, scheduled by the server; still retried if the worker dies |
 | Seeing where a run is stuck | Read a JSON file | Query a table | Web UI / `temporal workflow describe` / visibility queries |
@@ -112,7 +112,7 @@ The key is the fourth note: **during replay, completed Activities don't run agai
 
 | Option | How it works | Learning cost | Ops cost | Expressiveness | Vendor lock-in | When to use |
 |---|---|---|---|---|---|---|
-| A. Home-grown checkpoints (Lessons 02 / 08 / 26) | Save `RunState` to Postgres after every step; a lease queue + heartbeats trigger recovery; a periodic scan handles approval timeouts | Low: code you already know | Low: just Postgres | Medium: anything is possible, but timers, cancellation, and version compatibility are all on you | None | Minute-scale tasks, small teams, simple recovery logic |
+| A. Checkpoints + a lease queue (Lessons 08 / 13 / 26, `agentkit.distributed`) | Save `RunState` to Postgres after every step (fenced takeover + version CAS); a lease queue + heartbeats trigger recovery; a periodic scan handles approval timeouts | Low: code you already know | Low: just Postgres | Medium: anything is possible, but timers, cancellation, and version compatibility are all on you | None | Minute-scale tasks, small teams, simple recovery logic |
 | B. Temporal (this lesson) | Orchestration as a Workflow, IO as Activities; the server records event history and replays after crashes | High: determinism, replay, and versioning are new concepts | High (self-hosted: database + several services) / Medium (Temporal Cloud) | High: arbitrary code, durable timers, signals/updates/queries, child workflows | Low: open source (MIT), self-host or managed | Hours to days, many steps, approvals and compensation, costly failures |
 | C. AWS Step Functions | Describe a state machine in Amazon States Language (JSON) or the visual designer; the Standard type runs up to 1 year with exactly-once execution; approvals use the `.waitForTaskToken` callback | Medium: a DSL to learn, but few concepts | Low: fully managed | Medium: branches, parallel, and Map exist, but complex logic in JSON is painful | High: AWS only | Already on AWS, fairly fixed flows, heavy integration with AWS services |
 | D. LangGraph checkpointer | A checkpoint at every super-step of the graph; `interrupt()` pauses, `Command(resume=...)` resumes; three durability modes: `exit` / `async` / `sync` | Medium: a graph model to learn | Low to medium: checkpoints go into your Postgres, but triggering recovery is still your job | Medium: good at agent graphs; `interrupt` has no built-in timeout parameter, and on resume the interrupted node **re-runs from the start** | Low: open source | Already writing agents in LangGraph, need human-in-the-loop and resumable runs |
@@ -164,11 +164,11 @@ sequenceDiagram
 
 | Option | How it works | Pros | Cons | When to use |
 |---|---|---|---|---|
-| A. Client-side retries | SDK `max_retries`, `ResilientLLM` / `AsyncResilientLLM` | Lowest latency, no extra infrastructure | Retries die with the process; invisible from outside (count and reason aren't in the history) | Default when there's no orchestration engine |
+| A. Client-side retries | SDK `max_retries`, `ResilientLLM` | Lowest latency, no extra infrastructure | Retries die with the process; invisible from outside (count and reason aren't in the history) | Default when there's no orchestration engine |
 | B. Activity RetryPolicy | The server reschedules failed Activities with exponential backoff; non-retryable errors are marked `non_retryable` or listed in `non_retryable_error_types` | Retries survive worker death; every attempt and its failure reason are in the event history | The smallest unit is a whole Activity; retries are unlimited by default, so you must set a cap | Default once you use Temporal |
 | C. Idempotency keys | The downstream "executes + records the key" in one transaction; a repeated key returns the previous result | Actually makes repeated execution harmless | The downstream must support it | Every write with side effects, **no matter which layer retries** |
 
-**How to choose**: **retry in exactly one layer**. With Temporal, turn client retries off (`OpenAICompatLLM` / `AsyncOpenAICompatLLM` already use `max_retries=0`) and let the RetryPolicy own it; then **every write also needs C**, because B only guarantees "at least once". For tools:
+**How to choose**: **retry in exactly one layer**. With Temporal, turn client retries off (`OpenAICompatLLM` already uses `max_retries=0`) and let the RetryPolicy own it; then **every write also needs C**, because B only guarantees "at least once". For tools:
 
 | Tool | `maximum_attempts` | Why |
 |---|---|---|
@@ -180,11 +180,11 @@ For model calls: 429, 408, 409, 5xx, and connection errors can be retried; 400, 
 
 Three details measured in this lesson:
 
-- **Don't wrap `AsyncResilientLLM` directly inside Temporal**: after all attempts fail it raises a single `LLMError` with `retryable=False`, so `llm_step` marks a perfectly retryable 429 as `non_retryable` and the RetryPolicy gives up. If you want its concurrency cap, set its `max_attempts` to 1 and keep this behavior in mind, or cap concurrency with `AsyncOpenAICompatLLM(max_connections=...)` instead (what this lesson does).
+- **Don't wrap `ResilientLLM` directly inside Temporal**: the two layers' retry counts multiply, and the inner retries never reach the event history. Early versions raised a single `retryable=False` `LLMError` once all attempts had failed, so `llm_step` marked a perfectly retryable 429 as `non_retryable` and the RetryPolicy gave up; today `ResilientLLM.chat()` keeps `retryable=True` when every failure was transient (rate limit, 5xx, circuit open), but `stream()` still marks the final error non-retryable once all attempts have failed. To cap concurrency, use `OpenAICompatLLM(max_connections=...)` directly (what this lesson does).
 - **Failed attempts cost money but don't show up in usage**: `AgentWorkflow` only accumulates tokens from the **successful** `llm_step`. A call that timed out and then succeeded on retry was paid for twice. Reconcile costs against the gateway's bill (Lesson 29).
 - **On the local dev server, retry intervals below 1 second were effectively raised to about 1 second**: with `initial_interval` at 0.1 s or 0.5 s, two retries took about 2 seconds either way; at 1.5 s they took about 4.5 s (1.5 + 3.0), matching the backoff formula. Don't count on sub-second retries for "fast recovery".
 
-**What this lesson implements**: `retry_policy_for(risk, idempotent)` (exercise (a)); `execute_tool` turns `exception` / `timeout` results from the executor into an `ApplicationError` for the RetryPolicy, while bad-argument and business errors go straight back to the model; once retries are exhausted, the workflow turns the failure into an "outcome unknown, please verify manually" observation. Pass a cross-worker idempotency store to `make_worker(idempotency_store=...)` and only then are write tools treated as idempotent; inside async activities use Lesson 26's `AsyncRedisIdempotencyStore` (every get / put of the sync version is a blocking network round trip that stalls the event loop), and test `test_write_tool_retry_with_async_redis_idempotency_store` verifies that the idempotency key is `workflow_id:call_id`. Demo scenario 2: the inventory service drops the first connection, attempt 2 succeeds, and the model only ever sees the successful result.
+**What this lesson implements**: `retry_policy_for(risk, idempotent)` (exercise (a)); `execute_tool` turns `exception` / `timeout` results from the executor into an `ApplicationError` for the RetryPolicy, while bad-argument and business errors go straight back to the model; once retries are exhausted, the workflow turns the failure into an "outcome unknown, please verify manually" observation. Pass a cross-worker idempotency store to `make_worker(idempotency_store=...)` and only then are write tools treated as idempotent; for a store shared by many workers use Lesson 26's `RedisIdempotencyStore` (built on `redis.asyncio`: get / put are async and don't stall the event loop; passing a synchronous `redis.Redis` client raises `TypeError`), and test `test_write_tool_retry_with_redis_idempotency_store` verifies that the idempotency key is `workflow_id:call_id`. Demo scenario 2: the inventory service drops the first connection, attempt 2 succeeds, and the model only ever sees the successful result.
 
 ### Problem 4: The traps in the determinism constraint
 
@@ -244,29 +244,34 @@ Look at the last row: the longer the conversation, the larger each new run's fir
 
 **Scenario**: A 5-person team builds an internal knowledge-base Q&A agent: P99 20 seconds, read-only tools, no approvals, one deploy a week. Someone proposes "adopt Temporal and be done with it".
 
-**Why it's hard**: the benefits of durable execution show up when tasks are long, wait for people, and are expensive to fail; its costs (one more service to operate, the determinism constraint, a few extra network round trips per step) start on day one. Measured on this machine: 20 workflows with a zero-latency model still spend about 1 second on Temporal's own overhead (about 50 ms per workflow).
+**Why it's hard**: the benefits of durable execution show up when tasks are long, wait for people, and are expensive to fail; its costs (one more service to operate, the determinism constraint, a few extra network round trips per step) start on day one. Measured on this machine (demo scenario 6): 20 workflows run serially wait 6.0 s on the model in total but take 7.38 s; the extra ~1.4 s is Temporal's own overhead (about 70 ms per workflow).
 
 | Option | How it works | When to use |
 |---|---|---|
-| A. Synchronous agent + checkpoints (Lesson 08) | One process, one request; on failure the user retries | Second-scale tasks, internal tools, prototypes |
-| B. AsyncAgent + Postgres checkpoints ([Lesson 26](../26_state_and_queues/README.en.md), [Lesson 30](../30_async_runtime/README.en.md)) | One process drives hundreds of sessions concurrently with asyncio; every step checkpoints to Postgres; a lease queue handles crash takeover | Minute-scale tasks, high-concurrency chat, teams that don't want another service to run |
-| C. Queue + stateless workers (Lessons 13, 26) | Tasks go into a queue; workers claim, heartbeat, and commit; failures go to a dead-letter queue | Batch and async jobs without complex mid-run waits |
+| A. In-process agent + checkpoints (Lesson 08) | One process runs requests with asyncio; on failure the user retries | Second-scale tasks, internal tools, prototypes |
+| B. `agentkit.distributed` + Postgres checkpoints ([Lesson 13](../13_distributed_concurrency/README.en.md), [Lesson 26](../26_state_and_queues/README.en.md)) | The API enqueues; every machine runs `python -m agentkit.distributed.worker --queue postgresql://...`, each process drives dozens of runs concurrently with asyncio; every step checkpoints to Postgres; when a lease expires, another worker takes over from the checkpoint with a larger fence | Minute-scale tasks, high-concurrency chat, teams that don't want another service to run |
+| C. Queue + stateless workers that keep no mid-run state (the queue from Lessons 13, 26) | Tasks go into a queue; workers claim, heartbeat, and commit; a failed task reruns from scratch and lands in the dead-letter queue when attempts run out | Batch and short jobs where rerunning from scratch is acceptable |
 | D. Temporal (this lesson) | Workflow + Activities, the server keeps the ledger | Hours to days, approvals / timers / compensation, many systems, costly failures |
 
-**Temporal durable workflows vs AsyncAgent + Postgres checkpoints**: both can "drive many runs concurrently in one process and pick up after a crash". The difference is **who guarantees it**:
+**B (lease / fence queue + checkpoints) vs D (Temporal's event sourcing + replay)**: both run for real in this repository — B went through kill -9, SIGSTOP, and a network partition with real worker processes in Lesson 13 (SQLite) and Lesson 26 (Postgres), and D kill -9s a real worker subprocess in this lesson's scenario 4. Both can "drive many runs concurrently in one process and pick up in another process after a crash". The difference is **how state is stored and who guarantees what**:
 
-| | AsyncAgent + Postgres checkpoints | Temporal |
+| | B: `agentkit.distributed` + Postgres checkpoints | D: Temporal |
 |---|---|---|
-| Granularity of recovery | Checkpoint: saved after every tool result | Event history: every activity result |
-| Who detects a crash and takes over | Your leases + heartbeats + scanner | The server's timeouts + task dispatch |
-| Timers (approval timeout) | Your scanner | Durable timers |
-| Code constraints | Almost none | Determinism, versioning |
-| Tool execution semantics | `AsyncToolExecutor` | **The same** `AsyncToolExecutor` (this lesson's `execute_tool` uses it directly) |
-| Extra infrastructure | Just Postgres | The Temporal service (+ its own database) |
+| State model | Snapshot: every step overwrites the latest `RunState` (version CAS) | Event sourcing: an append-only event history, replayed to rebuild in-memory state |
+| Granularity of recovery | The latest checkpoint (after every model reply and every tool result) | Every activity result |
+| Who detects a crash | Nobody renews the lease → reclaimed at the next `claim` (`run_worker`'s heartbeat coroutine) | The server: the activity's heartbeat / start-to-close timeout |
+| Who takes over | The next worker to claim it: larger fence, `fenced(fence).load` takes over the checkpoint | The server hands the workflow task / activity retry to any live worker |
+| When a zombie (frozen / partitioned old holder) wakes up | Heartbeats, commits, and checkpoint writes all carry the fence / version and are rejected by the store (measured with SIGSTOP in Lesson 13 and a network partition in Lesson 26) | Only one workflow task advances a given workflow at a time; activities are still at-least-once, so writes still need idempotency keys |
+| How long a takeover waits | Set by the lease length (2 s in the Lesson 26 demo) | Set by heartbeat_timeout (2 s in scenario 4) |
+| Timers (approval timeout) | Write your own scanner (or delayed jobs via `run_at`) | Durable timers |
+| Human approval | The checkpoint is saved as paused → the API enqueues a resume job (Lesson 26 demo part 2) | signal / update + `wait_condition(timeout=...)` |
+| Code constraints | Almost none: plain async Python | Determinism, versioning, sandbox |
+| Tool execution semantics | `agentkit.tools.ToolExecutor` | **The same** `ToolExecutor` (this lesson's `execute_tool` uses it directly) |
+| Extra infrastructure | Just Postgres (SQLite on a single machine; switching is a `--queue` change) | The Temporal service (+ its own database) |
 
 **How to choose**: consider Temporal only if at least two of these hold: single tasks often run longer than 30 minutes; runs wait for people (approvals, extra documents); there are timed actions (timeouts, reminders, periodic retries); one failure needs manual cleanup (money or external commitments); someone (or a platform team) operates it, or there's budget for Temporal Cloud. If none apply, use B or C — they are first-class citizens of Part 4 of this course, too.
 
-**What this lesson implements**: `execute_tool` runs tools through `agentkit.aio.AsyncToolExecutor` — **the same execution semantics** as `AsyncAgent` (async tools are truly cancellable, sync tools go to a bounded thread pool, `isolated(tool)` runs in a subprocess and is killed on timeout). Moving from B to D doesn't change a single line of tool code.
+**What this lesson implements**: `execute_tool` runs tools through `agentkit.tools.ToolExecutor` — **the same execution semantics** as `Agent` (async tools are truly cancellable, sync tools go to a bounded thread pool, `isolated(tool)` runs in a subprocess and is killed on timeout). Moving from B to D doesn't change a single line of tool code.
 
 ### Problem 6: Operations — who runs Temporal itself?
 
@@ -280,7 +285,7 @@ Look at the last row: the longer the conversation, the larger each new run's fir
 
 Operational notes:
 
-- **Scaling workers horizontally**: workers are stateless; adding processes on the same task queue is scaling out. Each worker has two concurrency knobs (the SDK defaults to 100 slots each): `max_concurrent_activities` (how many activities run at once — agents spend nearly all their time waiting on the model, so this usually has to match the model gateway's concurrency quota) and `max_concurrent_workflow_tasks` (how many workflow tasks are processed at once — each is short, but it becomes the bottleneck right after a worker starts and must replay histories for many workflows). Demo scenario 6 measured it: for the same 20 workflows, `max_concurrent_activities=4` kept peak model-call concurrency at exactly 4, and the time went from 1.15 s to 2.18 s.
+- **Scaling workers horizontally**: workers are stateless; adding processes on the same task queue is scaling out. Each worker has two concurrency knobs (the SDK defaults to 100 slots each): `max_concurrent_activities` (how many activities run at once — agents spend nearly all their time waiting on the model, so this usually has to match the model gateway's concurrency quota) and `max_concurrent_workflow_tasks` (how many workflow tasks are processed at once — each is short, but it becomes the bottleneck right after a worker starts and must replay histories for many workflows). Demo scenario 6 measured it: for the same 20 workflows, `max_concurrent_activities=4` kept peak model-call concurrency at exactly 4, and the time went from 0.65 s to 1.89 s.
 - **Visibility queries and the Web UI**: the Web UI filters by workflow type, status, and time; click through to the full event history (every activity's input, output, attempts, and failure reasons). Finding workflows by business fields (tenant, order number) requires custom Search Attributes.
 - **The event history is data**: prompts, tool arguments, and tool results (including internal error text in `ToolResult.detail`) are stored verbatim, and anyone who can see the Web UI can see them. Encrypt sensitive data with a Payload Codec in workers and clients (the server only sees ciphertext), deploy a Codec Server for the Web UI to decrypt, and set the Namespace retention period to meet compliance (1–90 days on Temporal Cloud).
 - **A bug in workflow code doesn't fail the workflow**: an ordinary exception raised in a workflow, by default, only fails that workflow task, which keeps being retried (the UI shows `WorkflowTaskFailed`) while the workflow itself stays suspended. Fix the code and redeploy, and it continues on its own — a feature, but alert on `WorkflowTaskFailed` or runs will sit stuck silently. Also, if a single workflow activation doesn't yield within 2 seconds, the Python SDK treats it as a deadlock.
@@ -292,11 +297,11 @@ Operational notes:
 ### 3.1 Four functions
 
 ```python
-from agentkit.aio import default_async_llm
+from agentkit import default_llm
 from agentkit.contrib.temporal import agent_status, approve, make_worker, start_agent
 
 # Worker process: hosts AgentWorkflow and three activities. llm_factory is called once when the worker starts.
-worker = make_worker(client, "support-agents", lambda: default_async_llm(max_connections=20), tools)
+worker = make_worker(client, "support-agents", lambda: default_llm(max_connections=20), tools)
 await worker.run()
 
 # API process: start a run (use a business key as workflow_id: resubmitting the same ticket runs only one agent)
@@ -340,10 +345,10 @@ flowchart LR
     SDK --> LLM["await llm.chat(...) raises CancelledError<br/>httpx aborts the HTTP request, the connection returns to the pool"]
 ```
 
-- **Why async**: agents spend nearly all their time waiting on the model. An async activity doesn't hold a thread while it waits, so one worker process can drive many workflows at once. Demo scenario 6: 20 workflows on one worker (2 model calls each, 0.15 s model latency) took 7.9 s serially and 1.15 s concurrently in one run on this machine, with a peak of 20 concurrent model calls (across runs it varied with machine load: 7.9–9.5 s serial, 1.15–1.6 s concurrent).
+- **Why async**: agents spend nearly all their time waiting on the model. An async activity doesn't hold a thread while it waits, so one worker process can drive many workflows at once. Demo scenario 6: 20 workflows on one worker (2 model calls each, 0.15 s model latency) took 7.38 s serially and 0.65 s concurrently in one run on this machine (Apple M1, 8 GB, load 4–7), with a peak of 20 concurrent model calls (three runs: 7.38–7.39 s serial, 0.62–0.65 s concurrent).
 - **Cancellation can only arrive through heartbeats**: the server doesn't push cancellations; it tells the worker in the response to a heartbeat. So `llm_step` and `execute_tool` heartbeat every `heartbeat_timeout / 2` while running. `heartbeat_timeout` (10 s by default) also decides how quickly a dead worker is noticed — otherwise you wait for the full `start_to_close_timeout` (120 s for model calls). Cancellation latency is roughly the heartbeat interval: measured on this machine, a 30-second model call was aborted 0.19 / 0.7 / 4.7 s after `handle.cancel()` with `heartbeat_timeout` at 1 / 2 / 10 s (test `test_cancel_reaches_the_inflight_llm_call`). For cancellation to reach the HTTP request, **the model client itself must be async**; a sync client running in a thread can only be "no longer awaited", and the request finishes in the background and is still billed.
-- **Never block inside an async activity**: async activities run on the worker's event loop, and one `requests.get` / `time.sleep` / synchronous database driver stalls **every** activity, heartbeat, and workflow-task exchange on that worker. The last row of demo scenario 6: a model client that blocks with `time.sleep` inside async code makes 20 workflows take 7.05 s with a peak concurrency of 1 — as slow as running them serially. We also hit a subtle version of this in real mode: at first the model client was created lazily inside the first `llm_step`; creating it imports openai / httpx (about 0.6 s here, over 2 s when the machine is busy), that synchronous code blocked the event loop, and an `llm_step` with `heartbeat_timeout=2` s was judged to have missed its heartbeat and retried — possibly paying for the model call twice. Fix: `make_worker` creates the client at startup.
-- **What about sync tools**: `execute_tool` hands them to `AsyncToolExecutor`: sync tools go to a bounded thread pool (the event loop isn't blocked), async tools are awaited directly. Temporal itself also supports sync activities, but the worker then needs an `activity_executor` (the docs recommend a `ThreadPoolExecutor`); in fact the Temporal docs' default advice is "make activities synchronous unless you're sure they don't block the event loop". This lesson chooses async because both the model client and the tool executor are truly asynchronous, which makes concurrency and cancellation real.
+- **Never block inside an async activity**: async activities run on the worker's event loop, and one `requests.get` / `time.sleep` / synchronous database driver stalls **every** activity, heartbeat, and workflow-task exchange on that worker. The last row of demo scenario 6: a model client that blocks with `time.sleep` inside async code makes 20 workflows take 6.88 s with a peak concurrency of 1 — about as slow as running them serially. We also hit a subtle version of this in real mode: at first the model client was created lazily inside the first `llm_step`; creating it imports openai / httpx (about 0.6 s here, over 2 s when the machine is busy), that synchronous code blocked the event loop, and an `llm_step` with `heartbeat_timeout=2` s was judged to have missed its heartbeat and retried — possibly paying for the model call twice. Fix: `make_worker` creates the client at startup.
+- **What about sync tools**: `execute_tool` hands them to `ToolExecutor`: sync tools go to a bounded thread pool (the event loop isn't blocked), async tools are awaited directly. Temporal itself also supports sync activities, but the worker then needs an `activity_executor` (the docs recommend a `ThreadPoolExecutor`); in fact the Temporal docs' default advice is "make activities synchronous unless you're sure they don't block the event loop". This lesson chooses async because both the model client and the tool executor are truly asynchronous, which makes concurrency and cancellation real.
 
 ### 3.4 Which agentkit hooks can go straight into the workflow
 
@@ -364,7 +369,7 @@ To add more pure-logic hooks to the workflow, write a subclass that overrides `e
 ## 4. Hands-on: run the demo
 
 ```bash
-python lessons/27_durable_workflows/demo.py --offline          # offline, about 50 seconds
+python lessons/27_durable_workflows/demo.py --offline          # offline, about 40 seconds
 python lessons/27_durable_workflows/demo.py                    # real model (gpt-5.5)
 python lessons/27_durable_workflows/demo.py --offline --hold 300   # keep the server for 5 minutes to browse event histories in the Web UI
 ```
@@ -373,7 +378,8 @@ On startup it prints the Web UI address (`start_local(ui=True)`). Without the op
 
 ```text
 Scenario 4: kill -9 a worker process — a new worker continues from the breakpoint; completed activities don't re-run
-  generate_report is running on worker-A (step 2, tools called ['lookup_order', 'generate_report']) → kill -9 30819
+  worker-A is a separate subprocess (pid=54637) that talks to this process only through the Temporal server
+  generate_report is running on worker-A (step 2, tools called ['lookup_order', 'generate_report']) → kill -9 54637
   worker-B called the model only 1 time: the earlier model replies were replayed from the event history, no money spent again
     6  ActivityTaskStarted                describe_tools attempt=1 worker=worker-A
    12  ActivityTaskStarted                llm_step attempt=1 worker=worker-A
@@ -384,10 +390,10 @@ Scenario 4: kill -9 a worker process — a new worker continues from the breakpo
 
 Scenario 6: async concurrency — one worker drives 20 workflows at once (model latency 0.15 s, offline model)
   Mode                                                   Total   Peak concurrent model calls
-  Serial: one after another                              7.90s             1
-  Concurrent: max_concurrent_activities=100 (default)    1.15s            20
-  Concurrent: max_concurrent_activities=4                2.18s             4
-  Concurrent, but the model client blocks in async (time.sleep)   7.05s     1
+  Serial: one after another                              7.38s             1
+  Concurrent: max_concurrent_activities=100 (default)    0.65s            20
+  Concurrent: max_concurrent_activities=4                1.89s             4
+  Concurrent, but the model client blocks in async (time.sleep)   6.88s     1
 ```
 
 What to look for:
@@ -413,12 +419,12 @@ make lesson N=27
 # or: .venv/bin/python -m pytest lessons/27_durable_workflows -v
 ```
 
-`test_integration.py` runs the full "look up order → refund → approval → execute" flow for real with `start_local()` (skipped automatically when temporalio isn't installed). The more complete tests for the contrib module are in [`tests/contrib/test_temporal.py`](../../tests/contrib/test_temporal.py) (23 tests, including worker replacement, cancellation propagation, concurrency, replay, and the Redis idempotency store).
+`test_integration.py` runs the full "look up order → refund → approval → execute" flow for real with `start_local()` (skipped automatically when temporalio isn't installed). The more complete tests for the contrib module are in [`tests/contrib/test_temporal.py`](../../tests/contrib/test_temporal.py) (22 tests, including worker replacement, cancellation propagation, concurrency, replay, and the Redis idempotency store).
 
 ## 6. Operational notes and common pitfalls
 
 1. **Activities retry forever by default.** Model calls and write tools must set `maximum_attempts`, and non-retryable errors must be marked `non_retryable`.
-2. **Two layers of retries stacked.** With a RetryPolicy, turn off client retries; `AsyncResilientLLM` turns the final error into a non-retryable one.
+2. **Two layers of retries stacked.** With a RetryPolicy, turn off client retries and don't wrap `ResilientLLM` either: the counts multiply and the inner retries are invisible in the event history.
 3. **Writes without idempotency keys.** Activities are at-least-once; the idempotency store must be shared across workers, and an in-process `IdempotencyStore` is as good as nothing here.
 4. **Setting only start-to-close, no heartbeats.** A dead worker is only retried after the full start-to-close, and cancellations can't be delivered. Long activities must heartbeat.
 5. **Blocking inside async activities**, including the subtle "create the client on the first call" kind.
@@ -471,7 +477,7 @@ Determinism only constrains orchestration code: given the same event history, th
 <details>
 <summary>3. Your agent uses openai SDK retries, ResilientLLM, and an Activity RetryPolicy at the same time. What's wrong, and how do you fix it?</summary>
 
-The counts multiply (2 × 3 × 5), amplifying load on the gateway during an incident; inner retries are invisible in the event history; and inner retries die with the process. Keep only the RetryPolicy: client `max_retries=0`, no ResilientLLM (or only its concurrency limit with `max_attempts=1`, keeping in mind that it marks the final error as non-retryable); translate the retryable / non-retryable classification into `ApplicationError(non_retryable=...)` inside the activity, and `Retry-After` into `next_retry_delay`.
+The counts multiply (2 × 3 × 5), amplifying load on the gateway during an incident; inner retries are invisible in the event history; and inner retries die with the process. Keep only the RetryPolicy: client `max_retries=0`, no ResilientLLM (cap concurrency with `OpenAICompatLLM(max_connections=...)` instead); translate the retryable / non-retryable classification into `ApplicationError(non_retryable=...)` inside the activity, and `Retry-After` into `next_retry_delay`.
 </details>
 
 <details>
@@ -495,7 +501,7 @@ Shipping it as is makes old runs' command sequences mismatch on replay (one extr
 <details>
 <summary>7. When would you argue against adopting Temporal?</summary>
 
-When tasks take seconds to minutes, nobody waits for a human, there are no timed actions, a failure can simply be retried by the user, and nobody on the team can operate it and there's no budget for the cloud service. Then AsyncAgent + Postgres checkpoints + a lease queue is simpler, the tool execution semantics are identical, and you can migrate smoothly later if needed.
+When tasks take seconds to minutes, nobody waits for a human, there are no timed actions, a failure can simply be retried by the user, and nobody on the team can operate it and there's no budget for the cloud service. Then `agentkit.distributed` (a Postgres lease queue + fenced checkpoints, Lesson 26) is simpler: just one more Postgres, the workers are plain async processes, the tool execution semantics are identical, and you can migrate smoothly later if needed.
 </details>
 
 <details>
@@ -514,7 +520,7 @@ Make activities async and use an async HTTP model client, so waiting on the mode
 - [ ] I can safely change a running workflow with `workflow.patched`
 - [ ] I can explain why an agent's event history grows quadratically, and the three ways to deal with it
 - [ ] I know what blocking inside an async activity does, and how cancellation travels all the way to the model call
-- [ ] I can decide whether a scenario calls for Temporal, AsyncAgent + Postgres checkpoints, or a queue + workers
+- [ ] I can decide whether a scenario calls for Temporal, `agentkit.distributed` + Postgres checkpoints, or a queue + workers, and explain what "snapshot + fence" and "event history + replay" each guarantee, and who guarantees it
 
 ## Further reading
 
