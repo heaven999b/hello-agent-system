@@ -135,14 +135,17 @@ Finally, add the lesson to the learning path table (the **📚 学习路线** se
 - **No new runtime dependencies**: the only dependencies are `openai` and `pydantic`. Put optional capabilities under `[project.optional-dependencies]`.
 - **Every behavior change needs tests** (`tests/`), kept offline and deterministic.
 - **Public API changes must be carried through the course**: search `lessons/`, `capstone/`, and `docs/` for every reference and update them in the same change.
-- Keep the teaching implementation synchronous and single-process; describe production-grade alternatives in comments or in Lesson 12.
+- **There is one implementation, and it is async**: don't add a separate synchronous version "for readability" (two implementations drift apart, and every bug has to be fixed twice).
+  `await` wherever you wait on I/O; keep pure computation as plain functions; never call a blocking function inside the event loop (Lesson 02, section 1.7).
+- **Claimed capabilities must be really implemented and proven by tests**: "concurrent" needs an in-flight peak to prove it; "multi-process / crash takeover" needs real processes and real signals (`agentkit.distributed.WorkerPool`).
+  Don't use threads to pretend to be processes, two objects in one process to pretend to be two machines, or sleeps and fake clocks to pretend to be failures. Whatever can't be done (e.g. multiple hosts, real Redis failover) must be written down honestly as a limitation.
 
 ## Code style
 
 - Python 3.10+; start every file with `from __future__ import annotations`; add type annotations to public functions.
 - **Identifiers in English; comments, docstrings, docs, and user-facing text in Chinese.**
 - Line length around 120 characters; follow PEP 8; group imports as standard library / third-party / local.
-- No async, metaclasses, or other advanced tricks (the course is aimed at developers with modest experience).
+- No metaclasses or other unnecessary advanced tricks (the course is aimed at developers with modest experience); async/await is the exception — it is a basic skill for server-side agents, taught from scratch in Lesson 02.
 - Chinese writing: put a space between Chinese and English text and between Chinese and numbers (e.g. "调用 LLM API 3 次", meaning "call the LLM API 3 times"), use full-width Chinese punctuation, and give both the Chinese and English name for a term the first time it appears.
 - Commands and code snippets in the docs must actually have been run; cited papers, blog posts, and incidents must be real — if you're not sure, leave it out.
 - **Keep the Chinese and English docs in sync**: every doc in this repo is bilingual (`xxx.md` is the Chinese version, `xxx.en.md` the English one). When you add or change a doc, update the other language in the same PR, following the [translation guide](docs/translation-guide.md) (language switcher line, identical structure, glossary).
