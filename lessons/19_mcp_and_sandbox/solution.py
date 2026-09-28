@@ -12,7 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 from agentkit import Tool, ToolContext, ToolError, ToolRegistry
 from agentkit.types import ToolCall
@@ -63,7 +63,7 @@ def _valid_id(rid: Any) -> bool:
     return isinstance(rid, (str, int)) and not isinstance(rid, bool)
 
 
-def handle_request(req: Any, tools: Iterable[Tool]) -> dict | None:
+async def handle_request(req: Any, tools: Iterable[Tool]) -> dict | None:
     registry = tools if isinstance(tools, ToolRegistry) else ToolRegistry(tools)
 
     # 1) 结构不合法 → -32600
@@ -116,7 +116,7 @@ def handle_request(req: Any, tools: Iterable[Tool]) -> dict | None:
         if registry.get(name) is None:
             return jsonrpc_error(rid, INVALID_PARAMS, f"Unknown tool: {name}")
         call = ToolCall(id=str(rid), name=name, arguments=json.dumps(arguments, ensure_ascii=False))
-        result = registry.execute(call, ToolContext(run_id="mcp", call_id=str(rid)))
+        result = await registry.execute(call, ToolContext(run_id="mcp", call_id=str(rid)))
         return ok({"content": [{"type": "text", "text": result.content}], "isError": not result.ok})
     return jsonrpc_error(rid, METHOD_NOT_FOUND, f"Method not found: {method}")
 
@@ -133,6 +133,7 @@ def _cut(text: str, limit: int) -> tuple[str, bool]:
 
 
 def run_with_limits(code: str, timeout_s: float = 2.0, max_output: int = 2000) -> SandboxResult:
+    # 同步版：在 async 代码里用 await asyncio.to_thread(run_with_limits, ...) 调用（见 exercise.py 的说明）
     workdir = tempfile.mkdtemp(prefix="exercise-sandbox-")
     try:
         script = os.path.join(workdir, "main.py")
@@ -192,7 +193,7 @@ def _risk_from_annotations(annotations: dict | None) -> str:
 
 def tool_from_mcp_schema(
     schema: dict,
-    call_fn: Callable[[str, dict], dict],
+    call_fn: Callable[[str, dict], Awaitable[dict]],
     *,
     trusted: bool = False,
     risk_overrides: dict[str, str] | None = None,
@@ -207,8 +208,8 @@ def tool_from_mcp_schema(
     else:
         risk = "dangerous"
 
-    def invoke(arguments: dict) -> str:
-        result = call_fn(remote, arguments)
+    async def invoke(arguments: dict) -> str:
+        result = await call_fn(remote, arguments)
         text = result_to_text(result)
         if result.get("isError"):
             raise ToolError(text or f"工具 {remote} 执行失败")

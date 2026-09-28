@@ -251,9 +251,11 @@ agentkit's argument models use `extra="forbid"`, so the generated schema already
 if registry.get(name) is None:  # unknown tool = protocol error (the spec's example uses -32602)
     return jsonrpc_error(rid, INVALID_PARAMS, f"Unknown tool: {name}")
 call = ToolCall(id=str(rid), name=name, arguments=json.dumps(arguments, ensure_ascii=False))
-result = registry.execute(call, ToolContext(run_id="mcp", call_id=str(rid)))
+result = await registry.execute(call, ToolContext(run_id="mcp", call_id=str(rid)))
 return ok({"content": [{"type": "text", "text": result.content}], "isError": not result.ok})
 ```
+
+That's why `handle_request` is `async def` (exercise (a)): `tools/call` has to wait for the tool to finish (the tool may be waiting on a downstream API); every other branch is pure computation.
 
 For unexpected exceptions inside a tool, `ToolRegistry` returns only "internal error (error ID xxx)" and keeps the original text in `ToolResult.detail`, which the server writes only to its own stderr log. The client (and the model behind it) never sees SQL or internal addresses, consistent with the "errors as observations" design from [Lesson 03](../03_tools/README.en.md).
 
@@ -267,16 +269,39 @@ if stdout is None:
     sys.stdout = sys.stderr
 ```
 
-The server exits when stdin hits EOF. Per the spec, that's the only portable graceful-shutdown signal for stdio.
+The server exits when stdin hits EOF. Per the spec, that's the only portable graceful-shutdown signal for stdio. Before exiting, it finishes the requests still in progress and writes their responses.
+
+**④ One task per request, and cancellation really stops the work.** For every request it reads, the main loop hands the message to a new asyncio task and goes back to reading the next line:
+
+```python
+while True:
+    raw = await asyncio.to_thread(stdin.readline)      # reading stdin blocks: do it in a thread so in-flight requests keep moving
+    ...
+    if msg["method"] == "notifications/cancelled":
+        task = in_flight.get(params.get("requestId"))
+        if task is not None:
+            task.cancel()                              # the client no longer wants the result: stop, and never reply
+        continue
+    task = asyncio.create_task(respond(msg))            # one task per request: whoever finishes first answers first
+    in_flight[msg["id"]] = task
+```
+
+A slow tool doesn't block the requests behind it, and responses go out in the order the work finishes, which may differ from the order of the requests. That is exactly why JSON-RPC has an `id`. On a cancellation notice, an async tool stops at its current `await`; a sync tool can't be stopped inside its thread, but its result is discarded. The official Python SDK works the same way: one task per request, and `notifications/cancelled` cancels the task handling it. The simplification here is that there is no cap on how many requests are processed at once.
 
 ### 2.2 The client: match responses by id, negotiate the era by the book
 
 `StdioMCPClient` in [`mcp_client.py`](mcp_client.py) makes four design decisions:
 
-1. **A background thread reads stdout and hands each response to the request waiting for that `id`.** Why not "write one line, read one line"? Because agentkit runs tools in a thread pool and may abandon a call on timeout, and the server may interleave notifications. Matching by id is the only way not to mix responses up. After a request times out, the client sends `notifications/cancelled` as the spec asks.
+1. **One background task reads stdout and hands each response to the request waiting for that `id`.** The server is started with `asyncio.create_subprocess_exec`; each request puts a `Future` into `_pending`, and the stdout-reading task looks it up by id and calls `set_result`. Why not "write one line, read one line"? Because several requests can be in flight at once: the agent runs several read-only tools from the same turn concurrently (Lesson 02), their `tools/call` requests go out together, and the server may answer out of order or interleave notifications. Matching by id is the only way not to mix responses up. When a request times out (via the cancellation-safe `agentkit.wait_for`), or the caller no longer needs the result (for example, the agent's run was cancelled and `CancelledError` arrives here), the client sends `notifications/cancelled` as the spec asks, so the server stops working on it; the cancellation path only writes and never waits, so it can't get stuck.
 2. **`connect()` follows the [spec's stdio backward-compatibility procedure](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) exactly**: probe with `server/discover` first. A `DiscoverResult` means a modern server; a `-32022` whose list of supported versions contains no legacy version means no common version, so fail; any other error or a timeout means a legacy server, so fall back to `initialize`. The spec stresses that the fallback **must not** be keyed to a single error code, because legacy servers react to pre-handshake requests in different ways.
 3. **Don't pass your whole environment to the server.** agentkit's `default_llm()` loads `.env` into `os.environ`; inherit everything and your `LLM_API_KEY` goes to every MCP server you launch. On POSIX, the official Python SDK passes only six variables by default: `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER`. We do the same and pass anything extra explicitly.
-4. **Shut down in the order the spec recommends**: close the server's stdin and wait for it to exit; if it doesn't, SIGTERM; if it still doesn't, SIGKILL.
+4. **Shut down in the order the spec recommends**: leaving `async with` calls `aclose()`: close the server's stdin and wait for it to exit; if it doesn't, SIGTERM; if it still doesn't, SIGKILL, waiting at most `close_timeout_s` at each step. The process is always reaped, and its exit code is kept in `client.returncode`. The subprocess's lifetime follows the `async with` block rather than `atexit`: once the event loop has finished, nothing can `await` the subprocess's exit anymore.
+
+Each of these is backed by a test (the last group in `test_exercise.py`; they start real subprocesses and don't depend on the exercises):
+
+- `test_async_client_and_server_in_both_eras_with_a_real_agent`: against this lesson's server, both protocol eras work; an agent calls two read-only remote tools in one turn and the client's in-flight peak (`max_in_flight`) is 2; on a normal close the server sees EOF and exits by itself with exit code 0.
+- `test_out_of_order_responses_are_matched_by_id_and_cancellation_reaches_the_server`: the server gets an async `nap(seconds)` tool. Send `nap(30)`, then `nap(0)`: the later one comes back first. After cancelling the task waiting on `nap(30)`, and after `nap(31)` times out, the server's stderr shows each one as cancelled, the client's cancellation reasons are `cancelled by caller` and then `timeout`, and the connection keeps working afterwards.
+- `test_close_escalates_from_eof_to_sigterm_to_sigkill`: a server that never reads stdin exits with -15 (SIGTERM); if it also ignores SIGTERM, it exits with -9 (SIGKILL).
 
 ### 2.3 Remote tools → agentkit Tool
 
@@ -286,6 +311,16 @@ The server exits when stdin hits EOF. Per the spec, that's the only portable gra
 - **You decide the risk level** (the three-step rule from 1.5);
 - **`isError: true` → raise `ToolError`**: `ToolRegistry` turns it into the familiar "Error: ..." observation. Protocol errors become ordinary exceptions, and the model only sees "internal error";
 - **Name sanitizing**: MCP allows dots in tool names and up to 128 characters, while function names in OpenAI-compatible APIs allow only `[a-zA-Z0-9_-]` and up to 64 characters. Pass `admin.tools.list` straight through and the model API returns 400. So the model sees a sanitized name, and calls to the server still use the original.
+
+Remote tools are **async tools**: `call_fn` (in real use, `client.call_tool`) has to wait for the server's reply, so the `invoke` you write in the exercise is `async def`, and `RemoteTool` runs as an async tool. The agent awaits it on the event loop; if the tool times out or the run is cancelled, the pending request is cancelled and the client sends the server a cancellation notice (point 1 in the previous section).
+
+```python
+async with StdioMCPClient([sys.executable, "lessons/19_mcp_and_sandbox/mcp_server.py"]) as client:
+    tools = await mcp_tools(client, include=["get_travel_policy"], risk_overrides={"get_travel_policy": "read"})
+    agent = Agent(llm, tools)
+    await agent.run("What's the hotel limit for a Tokyo trip?")
+# leaving async with: the server subprocess is always shut down
+```
 
 `mcp_tools()` adds two more gates: `include` imports only the tools you need (least privilege, and less context used); `pinned` compares tool-definition fingerprints (a hash of name + description + parameters + annotations) and refuses to load anything that differs from what you reviewed. That's version pinning for tool definitions, a defense against rug pulls.
 
@@ -297,12 +332,12 @@ The server exits when stdin hits EOF. Per the spec, that's the only portable gra
 |---|---|---|
 | A fresh temp directory as the working dir, deleted afterwards | Leftovers, cross-run leakage, writing into your repo | Model-generated files shouldn't land anywhere meaningful |
 | Environment has only `PATH`; `HOME` and `TMPDIR` point to the temp dir | Stealing secrets from environment variables | Same as point 3 in 2.2 |
-| `start_new_session=True` + `os.killpg` on timeout | Infinite loops, `sleep`, subprocesses the code starts | `subprocess.run(timeout=...)` kills only the direct child; grandchildren become orphans and keep running (exercise (b) has a test that catches exactly this) |
+| `start_new_session=True` + `os.killpg` on timeout or cancellation | Infinite loops, `sleep`, subprocesses the code starts; code that keeps running in the background after the agent's run is cancelled | `subprocess.run(timeout=...)` kills only the direct child; grandchildren become orphans and keep running (exercise (b) has a test that catches exactly this) |
 | rlimits: CPU, memory, single-file size, file descriptors, core files | Resource exhaustion, filling the disk | Enforced by the kernel, not by the code's good behavior |
 | Read-and-discard output collection + truncation | One `print` blowing up the context, or the parent's memory | You must keep draining the pipe (or the child blocks when it fills), but keep only the first N bytes |
 | Structured result: `stdout`, `stderr`, `exit_code`, `timed_out`, `killed_reason`, `notes` | The model not understanding what happened | The model needs the raw traceback to fix its code; `notes` records honestly which limits took effect and which didn't |
 
-**How are rlimits applied? Not with `preexec_fn`.** The Python [docs](https://docs.python.org/3/library/subprocess.html) warn explicitly that `preexec_fn` is not safe when your program has other threads: the child could deadlock before exec. Our process has pipe-reading threads and MCP client threads. So we use a tiny "launcher" that sets its own rlimits and then `execv`s into the real program. rlimits survive exec and the pid doesn't change, so the process group and memory monitoring keep working:
+**How are rlimits applied? Not with `preexec_fn`.** The Python [docs](https://docs.python.org/3/library/subprocess.html) warn explicitly that `preexec_fn` is not safe when your program has other threads: the child could deadlock before exec. An async program still has threads: the event loop's default thread pool (used by `asyncio.to_thread` and by sync tools), and on macOS, Python 3.11's asyncio starts one thread per subprocess to wait for it to exit (the thread is named `asyncio-waitpid-0` in a test here). So we use a tiny "launcher" that sets its own rlimits and then `execv`s into the real program. rlimits survive exec and the pid doesn't change, so the process group and memory monitoring keep working:
 
 ```python
 _LAUNCHER = """
@@ -316,7 +351,9 @@ os.execv(sys.executable, [sys.executable] + sys.argv[2:])
 """
 ```
 
-Finally, it's wrapped as a `run_python` tool (`risk="dangerous"`); give it to an agent together with `PermissionPolicy` and every execution needs approval. The tool-level timeout is 10 seconds longer than the sandbox timeout, so the sandbox kills the process and returns a structured result itself instead of the tool layer just "giving up waiting" (as Lesson 03 noted, a thread timeout only stops waiting; the code may still be running).
+Finally, it's wrapped as a `run_python` tool (`risk="dangerous"`); give it to an agent together with `PermissionPolicy` and every execution needs approval. `run_python` is async (`asyncio.create_subprocess_exec`, two pipe-reading tasks, and a check for timeout and memory every 20 ms), and the tool is `async def` too. The tool-level timeout is 10 seconds longer than the sandbox timeout: normally the sandbox kills the process and returns a structured result itself. As soon as the agent's run is cancelled (the user disconnects, `run_timeout` expires), `CancelledError` reaches `run_python`, which `killpg`s the whole process group first and then lets the cancellation propagate. The sync version can't do this: a thread can't be stopped, so it would have to wait for the sandbox's own wall-clock timeout (Lesson 03). The test `test_cancelling_run_python_kills_the_whole_process_group_right_away` starts a grandchild process running `sleep(60)` inside the sandbox; after the cancellation it is gone immediately, without waiting 60 seconds.
+
+Exercise (b)'s `run_with_limits` is the sync version (a plain `def` using `subprocess.Popen`): it is about OS mechanisms (process groups, environment variables, pipes), and `communicate(timeout=...)` can still collect the output written before a timeout, which keeps it simple. To use it from async code, call `await asyncio.to_thread(run_with_limits, code)` so it doesn't block the event loop; the cost is that if the caller is cancelled, the thread can't be stopped and the child runs until its own `timeout_s`.
 
 ### 2.5 Three pitfalls measured on macOS
 
@@ -371,9 +408,9 @@ These numbers come from one machine; another Mac or OS version may differ. That'
 
 What to notice: `notifications/initialized` goes out and nothing comes back; the next message is `tools/list`. "Mars" and "the amount written as 'twenty thousand'" are both normal results with `isError: true`; only `resources/list` (which we didn't implement) is a protocol error.
 
-If the official `mcp` SDK (2.x) is installed, step 1d connects the official client to our server and our client to an official server. Measured here (mcp 2.2.0): the official client's `auto` mode negotiated 2026-07-28 via `server/discover`, its `legacy` mode negotiated 2025-11-25 via `initialize`, and calls worked in both directions. Without the SDK, this step is skipped automatically.
+If the official `mcp` SDK (2.x) is installed, step 1d connects the official client to our server and our client to an official server. Measured here (mcp 2.2.0; re-tested on 2026-09-28 after switching to the async client and server): the official client's `auto` mode negotiated 2026-07-28 via `server/discover`, its `legacy` mode negotiated 2025-11-25 via `initialize`, and calls worked in both directions. Without the SDK, this step is skipped automatically.
 
-**Part 2: an agent calling remote tools over MCP** (one run with the real model, gpt-5.5):
+**Part 2: an agent calling remote tools over MCP** (one run with the real model, gpt-5.5, on 2026-09-28, async client):
 
 ```text
    Connected to agentkit-mini-mcp (modern, 2026-07-28); the server has 4 tools, importing only 3:
@@ -382,30 +419,31 @@ If the official `mcp` SDK (2.x) is installed, step 1d connects the official clie
      - submit_expense     server annotations {'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False} → local risk dangerous
 ▶ User: I'm going to Tokyo next week for 3 nights; the hotel is 21,000 yen a night. Check whether it's within company policy; if it is, submit the 3 nights of lodging in CNY with the title "Tokyo trip lodging".
    🛠  get_travel_policy({"city":"Tokyo"})
-      ↳ {"city": "Tokyo", "hotel_cap_per_night_cny": 1100, "meal_allowance_per_day_cny": 300}
    🛠  convert_currency({"amount":21000,"from_currency":"JPY","to_currency":"CNY"})
-      ↳ {"amount": 21000.0, "from": "JPY", "to": "CNY", "result": 1008.0}
    🛠  convert_currency({"amount":63000,"from_currency":"JPY","to_currency":"CNY"})
+      ↳ {"city": "Tokyo", "hotel_cap_per_night_cny": 1100, "meal_allowance_per_day_cny": 300}
+      ↳ {"amount": 21000.0, "from": "JPY", "to": "CNY", "result": 1008.0}
       ↳ {"amount": 63000.0, "from": "JPY", "to": "CNY", "result": 3024.0}
    🛠  submit_expense({"title":"Tokyo trip lodging","amount_cny":3024})
       🔐 [approval] submit_expense risk dangerous → approved (auto-approved in the demo)
       ↳ {"expense_id": "EXP-1001", "status": "submitted", "title": "Tokyo trip lodging", "amount_cny": 3024.0}
    status completed, 3 steps, tool call order ['get_travel_policy', 'convert_currency', 'convert_currency', 'submit_expense']
+   MCP in-flight peak: 3 (when read-only tools from the same turn run concurrently, several tools/call requests wait on the server at once, and responses are matched by id)
 ```
 
-What to notice: the server says `submit_expense` is non-destructive, but we haven't reviewed it, so it stays `dangerous` and the call pauses for approval. In this run, the model issued both conversions (per night and the 3-night total) in parallel in one turn instead of multiplying by itself; in another run, it converted only the 3-night total and divided to get the nightly amount. A real model can take a different path every time, so evaluate an agent on outcomes and constraints (within policy or not, correct amount, writes approved) rather than pinning one fixed call sequence ([Lesson 11](../11_evals/README.en.md)).
+What to notice: the server says `submit_expense` is non-destructive, but we haven't reviewed it, so it stays `dangerous` and the call pauses for approval. In this run, the model issued three read-only calls together in its first turn (look up the policy, convert per night, convert the 3-night total) instead of multiplying by itself. All three are read-only, so the agent ran them concurrently and three `tools/call` requests were waiting on the server at the same time (in-flight peak 3); that's why the three "🛠" lines print first and the three results arrive after. In earlier runs, the model sometimes looked up the policy first and ran the two conversions in parallel in the next turn, and sometimes converted only the 3-night total and divided to get the nightly amount. A real model can take a different path every time, so evaluate an agent on outcomes and constraints (within policy or not, correct amount, writes approved) rather than pinning one fixed call sequence ([Lesson 11](../11_evals/README.en.md)). The offline script copies the "two parallel conversions in the second turn" path, with an in-flight peak of 2.
 
-**Part 3: the sandbox** (output on macOS):
+**Part 3: the sandbox** (output on macOS, re-run on 2026-09-28 after switching to the async sandbox):
 
 ```text
 ▶ 3b Infinite loop: 1 s wall-clock timeout, the whole process group gets SIGKILL
-   exit_code=-9  timed_out=True  killed_reason=timeout  took 1.012s
+   exit_code=-9  timed_out=True  killed_reason=timeout  took 1.016s
    stdout: computing…
 
 ▶ 3c Memory bomb: allocate 64 MB chunks back to back, up to 1 GB; limit 256 MB
-   exit_code=-9  timed_out=False  killed_reason=memory  took 0.112s
+   exit_code=-9  timed_out=False  killed_reason=memory  took 0.074s
    · memory: RLIMIT_AS can't be set on this platform; falling back to polling memory usage (race window)
-   · memory usage when killed ≈ 295 MB (limit 256 MB)
+   · memory usage when killed ≈ 316 MB (limit 256 MB)
 
 ▶ 3d Stealing a "private key" and phoning home: process-level sandbox first, then an OS sandbox on top
    [Process-level sandbox (timeout + rlimit + temp dir + minimal env)]
@@ -429,9 +467,9 @@ Open [`exercise.py`](exercise.py) and implement three functions:
 
 | Task | What to do | How the tests check it |
 |---|---|---|
-| (a) `handle_request` | JSON-RPC dispatch for an MCP server: `initialize` / `server/discover` / `tools/list` / `tools/call`; unknown method -32601; never reply to notifications; for modern requests, validate the version (-32022) and `clientCapabilities`; tool failures use `isError` | 9 cases: version negotiation in the handshake, no reply to any notification, schema reuse and annotations, `resultType` for modern requests, version validation, invalid requests, a successful call, three kinds of tool failure all reported via `isError` (without leaking the raw internal exception), three kinds of protocol error |
-| (b) `run_with_limits` | Temp dir + minimal env + kill the whole process group on timeout + output truncation + honest exit codes | 6 cases: normal run, non-zero exit with traceback, timeout keeps earlier output, **grandchildren are killed too**, output truncation, parent env vars invisible and temp dir deleted |
-| (c) `tool_from_mcp_schema` | Remote tool definition → agentkit `Tool`; risk decided by "override → trusted annotations → dangerous"; `isError` becomes `ToolError`; name sanitizing | 6 cases: schema passthrough, annotation mapping when trusted (including defaults), annotations ignored when untrusted and overrides win, call forwarding and error conversion, name sanitizing, plugged into a real Agent + `PermissionPolicy` and going through approval |
+| (a) `handle_request` (`async def`) | JSON-RPC dispatch for an MCP server: `initialize` / `server/discover` / `tools/list` / `tools/call`; unknown method -32601; never reply to notifications; for modern requests, validate the version (-32022) and `clientCapabilities`; tool failures use `isError` | 9 cases: version negotiation in the handshake, no reply to any notification, schema reuse and annotations, `resultType` for modern requests, version validation, invalid requests, a successful call, three kinds of tool failure all reported via `isError` (without leaking the raw internal exception), three kinds of protocol error |
+| (b) `run_with_limits` (plain `def`; see the end of 2.4 for why) | Temp dir + minimal env + kill the whole process group on timeout + output truncation + honest exit codes | 6 cases: normal run, non-zero exit with traceback, timeout keeps earlier output, **grandchildren are killed too**, output truncation, parent env vars invisible and temp dir deleted |
+| (c) `tool_from_mcp_schema` | Remote tool definition → agentkit `Tool` (an async tool: `call_fn` is async, and so is the `invoke` you write); risk decided by "override → trusted annotations → dangerous"; `isError` becomes `ToolError`; name sanitizing | 6 cases: schema passthrough, annotation mapping when trusted (including defaults), annotations ignored when untrusted and overrides win, call forwarding and error conversion, name sanitizing, plugged into a real Agent + `PermissionPolicy` and going through approval |
 
 ```bash
 make lesson N=19
@@ -440,10 +478,10 @@ make lesson N=19
 
 Hints:
 
-- (a) Handle "no reply" and "malformed" first, then decide the era, then dispatch by method. For `tools/call`, just use `ToolRegistry(tools).execute(...)`; don't rewrite argument validation.
+- (a) Handle "no reply" and "malformed" first, then decide the era, then dispatch by method. For `tools/call`, just use `await ToolRegistry(tools).execute(...)`; don't rewrite argument validation. The tests call it as `resp = await handle_request(msg, tools)`.
 - (b) After `proc.communicate(timeout=...)` times out, first `os.killpg(proc.pid, signal.SIGKILL)`, then call `communicate()` once more to collect what was already written, with a timeout on that call too.
-- (c) `annotations` may be `None` or missing fields; remember that `destructiveHint` defaults to `true`.
-- The whole suite runs in about 2 seconds here.
+- (c) `annotations` may be `None` or missing fields; remember that `destructiveHint` defaults to `true`. Inside `invoke`, `result = await call_fn(remote_tool_name, arguments)`.
+- Besides the 21 exercise tests, `test_exercise.py` ends with 5 tests of the lesson code itself (the ones listed in 2.2 and 2.4); they pass even before you do the exercises. The whole suite runs in about 3–4 seconds here.
 
 ## 5. Going deeper (optional)
 
@@ -492,6 +530,8 @@ This lesson's `os_sandbox=True` uses the same kind of mechanism but only does "d
 10. **Believing that changing `HOME` isolates `~/.ssh`**: code can find the real home directory via `pwd` and read it by absolute path.
 11. **Trusting `RLIMIT_AS` / RSS / `RLIMIT_CPU` on macOS**: see 2.5. Measure whether a limit actually works.
 12. **Leaving the network on inside the sandbox**: code execution plus network completes the "external communication" leg of the [lethal trifecta](../09_security/README.en.md#14-the-lethal-trifecta).
+13. **Waiting on a subprocess with sync `subprocess.run` / `Popen.communicate` inside async code**: the whole event loop stalls and every session waits with it. Use `asyncio.create_subprocess_exec`, or `await asyncio.to_thread(...)`.
+14. **Not telling the server when a request times out or is cancelled**: the client stopped waiting, but the server keeps doing the work (maybe an expensive query). Send `notifications/cancelled`, and on the server side actually cancel the task handling it.
 
 ## 7. Interview & design review questions
 
@@ -577,6 +617,7 @@ This lesson's `os_sandbox=True` uses the same kind of mechanism but only does "d
 - [ ] I can name one defense each for tool poisoning, rug pulls, and over-permissioning
 - [ ] I can list the six things a process-level sandbox does, and the three things it can't stop
 - [ ] I know the sandbox pitfalls of `subprocess.run(timeout=...)` and of `preexec_fn`
+- [ ] I can explain why an MCP client matches responses by id, and why it sends `notifications/cancelled` after a timeout or cancellation
 - [ ] I can choose between process-level, OS-level, container, gVisor, microVM, and hosted options for a given scenario
 
 ## Further reading

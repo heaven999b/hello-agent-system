@@ -111,10 +111,10 @@ The Mem0 paper (Chhikara et al., 2025) splits a write into two phases, and this 
 1. **Extraction phase**: the input is the newest message pair, plus a summary of the whole conversation and the last m messages (the paper uses m = 10). An LLM outputs a set of candidate facts. The summary is refreshed periodically by an asynchronous module, so it doesn't block the conversation.
 2. **Update phase**: for each candidate fact, vector search retrieves the s most similar existing memories (the paper uses s = 10). An LLM then picks one of four operations through function calling: **ADD** (no equivalent memory exists), **UPDATE** (augment or rewrite an existing memory), **DELETE** (the new information contradicts it), or **NOOP** (no change needed).
 
-The core of [`FactMemory.observe`](memory_kit.py) is exactly these steps:
+The core of [`FactMemory.observe`](memory_kit.py) is exactly these steps (`observe` is `async def`; callers write `await mem.observe(...)`):
 
 ```python
-facts = self.last_facts = self._extract(message, now)            # ① extract (complete_json guarantees structure)
+facts = self.last_facts = await self._extract(message, now)      # ① extract (complete_json guarantees structure)
 if not facts:
     return []
 live = [r for r in store.values() if r.is_live(now)]
@@ -122,7 +122,7 @@ candidates = self._candidates(facts, live)                        # ② top_s mo
 if not candidates:                                                #    nothing to compare with: it can only be ADD
     ops = [MemoryOp("ADD", None, f.text, f.key, f.importance, f.ttl_days, "new user / new topic") for f in facts]
 else:
-    ops = self._decide(message, facts, candidates, now)           # ③ LLM decides
+    ops = await self._decide(message, facts, candidates, now)     # ③ LLM decides
 ops = self._guard(ops, store, now)                                # ④ rule-based guard
 results = self.apply_fn(store, ops, now=now, new_id=self.new_id)  # ⑤ apply (Exercise b)
 ```
@@ -134,6 +134,7 @@ A few design decisions:
 - **Why show the model short ids like "0" and "1"?** It's a small trick from Mem0's open-source code (the code comment calls it anti-hallucination): ask a model to copy a UUID and it may copy it wrong or make one up. Short ids get mapped back to real ids in code.
 - **Skip the decision call when the store is empty.** The only possible decision is ADD, so there's no point paying a model to say so.
 - **Only things the user said can be written.** `observe(..., source_type="document")` is rejected outright, without even calling the model (Lesson 04's first anti-poisoning principle).
+- **Writes for the same user queue up; different users still run concurrently.** Between "read existing memories" (`live = ...`) and "store" (`apply_fn`) there are two `await`s (extract, decide). If two messages from the same user interleave, the second one decides based on stale candidates. So `observe` / `maybe_reflect` hold a per-`(tenant_id, user_id)` lock (`agentkit.limits.KeyedLocks`). The test `test_fact_memory_serializes_writes_per_user_but_not_across_users` sends two messages at once: "I'm allergic to peanuts" and "correction: not peanuts, mangoes". With the lock, the second waits its turn, sees the peanut allergy, and deletes it; the in-flight peak of model calls is 1. Remove the lock and both wait on the model at the same time (in-flight peak 2); the second decision never sees "peanuts", and the stale memory survives. Three different users writing at once reach an in-flight peak of 3, with no waiting on each other. The lock only covers one process: memories live in an in-process dict, and each worker process has its own. In production, records go in Postgres (Lesson 26), the vector index in pgvector or similar (Lessons 15 and 17), and per-user serialization comes from a queue partitioned by user or a database lock ([Lesson 26 Problem 5](../26_state_and_queues/README.en.md#problem-5-distributed-locks--redis-postgres-advisory-locks-etcd-or-zookeeper)).
 
 > 💡 **An easy-to-miss number**: in the Mem0 paper's LOCOMO results, **putting the entire conversation into the context (full-context) actually has the highest accuracy** (LLM-as-judge score 72.9% vs. 66.9% for Mem0). What the memory system buys you is 91% lower p95 latency (17.1 s → 1.4 s) and over 90% fewer tokens. **A memory system is first of all a cost and latency optimization, not a free accuracy win.**
 
@@ -287,7 +288,7 @@ core = CoreMemory({"human": ("Key facts and preferences about the user", 120), "
 archival = MemoryStore()                                   # archival memory reuses Lesson 04's MemoryStore
 tools = memgpt_tools(core, archival)                       # core_memory_append / core_memory_replace / archival_insert / archival_search
 agent = Agent(llm, tools, system_prompt=PROMPT, hooks=[CoreMemoryHook(core, archival, PROMPT)])
-agent.run("……", metadata={"tenant_id": "acme", "user_id": "alice"})   # identity only comes from metadata → ctx
+await agent.run("……", metadata={"tenant_id": "acme", "user_id": "alice"})   # identity only comes from metadata → ctx
 ```
 
 Design decisions:
@@ -296,6 +297,7 @@ Design decisions:
 - **Show "used / limit" characters when rendering**, e.g. `<human chars="42/120">`. This is a simplified version of MemGPT's "memory pressure" idea: let the model see how much room is left. When a write would exceed the limit, the tool returns an error the model can act on: "condense with core_memory_replace first, or move details to archival memory with archival_insert".
 - **Core memory is the most expensive place in the whole system to get poisoned**: it's spliced into the system prompt and read as top-priority context on every turn. So every write goes through `detect_injection` and sensitive-data checks, and is recorded in the audit history (who, when, old value, new value), so it can be rolled back with `rollback` if something goes wrong.
 - **Identity comes from `ctx`**, so the model has no way to choose whose memory to edit (Lesson 03, principle 4).
+- **All four tools are `async def`, even though their bodies never `await`**: plain-function tools run in a thread pool (meant for blocking I/O; see [`agentkit/tools.py`](../../agentkit/tools.py)), which would mean core memory is modified on a tool thread while `CoreMemoryHook` reads it on the event-loop thread, and concurrent sessions would need locks. These tools only touch in-process data structures (microseconds), so they run on the event-loop thread: every read and write happens on one thread and nothing can interrupt them between two `await`s. Once storage moves to a database, the bodies contain real `await`s.
 
 A few behaviors from the real runs (gpt-5.5) are worth noting:
 
@@ -392,6 +394,8 @@ Excerpt from a real run (gpt-5.5), experiment 2:
 
 (The offline output is scripted, but the extract → compare → decide → guard → store data flow is exactly the same as in a real run. The offline script copies several behaviors from real runs, such as the 4-way split in session 4 and how group B answers, and it deliberately stages one model mistake in session 3 to demonstrate the guard.)
 
+(The story's "4 months" is a logical clock: before each session the demo sets `now` to that day, and write dates, recency decay, and TTLs are all computed from it, so the demo covers 4 months in a few seconds. It simulates the passage of time, not concurrency: every session and every model call is a real `await`, run one after another.)
+
 ## 4. Exercises
 
 Open [`exercise.py`](exercise.py) and implement three functions:
@@ -407,7 +411,7 @@ make lesson N=18
 # or: .venv/bin/python -m pytest lessons/18_memory_systems -v
 ```
 
-All 14 tests run offline. One integration test plugs your `apply_memory_ops` into `FactMemory` and runs two full sessions with a script standing in for the model. Stuck? Reread §2.4 and §2.5 first, then look at [`solution.py`](solution.py).
+All 15 tests run offline. 14 test your exercises; one integration test plugs your `apply_memory_ops` into `FactMemory` and runs two full sessions with a script standing in for the model (`FactMemory.observe` is async, so the test `await`s it; the three functions you write are pure computation and stay plain functions). The other 1 tests the lesson code itself (the per-user queueing in §2.2) and passes even before you do the exercises. Stuck? Reread §2.4 and §2.5 first, then look at [`solution.py`](solution.py).
 
 ## 5. Going deeper (if you have time)
 
@@ -442,7 +446,7 @@ Mem0's API scopes memories along three dimensions: `user_id`, `agent_id`, and `r
 
 ### 5.5 At scale
 
-- **Asynchronous writes**: 1–2 model calls per message can't sit on the response path. Put them in a queue (Lesson 13) and process each user's writes serially; otherwise two messages reconciling concurrently cause lost updates.
+- **Move writes off the response path**: 1–2 model calls per message add seconds for the user even when they are `await`ed. Put them in a background task queue (Lesson 13) and process each user's writes serially; otherwise two messages reconciling concurrently cause lost updates. This lesson's `FactMemory` serializes per user within one process with a per-user lock (§2.2, proven by a test); across worker processes you need a queue partitioned by user or a database lock (Lesson 26).
 - **Cost**: extraction and decisions can use small models, but monitor their error rates. Sample some writes for review by a larger model or a human.
 - **Metrics**: memories per user, the ADD / UPDATE / DELETE ratio, the fraction of memories ever retrieved (memories that are never retrieved are cleanup candidates), and the number of user corrections (the most direct signal of memory quality).
 

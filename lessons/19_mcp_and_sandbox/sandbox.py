@@ -1,10 +1,11 @@
 """第 19 课：进程级 Python 代码执行沙箱（零依赖）。
 
-    result = run_python("print(sum(range(10)))", SandboxLimits(timeout_s=2))
+    result = await run_python("print(sum(range(10)))", SandboxLimits(timeout_s=2))
     result.stdout, result.exit_code, result.timed_out
 
 它能做到的（每一条都对应一种威胁）：
   - 墙钟超时 + 杀掉整个进程组        → 死循环、sleep、子进程赖着不走
+  - 调用方取消时同样整组杀掉          → Agent 的运行被取消 / 工具层超时后，代码不会在后台接着跑
   - RLIMIT_CPU                       → 纯计算把 CPU 烧满
   - 内存上限                          → 内存炸弹（Linux 用 RLIMIT_AS；macOS 设不上，改为轮询 phys_footprint 兜底）
   - RLIMIT_FSIZE / RLIMIT_NOFILE     → 写满磁盘、耗尽文件描述符
@@ -23,6 +24,7 @@ os_sandbox=True 时，在 macOS 上额外套一层 Seatbelt：拒绝网络、拒
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import ctypes.util
 import functools
@@ -34,7 +36,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Annotated
@@ -155,8 +156,9 @@ def _seatbelt_profile(workdir: str) -> str:
 
 
 # 启动器：一个极小的 Python 程序，先给自己设好 rlimit，再用 execv 把自己"替换"成真正要跑的程序。
-# 为什么不用 subprocess 的 preexec_fn？官方文档明确警告：父进程里有其他线程时（我们有读管道的线程、
-# MCP 客户端的线程），preexec_fn 可能在 fork 出来的子进程里死锁。启动器是全新的单线程进程，没有这个问题；
+# 为什么不用 subprocess 的 preexec_fn？官方文档明确警告：父进程里有其他线程时（事件循环的默认线程池、
+# asyncio 在 3.11 上等待子进程退出用的监视线程、同步工具的线程池），preexec_fn 可能在 fork 出来的子进程里死锁。
+# 启动器是全新的单线程进程，没有这个问题；
 # execv 不换 pid，所以进程组、内存监控都照常工作。rlimit 会跨 exec 继承。
 _LAUNCHER = """
 import json, os, resource, sys
@@ -197,6 +199,11 @@ class _RUsageInfoV2(ctypes.Structure):
     ]
 
 
+@functools.lru_cache(maxsize=None)
+def _libc() -> ctypes.CDLL:
+    return ctypes.CDLL(ctypes.util.find_library("c"))
+
+
 def _memory_mb(pid: int) -> float | None:
     """读子进程当前占用的内存（MB）。
 
@@ -207,7 +214,7 @@ def _memory_mb(pid: int) -> float | None:
     """
     if sys.platform == "darwin":
         try:
-            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            libc = _libc()
             info = _RUsageInfoV2()
             if libc.proc_pid_rusage(pid, 2, ctypes.byref(info)) == 0:  # 2 = RUSAGE_INFO_V2
                 return info.phys_footprint / (1024 * 1024)
@@ -227,25 +234,27 @@ def _memory_mb(pid: int) -> float | None:
         return None
 
 
-def _kill_group(proc: subprocess.Popen) -> None:
+def _kill_group(proc: asyncio.subprocess.Process) -> None:
     """杀掉整个进程组：代码里启动的子进程、孙进程一起杀（前提是启动时 start_new_session=True）。"""
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
-        proc.kill()
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
-class _Collector(threading.Thread):
-    """后台读一个管道，只保留前 cap 字节，后面的读出来直接丢掉（不读的话子进程写满管道会卡住）。"""
+class _Capped:
+    """读一个管道，只保留前 cap 字节，后面的读出来直接丢掉（不读的话子进程写满管道会卡住）。"""
 
-    def __init__(self, stream, cap: int):
-        super().__init__(daemon=True)
-        self.stream, self.cap = stream, cap
+    def __init__(self, cap: int):
+        self.cap = cap
         self.data = bytearray()
         self.total = 0
 
-    def run(self) -> None:
-        for chunk in iter(lambda: self.stream.read1(65536), b""):
+    async def drain(self, stream: asyncio.StreamReader) -> None:
+        while chunk := await stream.read(65536):
             self.total += len(chunk)
             room = self.cap - len(self.data)
             if room > 0:
@@ -258,8 +267,28 @@ def _truncate(text: str, limit: int, total_bytes: int, kept_bytes: int) -> tuple
     return text[:limit] + f"\n...[输出已截断：原始输出约 {total_bytes} 字节]", True
 
 
-def run_python(code: str, limits: SandboxLimits | None = None) -> SandboxResult:
-    """在一次性子进程里执行 code，返回结构化结果。"""
+async def _reap(proc: asyncio.subprocess.Process, exited: asyncio.Task, readers: list[asyncio.Task], notes: list[str]) -> None:
+    """收尾：确认进程已经退出（不留僵尸），读管道的任务读到 EOF。"""
+    if not exited.done():
+        _kill_group(proc)
+    await asyncio.wait({exited})
+    _, pending = await asyncio.wait(readers, timeout=2)  # 有孙进程用 setsid 逃出了进程组、还攥着管道时，别无限等
+    if pending:
+        notes.append("有进程逃出了进程组，仍占着输出管道（进程级沙箱管不住它，容器的 PID namespace 可以）")
+        for t in pending:
+            t.cancel()
+        await asyncio.wait(pending)
+    for t in [exited, *readers]:  # 取走异常：没人取的任务异常会在垃圾回收时报"never retrieved"
+        if not t.cancelled() and t.exception() is not None:
+            notes.append(f"收尾时读到异常：{t.exception()!r}")
+
+
+async def run_python(code: str, limits: SandboxLimits | None = None) -> SandboxResult:
+    """在一次性子进程里执行 code，返回结构化结果。
+
+    async：等子进程的这段时间让出事件循环。调用方被取消（Agent 的运行被取消、工具层超时、用户断开）时，
+    立刻杀掉整个进程组再把取消传出去 —— 不用等墙钟超时，也不会留下没人管的子进程。
+    """
     limits = limits or SandboxLimits()
     notes: list[str] = []
     workdir = tempfile.mkdtemp(prefix="agent-sandbox-")
@@ -267,7 +296,7 @@ def run_python(code: str, limits: SandboxLimits | None = None) -> SandboxResult:
         with open(os.path.join(workdir, "main.py"), "w", encoding="utf-8") as f:
             f.write(code)
 
-        use_as = rlimit_as_works(limits.memory_mb)
+        use_as = await asyncio.to_thread(rlimit_as_works, limits.memory_mb)  # 第一次要起一个子进程探测：放进线程，不卡事件循环
         watch_memory = not use_as
         notes.append("内存：RLIMIT_AS（内核强制）" if use_as else "内存：RLIMIT_AS 在本平台设不上，改为轮询内存占用兜底（有竞态窗口）")
         use_cpu = rlimit_cpu_reliable()
@@ -289,44 +318,44 @@ def run_python(code: str, limits: SandboxLimits | None = None) -> SandboxResult:
         # 最小环境变量：不继承父进程的 LLM_API_KEY、云凭证等；HOME 指向临时目录
         env = {"PATH": "/usr/bin:/bin", "HOME": workdir, "TMPDIR": workdir}
         start = time.monotonic()
-        proc = subprocess.Popen(
-            cmd,
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
             cwd=workdir,
             env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,  # 新会话 = 新进程组，超时时可以整组杀掉
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,  # 新会话 = 新进程组，超时或被取消时可以整组杀掉
         )
         cap = limits.max_output_chars * 4 + 16  # UTF-8 一个字符最多 4 字节
-        out_c, err_c = _Collector(proc.stdout, cap), _Collector(proc.stderr, cap)
-        out_c.start()
-        err_c.start()
+        out_c, err_c = _Capped(cap), _Capped(cap)
+        readers = [asyncio.create_task(out_c.drain(proc.stdout)), asyncio.create_task(err_c.drain(proc.stderr))]
+        exited = asyncio.create_task(proc.wait())
 
         killed_reason = None
-        while proc.poll() is None:
-            elapsed = time.monotonic() - start
-            if elapsed > limits.timeout_s:
-                killed_reason = "timeout"
-                _kill_group(proc)
-                break
-            if watch_memory:
-                used = _memory_mb(proc.pid)
-                if used is not None and used > limits.memory_mb:
-                    killed_reason = "memory"
-                    notes.append(f"被杀时内存占用 ≈ {used:.0f} MB（上限 {limits.memory_mb} MB）")
+        try:
+            while not exited.done():
+                if time.monotonic() - start > limits.timeout_s:
+                    killed_reason = "timeout"
                     _kill_group(proc)
                     break
-            try:
-                proc.wait(timeout=0.02)  # 轮询间隔：越短越及时；两次轮询之间分配的内存就是"竞态窗口"
-            except subprocess.TimeoutExpired:
-                pass
-        exit_code = proc.wait()
+                if watch_memory:
+                    used = _memory_mb(proc.pid)
+                    if used is not None and used > limits.memory_mb:
+                        killed_reason = "memory"
+                        notes.append(f"被杀时内存占用 ≈ {used:.0f} MB（上限 {limits.memory_mb} MB）")
+                        _kill_group(proc)
+                        break
+                # 轮询间隔：越短越及时；两次轮询之间分配的内存就是"竞态窗口"。asyncio.wait 超时不会取消 exited
+                await asyncio.wait({exited}, timeout=0.02)
+        except BaseException:
+            _kill_group(proc)  # 被取消（或出了别的错）：先杀整个进程组，再往外传
+            raise
+        finally:
+            # shield：收尾本身不能被再次取消打断，否则可能留下僵尸进程和悬空的读管道任务
+            await asyncio.shield(asyncio.ensure_future(_reap(proc, exited, readers, notes)))
+        exit_code = exited.result()
         duration = time.monotonic() - start
-        for c in (out_c, err_c):
-            c.join(timeout=2)  # 有孙进程用 setsid 逃出了进程组、还攥着管道时，别无限等
-            if c.is_alive():
-                notes.append("有进程逃出了进程组，仍占着输出管道（进程级沙箱管不住它，容器的 PID namespace 可以）")
         if killed_reason is None and exit_code == -getattr(signal, "SIGXCPU", 0):
             killed_reason = "cpu"
 
@@ -356,9 +385,10 @@ def make_run_python_tool(limits: SandboxLimits | None = None) -> Tool:
         f"只有标准库可用。结果必须用 print() 输出。"
     )
 
-    def run_python_code(code: Annotated[str, Field(description="要执行的完整 Python 3 程序")]) -> str:
-        return run_python(code, limits).summary()
+    async def run_python_code(code: Annotated[str, Field(description="要执行的完整 Python 3 程序")]) -> str:
+        return (await run_python(code, limits)).summary()
 
+    # async 工具：Agent 的运行被取消、或工具层超时，run_python 会被取消，进程组立刻被杀。
     # 工具层超时要比沙箱超时长：让沙箱自己先杀进程、返回结构化结果，而不是被工具层"放弃等待"
     return Tool(
         run_python_code,

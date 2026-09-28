@@ -11,9 +11,9 @@ import re
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
-from agentkit.tools import ToolRegistry
+from agentkit.tools import ToolRegistry, maybe_await
 from agentkit.tracing import Tracer
 from agentkit.types import Message, calls_in, tool_message
 from agentkit.workflows import extract_json
@@ -98,7 +98,7 @@ class MemoryCheckpointer:
         return [Checkpoint(**json.loads(r)) for r in reversed(self._data.get(thread_id, []))]
 
 
-Node = Callable[[dict], "dict | None"]
+Node = Callable[[dict], "dict | None | Awaitable[dict | None]"]  # 普通函数或 async 函数都行
 Router = Callable[[dict], str]
 
 
@@ -163,18 +163,19 @@ class CompiledGraph:
         self.tracer = tracer
 
     # ---------------------------------------------------------------- 公共 API（已给出）
-    def invoke(self, inputs: dict, thread_id: str = "default") -> dict:
+    # invoke / resume 是 async 的（对应 LangGraph 的 ainvoke）：节点可能要等模型、等工具
+    async def invoke(self, inputs: dict, thread_id: str = "default") -> dict:
         state = json.loads(json.dumps(inputs, ensure_ascii=False))  # 复制一份，同时确认输入可序列化
         cp = Checkpoint(thread_id=thread_id, step=0, next=self.graph.entry, state=state, status="running")
         self.checkpointer.put(cp)  # 第 0 个检查点：输入本身
-        return self._run(cp)
+        return await self._run(cp)
 
-    def resume(self, thread_id: str, value: Any) -> dict:
+    async def resume(self, thread_id: str, value: Any) -> dict:
         cp = self.checkpointer.latest(thread_id)
         if cp is None or cp.status != "interrupted":
             raise ValueError(f"thread {thread_id!r} 当前没有被中断，不能 resume")
         cp = replace(cp, status="running", interrupt=None, resume_values=cp.resume_values + [value])
-        return self._run(cp)
+        return await self._run(cp)
 
     def get_state(self, thread_id: str) -> Checkpoint | None:
         return self.checkpointer.latest(thread_id)
@@ -183,12 +184,16 @@ class CompiledGraph:
         return self.checkpointer.history(thread_id)
 
     # ---------------------------------------------------------------- 已给出：执行一个节点
-    def _call_node(self, name: str, state: dict, resume_values: list) -> dict:
-        """执行节点：传入状态的深拷贝（节点只能靠"返回更新"改状态），并把恢复值放进 contextvar 给 interrupt() 用。"""
+    async def _call_node(self, name: str, state: dict, resume_values: list) -> dict:
+        """执行节点：传入状态的深拷贝（节点只能靠"返回更新"改状态），并把恢复值放进 contextvar 给 interrupt() 用。
+
+        节点可以是普通函数（纯计算，如路由、审批判断），也可以是 async 函数（要 await 模型或工具）：
+        maybe_await 两种都接得住。contextvar 在同一个任务里跨 await 仍然有效，所以 async 节点里也能调 interrupt()。
+        """
         token = _resume.set(_ResumeCursor(list(resume_values)))
         try:
             with self.tracer.span(f"node.{name}") if self.tracer else nullcontext():
-                update = self.graph.nodes[name](copy.deepcopy(state))
+                update = await maybe_await(self.graph.nodes[name](copy.deepcopy(state)))
         finally:
             _resume.reset(token)
         if update is None:
@@ -220,14 +225,14 @@ class CompiledGraph:
         return key
 
     # ---------------------------------------------------------------- TODO (a4)
-    def _run(self, cp: Checkpoint) -> dict:
+    async def _run(self, cp: Checkpoint) -> dict:
         thread_id, state, node, step = cp.thread_id, cp.state, cp.next, cp.step
         resume_values = list(cp.resume_values)
         while node != END:
             if step >= self.max_steps:
                 raise GraphRecursionError(f"执行了 {step} 个节点仍未到达 END（max_steps={self.max_steps}），下一个节点是 {node!r}")
             try:
-                update = self._call_node(node, state, resume_values)
+                update = await self._call_node(node, state, resume_values)
             except GraphInterrupt as e:
                 self.checkpointer.put(
                     Checkpoint(thread_id, step, node, state, "interrupted", interrupt=e.payload, resume_values=resume_values)
@@ -251,10 +256,11 @@ def build_agent_graph(llm, registry: ToolRegistry, needs_approval: set[str], *, 
 
     llm 是任何 agentkit LLM（测试里用 ScriptedLLM），工具由 agentkit 的 ToolRegistry 执行（校验、超时、截断都还在）。
     输入状态：{"messages": [system, user], "decisions": {}}。
+    agent、tools 两个节点要 await 模型和工具，是 async 函数；approval 只读状态、调 interrupt()，是普通函数。
     """
 
-    def agent(state: dict) -> dict:
-        response = llm.chat(state["messages"], tools=registry.schemas() or None)
+    async def agent(state: dict) -> dict:
+        response = await llm.chat(state["messages"], tools=registry.schemas() or None)
         return {"messages": [response.to_message()]}
 
     def approval(state: dict) -> dict:
@@ -264,11 +270,11 @@ def build_agent_graph(llm, registry: ToolRegistry, needs_approval: set[str], *, 
                 decisions[call.id] = bool(interrupt({"tool": call.name, "arguments": call.parsed_args()}))
         return {"decisions": decisions}
 
-    def tools(state: dict) -> dict:
+    async def tools(state: dict) -> dict:
         decisions = state.get("decisions") or {}
         out = []
         for call in calls_in(state["messages"][-1]):
-            content = REJECTED if decisions.get(call.id, True) is False else registry.execute(call).content
+            content = REJECTED if decisions.get(call.id, True) is False else (await registry.execute(call)).content
             out.append(tool_message(call.id, content))
         return {"messages": out}
 
@@ -446,6 +452,7 @@ class Predict:
     """最简单的"模块"：Signature + 一种调用策略（调一次模型，解析失败就把错误反馈回去重试）。
 
     DSPy 的 ChainOfThought / ReAct 本质上也是"同一个 Signature + 不同的调用策略"。
+    调用是 async 的：pred = await Predict(sig, llm)(question=...)（DSPy 3 里对应 await module.acall(...)）。
     """
 
     def __init__(self, signature: Signature, llm, max_repairs: int = 1):
@@ -453,11 +460,11 @@ class Predict:
         self.llm = llm
         self.max_repairs = max_repairs
 
-    def __call__(self, **inputs: Any) -> Prediction:
+    async def __call__(self, **inputs: Any) -> Prediction:
         messages = self.signature.to_messages(**inputs)
         last_error = ""
         for _ in range(self.max_repairs + 1):
-            text = self.llm.chat(messages).content or ""
+            text = (await self.llm.chat(messages)).content or ""
             try:
                 return Prediction(self.signature.parse_output(text))
             except ValueError as e:

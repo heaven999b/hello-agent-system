@@ -7,10 +7,12 @@
   A. 官方 SDK 客户端  →  我们手写的 mcp_server.py（auto 模式走现代版，legacy 模式走 initialize 握手）
   B. 我们手写的客户端 →  官方 SDK 写的服务器（本文件加 --serve 参数运行）
 官方 SDK 用的是 2.x 版本的 API（1.x 里的 FastMCP 在 2.x 改名为 MCPServer）。
+两边都是 async：官方客户端基于 anyio（在 asyncio 上运行），我们的客户端直接用 asyncio，所以 A、B 在同一个事件循环里跑。
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -41,13 +43,12 @@ def serve_with_sdk() -> None:
     server.run("stdio")
 
 
-def run_comparison(out=print) -> bool:
+async def run_comparison(out=print) -> bool:
     """跑 A、B 两个方向的互通验证。没装官方 SDK 时返回 False。"""
     if not sdk_available():
         out("  （没有安装官方 mcp SDK，跳过。想看对照：pip install \"mcp>=2.2\"）")
         return False
     try:
-        import anyio
         from mcp import Client, StdioServerParameters
     except ImportError as e:  # 比如装的是 1.x：没有 mcp.Client
         out(f"  （已安装的 mcp SDK 版本不兼容本对照（需要 2.x）：{e}，跳过）")
@@ -68,15 +69,15 @@ def run_comparison(out=print) -> bool:
             out(f"      业务错误 isError={bad.is_error}：{bad.content[0].text[:40]}…")
 
     for mode in ("auto", "legacy"):
-        anyio.run(sdk_client_to_our_server, mode)
+        await sdk_client_to_our_server(mode)
 
     # B：我们的客户端连官方 SDK 服务器
     spec = importlib.util.spec_from_file_location(f"{HERE.name}__mcp_client", HERE / "mcp_client.py")
     mcp_client = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mcp_client)
-    with mcp_client.StdioMCPClient([sys.executable, str(__file__), "--serve"]) as c:
-        tools = c.list_tools()
-        result = c.call_tool("get_travel_policy", {"city": "上海"})
+    async with mcp_client.StdioMCPClient([sys.executable, str(__file__), "--serve"]) as c:
+        tools = await c.list_tools()
+        result = await c.call_tool("get_travel_policy", {"city": "上海"})
         out(f"  [B] 手写客户端 → 官方服务器 {c.server_info.get('name')}：era={c.era}，版本 {c.protocol_version}")
         out(f"      工具 {[t['name'] for t in tools]}，注解 {tools[0].get('annotations')}")
         out(f"      调用结果：{' '.join(mcp_client.result_to_text(result).split())}")
@@ -87,4 +88,4 @@ if __name__ == "__main__":
     if "--serve" in sys.argv:
         serve_with_sdk()
     else:
-        run_comparison()
+        asyncio.run(run_comparison())

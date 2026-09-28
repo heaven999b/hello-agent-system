@@ -16,7 +16,7 @@ So far in this course you have been driving stick: how messages are assembled, w
 
 This lesson puts four implementations side by side on one concrete task: **the same IT help-desk question, the same tools, and the same operation that needs human approval**, built with agentkit, DSPy, LangGraph, and the OpenAI Agents SDK, all running for real against the same local model gateway. You will see things you would never guess without reading the source:
 
-- DSPy's ReAct **does not use the model's native tool calling at all**. Tool descriptions are written into the prompt, and on the same task it uses 2–3 times as many input tokens as the other three.
+- DSPy's ReAct **does not use the model's native tool calling at all**. Tool descriptions are written into the prompt, and on the same task it uses 1.4–3.5 times as many input tokens as the other three.
 - When LangGraph resumes after an approval, the approval node **runs again from the top**. That is by design, not a bug — and if you get it wrong, you charge the customer twice.
 - The OpenAI Agents SDK's tracing is **on by default and uploads to OpenAI**. If you point it at a local gateway and do nothing, your conversation data will try to leave the building.
 - Write "high risk, requires approval" in a tool description and the model may **simply refuse to call the tool**, so the approval flow never fires.
@@ -58,7 +58,7 @@ The spectrum makes it tempting to read DSPy as "a more advanced LangGraph". In f
 | **LangGraph** | ✅ Core strength: graph + checkpoints + interrupt | ❌ You write every prompt |
 | **OpenAI Agents SDK** | ✅ Runner owns the loop, approvals, handoffs | ⚪ Only `instructions`; assembly is fixed |
 | **DSPy** | ⚪ Modules like ReAct carry a simple loop; no pause/resume | ✅ Core strength: signature → prompt, plus automatic optimization |
-| **agentkit** | ✅ Your hand-written `Agent._loop` + checkpoints | ❌ Your hand-written system prompt |
+| **agentkit** | ✅ Your hand-written `Agent._loop_body` + checkpoints | ❌ Your hand-written system prompt |
 
 So they **compose**: LangGraph runs the workflow and approvals, and one of its nodes calls a DSPy program for classification or extraction. That is a common setup.
 
@@ -79,7 +79,7 @@ flowchart LR
     M --> ANS["Answer in Chinese + cite KB IDs"]
 ```
 
-Five comparison dimensions, written out with the same headings at the top of all four implementation files so you can read them side by side: **how state is represented, how tools are declared, where the loop lives, how checkpoints and interrupts work, how tracing hooks in**.
+Six comparison dimensions, written out with the same headings at the top of all four implementation files so you can read them side by side: **how state is represented, how tools are declared, where the loop lives, how checkpoints and interrupts work, how tracing hooks in, sync or async**. All four implementations' `run()` are `async def`, each using its framework's async entry point: agentkit's `await agent.run(...)`, DSPy's `await agent.acall(...)`, LangGraph's `await graph.ainvoke(...)`, and the OpenAI Agents SDK's `await Runner.run(...)`.
 
 ### 1.4 Concept map
 
@@ -88,12 +88,12 @@ This table is the data source for exercise (c) (`map_concept` parses the Chinese
 <!-- concept-map:start -->
 | agentkit | DSPy | LangGraph | OpenAI Agents SDK |
 |---|---|---|---|
-| `Agent` / `Agent.run` | `dspy.ReAct(signature, tools)`; calling the module runs it | `StateGraph(...).compile()`, `graph.invoke(inputs, config)` | `Agent(...)` + `Runner.run(agent, input)` |
+| `Agent` / `Agent.run` | `dspy.ReAct(signature, tools)`; calling the module runs it; async entry point `await module.acall(...)` | `StateGraph(...).compile()`, `graph.invoke(inputs, config)`; async version `await graph.ainvoke(...)` | `Agent(...)` + `await Runner.run(agent, input)` (`Runner.run_sync` is a sync wrapper) |
 | `max_steps` | `ReAct(max_iters=20)` (default 20); on reaching it, stops and extracts an answer | `recursion_limit` (default 1000, counted in super-steps); exceeding it raises `GraphRecursionError` | `max_turns` (default 10); exceeding it raises `MaxTurnsExceeded` |
 | `@tool` / `Tool` | Plain functions or `dspy.Tool`; descriptions go into the prompt, no native function calling | `langchain_core.tools.tool` + `model.bind_tools()`; execute with `ToolNode` or your own node | `@function_tool` (strict JSON Schema; the docstring's Args section becomes parameter descriptions) |
 | `ToolContext` | No equivalent; inject via closures | Nodes declare a `runtime` parameter and read `runtime.context` (`StateGraph(State, context_schema=...)`) | `RunContextWrapper`, passed via `Runner.run(context=...)`, never sent to the model |
 | `RunState` / `Checkpointer` | No runtime checkpoints (`program.save()` stores optimized instructions and demos, not run state) | A checkpointer (`InMemorySaver` / `PostgresSaver`) + `thread_id`; one checkpoint per super-step | `RunState` (`to_string()` / `from_string()`); multi-turn history goes in a `Session` |
-| `PauseRun` / `approve` / `PermissionPolicy` | No pause mechanism; ask the approver synchronously inside the tool | `interrupt(payload)` in a node; resume with `invoke(Command(resume=...), config)`; the node re-runs from the top | `needs_approval=True` on the tool → `result.interruptions` → `state.approve()` / `state.reject()` → `Runner.run(agent, state)` |
+| `PauseRun` / `approve` / `PermissionPolicy` | No pause mechanism; wait for the approver's answer right there inside the tool | `interrupt(payload)` in a node; resume with `ainvoke(Command(resume=...), config)` (sync version `invoke`); the node re-runs from the top | `needs_approval=True` on the tool → `result.interruptions` → `state.approve()` / `state.reject()` → `Runner.run(agent, state)` |
 | `Hook` | `BaseCallback` (`on_lm_start` / `on_tool_start`, etc.; mainly for observation) | Nodes and edges are the insertion points; LangChain v1's `create_agent` uses `AgentMiddleware` | `RunHooks` / `AgentHooks` (mostly observational) |
 | `InputGuard` / `OutputGuard` | No built-in guardrails; `dspy.BestOfN` can retry against a reward function | None built in; write a node or use LangChain middleware (e.g. `PIIMiddleware`) | `@input_guardrail` / `@output_guardrail` (tripwires); tool-level `@tool_input_guardrail` |
 | `Tracer` / `Span` | `lm.history`, `dspy.inspect_history()`, `BaseCallback`, MLflow's `mlflow.dspy.autolog()` | Replay checkpoints with `get_state_history()`; online tracing via LangSmith (`LANGSMITH_TRACING=true`) | Built-in tracing, uploads to OpenAI by default; replace with `set_trace_processors()`, disable with `set_tracing_disabled(True)` |
@@ -103,7 +103,10 @@ This table is the data source for exercise (c) (`map_concept` parses the Chinese
 | `SlidingWindow` / `SummarizingCompactor` | ReAct drops the oldest trajectory step when the context overflows (`truncate_trajectory`) | `trim_messages`; LangChain `SummarizationMiddleware` | `OpenAIResponsesCompactionSession`; a handoff's `input_filter` |
 | `agent_as_tool` | Module composition: call submodules in `forward()` | A subgraph as a node, or call a sub-agent inside a tool | `agent.as_tool()`; transfer control with `handoffs=[...]` |
 | `workflows` | A custom `dspy.Module` with plain Python control flow in `forward()` | Nodes + conditional edges; `Send` for dynamic fan-out | Code-driven orchestration (`asyncio.gather`) or LLM-driven (handoff / `as_tool`) |
+| `parallel_tools` (read-only tools from one turn run concurrently) | None: ReAct picks one tool per turn; run several modules in parallel with `dspy.Parallel` | Multiple nodes triggered in the same super-step run concurrently | All function tool calls from one turn run concurrently by default (cap it with `RunConfig(tool_execution=ToolExecutionConfig(max_function_tool_concurrency=...))`) |
 <!-- concept-map:end -->
+
+Every agentkit API in the table is async: `await agent.run(...)`, `await agent.approve(...)`, and tools may be `async def`. Of the four, only agentkit has no sync entry point at all (Lesson 02 explains why).
 
 For a fuller comparison (including Claude Agent SDK, Google ADK, CrewAI, Microsoft Agent Framework, and Temporal), see [agentkit concepts ↔ mainstream frameworks](../../docs/framework-comparison.en.md).
 
@@ -139,7 +142,7 @@ Why not let the model pass a `username`? As Lesson 03 put it: letting the model 
 
 ### 2.2 Baseline: the agentkit version
 
-[`impl_agentkit.py`](impl_agentkit.py) is what you built by hand in the earlier lessons — 64 effective lines of code:
+[`impl_agentkit.py`](impl_agentkit.py) is what you built by hand in the earlier lessons — 65 effective lines of code:
 
 ```python
 tools = [
@@ -150,20 +153,21 @@ tools = [
 agent = Agent(llm, tools, system_prompt=shared.SYSTEM_PROMPT, max_steps=8,
               hooks=[PermissionPolicy(ask_risks={"dangerous"})], tracer=Tracer())
 
-result = agent.run(question, metadata={"user_id": desk.user_id})
+result = await agent.run(question, metadata={"user_id": desk.user_id})
 while result.status == "paused":                     # state is persisted; the process may exit
     call = result.pending_approval
     ok = approver(call.name, call.parsed_args())
-    result = agent.approve(result.run_id, ok, by="demo-approver")
+    result = await agent.approve(result.run_id, ok, by="demo-approver")
 ```
 
 | Dimension | How agentkit does it |
 |---|---|
 | State | `RunState`: messages, step count, usage, pending call, approval log — saved to a `Checkpointer` at every step |
 | Tools | `@tool` generates the JSON Schema from type hints; `risk` marks the risk level |
-| Loop | `Agent._loop`: `while step < max_steps` → call the model → run tools → stop when there are no tool calls |
+| Loop | `Agent._loop_body`: `while step < max_steps` → call the model → run tools → stop when there are no tool calls |
 | Checkpoint / interrupt | `PermissionPolicy.before_tool` raises `PauseRun` → persisted → `approve()` resumes from the checkpoint |
 | Tracing | `Tracer`: nested `agent.run` / `llm.chat` / `tool.*` spans |
+| Sync / async | Async only: `await agent.run()`; read-only tools from one turn run concurrently with `asyncio.gather`, and if any tool writes they run in order |
 
 Keep this table in mind; the three frameworks below are all compared against it.
 
@@ -179,8 +183,8 @@ class ITHelpdesk(dspy.Signature):
 
 lm = dspy.LM(f"openai/{model}", api_base=base_url, api_key=api_key, cache=False)
 agent = dspy.ReAct(ITHelpdesk, tools=[dspy.Tool(f) for f in ...], max_iters=8)
-with dspy.context(lm=lm, callbacks=[counter]):
-    pred = agent(question=question)
+with dspy.context(lm=lm, callbacks=[counter]):   # built on contextvars, so it's safe in async code too
+    pred = await agent.acall(question=question)  # async entry point; the sync form is agent(question=question)
 ```
 
 You did not write a single word of prompt. So what does the model receive? The system message in `lm.history[0]` (excerpt from a real run; the Chinese parts are the lesson's own instructions and tool docstrings, translated here):
@@ -209,10 +213,11 @@ That is what DSPy "hides" — and also its entire value:
 | State | No run-state object; ReAct concatenates thought / tool_name / tool_args / observation into a `trajectory` string field | Nothing serializable that represents "half-way through a run" |
 | Tools | Function signatures and docstrings are **written into the prompt**; the model picks a tool "in text" via the `next_tool_name` and `next_tool_args` output fields | No native function calling (ChatAdapter defaults to `use_native_function_calling=False`); one tool per turn |
 | Loop | `ReAct.forward`: up to `max_iters` turns; stops when the model picks the built-in `finish` tool; **then one more `ChainOfThought` call extracts the answer from the trajectory** | Always one extra model call |
-| Checkpoint / interrupt | None. Approval can only happen **synchronously** inside the tool (this lesson wraps it with `with_approval`), like agentkit's synchronous `approver=` mode | If the approver doesn't answer, the whole program blocks; a restart loses everything |
+| Checkpoint / interrupt | None. Approval can only **wait right there** inside the tool for the approver's answer (this lesson wraps it with `with_approval`), like agentkit's `PermissionPolicy(approver=...)` rather than a persisted `PauseRun` pause | If the approver doesn't answer, the run just stays stuck there; a restart loses everything |
 | Tracing | `lm.history` (messages, usage, cost), `dspy.inspect_history()`, `BaseCallback`, MLflow | This lesson counts events with a `BaseCallback` |
+| Sync / async | Calling a module directly is sync; `await module.acall()` is the async entry point (used here) | On the async path, sync tool functions run directly on the event loop, not in a thread pool: write slow tools as `async def` (this lesson's approval wrapper is async) |
 
-In real runs the DSPy version made **4 model calls and used about 5,200 input tokens** all three times, while the other three made 2–3 calls with 1,500–2,700 input tokens; it also took 60% to 120% longer. What you get in exchange: the prompt becomes a "parameter" a program can rewrite.
+In real runs the DSPy version made **4 model calls and used about 5,200 input tokens** all four times, while the other three made 2–4 calls with 1,500–3,600 input tokens; it usually took longer, too. What you get in exchange: the prompt becomes a "parameter" a program can rewrite.
 
 **Two details for connecting to the gateway:**
 - The `"openai/<model name>"` prefix means "call it with the OpenAI-compatible protocol"; `api_base` points at the local gateway. Starting with DSPy 3.4.0 (released 2026-09-25), `dspy.LM` defaults to `engine="auto"`: it uses its new native engine, lm15, when it can and falls back to LiteLLM otherwise. On our local gateway, `auto` picked lm15; setting `DSPY_ENGINE=litellm` (which `impl_dspy.py` reads) to force LiteLLM also works. Many tutorials say "DSPy calls models through LiteLLM" — since 3.4 that is no longer the whole story.
@@ -246,7 +251,7 @@ class HelpdeskState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]  # reducer: append instead of overwrite
     decisions: dict[str, bool]                           # no reducer: last write wins
 
-def approval(state):
+async def approval(state):                          # nodes may be async def (the agent and tools nodes await the model and tools)
     # This node re-runs from the top on resume: only read state and call interrupt, no side effects
     decisions = dict(state.get("decisions") or {})
     for call in state["messages"][-1].tool_calls:
@@ -262,10 +267,10 @@ builder.add_edge("approval", "tools")
 builder.add_edge("tools", "agent")                # back edge: this *is* the agent loop
 graph = builder.compile(checkpointer=InMemorySaver())
 
-result = graph.invoke(inputs, {"configurable": {"thread_id": tid}, "recursion_limit": 25})
+result = await graph.ainvoke(inputs, {"configurable": {"thread_id": tid}, "recursion_limit": 25})
 while result.get("__interrupt__"):
     ok = approver(...)
-    result = graph.invoke(Command(resume=ok), config)   # resume on the same thread_id
+    result = await graph.ainvoke(Command(resume=ok), config)   # resume on the same thread_id
 ```
 
 | Dimension | How LangGraph does it | Difference from agentkit |
@@ -275,8 +280,9 @@ while result.get("__interrupt__"):
 | Loop | The back edge `tools → agent`; `recursion_limit` (default 1000) caps super-steps | It caps super-steps, not model calls |
 | Checkpoint / interrupt | Per the official docs, a checkpointer saves a state snapshot at **every super-step**; `interrupt()` pauses, `Command(resume=...)` resumes | **On resume, the interrupted node re-runs from the top** |
 | Tracing | `get_state_history(config)` (newest first) is a replayable execution record; LangSmith for online tracing | Checkpoints double as the execution log |
+| Sync / async | Two entry points, `invoke` / `ainvoke`; nodes may be `async def`; multiple nodes in the same super-step run concurrently | Under `ainvoke`, sync nodes run in a thread pool (thread name `asyncio_0` in a test here); the same goes for a tool's `ainvoke` |
 
-**Why make approval its own node?** Because the official docs say it plainly: on resume the node executes again from the beginning, so the code before `interrupt()` runs twice. Real run output (demo output translated from Chinese):
+**Why make approval its own node?** Because the official docs say it plainly: on resume the node executes again from the beginning, so the code before `interrupt()` runs twice. Real run output (re-run on 2026-09-28 after switching to `ainvoke`; the numbers are unchanged; demo output translated from Chinese):
 
 ```text
   · 9 checkpoints (one per super-step; get_state_history can replay each one)
@@ -319,6 +325,7 @@ while result.interruptions:
 | Loop | `Runner.run(..., max_turns=10)`; exceeding it raises `MaxTurnsExceeded` | Nearly one-to-one |
 | Checkpoint / interrupt | `result.interruptions` → `to_state()` → `approve()` / `reject()` → `Runner.run(agent, state)` | Tools that don't need approval **run before the pause**; only the one awaiting approval is held back |
 | Tracing | Built in, **on by default and uploads to OpenAI**; replace with `set_trace_processors()`, disable with `set_tracing_disabled(True)` | agentkit keeps traces in memory by default |
+| Sync / async | Async-native: `await Runner.run()`; multiple function tools from one turn run concurrently | The closest to agentkit; `Runner.run_sync` is only a wrapper and can't be used where an event loop is already running (async functions, FastAPI, Jupyter) |
 
 **Two details for connecting to the gateway:**
 - By default the SDK uses `OpenAIResponsesModel`, which calls `/responses`; the official docs warn that many third-party providers don't support it and you may see 404s. Our gateway actually supports both, but for portability (common gateways such as vLLM, DeepSeek, and Qwen mostly offer only Chat Completions) we use `OpenAIChatCompletionsModel` explicitly. The alternative is a global `set_default_openai_api("chat_completions")`.
@@ -336,21 +343,22 @@ Two details you only notice in real data (demo output translated from Chinese):
 
 Handoffs, guardrails, and sessions aren't needed for this task; their agentkit mappings are in the concept map in 1.4: a handoff ≈ the "control transfers" version of `agent_as_tool`; `@input_guardrail` / `@output_guardrail` ≈ `InputGuard` / `OutputGuard` (note that input guardrails only apply to the first agent in the chain; see [framework comparison 2.5](../../docs/framework-comparison.en.md#25-guardrails-agentkit-inputguard--tooloutputguard--outputguard)).
 
-### 2.6 All five dimensions side by side
+### 2.6 All six dimensions side by side
 
 | | agentkit | DSPy | LangGraph | OpenAI Agents SDK |
 |---|---|---|---|---|
 | **State** | `RunState` (you define it) | A trajectory string; no run-state object | `TypedDict` + reducers | `RunState` + `Session` |
 | **Tools** | `@tool` + `risk` | Functions → written into the prompt | `tool()` + `bind_tools()` | `@function_tool` + `needs_approval` |
-| **Where the loop lives** | The `while` in `Agent._loop` | The `for` in `ReAct.forward` + an extraction step | The graph's back edge `tools → agent` | Inside `Runner.run` |
-| **Checkpoint / interrupt** | Persisted every step; `PauseRun` → `approve()` | None; synchronous approval only | A checkpoint per super-step; `interrupt()` → `Command(resume=)`, node re-runs | `interruptions` → `to_state()` → `approve()` |
+| **Where the loop lives** | The `while` in `Agent._loop_body` | The `for` in `ReAct.forward` + an extraction step | The graph's back edge `tools → agent` | Inside `Runner.run` |
+| **Checkpoint / interrupt** | Persisted every step; `PauseRun` → `approve()` | None; the tool can only wait for the approver in place | A checkpoint per super-step; `interrupt()` → `Command(resume=)`, node re-runs | `interruptions` → `to_state()` → `approve()` |
 | **Tracing** | `Tracer`, in memory by default | `lm.history` / callbacks / MLflow | Checkpoint history / LangSmith | Built in, uploads to OpenAI by default |
+| **Sync / async** | Async only | Mostly sync; `acall` is the async entry point | Both `invoke` and `ainvoke` | Async-native; `run_sync` is a wrapper |
 | **Good for** | Learning the principles; full control | Prompts that must be optimized against data and models; classification, extraction, RAG pipelines | Complex stateful flows, long waits, replay | The fewest abstractions, shipping fast |
 | **Cost** | You write everything | Invisible prompts, more tokens, no pause/resume | Heavy mental model (super-steps, reducers, re-run semantics) | Defaults lean toward the OpenAI platform (Responses API, trace upload) |
 
 ### 2.7 A framework's core is smaller than you think
 
-What is LangGraph's core? A loop of "run a node → merge state → pick the next edge → save a checkpoint", plus an `interrupt` that "pauses by raising and re-runs the node with a resume value". Exercise (a) has you write that in under 60 lines, then combine it with agentkit's `LLM` and `ToolRegistry` to build an approval agent with the same shape as `impl_langgraph.py` — without a single line of framework code. After that, words like "super-step", "reducer", and "node re-run" in the LangGraph docs stop being abstract.
+What is LangGraph's core? A loop of "run a node → merge state → pick the next edge → save a checkpoint", plus an `interrupt` that "pauses by raising and re-runs the node with a resume value". Exercise (a) has you write that in under 60 lines, then combine it with agentkit's `LLM` and `ToolRegistry` to build an approval agent with the same shape as `impl_langgraph.py` — without a single line of framework code. It is async too: `await graph.invoke(...)` corresponds to LangGraph's `ainvoke`, and nodes may be plain functions or `async def` (the `agent` and `tools` nodes await the model and tools). `interrupt()` finds its resume value through a contextvar, and a contextvar stays valid across `await`s within the same task, so async nodes can pause too. After that, words like "super-step", "reducer", and "node re-run" in the LangGraph docs stop being abstract.
 
 Exercise (b) is the same idea: the core of a DSPy signature is "field declarations → prompt text → parse JSON back into a structure", plus "instructions and demos are replaceable parameters".
 
@@ -360,7 +368,7 @@ Exercise (b) is the same idea: the core of a DSPy signature is "field declaratio
 # Offline (runs in CI): only the agentkit version (ScriptedLLM script); other frameworks print instructions
 .venv/bin/python lessons/20_frameworks_bridge/demo.py --offline
 
-# Real model: install the frameworks, then run all four in sequence (serially, no concurrency)
+# Real model: install the frameworks, then run all four in sequence (serially: running them at once would compete for the gateway and make the timings incomparable)
 .venv/bin/pip install dspy langgraph langchain-openai openai-agents
 .venv/bin/python lessons/20_frameworks_bridge/demo.py
 .venv/bin/python lessons/20_frameworks_bridge/demo.py --only dspy,langgraph   # run some frameworks only
@@ -379,7 +387,7 @@ If a framework isn't installed, the demo skips it and prints the install command
 | `openai-agents` | 0.22.3 |
 | `openai` | 3.19.2 (shared by all four implementations) |
 
-Comparison tables from two full real-model runs (local gateway, gpt-5.5; excerpt of section 5 of the output; demo output translated from Chinese):
+Comparison tables from three full real-model runs (local gateway, gpt-5.5; excerpt of section 5 of the output; demo output translated from Chinese). The first two ran with agentkit 0.1.0 (the sync version); run 3 ran on 2026-09-28 after all four `run()` functions switched to async entry points (effective line counts changed with it: the DSPy version gained 4 lines, mostly the async approval wrapper):
 
 ```text
 # Run 1
@@ -394,13 +402,18 @@ Comparison tables from two full real-model runs (local gateway, gpt-5.5; excerpt
   DSPy               3.4.0    4          2           5257→826       20.6s  79
   LangGraph          1.2.12   2          3           1520→331       9.6s   98
   OpenAI Agents SDK  0.22.3   3          4           2667→497       12.5s  77
+# Run 3 (async entry points)
+  agentkit           0.2.0    2          3           1526→343       9.0s   65
+  DSPy               3.4.0    4          2           5161→590       15.6s  83
+  LangGraph          1.2.12   3          4           2610→467       13.6s  99
+  OpenAI Agents SDK  0.22.3   4          4           3604→439       13.0s  75
 ```
 
 What to look for:
 
-1. **DSPy uses 2–3 times the input tokens of the other three, and always makes one extra call.** The reasons are in 2.3: tool descriptions and the whole trajectory live in the prompt, and a final ChainOfThought extracts the answer. That's not "DSPy is bad" — it's the price of "prompts that can be optimized". If what your use case needs is approvals and long workflows, the price isn't worth paying.
+1. **DSPy uses 1.4–3.5 times the input tokens of the other three, and always makes one extra call.** The reasons are in 2.3: tool descriptions and the whole trajectory live in the prompt, and a final ChainOfThought extracts the answer. That's not "DSPy is bad" — it's the price of "prompts that can be optimized". If what your use case needs is approvals and long workflows, the price isn't worth paying.
 2. **Fewer "effective lines" is not automatically better.** The agentkit version is shortest because the loop, approvals, and tracing already live in `agentkit/` — it *is* a framework. The LangGraph version is longest because you write every node and edge yourself, and in return get fully visible, replayable control flow. Line counts measure how much a framework does for you, not how good it is.
-3. **Same model, same prompt, different trajectories.** In run 2, the agentkit and LangGraph versions both called 3–4 tools in parallel in the first turn, dropping from 3 model calls to 2; the OpenAI Agents SDK version searched the knowledge base twice in both runs; and the DSPy version (one tool per turn) never checked the account status in any of the three runs we did — once it even requested the password reset before searching the knowledge base. That's model randomness, not a framework difference. To compare the frameworks themselves, either fix the script (which is what `test_integration.py` does with each framework's own fake model) or run many times and look at the distribution ([Lesson 22](../22_eval_methodology/README.en.md)).
+3. **Same model, same prompt, different trajectories.** In run 2, the agentkit and LangGraph versions both called 3–4 tools in parallel in the first turn, dropping from 3 model calls to 2; in run 3, agentkit again called 3 tools in the first turn and made only 2 model calls, while LangGraph took 3 turns this time. The OpenAI Agents SDK version searched the knowledge base twice in all three runs, and made one extra model call in run 3; the DSPy version (one tool per turn) never checked the account status in any of the four runs we did — once it even requested the password reset before searching the knowledge base. That's model randomness, not a framework difference. To compare the frameworks themselves, either fix the script (which is what `test_integration.py` does with each framework's own fake model) or run many times and look at the distribution ([Lesson 22](../22_eval_methodology/README.en.md)).
 4. **All four answers cite KB-101, and all say "reset done" only after approval.** Functionally they're equivalent; the differences are all in the places you can't see: the prompts, the checkpoints, where traces go.
 
 ## 4. Exercises
@@ -409,7 +422,7 @@ Open [`exercise.py`](exercise.py). All three exercises are **offline and framewo
 
 | Exercise | You implement | Framework | Key ideas |
 |---|---|---|---|
-| (a) Mini StateGraph | `validate` / `_merge` / `_next` / `_run` | LangGraph | Conditional edges, reducers, a step limit, a checkpoint per step, `interrupt()` pause and `resume()` re-run |
+| (a) Mini StateGraph | `validate` / `_merge` / `_next` / `_run` (`async def`) | LangGraph | Conditional edges, reducers, a step limit, a checkpoint per step, `interrupt()` pause and `resume()` re-run; the graph is async, and nodes may be plain functions or `async def` |
 | (b) DSPy-style signatures | `parse_signature` / `to_messages` / `parse_output` | DSPy | Generate a prompt from field declarations, turn few-shot demos into conversation turns, parse JSON back into typed structures |
 | (c) Concept lookup | `parse_concept_table` / `map_concept` | All | Parse the table in section 1.4 of the Chinese README directly; name normalization, aliases, suggestions for typos |
 
@@ -420,7 +433,7 @@ make lesson N=20
 # or: .venv/bin/python -m pytest lessons/20_frameworks_bridge/test_exercise.py -v
 ```
 
-`test_exercise.py` has 20 tests, all offline and deterministic, with no framework installs required. Separately, [`test_integration.py`](test_integration.py) runs the four `impl_*.py` files offline with each framework's own fake model (`DummyLM`, `GenericFakeChatModel`, `agents.testing.ScriptedModel`) and skips automatically when a framework isn't installed. It isn't part of the exercises; its job is to **catch version drift** — when a framework upgrade changes an API, it fails first.
+`test_exercise.py` has 20 tests, all offline and deterministic, with no framework installs required. The graph's `invoke` / `resume` and `Predict` are async, so the tests call them with `await`; of the functions you write, only `_run` is `async def` (the node-running step is `update = await self._call_node(...)`), and the rest are pure computation, written as plain `def`. Separately, [`test_integration.py`](test_integration.py) (8 tests) runs the async entry points of the four `impl_*.py` files offline with each framework's own fake model (`DummyLM`, `GenericFakeChatModel`, `agents.testing.ScriptedModel`) and skips automatically when a framework isn't installed. It isn't part of the exercises; its job is to **catch version drift** — when a framework upgrade changes an API, it fails first.
 
 ## 5. Going deeper
 
@@ -498,6 +511,7 @@ The DSPy paper recasts prompt engineering as an optimization problem: humans wri
 | Adding up `raw_responses` across runs | Model calls get double-counted (here: 5 computed, 3 real) | Use `result.context_wrapper.usage.requests` |
 | Using `InMemorySaver` in production | A process restart loses every run awaiting approval | The official docs mark it as experimentation-only; use `PostgresSaver` or similar in production |
 | Following a year-old tutorial | `create_react_agent` deprecation warnings, a changed DSPy call path, a changed default model | Pin versions; trust the current official docs; write contract tests |
+| Calling a framework's sync entry point inside an async service | `graph.invoke` or calling a DSPy module directly blocks the event loop, and every session waits; `Runner.run_sync` raises when an event loop is already running | Use the async entry points: `ainvoke`, `acall`, `await Runner.run(...)`; write slow DSPy tools as `async def` |
 
 ## 7. Interview & design-review questions
 
@@ -506,7 +520,7 @@ The DSPy paper recasts prompt engineering as an optimization problem: humans wri
 
 - DSPy's `ReAct` doesn't use native function calling: tool descriptions, field-format instructions, and the whole trajectory are written into the prompt as text on every turn.
 - It picks one tool per turn (no parallel calls), and after finishing it makes one more `ChainOfThought` call to extract the answer from the trajectory.
-- Measured here: DSPy made 4 calls with about 5,200 input tokens; the other three made 2–3 calls with 1,500–2,700 input tokens.
+- Measured here: DSPy made 4 calls with about 5,200 input tokens; the other three made 2–4 calls with 1,500–3,600 input tokens.
 - That's the price of "prompts that can be optimized": only a textual prompt can be rewritten by an optimizer. If you don't plan to use optimizers, the price isn't worth paying.
 </details>
 

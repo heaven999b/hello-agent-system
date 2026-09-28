@@ -226,3 +226,28 @@ def test_hybrid_on_the_lesson_corpus_combines_both_strengths():
     # 型号精确匹配：Gen 12 必须排在几乎一模一样的 Gen 11 前面
     top = ids(ex.hybrid_search("X1 Carbon Gen 12 保修几年", bm25.search, vec.search, k=3))
     assert top.index("it-laptop-x1g12") < top.index("it-laptop-x1g11")
+
+
+# =====================================================================
+# 课程工具（不是练习）：pointwise 重排的并发是真的，而且有上限
+# =====================================================================
+
+
+async def test_pointwise_rerank_runs_judgments_concurrently_up_to_the_cap():
+    from agentkit import ScriptedLLM, reply
+
+    kit = _kit()
+
+    def judge(messages):  # 候选片段里写着自己该得几分
+        text = messages[-1]["content"]
+        return reply('{"score": %s}' % text.split("候选片段：分数")[1][0])
+
+    cands = [(f"d{i}", f"分数{s} 片段 {i}") for i, s in enumerate([1, 3, 0, 3, 2, 1])]
+    for cap in (1, 2, 4):
+        inner = ScriptedLLM(responder=judge, latency=0.02)  # 每次调用都真的要等：并发的调用才会重叠
+        llm = kit.MeteredLLM(inner)
+        order = await kit.llm_rerank_pointwise(llm, "q", cands, max_concurrency=cap)
+        assert order == ["d1", "d3", "d4", "d0", "d5", "d2"]  # 按分数降序，同分保持原顺序
+        assert llm.calls == inner.call_count == 6  # 每个候选恰好一次调用
+        assert inner.max_in_flight == llm.max_in_flight == cap  # 同时在路上的调用数 = 上限，不多也不少
+        assert llm.in_flight == 0

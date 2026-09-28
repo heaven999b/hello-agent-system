@@ -12,6 +12,8 @@
             state.approve(item) / state.reject(item) → Runner.run(agent, state) 继续
   追踪      **默认开启并上传到 OpenAI**。本地网关场景必须关掉（set_tracing_disabled）或替换处理器
             （set_trace_processors）——这里用一个只在内存里计数的处理器替换掉默认的上传处理器
+  async     async 原生：await Runner.run(...)；Runner.run_sync 只是包装，在已经有事件循环的地方
+            （async 函数、FastAPI、Jupyter）不能用。同一轮的多个函数工具并发执行
 
 连接本地网关：默认的 OpenAIResponsesModel 走 /responses 接口，很多兼容网关只支持 /chat/completions，
 所以显式用 OpenAIChatCompletionsModel(model=..., openai_client=AsyncOpenAI(base_url=...))。
@@ -90,7 +92,7 @@ def build_agent(model, desk) -> Agent:
     )
 
 
-async def _run(question: str, approver, model) -> "shared.FrameworkResult":
+async def run(question: str = shared.QUESTION, approver=shared.auto_approver, model=None) -> "shared.FrameworkResult":
     desk = shared.ITDesk(user_id="alice")
     agent = build_agent(model or make_model(), desk)
     tracer = LocalSpanCounter()
@@ -131,9 +133,5 @@ async def _run(question: str, approver, model) -> "shared.FrameworkResult":
     )
 
 
-def run(question: str = shared.QUESTION, approver=shared.auto_approver, model=None) -> "shared.FrameworkResult":
-    return asyncio.run(_run(question, approver, model))
-
-
 if __name__ == "__main__":
-    shared.print_result(run())
+    shared.print_result(asyncio.run(run()))

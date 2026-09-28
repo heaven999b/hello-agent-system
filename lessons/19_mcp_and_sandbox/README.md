@@ -251,9 +251,11 @@ agentkit 的参数模型是 `extra="forbid"`，生成的 schema 自带 `"additio
 if registry.get(name) is None:  # 未知工具 = 协议错误（规范示例用的就是 -32602）
     return jsonrpc_error(rid, INVALID_PARAMS, f"Unknown tool: {name}")
 call = ToolCall(id=str(rid), name=name, arguments=json.dumps(arguments, ensure_ascii=False))
-result = registry.execute(call, ToolContext(run_id="mcp", call_id=str(rid)))
+result = await registry.execute(call, ToolContext(run_id="mcp", call_id=str(rid)))
 return ok({"content": [{"type": "text", "text": result.content}], "isError": not result.ok})
 ```
+
+所以 `handle_request` 是 `async def`（练习 (a)）：`tools/call` 要等工具执行完（工具可能在等下游 API），其余分支都是纯计算。
 
 工具内部抛出的意外异常，`ToolRegistry` 只给一句"内部出错（错误编号 xxx）"，原文放在 `ToolResult.detail` 里，服务器只写进自己的 stderr 日志。这样客户端（以及它背后的模型）就看不到 SQL、内网地址之类的内部细节，和[第 03 课](../03_tools/README.md)"错误即观察"的设计一致。
 
@@ -267,16 +269,39 @@ if stdout is None:
     sys.stdout = sys.stderr
 ```
 
-stdin 读到 EOF 就退出。按照规范，这是 stdio 传输唯一可移植的"优雅关机"信号。
+stdin 读到 EOF 就退出。按照规范，这是 stdio 传输唯一可移植的"优雅关机"信号。退出前，先把还在处理的请求做完、把响应写出去。
+
+**④ 每个请求一个任务，取消真的会停下来。** 主循环每读到一个请求，就交给一个新的 asyncio 任务，自己接着读下一行：
+
+```python
+while True:
+    raw = await asyncio.to_thread(stdin.readline)      # 读 stdin 会阻塞：放进线程，事件循环照常推进正在处理的请求
+    ...
+    if msg["method"] == "notifications/cancelled":
+        task = in_flight.get(params.get("requestId"))
+        if task is not None:
+            task.cancel()                              # 客户端不要这个结果了：停下来，被取消的请求不再回复
+        continue
+    task = asyncio.create_task(respond(msg))            # 每个请求一个任务：谁先做完谁先回
+    in_flight[msg["id"]] = task
+```
+
+一个慢工具不会挡住后面的请求，响应按"谁先做完谁先回"写出，顺序可能和请求不同 —— 这正是 JSON-RPC 要有 `id` 的原因。收到取消通知时，async 工具在 `await` 处立刻停下；同步工具在线程里停不下来，但它的结果会被丢弃。官方 Python SDK 也是这样：每个请求一个任务，收到 `notifications/cancelled` 就取消处理它的任务。本课的简化是没有给"同时在处理的请求数"设上限。
 
 ### 2.2 客户端：按 id 配对、按规范协商时代
 
 [`mcp_client.py`](mcp_client.py) 的 `StdioMCPClient` 有四个设计决策：
 
-1. **后台线程读 stdout，按 `id` 把响应交给等待它的请求。** 为什么不"写一条、读一行"？因为 agentkit 的工具在线程池里执行，可能超时被放弃；服务器也可能夹带通知。按 id 配对才不会张冠李戴。请求超时后，客户端按规范发送 `notifications/cancelled`。
+1. **一个后台任务读 stdout，按 `id` 把响应交给等待它的请求。** 服务器用 `asyncio.create_subprocess_exec` 启动；每个请求在 `_pending` 里放一个 `Future`，读 stdout 的任务收到响应就按 id 找到它、`set_result`。为什么不"写一条、读一行"？因为多个请求可以同时在路上：Agent 同一轮的多个只读工具会并发执行（第 02 课），它们的 `tools/call` 一起发出去，服务器也可能乱序回复、夹带通知。按 id 配对才不会张冠李戴。请求超时（用取消安全的 `agentkit.wait_for`），或者调用方不再需要结果（例如 Agent 的运行被取消，`CancelledError` 传到这里），客户端都按规范发 `notifications/cancelled`，让服务器停下手里的活；取消路径上只写不等，不会再卡住。
 2. **`connect()` 严格按[规范的 stdio 向后兼容流程](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio)**：先发 `server/discover` 探测。返回 `DiscoverResult` 就说明是现代服务器；返回 `-32022` 而且对方列出的版本里没有旧版，就说明没有共同版本，直接报错；其他任何错误或超时，都视为旧版服务器，回退到 `initialize`。规范特别强调，回退**不能**只认某一个错误码，因为旧版服务器对未握手请求的反应各不相同。
 3. **启动服务器时不继承你的全部环境变量。** agentkit 的 `default_llm()` 会把 `.env` 读进 `os.environ`，直接继承的话，你的 `LLM_API_KEY` 会被交给你启动的每一个 MCP 服务器。官方 Python SDK 在 POSIX 上默认只传 `HOME`、`LOGNAME`、`PATH`、`SHELL`、`TERM`、`USER` 六个变量，我们照做，需要的额外变量显式传入。
-4. **关闭顺序按规范来**：先关服务器的 stdin，等它自己退出；不退就 SIGTERM，再不退就 SIGKILL。
+4. **关闭顺序按规范来**：`async with` 退出时调用 `aclose()`：先关服务器的 stdin，等它自己退出；不退就 SIGTERM，再不退就 SIGKILL，每一步最多等 `close_timeout_s`。进程一定会被收掉，退出码记在 `client.returncode`。子进程的生命周期跟着 `async with` 走，而不是靠 `atexit`：事件循环结束之后，已经没有人能 `await` 子进程退出了。
+
+这几条都有测试证明（`test_exercise.py` 最后一组，起的是真实子进程，和练习无关）：
+
+- `test_async_client_and_server_in_both_eras_with_a_real_agent`：连本课的服务器，两代协议都能通；Agent 同一轮调用两个只读远程工具，客户端的在途峰值（`max_in_flight`）是 2；正常关闭时服务器读到 EOF 自己退出，退出码 0。
+- `test_out_of_order_responses_are_matched_by_id_and_cancellation_reaches_the_server`：服务器上放一个 async 的 `nap(seconds)` 工具。先发 `nap(30)` 再发 `nap(0)`，后发的先回来；取消等 `nap(30)` 的任务、以及 `nap(31)` 超时之后，服务器的 stderr 里都出现了"被取消"，客户端发出的取消理由依次是 `cancelled by caller` 和 `timeout`，之后连接照常可用。
+- `test_close_escalates_from_eof_to_sigterm_to_sigkill`：一个从不读 stdin 的服务器，退出码是 -15（SIGTERM）；它再忽略 SIGTERM，退出码是 -9（SIGKILL）。
 
 ### 2.3 远程工具 → agentkit Tool
 
@@ -286,6 +311,16 @@ stdin 读到 EOF 就退出。按照规范，这是 stdio 传输唯一可移植�
 - **风险等级由你决定**（1.5 节的三步规则）；
 - **`isError: true` → 抛 `ToolError`**：`ToolRegistry` 会把它变成模型熟悉的"错误：……"观察。协议错误则变成普通异常，模型只看到"内部出错"；
 - **名字清洗**：MCP 允许工具名里有点号、最长 128 个字符，而 OpenAI 兼容接口的函数名只允许 `[a-zA-Z0-9_-]`、最长 64 个字符。直接透传 `admin.tools.list`，模型接口会报 400。所以给模型看清洗后的名字，调用服务器时仍用原名。
+
+远程工具是 **async 工具**：`call_fn`（真实使用时就是 `client.call_tool`）要等服务器回复，所以练习里写的 `invoke` 是 `async def`，`RemoteTool` 按 async 工具执行。Agent 在事件循环里 await 它；工具超时或运行被取消，等待中的请求被取消，客户端给服务器发取消通知（上一节第 1 条）。
+
+```python
+async with StdioMCPClient([sys.executable, "lessons/19_mcp_and_sandbox/mcp_server.py"]) as client:
+    tools = await mcp_tools(client, include=["get_travel_policy"], risk_overrides={"get_travel_policy": "read"})
+    agent = Agent(llm, tools)
+    await agent.run("东京出差的酒店标准是多少？")
+# 离开 async with：服务器子进程一定被关掉
+```
 
 `mcp_tools()` 在此之上再加两道闸：`include` 只导入需要的工具（最小权限，也少占上下文）；`pinned` 比对工具定义指纹（名字 + 描述 + 参数 + 注解的哈希），和审查时不一致就拒绝加载。这就是给工具定义"锁版本"，用来防 rug pull。
 
@@ -297,12 +332,12 @@ stdin 读到 EOF 就退出。按照规范，这是 stdio 传输唯一可移植�
 |---|---|---|
 | 每次新建临时目录作为工作目录，用完即删 | 残留、串味、在你的仓库里乱写 | 模型生成的文件不该落在任何有意义的地方 |
 | 环境变量只给 `PATH`，`HOME` 和 `TMPDIR` 指向临时目录 | 偷环境变量里的密钥 | 同 2.2 节第 3 条 |
-| `start_new_session=True` + 超时后 `os.killpg` | 死循环、`sleep`、代码自己启动的子进程 | `subprocess.run(timeout=...)` 只杀直接子进程，孙进程会变成孤儿继续运行（练习 (b) 有测试专门抓这个） |
+| `start_new_session=True` + 超时或被取消时 `os.killpg` | 死循环、`sleep`、代码自己启动的子进程；Agent 的运行被取消后代码还在后台跑 | `subprocess.run(timeout=...)` 只杀直接子进程，孙进程会变成孤儿继续运行（练习 (b) 有测试专门抓这个） |
 | rlimit：CPU、内存、单文件大小、文件描述符、core 文件 | 资源耗尽、写满磁盘 | 由内核强制执行，不依赖代码"自觉" |
 | 边读边丢的输出收集 + 截断 | 一行 `print` 撑爆上下文，或把父进程内存撑爆 | 必须一直读管道（否则子进程写满管道会卡住），但只保留前 N 个字节 |
 | 结构化结果：`stdout`、`stderr`、`exit_code`、`timed_out`、`killed_reason`、`notes` | 模型看不懂发生了什么 | Traceback 原样给模型，它才能自己改代码；`notes` 如实记录哪些限制生效了、哪些没有 |
 
-**rlimit 怎么设？不用 `preexec_fn`。** Python [官方文档](https://docs.python.org/3/library/subprocess.html)明确警告：程序里有其他线程时，`preexec_fn` 不安全，子进程可能在 exec 之前死锁。而我们的进程里有读管道的线程、MCP 客户端的线程。所以用一个极小的"启动器"：先给自己设好 rlimit，再 `execv` 成真正要跑的程序。rlimit 会跨 exec 继承，pid 不变，进程组和内存监控都照常工作：
+**rlimit 怎么设？不用 `preexec_fn`。** Python [官方文档](https://docs.python.org/3/library/subprocess.html)明确警告：程序里有其他线程时，`preexec_fn` 不安全，子进程可能在 exec 之前死锁。async 程序里照样有线程：事件循环的默认线程池（`asyncio.to_thread`、同步工具都用它），Python 3.11 的 asyncio 在 macOS 上还会为每个子进程起一个等它退出的线程（本机实测线程名 `asyncio-waitpid-0`）。所以用一个极小的"启动器"：先给自己设好 rlimit，再 `execv` 成真正要跑的程序。rlimit 会跨 exec 继承，pid 不变，进程组和内存监控都照常工作：
 
 ```python
 _LAUNCHER = """
@@ -316,7 +351,9 @@ os.execv(sys.executable, [sys.executable] + sys.argv[2:])
 """
 ```
 
-最后包装成一个 `run_python` 工具（`risk="dangerous"`），交给 Agent 时配上 `PermissionPolicy`，每次执行代码前都要审批。工具层的超时比沙箱超时多 10 秒：让沙箱自己先杀进程、返回结构化结果，而不是被工具层"放弃等待"（第 03 课提到过，线程超时只是不再等它，代码可能还在跑）。
+最后包装成一个 `run_python` 工具（`risk="dangerous"`），交给 Agent 时配上 `PermissionPolicy`，每次执行代码前都要审批。`run_python` 是 async 的（`asyncio.create_subprocess_exec`，两个读管道的任务 + 每 20 毫秒检查一次超时和内存），工具也是 `async def`。工具层的超时比沙箱超时多 10 秒：正常情况下让沙箱自己先杀进程、返回结构化结果。一旦 Agent 的运行被取消（用户断开、`run_timeout` 到期），`CancelledError` 传进 `run_python`，它先 `killpg` 整个进程组，再把取消传出去。同步写法做不到这一点：线程停不下来，只能等沙箱自己的墙钟超时（第 03 课）。测试 `test_cancelling_run_python_kills_the_whole_process_group_right_away` 在沙箱里起一个 `sleep(60)` 的孙进程，取消之后它立刻消失，不用等 60 秒。
+
+练习 (b) 的 `run_with_limits` 是同步版（普通 `def`，用 `subprocess.Popen`）：它考的是进程组、环境变量、管道这些操作系统机制，`communicate(timeout=...)` 超时后还能取回已经输出的内容，写起来最直接。在 async 代码里要用它，就 `await asyncio.to_thread(run_with_limits, code)`，别让它卡住事件循环；代价是调用方被取消时线程停不下来，子进程会跑到它自己的 `timeout_s` 为止。
 
 ### 2.5 在 macOS 上实测出的三个坑
 
@@ -369,9 +406,9 @@ os.execv(sys.executable, [sys.executable] + sys.argv[2:])
 
 观察：`notifications/initialized` 发出去之后没有任何回复，下一条就是 `tools/list`；"火星"和"参数写成了'两万'"都是 `isError: true` 的正常结果，只有 `resources/list`（我们没实现）是协议错误。
 
-如果环境里装了官方 `mcp` SDK（2.x），1d 会让官方客户端连我们的服务器、我们的客户端连官方服务器，各跑一遍。本机实测（mcp 2.2.0）：官方客户端的 `auto` 模式通过 `server/discover` 协商到 2026-07-28，`legacy` 模式通过 `initialize` 协商到 2025-11-25，两个方向都能正常调用。没装 SDK 时这一步会自动跳过。
+如果环境里装了官方 `mcp` SDK（2.x），1d 会让官方客户端连我们的服务器、我们的客户端连官方服务器，各跑一遍。本机实测（mcp 2.2.0；2026-09-28 换成 async 的客户端和服务器后重测）：官方客户端的 `auto` 模式通过 `server/discover` 协商到 2026-07-28，`legacy` 模式通过 `initialize` 协商到 2025-11-25，两个方向都能正常调用。没装 SDK 时这一步会自动跳过。
 
-**第 2 部分：Agent 通过 MCP 调用远程工具**（真实模型 gpt-5.5 的一次运行）：
+**第 2 部分：Agent 通过 MCP 调用远程工具**（真实模型 gpt-5.5 的一次运行，2026-09-28，async 客户端）：
 
 ```text
    已连接 agentkit-mini-mcp（modern，2026-07-28），服务器共 4 个工具，只导入 3 个：
@@ -380,30 +417,31 @@ os.execv(sys.executable, [sys.executable] + sys.argv[2:])
      - submit_expense     服务器注解 {'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False} → 本地风险等级 dangerous
 ▶ 用户：我下周去东京出差 3 晚，酒店每晚 21000 日元。帮我看看超没超公司标准；没超的话，把 3 晚住宿费按人民币提交报销，标题写“东京出差住宿”。
    🛠  get_travel_policy({"city":"东京"})
-      ↳ {"city": "东京", "hotel_cap_per_night_cny": 1100, "meal_allowance_per_day_cny": 300}
    🛠  convert_currency({"amount":21000,"from_currency":"JPY","to_currency":"CNY"})
-      ↳ {"amount": 21000.0, "from": "JPY", "to": "CNY", "result": 1008.0}
    🛠  convert_currency({"amount":63000,"from_currency":"JPY","to_currency":"CNY"})
+      ↳ {"city": "东京", "hotel_cap_per_night_cny": 1100, "meal_allowance_per_day_cny": 300}
+      ↳ {"amount": 21000.0, "from": "JPY", "to": "CNY", "result": 1008.0}
       ↳ {"amount": 63000.0, "from": "JPY", "to": "CNY", "result": 3024.0}
    🛠  submit_expense({"title":"东京出差住宿","amount_cny":3024})
       🔐 [审批] submit_expense 风险等级 dangerous → 批准（演示中自动批准）
       ↳ {"expense_id": "EXP-1001", "status": "submitted", "title": "东京出差住宿", "amount_cny": 3024.0}
    状态 completed，3 步，工具调用顺序 ['get_travel_policy', 'convert_currency', 'convert_currency', 'submit_expense']
+   MCP 请求在途峰值：3（同一轮的只读工具并发执行时，多个 tools/call 同时在等服务器，响应按 id 配对）
 ```
 
-观察：服务器说 `submit_expense` 不具破坏性，但我们没审查过它，所以它仍是 `dangerous`，调用前停下来审批。这次运行里，模型在同一轮里并行发起了两次换算（每晚和 3 晚合计），没有自己做乘法；在另一次运行里，它只换算了 3 晚的总额，每晚的金额自己除出来。真实模型每次走的路径都可能不同，所以评估一个 Agent 要看结果和约束（有没有超标、报销金额对不对、写操作有没有经过审批），而不是死盯一条固定的调用序列（[第 11 课](../11_evals/README.md)）。
+观察：服务器说 `submit_expense` 不具破坏性，但我们没审查过它，所以它仍是 `dangerous`，调用前停下来审批。这次运行里，模型在第一轮就同时发起了三个只读调用（查标准、换算每晚、换算 3 晚合计），没有自己做乘法。三个都是只读工具，Agent 并发执行，三个 `tools/call` 同时在等服务器（在途峰值 3），所以三行"🛠"先打印，三个结果后到。之前的运行里，模型有时先查标准、下一轮再并行换算两次，有时只换算 3 晚的总额、每晚的金额自己除出来。真实模型每次走的路径都可能不同，所以评估一个 Agent 要看结果和约束（有没有超标、报销金额对不对、写操作有没有经过审批），而不是死盯一条固定的调用序列（[第 11 课](../11_evals/README.md)）。离线剧本照搬了"第二轮并行换算两次"的那种走法，在途峰值是 2。
 
-**第 3 部分：沙箱**（macOS 上的输出）：
+**第 3 部分：沙箱**（macOS 上的输出，2026-09-28 换成 async 沙箱后重跑）：
 
 ```text
 ▶ 3b 死循环：墙钟超时 1 秒，整个进程组被 SIGKILL
-   exit_code=-9  timed_out=True  killed_reason=timeout  用时 1.012s
+   exit_code=-9  timed_out=True  killed_reason=timeout  用时 1.016s
    stdout: 开始计算…
 
 ▶ 3c 内存炸弹：连续分配 64 MB 的块，最多 1 GB；上限 256 MB
-   exit_code=-9  timed_out=False  killed_reason=memory  用时 0.112s
+   exit_code=-9  timed_out=False  killed_reason=memory  用时 0.074s
    · 内存：RLIMIT_AS 在本平台设不上，改为轮询内存占用兜底（有竞态窗口）
-   · 被杀时内存占用 ≈ 295 MB（上限 256 MB）
+   · 被杀时内存占用 ≈ 316 MB（上限 256 MB）
 
 ▶ 3d 偷读'私钥'和偷偷联网：先用进程级沙箱，再加一层 OS 沙箱
    【进程级沙箱（超时 + rlimit + 临时目录 + 最小环境变量）】
@@ -427,9 +465,9 @@ os.execv(sys.executable, [sys.executable] + sys.argv[2:])
 
 | 题目 | 要做什么 | 测试怎么验证 |
 |---|---|---|
-| (a) `handle_request` | MCP 服务端的 JSON-RPC 分发：`initialize` / `server/discover` / `tools/list` / `tools/call`；未知方法 -32601；通知不回复；现代请求校验版本（-32022）和 `clientCapabilities`；工具失败走 `isError` | 9 个用例：握手的版本协商、通知一律不回复、schema 复用与注解、现代版的 `resultType`、版本校验、非法请求、调用成功、三种工具失败都是 `isError`（且不泄露内部异常原文）、三种协议错误 |
-| (b) `run_with_limits` | 临时目录 + 最小环境 + 超时杀整个进程组 + 输出截断 + 如实返回退出码 | 6 个用例：正常运行、非零退出与 Traceback、超时保留已有输出、**孙进程也被杀掉**、输出截断、看不到父进程的环境变量且临时目录被删除 |
-| (c) `tool_from_mcp_schema` | 远程工具定义 → agentkit `Tool`；风险等级按"覆盖 → 信任的注解 → dangerous"决定；`isError` 变 `ToolError`；名字清洗 | 6 个用例：schema 透传、信任时的注解映射（含默认值）、不信任时忽略注解且覆盖优先、调用转发与错误转换、名字清洗、接进真正的 Agent + `PermissionPolicy` 后走审批 |
+| (a) `handle_request`（`async def`） | MCP 服务端的 JSON-RPC 分发：`initialize` / `server/discover` / `tools/list` / `tools/call`；未知方法 -32601；通知不回复；现代请求校验版本（-32022）和 `clientCapabilities`；工具失败走 `isError` | 9 个用例：握手的版本协商、通知一律不回复、schema 复用与注解、现代版的 `resultType`、版本校验、非法请求、调用成功、三种工具失败都是 `isError`（且不泄露内部异常原文）、三种协议错误 |
+| (b) `run_with_limits`（普通 `def`，原因见 2.4 节末尾） | 临时目录 + 最小环境 + 超时杀整个进程组 + 输出截断 + 如实返回退出码 | 6 个用例：正常运行、非零退出与 Traceback、超时保留已有输出、**孙进程也被杀掉**、输出截断、看不到父进程的环境变量且临时目录被删除 |
+| (c) `tool_from_mcp_schema` | 远程工具定义 → agentkit `Tool`（async 工具：`call_fn` 是 async 的，你写的 `invoke` 也是 `async def`）；风险等级按"覆盖 → 信任的注解 → dangerous"决定；`isError` 变 `ToolError`；名字清洗 | 6 个用例：schema 透传、信任时的注解映射（含默认值）、不信任时忽略注解且覆盖优先、调用转发与错误转换、名字清洗、接进真正的 Agent + `PermissionPolicy` 后走审批 |
 
 ```bash
 make lesson N=19
@@ -438,10 +476,10 @@ make lesson N=19
 
 提示：
 
-- (a) 先处理"不回复"和"结构不合法"，再判断时代，最后按方法分发。`tools/call` 直接用 `ToolRegistry(tools).execute(...)`，别自己重写参数校验。
+- (a) 先处理"不回复"和"结构不合法"，再判断时代，最后按方法分发。`tools/call` 直接用 `await ToolRegistry(tools).execute(...)`，别自己重写参数校验。测试里这样调用：`resp = await handle_request(msg, tools)`。
 - (b) `proc.communicate(timeout=...)` 超时后，先 `os.killpg(proc.pid, signal.SIGKILL)`，再调一次 `communicate()` 取回已经输出的内容，这一次也要加超时。
-- (c) `annotations` 可能是 `None`，也可能缺字段，注意 `destructiveHint` 的默认值是 `true`。
-- 整套测试在本机约 2 秒跑完。
+- (c) `annotations` 可能是 `None`，也可能缺字段，注意 `destructiveHint` 的默认值是 `true`。`invoke` 里 `result = await call_fn(远程工具名, arguments)`。
+- 除了 21 个练习测试，`test_exercise.py` 最后还有 5 个测课程代码本身的测试（2.2 节、2.4 节列出的那几个），不做练习也会通过。整套测试在本机约 3～4 秒跑完。
 
 ## 5. 深入（给有余力的你）
 
@@ -490,6 +528,8 @@ Anthropic 在 [2025 年 10 月的文章](https://www.anthropic.com/engineering/c
 10. **以为改了 `HOME` 就隔离了 `~/.ssh`**：代码用 `pwd` 就能查到真实家目录，用绝对路径照样能读。
 11. **在 macOS 上相信 `RLIMIT_AS` / RSS / `RLIMIT_CPU`**：见 2.5 节。限制有没有生效，要实测。
 12. **沙箱里留着网络**：代码执行加上网络，就凑齐了[致命三要素](../09_security/README.md#14-致命三要素lethal-trifecta)里的"对外通信"。
+13. **在 async 代码里直接调用同步的 `subprocess.run` / `Popen.communicate` 等子进程**：整个事件循环跟着卡住，所有会话一起等。用 `asyncio.create_subprocess_exec`，或者 `await asyncio.to_thread(...)`。
+14. **请求超时或被取消后不通知服务器**：客户端不等了，服务器却还在把活干完（可能是一次昂贵的查询）。发 `notifications/cancelled`，服务器那边要真的取消处理它的任务。
 
 ## 7. 面试 & 设计评审问题
 
@@ -575,6 +615,7 @@ Anthropic 在 [2025 年 10 月的文章](https://www.anthropic.com/engineering/c
 - [ ] 我能说出工具投毒、rug pull、过度授权各一个防御手段
 - [ ] 我能说出进程级沙箱的六件事，以及它挡不住的三件事
 - [ ] 我知道 `subprocess.run(timeout=...)` 和 `preexec_fn` 在沙箱里分别有什么坑
+- [ ] 我能解释为什么 MCP 客户端要按 id 配对响应，以及超时或被取消之后为什么要发 `notifications/cancelled`
 - [ ] 我能根据场景在进程级、OS 级、容器、gVisor、microVM、托管服务之间做出选择
 
 ## 延伸阅读

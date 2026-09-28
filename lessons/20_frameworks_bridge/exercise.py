@@ -7,8 +7,12 @@
         TODO (a3) CompiledGraph._next     (a4) CompiledGraph._run
       写完之后，文件里已经给出的 build_agent_graph() 会用你的 MiniGraph + agentkit 的 LLM / ToolRegistry
       搭出一个"会等人工审批"的 Agent——和 impl_langgraph.py 同构，但一行框架代码都没有
+      async：图的 invoke / resume 和 _run 都是 async def（对应 LangGraph 的 ainvoke），节点可以是普通函数或
+      async 函数；你要写的 _run 里执行节点那一步是 `update = await self._call_node(...)`。
+      validate / _merge / _next 是纯计算，写成普通 def
   (b) DSPy 风格的 Signature：从字段声明生成提示词，把 JSON 输出解析回结构
         TODO (b1) parse_signature   (b2) Signature.to_messages   (b3) Signature.parse_output
+      三个都是纯计算（普通 def）；调用模型的 Predict 已经给出，它是 async 的
   (c) 概念对照查询 map_concept(agentkit 概念, 框架)，数据直接读本课 README.md 里的对照表
         TODO (c1) parse_concept_table   (c2) map_concept
 
@@ -31,9 +35,9 @@ import re
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
-from agentkit.tools import ToolRegistry
+from agentkit.tools import ToolRegistry, maybe_await
 from agentkit.tracing import Tracer
 from agentkit.types import Message, calls_in, tool_message
 from agentkit.workflows import extract_json
@@ -118,7 +122,7 @@ class MemoryCheckpointer:
         return [Checkpoint(**json.loads(r)) for r in reversed(self._data.get(thread_id, []))]
 
 
-Node = Callable[[dict], "dict | None"]
+Node = Callable[[dict], "dict | None | Awaitable[dict | None]"]  # 普通函数或 async 函数都行
 Router = Callable[[dict], str]
 
 
@@ -178,18 +182,19 @@ class CompiledGraph:
         self.tracer = tracer
 
     # ---------------------------------------------------------------- 公共 API（已给出）
-    def invoke(self, inputs: dict, thread_id: str = "default") -> dict:
+    # invoke / resume 是 async 的（对应 LangGraph 的 ainvoke）：节点可能要等模型、等工具
+    async def invoke(self, inputs: dict, thread_id: str = "default") -> dict:
         state = json.loads(json.dumps(inputs, ensure_ascii=False))  # 复制一份，同时确认输入可序列化
         cp = Checkpoint(thread_id=thread_id, step=0, next=self.graph.entry, state=state, status="running")
         self.checkpointer.put(cp)  # 第 0 个检查点：输入本身
-        return self._run(cp)
+        return await self._run(cp)
 
-    def resume(self, thread_id: str, value: Any) -> dict:
+    async def resume(self, thread_id: str, value: Any) -> dict:
         cp = self.checkpointer.latest(thread_id)
         if cp is None or cp.status != "interrupted":
             raise ValueError(f"thread {thread_id!r} 当前没有被中断，不能 resume")
         cp = replace(cp, status="running", interrupt=None, resume_values=cp.resume_values + [value])
-        return self._run(cp)
+        return await self._run(cp)
 
     def get_state(self, thread_id: str) -> Checkpoint | None:
         return self.checkpointer.latest(thread_id)
@@ -198,12 +203,16 @@ class CompiledGraph:
         return self.checkpointer.history(thread_id)
 
     # ---------------------------------------------------------------- 已给出：执行一个节点
-    def _call_node(self, name: str, state: dict, resume_values: list) -> dict:
-        """执行节点：传入状态的深拷贝（节点只能靠"返回更新"改状态），并把恢复值放进 contextvar 给 interrupt() 用。"""
+    async def _call_node(self, name: str, state: dict, resume_values: list) -> dict:
+        """执行节点：传入状态的深拷贝（节点只能靠"返回更新"改状态），并把恢复值放进 contextvar 给 interrupt() 用。
+
+        节点可以是普通函数（纯计算，如路由、审批判断），也可以是 async 函数（要 await 模型或工具）：
+        maybe_await 两种都接得住。contextvar 在同一个任务里跨 await 仍然有效，所以 async 节点里也能调 interrupt()。
+        """
         token = _resume.set(_ResumeCursor(list(resume_values)))
         try:
             with self.tracer.span(f"node.{name}") if self.tracer else nullcontext():
-                update = self.graph.nodes[name](copy.deepcopy(state))
+                update = await maybe_await(self.graph.nodes[name](copy.deepcopy(state)))
         finally:
             _resume.reset(token)
         if update is None:
@@ -236,14 +245,14 @@ class CompiledGraph:
         raise NotImplementedError("TODO (a3): 实现 CompiledGraph._next，要求见上面的 docstring")
 
     # ---------------------------------------------------------------- TODO (a4)
-    def _run(self, cp: Checkpoint) -> dict:
-        """主循环：从检查点 cp 开始执行，直到 END 或被中断。invoke() 和 resume() 都调用它。
+    async def _run(self, cp: Checkpoint) -> dict:
+        """主循环：从检查点 cp 开始执行，直到 END 或被中断。invoke() 和 resume() 都调用它（都会 await 它）。
 
         变量：state = cp.state，node = cp.next，step = cp.step，resume_values = list(cp.resume_values)
 
         循环（node != END 时）：
           1. step >= self.max_steps → 抛 GraphRecursionError（防止环无限转下去）
-          2. update = self._call_node(node, state, resume_values)
+          2. update = await self._call_node(node, state, resume_values)   ← _call_node 是 async 的，别忘了 await
              如果抛了 GraphInterrupt e：存一个检查点
                  Checkpoint(thread_id, step, node, state, "interrupted", interrupt=e.payload, resume_values=resume_values)
              然后返回 {**state, "__interrupt__": e.payload}（注意：不要把 "__interrupt__" 合并进 state）
@@ -268,10 +277,11 @@ def build_agent_graph(llm, registry: ToolRegistry, needs_approval: set[str], *, 
 
     llm 是任何 agentkit LLM（测试里用 ScriptedLLM），工具由 agentkit 的 ToolRegistry 执行（校验、超时、截断都还在）。
     输入状态：{"messages": [system, user], "decisions": {}}。
+    agent、tools 两个节点要 await 模型和工具，是 async 函数；approval 只读状态、调 interrupt()，是普通函数。
     """
 
-    def agent(state: dict) -> dict:
-        response = llm.chat(state["messages"], tools=registry.schemas() or None)
+    async def agent(state: dict) -> dict:
+        response = await llm.chat(state["messages"], tools=registry.schemas() or None)
         return {"messages": [response.to_message()]}
 
     def approval(state: dict) -> dict:
@@ -281,11 +291,11 @@ def build_agent_graph(llm, registry: ToolRegistry, needs_approval: set[str], *, 
                 decisions[call.id] = bool(interrupt({"tool": call.name, "arguments": call.parsed_args()}))
         return {"decisions": decisions}
 
-    def tools(state: dict) -> dict:
+    async def tools(state: dict) -> dict:
         decisions = state.get("decisions") or {}
         out = []
         for call in calls_in(state["messages"][-1]):
-            content = REJECTED if decisions.get(call.id, True) is False else registry.execute(call).content
+            content = REJECTED if decisions.get(call.id, True) is False else (await registry.execute(call)).content
             out.append(tool_message(call.id, content))
         return {"messages": out}
 
@@ -437,6 +447,7 @@ class Predict:
     """最简单的"模块"：Signature + 一种调用策略（调一次模型，解析失败就把错误反馈回去重试）。
 
     DSPy 的 ChainOfThought / ReAct 本质上也是"同一个 Signature + 不同的调用策略"。
+    调用是 async 的：pred = await Predict(sig, llm)(question=...)（DSPy 3 里对应 await module.acall(...)）。
     """
 
     def __init__(self, signature: Signature, llm, max_repairs: int = 1):
@@ -444,11 +455,11 @@ class Predict:
         self.llm = llm
         self.max_repairs = max_repairs
 
-    def __call__(self, **inputs: Any) -> Prediction:
+    async def __call__(self, **inputs: Any) -> Prediction:
         messages = self.signature.to_messages(**inputs)
         last_error = ""
         for _ in range(self.max_repairs + 1):
-            text = self.llm.chat(messages).content or ""
+            text = (await self.llm.chat(messages)).content or ""
             try:
                 return Prediction(self.signature.parse_output(text))
             except ValueError as e:

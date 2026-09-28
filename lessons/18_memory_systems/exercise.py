@@ -13,6 +13,7 @@
     # 或者：.venv/bin/python -m pytest lessons/18_memory_systems -v
 
 测试里有一个"集成测试"：把你写的 apply_memory_ops 塞进 FactMemory，跑一遍 Mem0 式的完整写入流程。
+三个函数都是纯计算，写成普通的 def 就好；调用模型的是 FactMemory.observe（async，测试里 await 它），不用你写。
 卡住了？先重读 README 第 2 节，再看 solution.py。
 """
 

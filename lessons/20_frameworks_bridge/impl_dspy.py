@@ -9,9 +9,11 @@
             模型在 next_tool_name / next_tool_args 两个输出字段里"用文字"选工具
   循环      dspy.ReAct.forward：最多 max_iters 轮，模型选了内置的 finish 工具就停，
             之后再用一次 ChainOfThought 从轨迹里"抽取"最终答案（所以总会多一次模型调用）
-  审批      没有暂停 / 恢复机制。只能在工具内部同步问审批人（相当于 agentkit 的 approver= 同步模式）；
-            需要"等人几小时"就得把 DSPy 程序放进 LangGraph / Temporal 之类的运行时里
+  审批      没有暂停 / 恢复机制。只能在工具内部当场问审批人、等他答复（相当于 agentkit 的 PermissionPolicy(approver=...)，
+            而不是 PauseRun 落盘暂停）；需要"等人几小时"就得把 DSPy 程序放进 LangGraph / Temporal 之类的运行时里
   追踪      lm.history（每次调用的消息、用量、成本）、dspy.inspect_history()、BaseCallback 回调、MLflow 集成
+  async     模块同步调用 agent(question=...)；async 入口是 await agent.acall(question=...)（本文件用它）。
+            async 路径上，同步的工具函数直接在事件循环里执行（不进线程池）：慢工具要写成 async def
 
 连接本地网关：dspy.LM("openai/<模型名>", api_base=..., api_key=...)。
 DSPy 3.4 起默认 engine="auto"：能用原生 lm15 引擎就用，否则回退到 LiteLLM；想强制走 LiteLLM
@@ -40,7 +42,9 @@ def _load_sibling(name: str):
 shared = _load_sibling("shared_tools")
 # --- end bootstrap ---
 
+import asyncio
 import functools
+import inspect
 import os
 import time
 
@@ -75,11 +79,14 @@ class EventCounter(BaseCallback):
 
 
 def with_approval(fn, approver, approvals: list):
-    """DSPy 没有 interrupt：审批只能在工具内部**同步**完成——审批人不回应，整个程序就卡在这里。"""
+    """DSPy 没有 interrupt：审批只能在工具内部当场等审批人答复——审批人不回应，这次运行就停在这里，
+    状态也不落盘（进程重启就丢）。写成 async：审批人可以是 async 函数（发 IM 卡片、等回调），等待时不卡事件循环。"""
 
     @functools.wraps(fn)  # 保留函数名、docstring、类型注解，dspy.Tool 靠它们生成工具说明
-    def guarded(**kwargs):
+    async def guarded(**kwargs):
         ok = approver(fn.__name__, kwargs)
+        if inspect.isawaitable(ok):
+            ok = await ok
         approvals.append((fn.__name__, kwargs, ok))
         return fn(**kwargs) if ok else "审批人拒绝了该操作。请告诉用户该操作未获批准，不要重试。"
 
@@ -98,7 +105,7 @@ def make_lm(model: str | None = None) -> dspy.LM:
     )
 
 
-def run(question: str = shared.QUESTION, approver=shared.auto_approver, lm=None) -> "shared.FrameworkResult":
+async def run(question: str = shared.QUESTION, approver=shared.auto_approver, lm=None) -> "shared.FrameworkResult":
     desk = shared.ITDesk(user_id="alice")
     fns = desk.functions()
     approvals: list = []
@@ -112,8 +119,8 @@ def run(question: str = shared.QUESTION, approver=shared.auto_approver, lm=None)
     counter = EventCounter()
     seen = len(getattr(lm, "history", []))  # 同一个 LM 对象可能被复用：只统计本次运行新增的记录
     t0 = time.perf_counter()
-    with dspy.context(lm=lm, callbacks=[counter]):  # context 只影响这段代码，不改全局配置
-        pred = agent(question=question)
+    with dspy.context(lm=lm, callbacks=[counter]):  # context 只影响这段代码（contextvars 实现，async 里也安全）
+        pred = await agent.acall(question=question)  # async 入口；同步写法是 agent(question=question)
     seconds = time.perf_counter() - t0
     usage = [h.get("usage") or {} for h in getattr(lm, "history", [])[seen:]]
     steps = sum(1 for k in pred.trajectory if k.startswith("tool_name_"))
@@ -130,7 +137,7 @@ def run(question: str = shared.QUESTION, approver=shared.auto_approver, lm=None)
         notes=[
             f"ReAct 轨迹 {steps} 步（最后一步是内置的 finish 工具），另加 1 次 ChainOfThought 抽取答案",
             f"回调事件：{counter.events}",
-            "审批：工具内同步调用审批人（没有检查点，进程重启就丢）",
+            "审批：在工具里当场等审批人（没有检查点，进程重启就丢）",
         ],
         extra={"events": dict(counter.events), "react_steps": steps},
     )
@@ -138,6 +145,6 @@ def run(question: str = shared.QUESTION, approver=shared.auto_approver, lm=None)
 
 if __name__ == "__main__":
     lm = make_lm()
-    shared.print_result(run(lm=lm))
+    shared.print_result(asyncio.run(run(lm=lm)))
     print("\n—— DSPy 替你生成的第一条 system 提示词（前 1200 字）——")
     print(lm.history[0]["messages"][0]["content"][:1200])

@@ -8,11 +8,13 @@
   工具      langchain_core.tools.tool 把函数包装成工具；model.bind_tools(...) 把 Schema 交给模型
   循环      没有 while：循环是图里的一条回边 tools → agent；agent 没有工具调用时条件边走向 END。
             recursion_limit（默认 1000）限制的是超步数（super-step），不是模型调用次数
-  审批      approval 节点里调用 interrupt(payload) → invoke 返回的结果里带 "__interrupt__"；
-            审批后 invoke(Command(resume=决定), 同一个 thread_id) 继续。
+  审批      approval 节点里调用 interrupt(payload) → ainvoke 返回的结果里带 "__interrupt__"；
+            审批后 ainvoke(Command(resume=决定), 同一个 thread_id) 继续。
             ⚠️ 恢复时 approval 节点会**从头重新执行**，所以它必须没有副作用——这正是把审批单独做成一个节点的原因
   追踪      每个超步一个检查点：get_state_history(config) 就是一条可回放的执行记录；
             在线追踪用 LangSmith（设置 LANGSMITH_TRACING=true 等环境变量），本 demo 不开启
+  async     invoke / ainvoke 两套入口，本文件用 await graph.ainvoke(...)；节点写成 async def，
+            await 模型（llm.ainvoke）和工具（tool.ainvoke）。同步节点在 ainvoke 下会被放进线程池执行
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ def _load_sibling(name: str):
 shared = _load_sibling("shared_tools")
 # --- end bootstrap ---
 
+import asyncio
 import time
 import uuid
 from collections import Counter
@@ -73,11 +76,12 @@ def build_graph(model, desk, counter: Counter):
     tools = {t.name: t for t in (tool(f) for f in desk.functions().values())}
     llm = model.bind_tools(list(tools.values()))
 
-    def agent(state: HelpdeskState) -> dict:
+    # 节点可以是 async 函数：图用 ainvoke 驱动时，等模型、等工具都不占线程（同步节点会被放进线程池）
+    async def agent(state: HelpdeskState) -> dict:
         counter["agent"] += 1  # 每执行一次 agent 节点 = 一次模型调用
-        return {"messages": [llm.invoke(state["messages"])]}
+        return {"messages": [await llm.ainvoke(state["messages"])]}
 
-    def approval(state: HelpdeskState) -> dict:
+    async def approval(state: HelpdeskState) -> dict:
         # 恢复时本节点从头重跑：这里只读状态、调用 interrupt，不产生任何副作用
         counter["approval"] += 1
         decisions = dict(state.get("decisions") or {})
@@ -86,7 +90,7 @@ def build_graph(model, desk, counter: Counter):
                 decisions[call["id"]] = bool(interrupt({"tool": call["name"], "args": call["args"]}))
         return {"decisions": decisions}
 
-    def run_tools(state: HelpdeskState) -> dict:
+    async def run_tools(state: HelpdeskState) -> dict:
         counter["tools"] += 1
         decisions = state.get("decisions") or {}
         results = []
@@ -96,7 +100,7 @@ def build_graph(model, desk, counter: Counter):
             elif call["name"] not in tools:
                 content = f"错误：不存在名为 {call['name']} 的工具"
             else:
-                content = str(tools[call["name"]].invoke(call["args"]))
+                content = str(await tools[call["name"]].ainvoke(call["args"]))  # 同步函数的工具，ainvoke 放进线程池执行
             results.append(ToolMessage(content=content, tool_call_id=call["id"]))
         return {"messages": results}
 
@@ -114,7 +118,7 @@ def build_graph(model, desk, counter: Counter):
     return builder.compile(checkpointer=InMemorySaver())  # 生产换成 PostgresSaver 等持久化实现
 
 
-def run(question: str = shared.QUESTION, approver=shared.auto_approver, model=None) -> "shared.FrameworkResult":
+async def run(question: str = shared.QUESTION, approver=shared.auto_approver, model=None) -> "shared.FrameworkResult":
     desk = shared.ITDesk(user_id="alice")
     counter: Counter = Counter()
     graph = build_graph(model or make_model(), desk, counter)
@@ -122,16 +126,16 @@ def run(question: str = shared.QUESTION, approver=shared.auto_approver, model=No
     approvals = []
     t0 = time.perf_counter()
     inputs = {"messages": [SystemMessage(shared.SYSTEM_PROMPT), HumanMessage(question)], "decisions": {}}
-    result = graph.invoke(inputs, config)
+    result = await graph.ainvoke(inputs, config)
     while result.get("__interrupt__"):  # 暂停：状态已在 checkpointer 里，凭 thread_id 随时恢复
         payload = result["__interrupt__"][0].value
         ok = approver(payload["tool"], payload["args"])
         approvals.append((payload["tool"], payload["args"], ok))
-        result = graph.invoke(Command(resume=ok), config)
+        result = await graph.ainvoke(Command(resume=ok), config)
     seconds = time.perf_counter() - t0
     ai = [m for m in result["messages"] if m.type == "ai"]
     usage = [m.usage_metadata or {} for m in ai]
-    checkpoints = list(graph.get_state_history(config))
+    checkpoints = [cp async for cp in graph.aget_state_history(config)]
     return shared.FrameworkResult(
         framework="LangGraph",
         version=f"{version('langgraph')} (+langchain-openai {version('langchain-openai')})",
@@ -151,4 +155,4 @@ def run(question: str = shared.QUESTION, approver=shared.auto_approver, model=No
 
 
 if __name__ == "__main__":
-    shared.print_result(run())
+    shared.print_result(asyncio.run(run()))

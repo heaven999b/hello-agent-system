@@ -3,6 +3,8 @@
 框架没装时对应测试自动跳过（pytest.importorskip），所以 CI 不需要装这三个框架。
 这些测试不属于练习——它们不依赖 exercise.py，在练习没写完时也会通过。
 它们的价值是**防版本漂移**：框架升级改了 API，这里会第一个报错。
+四个 run() 都是 async 的，用的是各框架的 async 入口：agentkit 的 agent.run、DSPy 的 acall、
+LangGraph 的 ainvoke、OpenAI Agents SDK 的 Runner.run。
 
     .venv/bin/python -m pytest lessons/20_frameworks_bridge/test_integration.py -v
 """
@@ -38,17 +40,17 @@ def _approvals(decision: bool):
     return approver, seen
 
 
-def test_agentkit_impl_offline_script():
+async def test_agentkit_impl_offline_script():
     impl = _load("impl_agentkit")
     approver, seen = _approvals(True)
-    res = impl.run(approver=approver, llm=impl.offline_llm())
+    res = await impl.run(approver=approver, llm=impl.offline_llm())
     assert res.tool_calls == ["search_kb", "get_account_status", "reset_password"]
     assert res.llm_calls == 3 and [a[0] for a in seen] == ["reset_password"]
     assert "KB-101" in res.answer
 
 
 @pytest.mark.parametrize("decision", [True, False])
-def test_langgraph_impl_with_fake_chat_model(decision):
+async def test_langgraph_impl_with_fake_chat_model(decision):
     pytest.importorskip("langgraph")
     fake_mod = pytest.importorskip("langchain_core.language_models.fake_chat_models")
     from langchain_core.messages import AIMessage
@@ -73,7 +75,7 @@ def test_langgraph_impl_with_fake_chat_model(decision):
     )
     impl = _load("impl_langgraph")
     approver, seen = _approvals(decision)
-    res = impl.run(approver=approver, model=model)
+    res = await impl.run(approver=approver, model=model)
     assert seen == [("reset_password", {"reason": "账号被锁"})]
     assert res.llm_calls == 2 and res.answer == "已处理（KB-101）"
     # 同一批里的 search_kb 也要等审批节点放行后才执行（整批一起过 approval 节点）
@@ -82,7 +84,7 @@ def test_langgraph_impl_with_fake_chat_model(decision):
 
 
 @pytest.mark.parametrize("decision", [True, False])
-def test_openai_agents_impl_with_scripted_model(decision):
+async def test_openai_agents_impl_with_scripted_model(decision):
     pytest.importorskip("agents")
     from agents.testing import ScriptedModel, assistant_message, function_call
 
@@ -97,7 +99,7 @@ def test_openai_agents_impl_with_scripted_model(decision):
     )
     impl = _load("impl_openai_agents")
     approver, seen = _approvals(decision)
-    res = impl.run(approver=approver, model=model)
+    res = await impl.run(approver=approver, model=model)
     assert seen == [("reset_password", {"reason": "账号被锁"})]
     assert res.answer == "已处理（KB-101）"
     # 和 LangGraph 版不同：不需要审批的 search_kb 在暂停前就执行了
@@ -115,7 +117,7 @@ def test_openai_agents_tool_flags():
     assert "username" not in reset.params_json_schema["properties"]  # 身份不交给模型
 
 
-def test_dspy_impl_with_dummy_lm():
+async def test_dspy_impl_with_dummy_lm():
     pytest.importorskip("dspy")
     from dspy.utils import DummyLM
 
@@ -129,7 +131,7 @@ def test_dspy_impl_with_dummy_lm():
     )
     impl = _load("impl_dspy")
     approver, seen = _approvals(True)
-    res = impl.run(approver=approver, lm=lm)
+    res = await impl.run(approver=approver, lm=lm)
     assert seen == [("reset_password", {"reason": "账号被锁"})]
     assert res.tool_calls == ["search_kb", "reset_password"]
     assert res.answer == "已处理（KB-101）"

@@ -1,4 +1,5 @@
 """第 20 课练习测试：离线、确定、零框架依赖（不需要安装 dspy / langgraph / openai-agents）。
+MiniGraph 的 invoke / resume 和 Predict 都是 async 的，所以这些测试写成 async def、用 await 调用。
 
 运行：make lesson N=20    或    .venv/bin/python -m pytest lessons/20_frameworks_bridge/test_exercise.py -v
 """
@@ -30,23 +31,23 @@ def _counter_graph(limit: int = 3, max_steps: int = 25):
     return g.compile(max_steps=max_steps)
 
 
-def test_graph_linear_run_to_end():
+async def test_graph_linear_run_to_end():
     g = ex.MiniGraph()
     g.add_node("a", lambda s: {"trail": s["trail"] + ["a"]})
     g.add_node("b", lambda s: {"trail": s["trail"] + ["b"], "done": True})
     g.add_edge(ex.START, "a")
     g.add_edge("a", "b")
     g.add_edge("b", ex.END)
-    out = g.compile().invoke({"trail": []}, thread_id="t")
+    out = await g.compile().invoke({"trail": []}, thread_id="t")
     assert out == {"trail": ["a", "b"], "done": True}
 
 
-def test_graph_conditional_loop_and_path_map():
-    out = _counter_graph(limit=3).invoke({"n": 0}, thread_id="t")
+async def test_graph_conditional_loop_and_path_map():
+    out = await _counter_graph(limit=3).invoke({"n": 0}, thread_id="t")
     assert out["n"] == 3 and out["finished"] is True
 
 
-def test_graph_router_without_path_map_and_unknown_target():
+async def test_graph_router_without_path_map_and_unknown_target():
     g = ex.MiniGraph()
     g.add_node("a", lambda s: None)  # 返回 None = 不改状态
     g.add_node("b", lambda s: {"went": "b"})
@@ -54,10 +55,10 @@ def test_graph_router_without_path_map_and_unknown_target():
     g.add_conditional_edges("a", lambda s: s["go"])  # 没有 path_map：路由函数直接返回节点名
     g.add_edge("b", ex.END)
     app = g.compile()
-    assert app.invoke({"go": "b"}, thread_id="t1")["went"] == "b"
-    assert app.invoke({"go": ex.END}, thread_id="t2") == {"go": ex.END}
+    assert (await app.invoke({"go": "b"}, thread_id="t1"))["went"] == "b"
+    assert await app.invoke({"go": ex.END}, thread_id="t2") == {"go": ex.END}
     with pytest.raises(ValueError):
-        app.invoke({"go": "nowhere"}, thread_id="t3")
+        await app.invoke({"go": "nowhere"}, thread_id="t3")
 
 
 def test_graph_validate_rejects_bad_structure():
@@ -77,27 +78,27 @@ def test_graph_validate_rejects_bad_structure():
         g.compile()
 
 
-def test_graph_reducer_appends_instead_of_overwrite():
+async def test_graph_reducer_appends_instead_of_overwrite():
     g = ex.MiniGraph(reducers={"log": operator.add})
     g.add_node("a", lambda s: {"log": ["a"], "last": "a"})
     g.add_node("b", lambda s: {"log": ["b"], "last": "b"})
     g.add_edge(ex.START, "a")
     g.add_edge("a", "b")
     g.add_edge("b", ex.END)
-    out = g.compile().invoke({"log": ["start"], "last": None}, thread_id="t")
+    out = await g.compile().invoke({"log": ["start"], "last": None}, thread_id="t")
     assert out["log"] == ["start", "a", "b"]  # 有 reducer：追加
     assert out["last"] == "b"  # 没有 reducer：后写覆盖
 
 
-def test_graph_max_steps_raises_recursion_error():
+async def test_graph_max_steps_raises_recursion_error():
     app = _counter_graph(limit=100, max_steps=5)
     with pytest.raises(ex.GraphRecursionError):
-        app.invoke({"n": 0}, thread_id="t")
+        await app.invoke({"n": 0}, thread_id="t")
 
 
-def test_graph_checkpoint_after_every_step_and_snapshots_are_immutable():
+async def test_graph_checkpoint_after_every_step_and_snapshots_are_immutable():
     app = _counter_graph(limit=2)
-    out = app.invoke({"n": 0}, thread_id="t")
+    out = await app.invoke({"n": 0}, thread_id="t")
     history = app.get_state_history("t")  # 最新在前
     # 输入 1 个 + 每执行一个节点 1 个：inc, inc, done → 共 4 个
     assert [cp.step for cp in history] == [3, 2, 1, 0]
@@ -108,7 +109,7 @@ def test_graph_checkpoint_after_every_step_and_snapshots_are_immutable():
     assert app.get_state("t").state["n"] == 2
 
 
-def test_graph_interrupt_pauses_then_resume_reruns_node():
+async def test_graph_interrupt_pauses_then_resume_reruns_node():
     runs = {"approval": 0}
 
     def approval(s):
@@ -126,26 +127,26 @@ def test_graph_interrupt_pauses_then_resume_reruns_node():
     g.add_edge("cancel", ex.END)
     app = g.compile()
 
-    first = app.invoke({"amount": 42}, thread_id="t")
+    first = await app.invoke({"amount": 42}, thread_id="t")
     assert first["__interrupt__"] == {"question": "批准吗？", "amount": 42}
     cp = app.get_state("t")
     assert cp.status == "interrupted" and cp.next == "approval" and cp.step == 0
     with pytest.raises(ValueError):
-        app.resume("no-such-thread", True)
+        await app.resume("no-such-thread", True)
 
-    final = app.resume("t", True)
+    final = await app.resume("t", True)
     assert final["paid"] is True and "__interrupt__" not in final
     assert runs["approval"] == 2
     assert app.get_state("t").status == "done"
     with pytest.raises(ValueError):  # 已经结束的 thread 不能再 resume
-        app.resume("t", True)
+        await app.resume("t", True)
 
-    rejected = app.invoke({"amount": 7}, thread_id="t2")
+    rejected = await app.invoke({"amount": 7}, thread_id="t2")
     assert "__interrupt__" in rejected
-    assert app.resume("t2", False)["paid"] is False
+    assert (await app.resume("t2", False))["paid"] is False
 
 
-def test_graph_node_with_two_interrupts_consumes_resume_values_in_order():
+async def test_graph_node_with_two_interrupts_consumes_resume_values_in_order():
     def ask_twice(s):
         a = ex.interrupt("第一个问题")
         b = ex.interrupt("第二个问题")
@@ -156,9 +157,9 @@ def test_graph_node_with_two_interrupts_consumes_resume_values_in_order():
     g.add_edge(ex.START, "ask")
     g.add_edge("ask", ex.END)
     app = g.compile()
-    assert app.invoke({}, thread_id="t")["__interrupt__"] == "第一个问题"
-    assert app.resume("t", "A")["__interrupt__"] == "第二个问题"
-    assert app.resume("t", "B")["answers"] == ["A", "B"]
+    assert (await app.invoke({}, thread_id="t"))["__interrupt__"] == "第一个问题"
+    assert (await app.resume("t", "A"))["__interrupt__"] == "第二个问题"
+    assert (await app.resume("t", "B"))["answers"] == ["A", "B"]
 
 
 def _helpdesk_registry(resets: list):
@@ -177,7 +178,7 @@ def _helpdesk_registry(resets: list):
 
 
 @pytest.mark.parametrize("decision", [True, False])
-def test_agent_graph_built_from_agentkit_blocks_waits_for_approval(decision):
+async def test_agent_graph_built_from_agentkit_blocks_waits_for_approval(decision):
     """用你的 MiniGraph + agentkit 的 LLM / ToolRegistry 搭出和 impl_langgraph.py 同构的审批 Agent。"""
     resets: list = []
     llm = ScriptedLLM(
@@ -191,11 +192,11 @@ def test_agent_graph_built_from_agentkit_blocks_waits_for_approval(decision):
     app = ex.build_agent_graph(llm, _helpdesk_registry(resets), {"reset_password"}, tracer=tracer)
     inputs = {"messages": [{"role": "system", "content": "你是 IT 助手"}, {"role": "user", "content": "VPN 连不上，顺便重置密码"}], "decisions": {}}
 
-    paused = app.invoke(inputs, thread_id="it-1")
+    paused = await app.invoke(inputs, thread_id="it-1")
     assert paused["__interrupt__"] == {"tool": "reset_password", "arguments": {"reason": "账号被锁"}}
     assert resets == [] and len(llm.calls) == 2  # 审批前：危险工具没执行，模型只被调用了 2 次
 
-    final = app.resume("it-1", decision)
+    final = await app.resume("it-1", decision)
     assert final["messages"][-1]["content"] == "处理完毕"
     assert resets == (["账号被锁"] if decision else [])
     tool_results = [m["content"] for m in final["messages"] if m["role"] == "tool"]
@@ -264,10 +265,10 @@ def test_signature_parse_output_extracts_and_coerces():
         sig.parse_output("抱歉，我不知道。")
 
 
-def test_predict_module_repairs_invalid_output_once():
+async def test_predict_module_repairs_invalid_output_once():
     sig = ex.Signature("question -> answer, confidence: float")
     llm = ScriptedLLM([reply("答案是更新证书"), reply('{"answer": "更新证书", "confidence": 0.7}')])
-    pred = ex.Predict(sig, llm, max_repairs=1)(question="VPN 证书过期")
+    pred = await ex.Predict(sig, llm, max_repairs=1)(question="VPN 证书过期")  # 调用模型：async
     assert pred.answer == "更新证书" and pred["confidence"] == 0.7
     assert len(llm.calls) == 2
     assert "没有通过校验" in llm.calls[1]["messages"][-1]["content"]  # 第二次调用带上了错误反馈

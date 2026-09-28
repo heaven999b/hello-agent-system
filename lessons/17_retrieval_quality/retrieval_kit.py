@@ -6,13 +6,14 @@
     VectorIndex           暴力（精确）向量检索：逐个算余弦相似度
     BM25                  稀疏检索：经典的关键词打分
     IVFIndex              近似最近邻（ANN）的一种：倒排文件索引（只用于演示召回率-延迟权衡）
-    llm_rerank_listwise   用 LLM 做列表式重排（一次调用排整组候选）
-    llm_rerank_pointwise  用 LLM 做逐条打分重排（每个候选一次调用）
-    multi_query / hyde    查询改写
+    llm_rerank_listwise   用 LLM 做列表式重排（一次调用排整组候选）                 async
+    llm_rerank_pointwise  用 LLM 做逐条打分重排（每个候选一次调用，可并发）         async
+    multi_query / hyde    查询改写                                                  async
     recall_at_k           Recall@k
-    MeteredLLM            给任何 LLM 套一层"计量表"：调用次数、token、耗时、估算成本
+    MeteredLLM            给任何 LLM 套一层"计量表"：调用次数、token、耗时、在途峰值、估算成本
     chunk_units / chunk_texts  切块实验用的"按句贪心合并"切块器
 
+调用模型的函数都是 async 的（`await llm.chat(...)`）；检索、指标、切块是纯计算，保持普通函数。
 练习里的三个函数（rrf_fuse、ndcg_at_k / mrr、hybrid_search）不在这里，见 exercise.py。
 
 ⚠️ 教学 embedding 不是神经网络 embedding。它能演示"向量、余弦相似度、近似检索"这些机制，
@@ -26,12 +27,10 @@ import json
 import math
 import random
 import re
-import threading
 import time
 import unicodedata
 import zlib
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
@@ -42,7 +41,7 @@ from agentkit.llm import LLM
 from agentkit.memory import tokenize  # 英文 / 数字按词，中文按相邻两字（bigram）
 from agentkit.pricing import estimate_cost
 from agentkit.types import LLMResponse, Message, Usage
-from agentkit.workflows import complete, complete_json
+from agentkit.workflows import complete, complete_json, parallel
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -427,7 +426,13 @@ class IVFIndex:
 
 
 class MeteredLLM:
-    """给任何 LLM 套一层计量表：调用次数、token、耗时。线程安全（demo 会用 2 个线程并发重排）。"""
+    """给任何 LLM 套一层计量表：调用次数、token、耗时，以及"同一时刻有几个调用在路上"。
+
+    in_flight / max_in_flight 是并发真实发生的证据：demo 用 asyncio.gather + Semaphore(2) 同时发两个重排请求，
+    max_in_flight 应该正好是 2。
+    不需要锁：所有协程跑在同一个事件循环线程里，只有 await 处才会切换，
+    `self.calls += 1` 这类更新之间没有 await，不会被别的协程打断。
+    """
 
     def __init__(self, inner: LLM):
         self.inner = inner
@@ -435,20 +440,24 @@ class MeteredLLM:
         self.calls = 0
         self.usage = Usage()
         self.seconds = 0.0
-        self._lock = threading.Lock()
+        self.in_flight = 0
+        self.max_in_flight = 0
 
-    def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+    async def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
         t0 = time.perf_counter()
-        resp = self.inner.chat(messages, tools, **kwargs)
-        with self._lock:
-            self.calls += 1
-            self.usage = self.usage + resp.usage
-            self.seconds += time.perf_counter() - t0
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            resp = await self.inner.chat(messages, tools, **kwargs)
+        finally:
+            self.in_flight -= 1
+        self.calls += 1
+        self.usage = self.usage + resp.usage
+        self.seconds += time.perf_counter() - t0
         return resp
 
     def snapshot(self) -> tuple[int, Usage, float]:
-        with self._lock:
-            return self.calls, Usage(**vars(self.usage)), self.seconds
+        return self.calls, Usage(**vars(self.usage)), self.seconds
 
     def cost_usd(self, usage: Usage | None = None) -> float:
         return estimate_cost(usage or self.usage, self.model)
@@ -506,7 +515,7 @@ def _labelled(candidates: Sequence[tuple[str, str]], max_chars: int) -> tuple[di
     return labels, "\n".join(lines)
 
 
-def llm_rerank_listwise(
+async def llm_rerank_listwise(
     llm: LLM, query: str, candidates: Sequence[tuple[str, str]], max_chars: int = 200
 ) -> list[str]:
     """列表式（listwise）重排：一次调用，让模型看到全部候选后给出完整排序。返回重排后的 doc_id 列表。"""
@@ -514,7 +523,7 @@ def llm_rerank_listwise(
         return [c[0] for c in candidates]
     labels, block = _labelled(candidates, max_chars)
     prompt = LISTWISE_PROMPT.format(query=query, n=len(candidates), candidates=block)
-    result = complete_json(llm, prompt, ListwiseRanking, system=RERANK_SYSTEM)
+    result = await complete_json(llm, prompt, ListwiseRanking, system=RERANK_SYSTEM)
     order = merge_ranking(result.ranking, list(labels))
     return [labels[x] for x in order]
 
@@ -532,24 +541,22 @@ class PointwiseJudgment(BaseModel):
     score: int = Field(ge=0, le=3, description="0-3 分")
 
 
-def llm_rerank_pointwise(
-    llm: LLM, query: str, candidates: Sequence[tuple[str, str]], max_chars: int = 200, max_workers: int = 1
+async def llm_rerank_pointwise(
+    llm: LLM, query: str, candidates: Sequence[tuple[str, str]], max_chars: int = 200, max_concurrency: int = 1
 ) -> list[str]:
     """逐条（pointwise）重排：每个候选单独一次调用、单独打分，再按分数排序。
     和 cross-encoder 的形态一样：模型一次只看 (问题, 一个片段)。分数相同的保持原来的顺序。
-    各条之间互不依赖，可以并发（max_workers）：延迟接近一次调用，但调用次数和 token 是候选数的 N 倍。"""
+    各条之间互不依赖，可以并发：最多 max_concurrency 个调用同时在路上（agentkit.workflows.parallel =
+    asyncio.gather + Semaphore，结果按输入顺序返回，一个失败其余立即取消）。
+    延迟接近 候选数 / max_concurrency 次调用，但调用次数和 token 是候选数的 N 倍。"""
 
-    def judge(text: str) -> int:
+    async def judge(text: str) -> int:
         text = " ".join(text.split())[:max_chars]
         prompt = POINTWISE_PROMPT.format(query=query, text=text)
-        return complete_json(llm, prompt, PointwiseJudgment, system=RERANK_SYSTEM).score
+        return (await complete_json(llm, prompt, PointwiseJudgment, system=RERANK_SYSTEM)).score
 
     texts = [t for _, t in candidates]
-    if max_workers > 1:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            scores = list(pool.map(judge, texts))
-    else:
-        scores = [judge(t) for t in texts]
+    scores = await parallel([lambda t=t: judge(t) for t in texts], max_concurrency=max_concurrency)
     order = sorted(range(len(candidates)), key=lambda i: (-scores[i], i))
     return [candidates[i][0] for i in order]
 
@@ -563,25 +570,25 @@ class QueryVariants(BaseModel):
     queries: list[str] = Field(description="改写后的检索查询，每条都是独立完整的一句话")
 
 
-def multi_query(llm: LLM, query: str, n: int = 3) -> list[str]:
+async def multi_query(llm: LLM, query: str, n: int = 3) -> list[str]:
     """多查询（multi-query）：让模型把口语化的问题改写成几种"更像文档"的说法，分别检索后再融合。"""
     prompt = (
         f"员工在企业知识库里搜索：{query}\n\n"
         f"请把它改写成 {n} 条不同的检索查询，用公司制度文件里常见的正式说法（例如把“坏了”写成“故障”），"
         "保留原问题里的型号、编号和否定条件。"
     )
-    out = complete_json(llm, prompt, QueryVariants)
+    out = await complete_json(llm, prompt, QueryVariants)
     return [q.strip() for q in out.queries if q.strip()][:n]
 
 
-def hyde(llm: LLM, query: str, max_chars: int = 120) -> str:
+async def hyde(llm: LLM, query: str, max_chars: int = 120) -> str:
     """HyDE（Hypothetical Document Embeddings）：先让模型"假装"写一段能回答问题的制度原文，
     再用这段假文档去做向量检索。假文档里的细节可能是编的，但它的"说法"和真文档更像。"""
     prompt = (
         f"员工问：{query}\n\n请写一段公司制度文件里可能出现的、能回答这个问题的原文（{max_chars} 字以内）。"
         "直接输出这段文字，不要解释。具体数字不确定也没关系。"
     )
-    return complete(llm, prompt).strip()[: max_chars * 2]
+    return (await complete(llm, prompt)).strip()[: max_chars * 2]
 
 
 # =====================================================================

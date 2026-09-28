@@ -109,10 +109,10 @@ Mem0 论文（Chhikara 等，2025）把写入分成两个阶段，本课照此�
 1. **抽取阶段**：输入是新的一对消息，加上整段对话的摘要和最近 m 条消息（论文取 m = 10），由 LLM 输出一组候选事实。摘要由一个异步模块定期刷新，不阻塞对话。
 2. **更新阶段**：对每条候选事实，用向量检索取出最相似的 s 条已有记忆（论文取 s = 10），再由 LLM 通过函数调用（function calling）从四个操作里选一个：**ADD**（没有等价的记忆，新增）、**UPDATE**（补充或改写已有记忆）、**DELETE**（新信息与之矛盾，删除）、**NOOP**（无需改动）。
 
-[`FactMemory.observe`](memory_kit.py) 的主干就是这几步：
+[`FactMemory.observe`](memory_kit.py) 的主干就是这几步（`observe` 是 `async def`，调用方写 `await mem.observe(...)`）：
 
 ```python
-facts = self.last_facts = self._extract(message, now)            # ① 抽取（complete_json 保证结构）
+facts = self.last_facts = await self._extract(message, now)      # ① 抽取（complete_json 保证结构）
 if not facts:
     return []
 live = [r for r in store.values() if r.is_live(now)]
@@ -120,7 +120,7 @@ candidates = self._candidates(facts, live)                        # ② 每条�
 if not candidates:                                                #    没东西可比：只可能是 ADD
     ops = [MemoryOp("ADD", None, f.text, f.key, f.importance, f.ttl_days, "新用户 / 新话题") for f in facts]
 else:
-    ops = self._decide(message, facts, candidates, now)           # ③ LLM 决策
+    ops = await self._decide(message, facts, candidates, now)     # ③ LLM 决策
 ops = self._guard(ops, store, now)                                # ④ 规则兜底
 results = self.apply_fn(store, ops, now=now, new_id=self.new_id)  # ⑤ 执行（练习 b）
 ```
@@ -132,6 +132,7 @@ results = self.apply_fn(store, ops, now=now, new_id=self.new_id)  # ⑤ 执行�
 - **为什么给模型看 "0""1" 这样的短编号？** 这是 Mem0 开源代码里的一个小技巧（代码注释写的是 anti-hallucination）：让模型抄一串 UUID，它容易抄错、甚至编一个；短编号在代码里再映射回真实 id。
 - **记忆库是空的时候跳过决策调用。** 这时候唯一可能的决策就是 ADD，没必要花钱问模型。
 - **只有用户本人说的话才能写入。** `observe(..., source_type="document")` 会被直接拒绝，连模型都不调用（第 04 课防投毒原则 1）。
+- **同一个用户的写入排队，不同用户照常并发。** 主干里"读已有记忆"（`live = ...`）和"落库"（`apply_fn`）之间隔着两次 `await`（抽取、决策）。同一个用户的两条消息如果交错执行，第二条就拿着过时的候选记忆去决策。所以 `observe` / `maybe_reflect` 外面套了一把按 `(tenant_id, user_id)` 的锁（`agentkit.limits.KeyedLocks`）。测试 `test_fact_memory_serializes_writes_per_user_but_not_across_users` 让两条消息同时到达："我对花生过敏"和"更正：不是花生，是芒果"。有锁时第二条排在后面，看得到"花生过敏"，把它删掉，模型调用的在途峰值是 1；把锁拿掉，两条同时等模型（在途峰值 2），第二条的决策没看到"花生"，过时的记忆就活了下来。三个不同用户同时写入时，在途峰值是 3，互不等待。这把锁只管一个进程：记忆存在进程内的 dict 里，多个 worker 进程各有一份。生产里记录放 Postgres（第 26 课），向量索引用 pgvector 之类（第 15、17 课），按用户串行靠按用户分区的队列或数据库锁（[第 26 课 问题 5](../26_state_and_queues/README.md#问题-5分布式锁--redispostgres-advisory-locketcdzookeeper怎么选)）。
 
 > 💡 **一个容易忽略的数字**：Mem0 论文在 LOCOMO 基准上的结果里，**把全部对话塞进上下文（full-context）的准确率反而最高**（LLM 评委分 72.9%，Mem0 是 66.9%）。记忆系统换来的是 p95 延迟降低 91%（17.1 秒 → 1.4 秒）、token 省掉 90% 以上。**记忆系统首先是成本和延迟的优化，不是准确率的免费午餐。**
 
@@ -285,7 +286,7 @@ core = CoreMemory({"human": ("关于当前用户的关键事实和偏好", 120),
 archival = MemoryStore()                                   # 归档直接复用第 04 课的 MemoryStore
 tools = memgpt_tools(core, archival)                       # core_memory_append / core_memory_replace / archival_insert / archival_search
 agent = Agent(llm, tools, system_prompt=PROMPT, hooks=[CoreMemoryHook(core, archival, PROMPT)])
-agent.run("……", metadata={"tenant_id": "acme", "user_id": "alice"})   # 身份只从 metadata → ctx 来
+await agent.run("……", metadata={"tenant_id": "acme", "user_id": "alice"})   # 身份只从 metadata → ctx 来
 ```
 
 设计决定：
@@ -294,6 +295,7 @@ agent.run("……", metadata={"tenant_id": "acme", "user_id": "alice"})   # 身�
 - **渲染时标出"已用 / 上限"字符数**，例如 `<human chars="42/120">`。这是 MemGPT"内存压力"思想的简化版：让模型看得见还剩多少空间。写入超限时，工具返回一条模型能照着做的错误："请先用 core_memory_replace 精简，或者把细节 archival_insert 进归档"。
 - **核心记忆是全系统投毒代价最高的位置**：它被拼进 system prompt，每一轮都会被当作最高优先级的上下文读。所以每次写入都要过 `detect_injection` 和敏感信息检查，并记录审计历史（谁、何时、旧值、新值），出事可以 `rollback`。
 - **身份从 `ctx` 取**，模型没有办法指定"改谁的记忆"（第 03 课原则 4）。
+- **四个工具都是 `async def`，虽然函数体里没有 `await`**：普通函数工具会被放进线程池执行（给阻塞 I/O 用的，见 [`agentkit/tools.py`](../../agentkit/tools.py)），那样核心记忆就会在工具线程里被改、同时在事件循环线程里被 `CoreMemoryHook` 读，并发的会话之间还得加锁。这几个工具只动进程内的数据结构（微秒级），放在事件循环线程上执行，所有读写都在一个线程里，两次 `await` 之间不会被打断。换成数据库存储后，函数体里就是真正的 `await`。
 
 真实运行（gpt-5.5）里有几个值得注意的行为：
 
@@ -390,6 +392,8 @@ agent.run("……", metadata={"tenant_id": "acme", "user_id": "alice"})   # 身�
 
 （离线模式的输出是剧本，但抽取 → 比对 → 决策 → 兜底 → 落库的数据流和真实运行完全一样。离线剧本照搬了真实运行里的几个行为，比如会话 4 的拆分、B 组的回答方式；另外在会话 3 故意制造了一次模型失误，用来演示兜底规则。）
 
+（故事里的"4 个月"是逻辑时钟：每次会话前把 `now` 拨到那一天，写入日期、近期性衰减、TTL 都按它算，这样 Demo 几秒钟就能跑完 4 个月。它模拟的是时间流逝，不是并发：每次会话、每次模型调用都是真实的 `await`，一个接一个地跑。）
+
 ## 4. 练习
 
 打开 [`exercise.py`](exercise.py)，完成三个函数：
@@ -405,7 +409,7 @@ make lesson N=18
 # 或者：.venv/bin/python -m pytest lessons/18_memory_systems -v
 ```
 
-14 个测试全部离线。其中一个集成测试会把你写的 `apply_memory_ops` 塞进 `FactMemory`，用剧本代替模型跑完整的两次会话。卡住了先重读 §2.4、§2.5，再看 [`solution.py`](solution.py)。
+15 个测试全部离线：14 个测你的练习，其中一个集成测试会把你写的 `apply_memory_ops` 塞进 `FactMemory`，用剧本代替模型跑完整的两次会话（`FactMemory.observe` 是 async 的，测试里用 `await`；你要写的三个函数都是纯计算，仍是普通函数）；另外 1 个测的是课程代码本身（§2.2 的按用户排队），不做练习也会通过。卡住了先重读 §2.4、§2.5，再看 [`solution.py`](solution.py)。
 
 ## 5. 深入（给有余力的你）
 
@@ -440,7 +444,7 @@ Mem0 的接口按 `user_id` / `agent_id` / `run_id` 三个维度划分记忆的�
 
 ### 5.5 规模化之后
 
-- **写入异步化**：每条消息 1~2 次模型调用，不能放在响应路径上。进队列（第 13 课），并按用户串行执行，否则两条消息并发对账，会出现"丢失更新"。
+- **写入移出响应路径**：每条消息 1~2 次模型调用，即使是 `await`，也会让用户多等几秒。放进后台任务队列（第 13 课），并按用户串行执行，否则两条消息并发对账，会出现"丢失更新"。本课的 `FactMemory` 在一个进程内用按用户的锁做到了串行（§2.2，有测试证明）；多个 worker 进程之间，要靠按用户分区的队列或数据库锁（第 26 课）。
 - **成本**：抽取和决策可以用小模型，但要监控它们的错误率。可以抽样一部分写入，交给大模型或人工复核。
 - **指标**：每个用户的记忆条数、ADD / UPDATE / DELETE 的比例、被检索到的比例（从来没被检索到的记忆可以考虑清理）、"用户纠正"的次数（记忆质量最直接的信号）。
 

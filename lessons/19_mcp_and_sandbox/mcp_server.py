@@ -4,8 +4,9 @@
 
 它把几个普通的 agentkit Tool 暴露成 MCP 工具。整个文件只做三件事：
   1. mcp_tool_def()      agentkit Tool → MCP 工具定义（inputSchema 直接复用 Tool.schema()）
-  2. handle_request()    一条 JSON-RPC 消息 → 一条响应（或者 None：通知不回复）
-  3. serve_stdio()       按行读 stdin、按行写 stdout 的主循环
+  2. handle_request()    一条 JSON-RPC 消息 → 一条响应（或者 None：通知不回复）；async，因为 tools/call 要 await 工具
+  3. serve_stdio()       按行读 stdin、按行写 stdout 的主循环：每个请求一个 asyncio 任务，慢工具不挡后面的请求
+                         （响应可能乱序，客户端按 id 配对）；收到 notifications/cancelled 就取消那个任务
 
 它是一个"双时代"（dual-era）服务器，同时支持两代协议：
   - 现代版 2026-07-28：没有握手，每个请求在 params._meta 里自带协议版本和客户端能力；
@@ -15,11 +16,12 @@
 
 简化说明（生产实现要补上的）：严格的双时代服务器会记住"这个 stdio 进程是否已经用 initialize
 进入了旧版模式"，并拒绝旧版模式下的现代请求；这里为了让 handle_request 保持无状态、好测试，
-按"每条请求自己带没带现代 _meta"来判断时代。
+按"每条请求自己带没带现代 _meta"来判断时代。另外没有给同时在处理的请求数设上限。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -101,8 +103,9 @@ def _as_registry(tools: Iterable[Tool] | ToolRegistry) -> ToolRegistry:
 # ───────────────────────────── 分发：一条消息 → 一条响应 ─────────────────────────────
 
 
-def handle_request(req: Any, tools: Iterable[Tool] | ToolRegistry, *, log: TextIO | None = None) -> dict | None:
+async def handle_request(req: Any, tools: Iterable[Tool] | ToolRegistry, *, log: TextIO | None = None) -> dict | None:
     """处理一条 JSON-RPC 消息，返回响应 dict；通知（没有 id）返回 None，表示"不回复"。
+    是 async 的：tools/call 要 await 工具执行（工具可能在等下游 API）；其余分支都是纯计算。
 
     两类错误一定要分清（MCP 规范 Tools → Error Handling）：
     - 协议错误（JSON-RPC error）：请求本身有问题 —— 方法不存在、未知工具、请求结构不合法。
@@ -205,7 +208,7 @@ def handle_request(req: Any, tools: Iterable[Tool] | ToolRegistry, *, log: TextI
 
         # 复用第 03 课的 ToolRegistry.execute：参数校验、ToolError、异常兜底、超时、截断都已经在里面了
         call = ToolCall(id=str(rid), name=name, arguments=json.dumps(arguments, ensure_ascii=False))
-        result = registry.execute(call, ToolContext(run_id="mcp", call_id=str(rid)))
+        result = await registry.execute(call, ToolContext(run_id="mcp", call_id=str(rid)))
         if result.detail and log is not None:
             print(f"[mini-mcp] {name} 内部错误：{result.detail}", file=log, flush=True)  # 原文只进服务器日志
         return ok({"content": [{"type": "text", "text": result.content}], "isError": not result.ok})
@@ -221,14 +224,19 @@ def _valid_id(rid: Any) -> bool:
 # ───────────────────────────── stdio 主循环 ─────────────────────────────
 
 
-def serve_stdio(
+async def serve_stdio(
     tools: Iterable[Tool] | ToolRegistry,
     *,
     stdin: BinaryIO | None = None,
     stdout: BinaryIO | None = None,
     log: TextIO | None = None,
 ) -> None:
-    """按行读 JSON-RPC、按行写回。stdin 关闭（EOF）就退出 —— 这是 stdio 传输唯一可移植的"优雅关机"信号。"""
+    """按行读 JSON-RPC、按行写回。stdin 关闭（EOF）就退出 —— 这是 stdio 传输唯一可移植的"优雅关机"信号。
+
+    每个请求放进一个独立的 asyncio 任务：一个慢工具不会挡住后面的请求，响应按"谁先做完谁先回"写出，
+    所以可能和请求的顺序不同 —— 客户端必须按 id 配对。收到 notifications/cancelled 就取消对应的任务
+    （async 工具在 await 处立刻停下；同步工具在线程里停不下来，但它的结果会被丢弃），被取消的请求不再回复（规范）。
+    """
     registry = _as_registry(tools)
     stdin = stdin or sys.stdin.buffer
     out = stdout or sys.stdout.buffer
@@ -239,31 +247,59 @@ def serve_stdio(
     if stdout is None:
         sys.stdout = sys.stderr
 
+    def write(response: dict) -> None:
+        # json.dumps 会把字符串里的换行转义成 \n，保证"一条消息一行"（规范：消息内不能有裸换行）。
+        # 所有任务都在同一个事件循环线程里写，一次 write 就是一整行，不会和别的响应交错。
+        out.write(json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n")
+        out.flush()
+
+    in_flight: dict[Any, asyncio.Task] = {}  # 请求 id → 正在处理它的任务
+
+    async def respond(msg: Any) -> None:
+        try:
+            response = await handle_request(msg, registry, log=log)
+        except asyncio.CancelledError:
+            print(f"[mini-mcp] 请求 {msg.get('id')!r}（{msg.get('method')}）已按客户端的要求取消，不再回复", file=log, flush=True)
+            return
+        except Exception as e:  # noqa: BLE001 —— 服务器自身的 bug 也不能让进程崩掉
+            print(f"[mini-mcp] 内部错误：{type(e).__name__}: {e}", file=log, flush=True)
+            rid = msg.get("id") if isinstance(msg, dict) else None
+            response = jsonrpc_error(rid if _valid_id(rid) else None, INTERNAL_ERROR, "Internal error")
+        if response is not None:
+            write(response)
+
     print(f"[mini-mcp] 已启动，工具：{', '.join(registry.names())}", file=log, flush=True)
-    for raw in stdin:
+    while True:
+        raw = await asyncio.to_thread(stdin.readline)  # 读 stdin 会阻塞：放进线程，事件循环照常推进正在处理的请求
+        if not raw:
+            break
         line = raw.strip()
         if not line:
             continue
         try:
             msg = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            response: dict | None = jsonrpc_error(None, PARSE_ERROR, f"Parse error: {e}")
-        else:
-            if isinstance(msg, list):  # JSON-RPC 批量请求：MCP 在 2025-06-18 版本移除了批量支持
-                response = jsonrpc_error(None, INVALID_REQUEST, "Invalid Request: MCP 不支持 JSON-RPC 批量请求")
-            else:
-                try:
-                    response = handle_request(msg, registry, log=log)
-                except Exception as e:  # noqa: BLE001 —— 服务器自身的 bug 也不能让进程崩掉
-                    print(f"[mini-mcp] 内部错误：{type(e).__name__}: {e}", file=log, flush=True)
-                    rid = msg.get("id") if isinstance(msg, dict) else None
-                    response = jsonrpc_error(rid if _valid_id(rid) else None, INTERNAL_ERROR, "Internal error")
-            if isinstance(msg, dict) and "method" in msg:
-                print(f"[mini-mcp] ← {msg['method']}", file=log, flush=True)
-        if response is not None:
-            # json.dumps 会把字符串里的换行转义成 \n，保证"一条消息一行"（规范：消息内不能有裸换行）
-            out.write(json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n")
-            out.flush()
+            write(jsonrpc_error(None, PARSE_ERROR, f"Parse error: {e}"))
+            continue
+        if isinstance(msg, list):  # JSON-RPC 批量请求：MCP 在 2025-06-18 版本移除了批量支持
+            write(jsonrpc_error(None, INVALID_REQUEST, "Invalid Request: MCP 不支持 JSON-RPC 批量请求"))
+            continue
+        if isinstance(msg, dict) and "method" in msg:
+            print(f"[mini-mcp] ← {msg['method']}", file=log, flush=True)
+            if msg["method"] == "notifications/cancelled" and "id" not in msg:
+                params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                task = in_flight.get(params.get("requestId"))
+                if task is not None:  # 还在处理：停下来。已经处理完的请求再收到取消，忽略即可（规范允许这种竞态）
+                    task.cancel()
+                continue
+        task = asyncio.create_task(respond(msg))
+        rid = msg.get("id") if isinstance(msg, dict) else None
+        if _valid_id(rid):
+            in_flight[rid] = task
+            task.add_done_callback(lambda t, rid=rid: in_flight.pop(rid) if in_flight.get(rid) is t else None)
+    # EOF：客户端不会再发请求了。把还在处理的请求做完、响应写出去，再退出
+    if in_flight:
+        await asyncio.gather(*in_flight.values(), return_exceptions=True)
     print("[mini-mcp] stdin 已关闭，退出", file=log, flush=True)
 
 
@@ -340,4 +376,4 @@ def _rug_pulled_tools() -> list[Tool]:
 if __name__ == "__main__":
     # MINI_MCP_VARIANT=rugpull 时模拟"服务器更新后工具定义被篡改"
     variant = os.environ.get("MINI_MCP_VARIANT", "")
-    serve_stdio(_rug_pulled_tools() if variant == "rugpull" else DEMO_TOOLS)
+    asyncio.run(serve_stdio(_rug_pulled_tools() if variant == "rugpull" else DEMO_TOOLS))

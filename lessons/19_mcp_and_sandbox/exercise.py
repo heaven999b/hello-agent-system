@@ -7,8 +7,11 @@
 
 三道题：
   (a) handle_request        MCP 服务端的 JSON-RPC 分发：协议错误 vs 工具执行错误、通知不回复、两代协议
+                            —— async def：tools/call 要 await registry.execute(...)，其余分支是纯计算
   (b) run_with_limits       进程级沙箱：临时目录、最小环境变量、超时杀整个进程组、输出截断
+                            —— 普通 def（同步），原因见函数说明；sandbox.run_python 是它的 async 生产版
   (c) tool_from_mcp_schema  把远程 MCP 工具定义变成 agentkit Tool，风险等级由"你"决定而不是由服务器决定
+                            —— call_fn 是 async 函数（要等服务器回复），你写的 invoke 也要是 async def
 
 同目录的 mcp_server.py / mcp_client.py / sandbox.py 是完整的参考实现（demo 用的就是它们）。
 建议先自己写，卡住了再去对照。
@@ -20,7 +23,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 from agentkit import Tool, ToolContext, ToolError, ToolRegistry  # noqa: F401  完成 TODO 时会用到
 from agentkit.types import ToolCall  # noqa: F401
@@ -68,8 +71,12 @@ result_to_text = mcp_client.result_to_text  # CallToolResult → 给模型看的
 # =====================================================================
 
 
-def handle_request(req: Any, tools: Iterable[Tool]) -> dict | None:
+async def handle_request(req: Any, tools: Iterable[Tool]) -> dict | None:
     """处理一条 JSON-RPC 消息，返回响应 dict；不该回复时返回 None。
+
+    它是 async def：tools/call 要执行工具，而 agentkit 的 ToolRegistry.execute 是 async 的
+    （工具可能在等下游 API），所以要 `result = await registry.execute(...)`。其余分支都是纯计算，不需要 await。
+    测试里这样调用：`resp = await handle_request(msg, tools)`。
 
     规则（按顺序检查）：
     1. req 不是 dict、或 req["jsonrpc"] != "2.0"、或 method 不是字符串 → 错误 -32600
@@ -90,7 +97,7 @@ def handle_request(req: Any, tools: Iterable[Tool]) -> dict | None:
        - "tools/call" →
            · params["name"] 不是字符串、或 params["arguments"]（缺省 {}）不是对象 → -32602（协议错误）
            · 工具不存在 → -32602，message 里包含工具名（协议错误：模型没法靠改参数修好它）
-           · 否则用 ToolRegistry.execute(ToolCall(...)) 执行，返回
+           · 否则用 await ToolRegistry.execute(ToolCall(...)) 执行，返回
              {"content": [{"type": "text", "text": 结果文字}], "isError": not result.ok}
              注意：参数校验失败、ToolError、工具内部异常都是**工具执行错误**（isError: true），不是协议错误。
        - 其他方法 → -32601
@@ -129,6 +136,12 @@ def run_with_limits(code: str, timeout_s: float = 2.0, max_output: int = 2000) -
     - proc.communicate(timeout=...) 超时会抛 subprocess.TimeoutExpired，杀掉进程组后
       再调用一次 proc.communicate() 取回已经输出的内容（给它也加个超时，防止有进程逃出了进程组）；
     - 为什么不直接用 subprocess.run(timeout=...)？它超时只杀直接子进程，孙进程会变成孤儿继续跑。
+
+    为什么这道题是普通 def，不是 async def：它考的是操作系统层面的机制（进程组、环境变量、管道），
+    subprocess.Popen 的 communicate(timeout=...) 在超时后还能取回已经输出的内容，写起来最直接。
+    在 async 代码里要调用它，就用 `await asyncio.to_thread(run_with_limits, code)`，别让它卡住事件循环；
+    代价是：调用方被取消时，线程停不下来，子进程会一直跑到它自己的 timeout_s。
+    生产版 sandbox.run_python 是 async 的（asyncio.create_subprocess_exec）：调用方一取消，立刻整组杀掉。
     """
     raise NotImplementedError("TODO: 练习 (b) —— 临时目录 + 最小环境 + 超时杀进程组 + 输出截断")
 
@@ -140,7 +153,7 @@ def run_with_limits(code: str, timeout_s: float = 2.0, max_output: int = 2000) -
 
 def tool_from_mcp_schema(
     schema: dict,
-    call_fn: Callable[[str, dict], dict],
+    call_fn: Callable[[str, dict], Awaitable[dict]],
     *,
     trusted: bool = False,
     risk_overrides: dict[str, str] | None = None,
@@ -150,7 +163,8 @@ def tool_from_mcp_schema(
 
     参数：
       schema:  {"name", "description", "inputSchema", "annotations"?}
-      call_fn: call_fn(远程工具名, 参数 dict) → CallToolResult dict（{"content": [...], "isError": bool}）
+      call_fn: async 函数，await call_fn(远程工具名, 参数 dict) → CallToolResult dict（{"content": [...], "isError": bool}）
+               真实使用时它就是 StdioMCPClient.call_tool：要等服务器子进程回复，所以是 async 的
       trusted: 是否信任这台服务器的注解
       risk_overrides: {远程工具名: "read" / "write" / "dangerous"}，你自己审查后定的等级，优先级最高
       name_prefix: 给模型看的名字前缀（多个服务器可能都有叫 search 的工具）
@@ -167,14 +181,17 @@ def tool_from_mcp_schema(
       - 模型调用时：把参数 dict 原样交给 call_fn；返回结果用 result_to_text 变成文字；
         如果结果 isError 为 true，抛 ToolError(文字) —— ToolRegistry 会把它变成"错误：..."反馈给模型。
 
-    提示：用现成的 RemoteTool(schema, invoke, name=..., risk=...)，你只需要写 invoke(arguments) -> str。
+    提示：用现成的 RemoteTool(schema, invoke, name=..., risk=...)，你只需要写 `async def invoke(arguments) -> str`，
+    在里面 `result = await call_fn(远程工具名, arguments)`。RemoteTool 会把它当成 async 工具：Agent 在事件循环里 await 它，
+    超时或运行被取消时，等待中的请求会被取消。
     """
     raise NotImplementedError("TODO: 练习 (c) —— 风险等级由客户端决定 + isError 变 ToolError")
 
 
 if __name__ == "__main__":
     # 随手试试你的 handle_request（写完 (a) 之后）
+    import asyncio
     import json
 
     req = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-    print(json.dumps(handle_request(req, mcp_server.DEMO_TOOLS), ensure_ascii=False, indent=2)[:800])
+    print(json.dumps(asyncio.run(handle_request(req, mcp_server.DEMO_TOOLS)), ensure_ascii=False, indent=2)[:800])

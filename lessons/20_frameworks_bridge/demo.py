@@ -1,6 +1,6 @@
 """第 20 课 Demo：同一个 IT 服务台任务，agentkit / DSPy / LangGraph / OpenAI Agents SDK 四种实现，一张对比表。
 
-    python lessons/20_frameworks_bridge/demo.py                   # 真实模型：四种实现依次运行（串行，模型并发 = 1）
+    python lessons/20_frameworks_bridge/demo.py                   # 真实模型：四种实现依次运行（串行，模型并发 = 1，耗时才可比）
     python lessons/20_frameworks_bridge/demo.py --offline         # 离线：只跑 agentkit（ScriptedLLM 剧本），其余框架打印说明
     python lessons/20_frameworks_bridge/demo.py --only dspy,langgraph
 
@@ -8,11 +8,15 @@
 并调用需要**人工审批**的 reset_password。审批人由 shared_tools.auto_approver 模拟（自动批准）。
 
 某个框架没装时自动跳过，并打印安装命令。三个框架都装上：pip install dspy langgraph langchain-openai openai-agents
+
+四个 impl_*.run() 都是 async def，各自用框架的 async 入口：agentkit 的 await agent.run(...)、
+DSPy 的 await agent.acall(...)、LangGraph 的 await graph.ainvoke(...)、OpenAI Agents SDK 的 await Runner.run(...)。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 import sys
 import traceback
@@ -75,7 +79,7 @@ def print_table(rows: list[list[str]]) -> None:
             print("  " + "-" * (sum(widths) - 2))
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--offline", action="store_true", help="只跑 agentkit（ScriptedLLM），不需要 API key")
     parser.add_argument("--only", default="", help="逗号分隔：agentkit,dspy,langgraph,openai")
@@ -108,9 +112,9 @@ def main() -> None:
         impl = _load_sibling(module)
         try:
             if label == "agentkit":
-                res = impl.run(llm=impl.offline_llm()) if args.offline else impl.run()
+                res = await (impl.run(llm=impl.offline_llm()) if args.offline else impl.run())
             else:
-                res = impl.run()
+                res = await impl.run()
         except Exception as e:  # noqa: BLE001 —— 一个框架失败不影响其他框架的演示
             print(f"  ❌ 运行失败：{type(e).__name__}: {str(e)[:300]}")
             traceback.print_exc(limit=2)
@@ -138,7 +142,9 @@ def main() -> None:
     print(
         "  · 模型调用次数：DSPy 的 ReAct 总会多 1 次（最后用 ChainOfThought 从轨迹里抽答案），\n"
         "    而且它把工具说明、轨迹都写进提示词、不走原生 function calling，所以输入 token 通常明显更多。\n"
-        "  · 审批：agentkit / LangGraph / OpenAI Agents SDK 都是\"暂停 → 状态落盘 → 恢复\"；DSPy 只能在工具里同步等。\n"
+        "  · 审批：agentkit / LangGraph / OpenAI Agents SDK 都是\"暂停 → 状态落盘 → 恢复\"；DSPy 只能在工具里当场等审批人。\n"
+        "  · 四个 run() 都是 async：agentkit 只有 async 一套；LangGraph 有 invoke / ainvoke 两套；\n"
+        "    Agents SDK 的 Runner.run 本来就是 async（run_sync 是包装）；DSPy 同步调用为主，acall 是 async 入口。\n"
         "  · LangGraph 的 approval 节点执行次数比审批次数多：恢复时被中断的节点会从头重跑，所以它不能有副作用。\n"
         "  · OpenAI Agents SDK 的追踪默认上传到 OpenAI；这里用 set_trace_processors 换成了本地计数器。\n"
         "  · 同一个模型、同一段提示词，四次运行的工具调用顺序和次数也可能不同——这是模型的随机性，不是框架的差别。\n"
@@ -147,4 +153,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

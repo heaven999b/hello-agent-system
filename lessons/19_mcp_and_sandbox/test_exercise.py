@@ -2,9 +2,10 @@
 
 运行：make lesson N=19    或    .venv/bin/python -m pytest lessons/19_mcp_and_sandbox -v
 
-(a) 直接把 JSON-RPC dict 喂给 handle_request，不起子进程；
+(a) 直接把 JSON-RPC dict 喂给 handle_request（async，用 await 调用），不起子进程；
 (b) 会真的起 Python 子进程，但每个用例都控制在 1 秒左右（超时用例用 0.5 秒）；
-(c) 用假的 call_fn 代替 MCP 服务器，最后一个用例把远程工具接进真正的 Agent + PermissionPolicy。
+(c) 用假的 call_fn（async）代替 MCP 服务器，最后一个用例把远程工具接进真正的 Agent + PermissionPolicy。
+最后一组测的是课程代码本身（不是练习）：async 的 MCP 客户端 / 服务器和沙箱，起真实子进程。
 """
 
 from __future__ import annotations
@@ -62,26 +63,26 @@ def rpc(method, params=None, id=1, **extra):
     return msg
 
 
-def test_legacy_initialize_negotiates_version():
-    resp = ex.handle_request(rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}), TOOLS)
+async def test_legacy_initialize_negotiates_version():
+    resp = await ex.handle_request(rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}), TOOLS)
     assert resp["id"] == 1 and "error" not in resp
     assert resp["result"]["protocolVersion"] == "2025-06-18"  # 支持的旧版本：原样返回
     assert "tools" in resp["result"]["capabilities"]
     assert resp["result"]["serverInfo"]["name"]
     # 不认识的版本：返回自己支持的最新旧版本，由客户端决定要不要断开
-    resp = ex.handle_request(rpc("initialize", {"protocolVersion": "1999-01-01", "capabilities": {}}, id="x"), TOOLS)
+    resp = await ex.handle_request(rpc("initialize", {"protocolVersion": "1999-01-01", "capabilities": {}}, id="x"), TOOLS)
     assert resp["id"] == "x" and resp["result"]["protocolVersion"] == ex.LEGACY_VERSIONS[0]
 
 
-def test_notifications_never_get_a_response():
-    assert ex.handle_request({"jsonrpc": "2.0", "method": "notifications/initialized"}, TOOLS) is None
-    assert ex.handle_request({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3}}, TOOLS) is None
+async def test_notifications_never_get_a_response():
+    assert await ex.handle_request({"jsonrpc": "2.0", "method": "notifications/initialized"}, TOOLS) is None
+    assert await ex.handle_request({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3}}, TOOLS) is None
     # 连不认识的通知也不能回复（哪怕是"方法不存在"的错误）
-    assert ex.handle_request({"jsonrpc": "2.0", "method": "no/such/thing"}, TOOLS) is None
+    assert await ex.handle_request({"jsonrpc": "2.0", "method": "no/such/thing"}, TOOLS) is None
 
 
-def test_tools_list_reuses_agentkit_schema_and_annotations():
-    resp = ex.handle_request(rpc("tools/list"), TOOLS)
+async def test_tools_list_reuses_agentkit_schema_and_annotations():
+    resp = await ex.handle_request(rpc("tools/list"), TOOLS)
     tools = resp["result"]["tools"]
     assert [t["name"] for t in tools] == ["lookup", "explode", "wipe"]
     assert tools[0]["inputSchema"] == lookup.schema()["function"]["parameters"]
@@ -90,62 +91,62 @@ def test_tools_list_reuses_agentkit_schema_and_annotations():
     assert "resultType" not in resp["result"]  # 旧版请求：不加现代字段
 
 
-def test_modern_requests_discover_and_result_type():
-    resp = ex.handle_request(rpc("server/discover", {"_meta": MODERN_META}), TOOLS)
+async def test_modern_requests_discover_and_result_type():
+    resp = await ex.handle_request(rpc("server/discover", {"_meta": MODERN_META}), TOOLS)
     assert "2026-07-28" in resp["result"]["supportedVersions"]
     assert resp["result"]["resultType"] == "complete"
     assert "tools" in resp["result"]["capabilities"]
-    resp = ex.handle_request(rpc("tools/list", {"_meta": MODERN_META}, id=2), TOOLS)
+    resp = await ex.handle_request(rpc("tools/list", {"_meta": MODERN_META}, id=2), TOOLS)
     assert resp["result"]["resultType"] == "complete" and len(resp["result"]["tools"]) == 3
 
 
-def test_modern_version_and_capabilities_are_validated():
+async def test_modern_version_and_capabilities_are_validated():
     bad_version = {**MODERN_META, "io.modelcontextprotocol/protocolVersion": "2099-01-01"}
-    resp = ex.handle_request(rpc("tools/list", {"_meta": bad_version}), TOOLS)
+    resp = await ex.handle_request(rpc("tools/list", {"_meta": bad_version}), TOOLS)
     assert resp["error"]["code"] == -32022
     assert resp["error"]["data"]["requested"] == "2099-01-01"
     assert "2026-07-28" in resp["error"]["data"]["supported"]
     missing_caps = {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
-    resp = ex.handle_request(rpc("tools/list", {"_meta": missing_caps}, id=9), TOOLS)
+    resp = await ex.handle_request(rpc("tools/list", {"_meta": missing_caps}, id=9), TOOLS)
     assert resp["id"] == 9 and resp["error"]["code"] == -32602
 
 
-def test_unknown_method_and_invalid_request():
-    resp = ex.handle_request(rpc("resources/list", id=7), TOOLS)
+async def test_unknown_method_and_invalid_request():
+    resp = await ex.handle_request(rpc("resources/list", id=7), TOOLS)
     assert resp["id"] == 7 and resp["error"]["code"] == -32601
-    resp = ex.handle_request({"id": 8, "method": "tools/list"}, TOOLS)  # 缺 jsonrpc 字段
+    resp = await ex.handle_request({"id": 8, "method": "tools/list"}, TOOLS)  # 缺 jsonrpc 字段
     assert resp["error"]["code"] == -32600 and resp["id"] == 8
-    resp = ex.handle_request(["not", "a", "dict"], TOOLS)
+    resp = await ex.handle_request(["not", "a", "dict"], TOOLS)
     assert resp["error"]["code"] == -32600 and resp["id"] is None
 
 
-def test_tools_call_success():
-    resp = ex.handle_request(rpc("tools/call", {"name": "lookup", "arguments": {"city": "东京"}}), TOOLS)
+async def test_tools_call_success():
+    resp = await ex.handle_request(rpc("tools/call", {"name": "lookup", "arguments": {"city": "东京"}}), TOOLS)
     result = resp["result"]
     assert result["isError"] is False
     assert json.loads(result["content"][0]["text"]) == {"city": "东京", "cap": 1100}
 
 
-def test_tool_failures_are_results_with_is_error_not_protocol_errors():
+async def test_tool_failures_are_results_with_is_error_not_protocol_errors():
     # 业务错误（ToolError）
-    resp = ex.handle_request(rpc("tools/call", {"name": "lookup", "arguments": {"city": "火星"}}), TOOLS)
+    resp = await ex.handle_request(rpc("tools/call", {"name": "lookup", "arguments": {"city": "火星"}}), TOOLS)
     assert "error" not in resp and resp["result"]["isError"] is True
     assert "没有这个城市" in resp["result"]["content"][0]["text"]
     # 参数校验错误：2025-11-25 起规范要求作为工具执行错误返回，让模型能自己改
-    resp = ex.handle_request(rpc("tools/call", {"name": "lookup", "arguments": {"town": "东京"}}, id=2), TOOLS)
+    resp = await ex.handle_request(rpc("tools/call", {"name": "lookup", "arguments": {"town": "东京"}}, id=2), TOOLS)
     assert "error" not in resp and resp["result"]["isError"] is True
     # 工具内部异常：isError=true，而且不能把内部细节（密码、内网地址）传出去
-    resp = ex.handle_request(rpc("tools/call", {"name": "explode", "arguments": {}}, id=3), TOOLS)
+    resp = await ex.handle_request(rpc("tools/call", {"name": "explode", "arguments": {}}, id=3), TOOLS)
     text = resp["result"]["content"][0]["text"]
     assert resp["result"]["isError"] is True and "hunter2" not in text and "db-internal" not in text
 
 
-def test_tools_call_protocol_errors():
-    resp = ex.handle_request(rpc("tools/call", {"name": "no_such_tool", "arguments": {}}), TOOLS)
+async def test_tools_call_protocol_errors():
+    resp = await ex.handle_request(rpc("tools/call", {"name": "no_such_tool", "arguments": {}}), TOOLS)
     assert resp["error"]["code"] == -32602 and "no_such_tool" in resp["error"]["message"]
-    resp = ex.handle_request(rpc("tools/call", {"arguments": {}}, id=2), TOOLS)  # 缺 name
+    resp = await ex.handle_request(rpc("tools/call", {"arguments": {}}, id=2), TOOLS)  # 缺 name
     assert resp["error"]["code"] == -32602
-    resp = ex.handle_request(rpc("tools/call", {"name": "lookup", "arguments": "city=东京"}, id=3), TOOLS)
+    resp = await ex.handle_request(rpc("tools/call", {"name": "lookup", "arguments": "city=东京"}, id=3), TOOLS)
     assert resp["error"]["code"] == -32602
 
 
@@ -223,11 +224,13 @@ POLICY_DEF = {
 
 
 class FakeServer:
+    """代替 StdioMCPClient.call_tool：和真的一样是 async 的。"""
+
     def __init__(self, is_error: bool = False):
         self.calls: list[tuple[str, dict]] = []
         self.is_error = is_error
 
-    def __call__(self, name: str, arguments: dict) -> dict:
+    async def __call__(self, name: str, arguments: dict) -> dict:
         self.calls.append((name, arguments))
         text = "没有这个城市" if self.is_error else f"{arguments.get('city')}：每晚 1100 元"
         return {"content": [{"type": "text", "text": text}], "isError": self.is_error}
@@ -263,37 +266,206 @@ def test_untrusted_annotations_are_ignored_but_overrides_win():
     assert t.risk == "dangerous"  # 你自己的审查结论优先于服务器的自我声明
 
 
-def test_calls_are_forwarded_and_is_error_becomes_tool_error():
+async def test_calls_are_forwarded_and_is_error_becomes_tool_error():
     server = FakeServer()
     t = ex.tool_from_mcp_schema(POLICY_DEF, server, trusted=True)
+    assert t.is_async, "远程工具要等服务器回复：invoke 应该是 async def"
     registry = ToolRegistry([t])
-    ok = registry.execute(ToolCall(id="c1", name="get_travel_policy", arguments='{"city": "东京"}'))
+    ok = await registry.execute(ToolCall(id="c1", name="get_travel_policy", arguments='{"city": "东京"}'))
     assert ok.ok and "每晚 1100 元" in ok.content
     assert server.calls == [("get_travel_policy", {"city": "东京"})]
 
     failing = ex.tool_from_mcp_schema(POLICY_DEF, FakeServer(is_error=True), trusted=True)
-    bad = ToolRegistry([failing]).execute(ToolCall(id="c2", name="get_travel_policy", arguments='{"city": "火星"}'))
+    bad = await ToolRegistry([failing]).execute(ToolCall(id="c2", name="get_travel_policy", arguments='{"city": "火星"}'))
     assert bad.ok is False and bad.error_type == "tool_error" and "没有这个城市" in bad.content
 
 
-def test_names_are_made_safe_for_openai_but_calls_use_remote_name():
+async def test_names_are_made_safe_for_openai_but_calls_use_remote_name():
     server = FakeServer()
     d = {**POLICY_DEF, "name": "travel.policy.get"}
     t = ex.tool_from_mcp_schema(d, server, trusted=True, name_prefix="hr__")
     assert t.name == "hr__travel_policy_get"
-    ToolRegistry([t]).execute(ToolCall(id="c1", name=t.name, arguments='{"city": "上海"}'))
+    await ToolRegistry([t]).execute(ToolCall(id="c1", name=t.name, arguments='{"city": "上海"}'))
     assert server.calls[0][0] == "travel.policy.get"
 
 
-def test_agent_uses_remote_tool_and_untrusted_tool_needs_approval():
+async def test_agent_uses_remote_tool_and_untrusted_tool_needs_approval():
     server = FakeServer()
     remote = ex.tool_from_mcp_schema(POLICY_DEF, server)  # 不信任 → dangerous
     approvals: list[str] = []
     policy = PermissionPolicy(approver=lambda call, state: approvals.append(call.name) or True)
     llm = ScriptedLLM([call_tool("get_travel_policy", city="东京"), reply("东京每晚上限 1100 元。")])
-    result = Agent(llm, [remote], hooks=[policy]).run("东京住宿标准是多少？")
+    result = await Agent(llm, [remote], hooks=[policy]).run("东京住宿标准是多少？")
     assert result.ok and result.output == "东京每晚上限 1100 元。"
     assert approvals == ["get_travel_policy"]  # 危险等级 → 走了审批
     assert server.calls == [("get_travel_policy", {"city": "东京"})]
     tool_msgs = [m for m in result.messages if m["role"] == "tool"]
     assert "每晚 1100 元" in tool_msgs[0]["content"]
+
+
+# ───────────────────────────── 课程代码（不是练习）：async 的 MCP 客户端 / 服务器、沙箱 ─────────────────────────────
+# 这几个测试起真实的子进程，证明讲义里说的事真的发生了：请求并发、按 id 配对、取消传到服务器、
+# 关闭时一步步升级到 SIGKILL、沙箱被取消时整组杀掉。不依赖练习，做不做练习都应该通过。
+
+import asyncio  # noqa: E402
+import signal  # noqa: E402
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import pytest  # noqa: E402
+
+from agentkit import call_tools  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+SERVER_CMD = [sys.executable, str(HERE / "mcp_server.py")]
+QUIET = {"MINI_MCP_QUIET": "1"}
+mc = ex.mcp_client
+
+
+async def wait_until(predicate, timeout: float, what: str):
+    """轮询一个条件，直到它为真（返回它的值）；超过宽松的上限就失败。只用来等"外部进程里的事发生"。"""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        value = predicate()
+        if value:
+            return value
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"{timeout} 秒内没有等到：{what}")
+        await asyncio.sleep(0.02)
+
+
+async def test_async_client_and_server_in_both_eras_with_a_real_agent():
+    async with mc.StdioMCPClient(SERVER_CMD, env=QUIET) as client:
+        assert (client.era, client.protocol_version) == ("modern", "2026-07-28")
+        tools = await mc.mcp_tools(client, include=["get_travel_policy", "convert_currency"], trusted=True)
+        assert [t.name for t in tools] == ["get_travel_policy", "convert_currency"]
+        assert all(t.is_async and t.risk == "read" for t in tools)
+        llm = ScriptedLLM([
+            call_tools(("get_travel_policy", {"city": "东京"}), ("convert_currency", {"amount": 21000, "from_currency": "JPY"})),
+            reply("没超标。"),
+        ])
+        result = await Agent(llm, tools).run("东京每晚 21000 日元超标吗？")
+        assert result.ok
+        outputs = [m["content"] for m in result.messages if m["role"] == "tool"]
+        assert "1100" in outputs[0] and "1008" in outputs[1]  # 结果按调用顺序写回
+        assert client.max_in_flight == 2  # 同一轮的两个只读远程工具同时在等服务器
+        with pytest.raises(mc.MCPError) as err:
+            await client.request("resources/list")
+        assert err.value.code == -32601
+    assert client.returncode == 0  # 关掉 stdin，服务器读到 EOF 自己退出：不需要 SIGTERM
+
+    async with mc.StdioMCPClient(SERVER_CMD, mode="legacy", env=QUIET) as client:
+        assert (client.era, client.protocol_version) == ("legacy", "2025-11-25")
+        assert len(await client.list_tools()) == 4
+    assert client.returncode == 0
+
+
+SLOW_SERVER = '''
+import asyncio, importlib.util, sys
+spec = importlib.util.spec_from_file_location("mini_server", sys.argv[1])
+server = importlib.util.module_from_spec(spec)
+sys.modules["mini_server"] = server
+spec.loader.exec_module(server)
+from agentkit import tool
+
+@tool
+async def nap(seconds: float) -> str:
+    """睡一会儿再回答，模拟一个慢的下游 API。"""
+    try:
+        await asyncio.sleep(seconds)
+    except asyncio.CancelledError:
+        print(f"nap({seconds:g}) 被取消", file=sys.stderr, flush=True)
+        raise
+    return f"睡了 {seconds:g} 秒"
+
+asyncio.run(server.serve_stdio([nap]))
+'''
+
+
+async def test_out_of_order_responses_are_matched_by_id_and_cancellation_reaches_the_server(tmp_path):
+    script = tmp_path / "slow_server.py"
+    script.write_text(SLOW_SERVER, encoding="utf-8")
+    wire: list[tuple[str, dict]] = []
+    cmd = [sys.executable, str(script), str(HERE / "mcp_server.py")]
+    async with mc.StdioMCPClient(cmd, env=QUIET, on_message=lambda d, m: wire.append((d, m))) as client:
+        slow = asyncio.create_task(client.call_tool("nap", {"seconds": 30}))
+        fast = asyncio.create_task(client.call_tool("nap", {"seconds": 0}))
+        try:
+            done, _ = await asyncio.wait({slow, fast}, return_when=asyncio.FIRST_COMPLETED)
+            assert done == {fast}  # 后发的先回来：服务器每个请求一个任务，响应乱序，客户端按 id 配对
+            assert (await fast)["content"][0]["text"] == "睡了 0 秒"
+            assert client.max_in_flight == 2
+
+            # 调用方不要结果了（例如 Agent 的运行被取消）：客户端发 notifications/cancelled，服务器真的停下
+            slow.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await slow
+        finally:  # 断言失败时也要把任务收掉：没人取的任务异常会在垃圾回收时捣乱
+            for t in (slow, fast):
+                t.cancel()
+            await asyncio.gather(slow, fast, return_exceptions=True)
+        await wait_until(lambda: "nap(30) 被取消" in client.stderr_lines, 10, "服务器取消 nap(30)")
+
+        # 超时：同样发取消通知，理由是 timeout
+        with pytest.raises(TimeoutError):
+            await client.request("tools/call", {"name": "nap", "arguments": {"seconds": 31}}, timeout_s=0.3)
+        await wait_until(lambda: "nap(31) 被取消" in client.stderr_lines, 10, "服务器取消 nap(31)")
+        reasons = [m["params"]["reason"] for d, m in wire if d == "→" and m.get("method") == "notifications/cancelled"]
+        assert reasons == ["cancelled by caller", "timeout"]
+
+        # 被取消的请求服务器不再回复；连接照常可用
+        assert (await client.call_tool("nap", {"seconds": 0}))["content"][0]["text"] == "睡了 0 秒"
+    answered = [m["id"] for d, m in wire if d == "←" and "id" in m]
+    assert len(answered) == len(set(answered))
+
+
+STUBBORN_SERVER = '''
+import signal, sys, time
+if sys.argv[1] == "ignore-sigterm":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print("ready", file=sys.stderr, flush=True)
+while True:          # 从不读 stdin：关掉 stdin 它也不会退出
+    time.sleep(1)
+'''
+
+
+@pytest.mark.parametrize("behavior, expected", [("obey-sigterm", -signal.SIGTERM), ("ignore-sigterm", -signal.SIGKILL)])
+async def test_close_escalates_from_eof_to_sigterm_to_sigkill(tmp_path, behavior, expected):
+    script = tmp_path / "stubborn.py"
+    script.write_text(STUBBORN_SERVER, encoding="utf-8")
+    client = mc.StdioMCPClient([sys.executable, str(script), behavior], close_timeout_s=0.3)
+    await client.start()
+    await wait_until(lambda: "ready" in client.stderr_lines, 15, "子进程装好信号处理")
+    started = asyncio.get_running_loop().time()
+    await client.aclose()
+    assert client.returncode == expected  # 不退就 SIGTERM，还不退就 SIGKILL；进程一定被收掉
+    assert asyncio.get_running_loop().time() - started < 10  # 每一步只等 0.3 秒（宽松上限，机器负载高）
+
+
+def _pid_with(marker: str) -> str | None:
+    out = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True).stdout
+    return next((line.split()[0] for line in out.splitlines() if marker in line), None)
+
+
+def _gone(pid: str) -> bool:
+    state = subprocess.run(["ps", "-o", "stat=", "-p", pid], capture_output=True, text=True).stdout.strip()
+    return not state or state.startswith("Z")  # 不存在，或只剩等待回收的僵尸
+
+
+async def test_cancelling_run_python_kills_the_whole_process_group_right_away():
+    marker = f"sandbox-cancel-{os.getpid()}-{time.monotonic_ns()}"
+    code = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)  # {marker}'])\n"
+        "time.sleep(60)\n"
+    )
+    task = asyncio.create_task(ex.sandbox.run_python(code, ex.sandbox.SandboxLimits(timeout_s=60)))
+    pid = await wait_until(lambda: _pid_with(marker), 20, "沙箱里的孙进程启动")
+    try:
+        task.cancel()  # 相当于 Agent 的运行被取消：不等 60 秒的墙钟超时
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await wait_until(lambda: _gone(pid), 10, "孙进程被杀")
+    finally:
+        if not _gone(pid):
+            os.kill(int(pid), 9)

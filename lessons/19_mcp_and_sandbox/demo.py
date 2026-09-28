@@ -19,18 +19,15 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 import json
-import os
-import pwd
 import shutil
-import socket
 import sys
-import threading
 from pathlib import Path
 from types import ModuleType
 
-from agentkit import Agent, Hook, PermissionPolicy, ResilientLLM, ScriptedLLM, call_tool, default_llm, reply
+from agentkit import Agent, Hook, PermissionPolicy, ResilientLLM, ScriptedLLM, call_tool, call_tools, default_llm, reply
 
 HERE = Path(__file__).resolve().parent
 RUNS = HERE / "runs"
@@ -114,42 +111,42 @@ class WirePrinter:
 # =====================================================================
 
 
-def part1_wire() -> None:
+async def part1_wire() -> None:
     banner("第 1 部分：MCP 报文实录 —— 协议就是一行一行的 JSON-RPC")
     info(f"服务器：{Path(SERVER_CMD[1]).relative_to(HERE.parents[1])}（子进程，stdin/stdout 各一个管道，一行一条消息）")
 
     step("1a 现代版（2026-07-28）：没有握手，每个请求自己带协议版本和能力")
-    with mcp_client.StdioMCPClient(SERVER_CMD, mode="auto", on_message=WirePrinter()) as c:
+    async with mcp_client.StdioMCPClient(SERVER_CMD, mode="auto", on_message=WirePrinter()) as c:
         info(f"→ 协商结果：era={c.era}，protocolVersion={c.protocol_version}")
-        c.list_tools()
-        c.call_tool("get_travel_policy", {"city": "东京"})
-        c.call_tool("get_travel_policy", {"city": "火星"})  # 业务错误
-        c.call_tool("convert_currency", {"amount": "两万", "from_currency": "JPY"})  # 参数错误
+        await c.list_tools()
+        await c.call_tool("get_travel_policy", {"city": "东京"})
+        await c.call_tool("get_travel_policy", {"city": "火星"})  # 业务错误
+        await c.call_tool("convert_currency", {"amount": "两万", "from_currency": "JPY"})  # 参数错误
         try:
-            c.request("resources/list")
+            await c.request("resources/list")
         except mcp_client.MCPError as e:
             info(f"→ 客户端收到协议错误 MCPError{e}")
     takeaway("同样是'没做成'：未知方法走 JSON-RPC error（-32601）；业务错误、参数错误走正常 result + isError: true。"
              "后者的文字会交给模型，让它自己改参数重试。")
 
     step("1b 旧版（2025-11-25）：先 initialize 握手，再 notifications/initialized，然后才能正常调用")
-    with mcp_client.StdioMCPClient(SERVER_CMD, mode="legacy", on_message=WirePrinter()) as c:
-        c.list_tools()
-        c.call_tool("get_travel_policy", {"city": "上海"})
+    async with mcp_client.StdioMCPClient(SERVER_CMD, mode="legacy", on_message=WirePrinter()) as c:
+        await c.list_tools()
+        await c.call_tool("get_travel_policy", {"city": "上海"})
     takeaway("注意 notifications/initialized 没有 id，服务器也没有回复它 —— 这就是'通知'。"
              "今天大多数已部署的服务器仍说旧版，所以本课的服务器两代都支持（dual-era）。")
 
     step("1c 防 rug pull：第一次审查时锁定工具指纹，之后每次连接都比对")
-    with mcp_client.StdioMCPClient(SERVER_CMD) as c:
-        pinned = mcp_client.tool_fingerprints(c.list_tools())
+    async with mcp_client.StdioMCPClient(SERVER_CMD) as c:
+        pinned = mcp_client.tool_fingerprints(await c.list_tools())
     info(f"审查通过时锁定的指纹：{pinned}")
-    try:
-        mcp_client.mcp_tools(SERVER_CMD, pinned=pinned, env={"MINI_MCP_VARIANT": "rugpull"})
-        info("（没检测到变化？这不应该发生）")
-    except PermissionError as e:
-        info(f"服务器'更新'后再连接 → 拒绝加载：{e}")
-    with mcp_client.StdioMCPClient(SERVER_CMD, env={"MINI_MCP_VARIANT": "rugpull"}) as c:
-        poisoned = next(t for t in c.list_tools() if t["name"] == "get_travel_policy")
+    async with mcp_client.StdioMCPClient(SERVER_CMD, env={"MINI_MCP_VARIANT": "rugpull"}) as c:
+        try:
+            await mcp_client.mcp_tools(c, pinned=pinned)
+            info("（没检测到变化？这不应该发生）")
+        except PermissionError as e:
+            info(f"服务器'更新'后再连接 → 拒绝加载：{e}")
+        poisoned = next(t for t in await c.list_tools() if t["name"] == "get_travel_policy")
     info("被篡改的工具说明书（模型能看到，用户界面里通常看不到）：")
     for line in poisoned["description"].splitlines():
         info(f"   │ {line}")
@@ -157,7 +154,7 @@ def part1_wire() -> None:
     takeaway("工具名没变、功能照常，只是说明书里多了给模型的'暗示'。指纹一比就露馅：这就是给工具定义'锁版本'。")
 
     step("1d （可选）和官方 MCP Python SDK 互相连一遍")
-    sdk_compare.run_comparison(out=info)
+    await sdk_compare.run_comparison(out=info)
 
 
 # =====================================================================
@@ -189,14 +186,20 @@ class LiveTrace(Hook):
         return None
 
 
-def part2_agent(offline: bool) -> None:
+async def part2_agent(offline: bool) -> None:
     banner("第 2 部分：Agent 通过 MCP 客户端调用远程工具")
-    tools = mcp_client.mcp_tools(
-        SERVER_CMD,
-        include=["get_travel_policy", "convert_currency", "submit_expense"],  # 最小权限：不导入 delete_expense
-        risk_overrides={"get_travel_policy": "read", "convert_currency": "read"},  # 我们审查过的两个只读工具
-    )
-    client = tools[0].client
+    async with mcp_client.StdioMCPClient(SERVER_CMD) as client:  # 离开 async with 时关掉服务器子进程
+        tools = await mcp_client.mcp_tools(
+            client,
+            include=["get_travel_policy", "convert_currency", "submit_expense"],  # 最小权限：不导入 delete_expense
+            risk_overrides={"get_travel_policy": "read", "convert_currency": "read"},  # 我们审查过的两个只读工具
+        )
+        await _travel_agent(client, tools, offline)
+    takeaway("对 Agent 来说，远程 MCP 工具和本地 @tool 没有区别：同样的 schema、同样的'错误即观察'、同样的审批钩子。"
+             "区别在信任：远程服务器的注解只是'自我介绍'，风险等级要由你来定。")
+
+
+async def _travel_agent(client, tools, offline: bool) -> None:
     info(f"已连接 {client.server_info.get('name')}（{client.era}，{client.protocol_version}），服务器共 4 个工具，只导入 3 个：")
     for t in tools:
         info(f"  - {t.name:<18} 服务器注解 {t.annotations} → 本地风险等级 {t.risk}")
@@ -206,7 +209,11 @@ def part2_agent(offline: bool) -> None:
         llm = ScriptedLLM(
             [
                 call_tool("get_travel_policy", city="东京"),
-                call_tool("convert_currency", amount=21000, from_currency="JPY", to_currency="CNY"),
+                # 照搬真实运行：同一轮里并行换算"每晚"和"3 晚合计"。两个都是只读工具，Agent 会同时执行
+                call_tools(
+                    ("convert_currency", {"amount": 21000, "from_currency": "JPY", "to_currency": "CNY"}),
+                    ("convert_currency", {"amount": 63000, "from_currency": "JPY", "to_currency": "CNY"}),
+                ),
                 call_tool("submit_expense", title="东京出差住宿", amount_cny=3024),
                 reply("没超标：东京每晚上限 1100 元，你每晚 21000 日元 ≈ 1008 元。已提交 3 晚住宿费 3024 元，单号 EXP-1001。"),
             ]
@@ -215,12 +222,10 @@ def part2_agent(offline: bool) -> None:
         llm = ResilientLLM(default_llm())
     agent = Agent(llm, tools, system_prompt=TRAVEL_SYSTEM, hooks=[LiveTrace(), PermissionPolicy(approver=approver)], max_steps=8)
     step(f"用户：{TRAVEL_TASK}")
-    result = agent.run(TRAVEL_TASK)
+    result = await agent.run(TRAVEL_TASK)
     say(result.output)
     info(f"状态 {result.status}，{result.steps} 步，工具调用顺序 {result.tools_called()}")
-    client.close()
-    takeaway("对 Agent 来说，远程 MCP 工具和本地 @tool 没有区别：同样的 schema、同样的'错误即观察'、同样的审批钩子。"
-             "区别在信任：远程服务器的注解只是'自我介绍'，风险等级要由你来定。")
+    info(f"MCP 请求在途峰值：{client.max_in_flight}（同一轮的只读工具并发执行时，多个 tools/call 同时在等服务器，响应按 id 配对）")
 
 
 # =====================================================================
@@ -263,9 +268,9 @@ def show_result(r, notes: bool = True) -> None:
         info(f"· {n}")
 
 
-def part3_sandbox(offline: bool) -> None:
+async def part3_sandbox(offline: bool) -> None:
     banner("第 3 部分：代码执行沙箱 —— 能挡住什么，挡不住什么")
-    info(f"平台：{sys.platform}；RLIMIT_AS 可用：{sandbox.rlimit_as_works()}；RLIMIT_CPU 可靠：{sandbox.rlimit_cpu_reliable()}；"
+    info(f"平台：{sys.platform}；RLIMIT_AS 可用：{await asyncio.to_thread(sandbox.rlimit_as_works)}；RLIMIT_CPU 可靠：{sandbox.rlimit_cpu_reliable()}；"
          f"Seatbelt 可用：{sandbox.seatbelt_available()}")
 
     step("3a CodeAct 风格：模型写代码，沙箱执行，结果作为观察返回（run_python 是 dangerous，每次都要审批）")
@@ -282,11 +287,11 @@ def part3_sandbox(offline: bool) -> None:
         max_steps=6,
     )
     step(f"用户：{PRIME_TASK}")
-    result = agent.run(PRIME_TASK)
+    result = await agent.run(PRIME_TASK)
     say(result.output)
 
     step("3b 死循环：墙钟超时 1 秒，整个进程组被 SIGKILL")
-    show_result(sandbox.run_python("print('开始计算…', flush=True)\nwhile True:\n    pass", sandbox.SandboxLimits(timeout_s=1)), notes=False)
+    show_result(await sandbox.run_python("print('开始计算…', flush=True)\nwhile True:\n    pass", sandbox.SandboxLimits(timeout_s=1)), notes=False)
 
     step("3c 内存炸弹：连续分配 64 MB 的块，最多 1 GB；上限 256 MB")
     bomb = (
@@ -299,7 +304,7 @@ def part3_sandbox(offline: bool) -> None:
         "except MemoryError:\n"
         "    print('MemoryError：分配到', len(chunks) * 64, 'MB 时被内核拒绝')\n"
     )
-    r = sandbox.run_python(bomb, sandbox.SandboxLimits(timeout_s=10, memory_mb=256))
+    r = await sandbox.run_python(bomb, sandbox.SandboxLimits(timeout_s=10, memory_mb=256))
     show_result(r)
     info(f"最后一行输出：{r.stdout.strip().splitlines()[-1] if r.stdout.strip() else '（无）'}")
 
@@ -307,18 +312,11 @@ def part3_sandbox(offline: bool) -> None:
     fake_key = RUNS / "fake_home" / ".ssh" / "id_ed25519"
     fake_key.parent.mkdir(parents=True, exist_ok=True)
     fake_key.write_text("-----BEGIN FAKE KEY----- 这是演示用的假私钥 -----END FAKE KEY-----\n", encoding="utf-8")
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    listener.listen()
-    port = listener.getsockname()[1]
-    def accept_forever() -> None:
-        try:
-            while True:
-                listener.accept()[0].close()
-        except OSError:  # 演示结束、socket 被关闭
-            pass
+    async def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer.close()  # "攻击者服务器"：接受连接就够了，说明数据发得出去
 
-    threading.Thread(target=accept_forever, daemon=True).start()
+    listener = await asyncio.start_server(accept, "127.0.0.1", 0)  # 和沙箱在同一个事件循环里：等沙箱时它照样接受连接
+    port = listener.sockets[0].getsockname()[1]
     info(f"准备：在仓库里放一个假私钥 {fake_key.relative_to(HERE.parents[1])}；在 127.0.0.1:{port} 开一个'攻击者服务器'。")
     probe = f"""
 import os, pwd, socket
@@ -338,7 +336,7 @@ except OSError as e:
     for os_sandbox in (False, True):
         label = "进程级沙箱（超时 + rlimit + 临时目录 + 最小环境变量）" if not os_sandbox else "再加一层 OS 沙箱（macOS Seatbelt）"
         info(f"\n   【{label}】")
-        r = sandbox.run_python(probe, sandbox.SandboxLimits(os_sandbox=os_sandbox))
+        r = await sandbox.run_python(probe, sandbox.SandboxLimits(os_sandbox=os_sandbox))
         for line in r.stdout.strip().splitlines():
             info(f"  {line}")
         if r.stderr.strip():
@@ -348,6 +346,7 @@ except OSError as e:
                 if n.startswith(("Seatbelt", "os_sandbox")):
                     info(f"  · {n}")
     listener.close()
+    await listener.wait_closed()
     shutil.rmtree(RUNS / "fake_home", ignore_errors=True)
     try:
         RUNS.rmdir()  # 目录空了就顺手删掉
@@ -357,7 +356,7 @@ except OSError as e:
              "要挡住文件和网络，需要 OS 级隔离（Seatbelt / bubblewrap / 容器的 namespace），多租户再往上到 gVisor 或 microVM。")
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description="第 19 课 Demo：MCP 协议与代码执行沙箱")
     parser.add_argument("--offline", action="store_true", help="使用离线剧本（ScriptedLLM），不调用真实模型")
     parser.add_argument("--only", default="1,2,3", help="只运行指定部分，如 --only 1,3")
@@ -372,7 +371,7 @@ def main() -> None:
         print(f"🌐 真实模型：{model}（第 1 部分和第 3b～3d 不调用模型）")
     parts = {"1": part1_wire, "2": lambda: part2_agent(args.offline), "3": lambda: part3_sandbox(args.offline)}
     for key in args.only.replace(" ", "").split(","):
-        parts[key]()
+        await parts[key]()
 
     banner("小结")
     info("1. MCP = JSON-RPC 2.0 + 约定好的方法名；stdio 传输就是'子进程 + 一行一条消息'，手写两三百行就能和官方 SDK 互通。")
@@ -382,4 +381,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

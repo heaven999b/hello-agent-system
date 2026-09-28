@@ -14,6 +14,9 @@
   7. 暴力检索 vs IVF 近似检索：召回率 - 延迟权衡
   8. 切块 × 召回：块大小的"倒 U 形"曲线
 
+模型调用全部是 async 的：场景 3 的 20 条查询用 asyncio.gather + Semaphore(2) 同时重排（最多 2 个请求在路上，
+MeteredLLM 记录的在途峰值就是证据），场景 5 的 pointwise 打分同样 2 路并发，场景 6 的多查询和 HyDE 同时发出。
+
 融合（rrf_fuse）、指标（ndcg_at_k / mrr）、混合检索（hybrid_search）来自练习：
 你完成 exercise.py 之后，Demo 会自动换成你的实现。
 如果 .venv 里装了 sentence-transformers，场景 3 会多出"真实 embedding"的对比行（可用 --no-st 关闭）。
@@ -22,21 +25,21 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
 import re
 import sys
-import threading
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable, Union
 
-from agentkit import ResilientLLM, default_llm
+from agentkit import ResilientLLM, default_llm, maybe_await
 from agentkit.types import LLMResponse, Message, Usage
 
 HERE = Path(__file__).resolve().parent
@@ -118,18 +121,17 @@ class RecordingLLM:
         self.inner = inner
         self.model = inner.model
         self.responses: dict[str, dict] = {}
-        self._lock = threading.Lock()
 
-    def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+    async def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
         t0 = time.perf_counter()
-        resp = self.inner.chat(messages, tools, **kwargs)
+        resp = await self.inner.chat(messages, tools, **kwargs)
         u = resp.usage
-        with self._lock:
-            self.responses[prompt_key(messages)] = {
-                "content": resp.content,
-                "usage": [u.input_tokens, u.output_tokens, u.cached_input_tokens, u.reasoning_tokens],
-                "seconds": round(time.perf_counter() - t0, 2),
-            }
+        # 并发的调用都在同一个事件循环线程里：这次写入和上面的 await 之间没有切换点，不需要锁
+        self.responses[prompt_key(messages)] = {
+            "content": resp.content,
+            "usage": [u.input_tokens, u.output_tokens, u.cached_input_tokens, u.reasoning_tokens],
+            "seconds": round(time.perf_counter() - t0, 2),
+        }
         return resp
 
     def save(self, path: Path) -> None:
@@ -156,8 +158,16 @@ def fallback_output(messages: list[Message]) -> str:
     return m.group(1).strip() if m else ""  # HyDE：用原问题代替假文档
 
 
+# 当前这条查询回放的调用"录制时真实花了多少秒"。用 ContextVar 而不是全局累加器：
+# 几条查询并发回放时，每个 asyncio 任务有自己的上下文，各记各的（pointwise 内部派生的子任务会继承同一个列表）。
+REPLAYED_SECONDS: ContextVar[list[float] | None] = ContextVar("replayed_seconds", default=None)
+
+
 class ReplayLLM:
-    """离线模式的模型：按提示词指纹回放录制的真实输出（确定性）；查不到就走 fallback_output。"""
+    """离线模式的模型：按提示词指纹回放录制的真实输出（确定性）；查不到就走 fallback_output。
+
+    回放不等待录制时的耗时（离线 Demo 要几秒跑完），但每次调用都会 await asyncio.sleep(0) 让出事件循环：
+    并发的查询真的会交替推进、同时停在 await 上，MeteredLLM 的在途峰值是真实测出来的。"""
 
     def __init__(self, path: Path):
         data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -165,15 +175,17 @@ class ReplayLLM:
         self.recorded_at = data.get("recorded_at", "未录制")
         self.responses: dict = data.get("responses", {})
         self.hits = self.misses = 0
-        self.recorded_seconds = 0.0  # 回放的这些调用，录制时真实花了多少秒
 
-    def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+    async def chat(self, messages: list[Message], tools: list[dict] | None = None, **kwargs) -> LLMResponse:
+        await asyncio.sleep(0)
         rec = self.responses.get(prompt_key(messages))
         if rec is None:
             self.misses += 1
             return LLMResponse(content=fallback_output(messages), usage=Usage(), model=self.model)
         self.hits += 1
-        self.recorded_seconds += rec["seconds"]
+        acc = REPLAYED_SECONDS.get()
+        if acc is not None:
+            acc[0] += rec["seconds"]
         return LLMResponse(content=rec["content"], usage=Usage(*rec["usage"]), model=self.model)
 
 
@@ -190,28 +202,31 @@ class Row:
     cost: float = 0.0
 
 
-def run_retriever(
+Ranker = Callable[[rk.Query], Union[list[str], Awaitable[list[str]]]]
+
+
+async def run_retriever(
     name: str,
-    fn: Callable[[rk.Query], list[str]],
+    fn: Ranker,
     queries: list[rk.Query],
     llm: rk.MeteredLLM | None = None,
     workers: int = 1,
-    extra_seconds: Callable[[], float] | None = None,
 ) -> Row:
+    """在每条查询上跑一次 fn（普通函数或 async 函数都行），最多 workers 条查询同时进行。
+
+    延迟 = 这条查询的墙钟时间；离线回放时再加上录制时模型的真实耗时（回放本身不等待）。"""
     before = llm.snapshot() if llm else None
+    sem = asyncio.Semaphore(workers)
 
-    def one(q: rk.Query):
-        extra0 = extra_seconds() if extra_seconds else 0.0
-        t0 = time.perf_counter()
-        ranked = fn(q)
-        dt = time.perf_counter() - t0 + ((extra_seconds() - extra0) if extra_seconds else 0.0)
-        return q.id, ranked, dt
+    async def one(q: rk.Query):
+        async with sem:  # 在拿到槽位之后才开始计时：排队的时间不算这条查询的延迟
+            replayed = [0.0]
+            REPLAYED_SECONDS.set(replayed)  # 只影响本任务（gather 给每条查询建了独立任务）
+            t0 = time.perf_counter()
+            ranked = await maybe_await(fn(q))
+            return q.id, ranked, time.perf_counter() - t0 + replayed[0]
 
-    if workers > 1:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(one, queries))
-    else:
-        results = [one(q) for q in queries]
+    results = await asyncio.gather(*(one(q) for q in queries))  # 按输入顺序返回
     row = Row(name, {qid: r for qid, r, _ in results}, 1000 * sum(dt for *_, dt in results) / len(results))
     if llm:
         calls, usage, _ = llm.snapshot()
@@ -248,7 +263,7 @@ def marks(ranked: list[str], q: rk.Query, n: int = 3) -> str:
 # ---------------------------------------------------------------- 主流程
 
 
-def main() -> None:
+async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--offline", action="store_true", help="回放 recorded_llm.json，无需 API key")
     ap.add_argument("--record", action="store_true", help="真实模式下把模型输出录制到 recorded_llm.json")
@@ -258,10 +273,10 @@ def main() -> None:
 
     replay: ReplayLLM | None = None
     recorder: RecordingLLM | None = None
+    workers = 2  # 共享网关，并发不超过 2（离线回放也走同一条并发路径）
     if args.offline:
         replay = ReplayLLM(RECORDING)
         llm = rk.MeteredLLM(replay)
-        workers = 1
         mode = f"离线（回放 {RECORDING.name}：{replay.model}，录制于 {replay.recorded_at}）"
     else:
         base = ResilientLLM(default_llm(args.model))
@@ -269,9 +284,7 @@ def main() -> None:
             recorder = RecordingLLM(base)
             base = recorder
         llm = rk.MeteredLLM(base)
-        workers = 2  # 共享网关，并发不超过 2
         mode = f"真实模型（{llm.model}）"
-    extra = (lambda: replay.recorded_seconds) if replay else None
 
     print(f"模式：{mode}")
     print(f"练习实现：{IMPL_NAME}")
@@ -332,16 +345,16 @@ def main() -> None:
     def hybrid_ids(q: rk.Query, vector_search=vec.search) -> list[str]:
         return [d for d, _ in IMPL.hybrid_search(q.query, bm25.search, vector_search, k=CANDIDATES)]
 
-    def rerank_ids(q: rk.Query) -> list[str]:
+    async def rerank_ids(q: rk.Query) -> list[str]:
         cands = hybrid_ids(q)
-        return rk.llm_rerank_listwise(llm, q.query, [(d, by_id[d].text) for d in cands])
+        return await rk.llm_rerank_listwise(llm, q.query, [(d, by_id[d].text) for d in cands])
 
-    step("在 20 条查询上逐一检索（BM25 和向量是毫秒级；LLM 重排每条查询调用一次模型）")
+    step("在 20 条查询上逐一检索（BM25 和向量是毫秒级；LLM 重排每条查询调用一次模型，2 条查询同时进行）")
     result_rows = [
-        run_retriever("BM25（稀疏）", lambda q: [d for d, _ in bm25.search(q.query, CANDIDATES)], queries),
-        run_retriever("向量·只有字面（对照）", lambda q: [d for d, _ in lex_vec.search(q.query, CANDIDATES)], queries),
-        run_retriever("向量·教学 embedding", lambda q: [d for d, _ in vec.search(q.query, CANDIDATES)], queries),
-        run_retriever("混合 RRF（BM25+向量）", hybrid_ids, queries),
+        await run_retriever("BM25（稀疏）", lambda q: [d for d, _ in bm25.search(q.query, CANDIDATES)], queries),
+        await run_retriever("向量·只有字面（对照）", lambda q: [d for d, _ in lex_vec.search(q.query, CANDIDATES)], queries),
+        await run_retriever("向量·教学 embedding", lambda q: [d for d, _ in vec.search(q.query, CANDIDATES)], queries),
+        await run_retriever("混合 RRF（BM25+向量）", hybrid_ids, queries),
     ]
     st_model = os.environ.get("RETRIEVAL_ST_MODEL", rk.DEFAULT_ST_MODEL)
     st_index, st_failed = None, False
@@ -353,12 +366,13 @@ def main() -> None:
             info(f"（sentence-transformers 已安装，但加载 {st_model} 失败，跳过真实 embedding 对比：{type(e).__name__}: {e}）")
     if st_index is not None:
         result_rows += [
-            run_retriever(f"向量·{st_model.split('/')[-1]}", lambda q: [d for d, _ in st_index.search(q.query, CANDIDATES)], queries),
-            run_retriever("混合 RRF（BM25+真实向量）", lambda q: hybrid_ids(q, st_index.search), queries),
+            await run_retriever(f"向量·{st_model.split('/')[-1]}", lambda q: [d for d, _ in st_index.search(q.query, CANDIDATES)], queries),
+            await run_retriever("混合 RRF（BM25+真实向量）", lambda q: hybrid_ids(q, st_index.search), queries),
         ]
     t0 = time.perf_counter()
-    rerank_row = run_retriever("混合 + LLM 重排", rerank_ids, queries, llm=llm, workers=workers, extra_seconds=extra)
+    rerank_row = await run_retriever("混合 + LLM 重排", rerank_ids, queries, llm=llm, workers=workers)
     wall = time.perf_counter() - t0
+    rerank_peak = llm.max_in_flight  # 到这里为止只有重排调用过模型
     result_rows.append(rerank_row)
 
     rows = []
@@ -375,9 +389,12 @@ def main() -> None:
         info("")
         info(f"（离线回放：命中录制 {replay.hits} 次、未命中 {replay.misses} 次；未命中的查询按原顺序返回，等于没重排。"
              "延迟一列用的是录制时的真实耗时。）")
+        info(f"（重排 {workers} 路并发：模型调用在途峰值 {rerank_peak}。回放不等待，所以离线的墙钟时间没有意义。）")
     else:
         info("")
-        info(f"（重排 2 路并发，20 条查询总墙钟时间 {wall:.0f} 秒；成本按 agentkit/pricing.py 的占位价格估算。）")
+        info(f"（重排 {workers} 路并发：模型调用在途峰值 {rerank_peak}，20 条查询总墙钟时间 {wall:.0f} 秒"
+             f"（逐条延迟之和 {rerank_row.ms_per_query * len(queries) / 1000:.0f} 秒）；"
+             "成本按 agentkit/pricing.py 的占位价格估算。）")
 
     step("按查询类别拆开看（Recall@5 / MRR@10）")
     main_rows = [result_rows[0], result_rows[2], result_rows[3], rerank_row]
@@ -423,9 +440,9 @@ def main() -> None:
     for name, fn in [
         ("listwise", lambda q: rk.llm_rerank_listwise(llm, q.query, [(d, by_id[d].text) for d in hybrid_ids(q)[:n_cand]])),
         ("pointwise", lambda q: rk.llm_rerank_pointwise(
-            llm, q.query, [(d, by_id[d].text) for d in hybrid_ids(q)[:n_cand]], max_workers=workers)),
+            llm, q.query, [(d, by_id[d].text) for d in hybrid_ids(q)[:n_cand]], max_concurrency=workers)),
     ]:
-        r = run_retriever(name, fn, sub, llm=llm, extra_seconds=extra)
+        r = await run_retriever(name, fn, sub, llm=llm)
         _, m, nd = metrics(r, sub)
         rows.append([name, str(r.calls), f"{r.usage.total:,}", fmt_ms(r.ms_per_query), f"{m:.2f}", f"{nd:.2f}",
                      " | ".join(marks(r.ranked[q.id], q, 2) for q in sub)])
@@ -443,9 +460,9 @@ def main() -> None:
     rows = []
     for qid in ["q02", "q03", "q05"]:
         q = next(x for x in queries if x.id == qid)
-        variants = rk.multi_query(llm, q.query, n=3)
+        # 两种改写互不依赖：同时发出，这条查询只等一次模型的时间
+        variants, fake = await asyncio.gather(rk.multi_query(llm, q.query, n=3), rk.hyde(llm, q.query))
         mq = IMPL.rrf_fuse([[d for d, _ in bm25.search(v, CANDIDATES)] for v in variants])
-        fake = rk.hyde(llm, q.query)
         hy = [d for d, _ in bm25.search(fake, CANDIDATES)]
         rows.append([q.query, marks([d for d, _ in bm25.search(q.query, 3)], q, 1),
                      marks([d for d, _ in mq], q, 1), marks(hy, q, 1)])
@@ -536,4 +553,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

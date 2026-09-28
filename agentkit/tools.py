@@ -96,13 +96,17 @@ class Tool:
         self.risk = risk
         self.timeout_s = timeout_s
         self.max_output_chars = max_output_chars
-        self.is_async = inspect.iscoroutinefunction(fn)
-        if isolation == "process" and self.is_async:
+        if isolation == "process" and inspect.iscoroutinefunction(fn):
             raise TypeError("async 工具不需要进程隔离：它本身就可以被取消")
         # None / "thread"：async 工具在事件循环里 await，同步工具进线程池；"process"：子进程执行，超时即 kill
         self.isolation = isolation
         self.wants_ctx = "ctx" in inspect.signature(fn).parameters
         self.args_model = _build_args_model(fn, self.name)
+
+    @property
+    def is_async(self) -> bool:
+        """每次执行时判断（而不是构造时记下）：子类或包装器替换了 self.fn 也能正确识别。"""
+        return inspect.iscoroutinefunction(self.fn)
 
     def schema(self) -> dict:
         """生成 OpenAI function-calling 格式的工具定义。

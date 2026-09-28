@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 
 import pytest
@@ -180,8 +181,8 @@ def test_delete_is_soft_and_later_ops_see_it():
                                "reason": "用户说记错了", "source": "session-5"}
 
 
-def test_fact_memory_end_to_end_with_your_apply_function():
-    """集成：把你的 apply_memory_ops 塞进 Mem0 式 FactMemory，跑两次会话（剧本代替模型）。"""
+async def test_fact_memory_end_to_end_with_your_apply_function():
+    """集成：把你的 apply_memory_ops 塞进 Mem0 式 FactMemory，跑两次会话（剧本代替模型）。observe 是 async 的。"""
 
     def extracted(*facts):
         return reply(json.dumps({"facts": [{"text": t, "key": k, "importance": i, "ttl_days": None} for t, k, i in facts]},
@@ -200,8 +201,8 @@ def test_fact_memory_end_to_end_with_your_apply_function():
         decide_update_city,
     ])
     mem = mk.FactMemory(llm, apply_fn=ex.apply_memory_ops, new_id=ids("m"))
-    mem.observe("acme", "alice", "我叫 Alice，住在上海", now=T0, source="s1")
-    pairs = mem.observe("acme", "alice", "我搬到深圳了", now=T0 + 30 * DAY, source="s2")
+    await mem.observe("acme", "alice", "我叫 Alice，住在上海", now=T0, source="s1")
+    pairs = await mem.observe("acme", "alice", "我搬到深圳了", now=T0 + 30 * DAY, source="s2")
     assert [(op.op, op.id, res.status) for op, res in pairs] == [("UPDATE", "m1", "applied"), ("NOOP", "m2", "noop")]
     live = {r.text for r in mem.live("acme", "alice", T0 + 31 * DAY)}
     assert live == {"用户住在深圳", "用户名叫 Alice"}
@@ -263,3 +264,55 @@ def test_consolidate_is_transitive_and_does_not_mutate_input():
     for bad in (0.0, 1.5, -0.1):
         with pytest.raises(ValueError):
             ex.consolidate(mems, sim, bad)
+
+
+# =====================================================================
+# 课程工具（不是练习）：同一个用户的写入排队，不同用户照常并发
+# =====================================================================
+
+
+async def test_fact_memory_serializes_writes_per_user_but_not_across_users():
+    """observe 在"读已有记忆"和"落库"之间要等两次模型（抽取、决策）。同一个用户的两条消息如果交错执行，
+    第二条就拿着过时的候选记忆去决策：这里它看不到刚写进去的"花生过敏"，也就不会删掉它，更正就丢了。
+    所以同一用户排队，不同用户互不等待。用带延迟的 ScriptedLLM 让调用真的重叠，用在途峰值证明，而不是看墙钟。"""
+    import asyncio
+
+    def responder(messages):  # 一个"讲道理"的模型：看得到花生过敏，就在更正时删掉它
+        prompt = messages[-1]["content"]
+        allergen = "芒果" if "芒果" in prompt else "花生"
+        fact = f"用户对{allergen}过敏"
+        if "记忆抽取器" in prompt:
+            return reply(json.dumps({"facts": [{"text": fact, "key": "allergy", "importance": 9, "ttl_days": None}]},
+                                    ensure_ascii=False))
+        existing = json.loads(prompt.split("<existing_memories>")[1].split("</existing_memories>")[0])
+        ops = [{"op": "DELETE", "id": e["id"], "reason": "用户更正"} for e in existing if allergen == "芒果" and "花生" in e["text"]]
+        ops.append({"op": "ADD", "text": fact, "key": "allergy", "importance": 9, "reason": "新信息"})
+        return reply(json.dumps({"ops": ops}, ensure_ascii=False))
+
+    async def two_messages_at_once(mem):
+        mk.apply_ops(mem.store("acme", "alice"), [MemoryOp("ADD", text="用户名叫 Alice", key="name")], now=T0,
+                     new_id=lambda: "m0")  # 已有一条记忆：两条消息都要走"比对 → 决策"
+        await asyncio.gather(
+            mem.observe("acme", "alice", "我对花生过敏", now=T0 + DAY, source="s1"),
+            mem.observe("acme", "alice", "更正：我不是对花生过敏，是对芒果过敏", now=T0 + DAY, source="s2"),
+        )
+        return sorted(r.text for r in mem.live("acme", "alice", T0 + 2 * DAY))
+
+    llm = ScriptedLLM(responder=responder, latency=0.02)  # 每次调用都真的要等：没有排队的话，两条消息会重叠
+    mem = mk.FactMemory(llm, new_id=ids("m"))
+    assert await two_messages_at_once(mem) == ["用户名叫 Alice", "用户对芒果过敏"]
+    assert llm.max_in_flight == 1, "同一个用户的两次写入不能同时等模型"
+    assert llm.call_count == 4  # 两条消息各一次抽取 + 一次决策
+
+    # 反例：把按用户排队的锁拿掉，同样两条消息 —— 第二条的决策没看到"花生过敏"，过时的记忆活了下来
+    unlocked = mk.FactMemory(ScriptedLLM(responder=responder, latency=0.02), new_id=ids("x"))
+    unlocked._lock = lambda tenant_id, user_id: contextlib.nullcontext()
+    assert await two_messages_at_once(unlocked) == ["用户名叫 Alice", "用户对芒果过敏", "用户对花生过敏"]
+    assert unlocked.llm.max_in_flight == 2
+
+    # 不同用户：同时在等模型，互不阻塞
+    llm = ScriptedLLM(responder=responder, latency=0.02)
+    mem = mk.FactMemory(llm, new_id=ids("u"))
+    await asyncio.gather(*(mem.observe("acme", user, "我对花生过敏", now=T0) for user in ("alice", "bob", "carol")))
+    assert llm.max_in_flight == 3
+    assert all(len(mem.live("acme", user, T0)) == 1 for user in ("alice", "bob", "carol"))

@@ -6,9 +6,10 @@
 对照要点（其余三个实现文件用同样的五个标题，方便并排阅读）：
   状态      RunState（消息历史、步数、用量、待审批调用），每一步存进 Checkpointer
   工具      @tool / Tool(fn, risk=...)：从类型注解自动生成 JSON Schema，风险等级是工具的属性
-  循环      Agent._loop：while step < max_steps → 调模型 → 有工具调用就执行 → 没有就结束
-  审批      PermissionPolicy 钩子抛 PauseRun → 状态落盘 → agent.approve(run_id, 决定) 从断点继续
+  循环      Agent._loop_body：while step < max_steps → 调模型 → 有工具调用就执行 → 没有就结束
+  审批      PermissionPolicy 钩子抛 PauseRun → 状态落盘 → await agent.approve(run_id, 决定) 从断点继续
   追踪      Tracer：agent.run / llm.chat / tool.* 嵌套 Span，render_tree 打印成树
+  async     只有 async 一套：await agent.run(...)（同 LangGraph 的 ainvoke、Agents SDK 的 Runner.run）
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ def _load_sibling(name: str):
 shared = _load_sibling("shared_tools")
 # --- end bootstrap ---
 
+import asyncio
 import time
 
 import agentkit
@@ -57,17 +59,17 @@ def build_agent(llm, desk) -> Agent:
     )
 
 
-def run(question: str = shared.QUESTION, approver=shared.auto_approver, llm=None) -> "shared.FrameworkResult":
+async def run(question: str = shared.QUESTION, approver=shared.auto_approver, llm=None) -> "shared.FrameworkResult":
     desk = shared.ITDesk(user_id="alice")
     agent = build_agent(llm or ResilientLLM(default_llm()), desk)
     approvals = []
     t0 = time.perf_counter()
-    result = agent.run(question, metadata={"user_id": desk.user_id})
+    result = await agent.run(question, metadata={"user_id": desk.user_id})
     while result.status == "paused":  # 暂停 = 状态已落盘，进程此时可以退出，审批人一小时后再来也行
         call = result.pending_approval
         ok = approver(call.name, call.parsed_args())
         approvals.append((call.name, call.parsed_args(), ok))
-        result = agent.approve(result.run_id, ok, by="demo-approver")
+        result = await agent.approve(result.run_id, ok, by="demo-approver")
     seconds = time.perf_counter() - t0
     spans = sum(1 for root in agent.tracer.traces for _ in root.walk())  # 想看整棵树：agentkit.tracing.render_tree(root)
     return shared.FrameworkResult(
@@ -104,5 +106,5 @@ def offline_llm() -> ScriptedLLM:
 
 if __name__ == "__main__":
     offline = "--offline" in sys.argv
-    res = run(llm=offline_llm() if offline else None)
+    res = asyncio.run(run(llm=offline_llm() if offline else None))
     shared.print_result(res)

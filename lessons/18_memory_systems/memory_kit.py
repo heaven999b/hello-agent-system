@@ -9,10 +9,15 @@
 和第 04 课 agentkit/memory.py 的 MemoryStore 的区别，一句话：
 MemoryStore 只会"往本子上添一行"；FactMemory 会"先翻本子，再决定是新增、改写、划掉，还是不动"。
 
+调用模型的方法是 async 的（FactMemory.observe / maybe_reflect，`await` 它们）；打分、执行操作、查看、删除是纯计算，
+保持普通方法。同一个用户的 observe / maybe_reflect 在本进程内按用户串行（见 FactMemory 的说明），不同用户照常并发。
+
 生产替换指南（本文件为了零依赖做的简化 → 生产中换成什么）：
     text_similarity（词袋余弦）      → 向量检索 + BM25 混合检索 + 重排（第 17 课）
-    dict 存储                        → Postgres（记录 + 审计表）/ 向量库（检索索引），按 tenant_id 分区
-    同步写入                          → 写入放进异步队列（第 13 课），不拖慢对话的响应
+    dict 存储（只在本进程的内存里）  → Postgres（记录 + 审计表，第 26 课）+ 向量索引（pgvector 等，第 15、17 课），
+                                       按 tenant_id 分区；多个 worker 进程看到的是同一份记忆
+    进程内按用户串行（KeyedLocks）   → 多进程时：按用户分区的任务队列，或 Postgres advisory lock（第 26 课 问题 5）
+    在对话里 await observe            → 写入放进后台任务队列（第 13 课 agentkit.distributed），不拖慢对话的响应
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from pydantic import BaseModel, Field
 
 from agentkit.guardrails import PII_PATTERNS, contains_secret, detect_injection
 from agentkit.hooks import Hook
+from agentkit.limits import KeyedLocks
 from agentkit.llm import LLM, LLMError
 from agentkit.memory import MemoryStore, tokenize
 from agentkit.tools import Tool, ToolContext, ToolError, tool
@@ -333,6 +339,11 @@ class FactMemory:
 
     身份（tenant_id, user_id）由调用方（系统）传入，不经过模型。
     apply_fn 可以替换成你在练习 (b) 里写的 apply_memory_ops。
+
+    并发：observe 在"读已有记忆"和"落库"之间有两次 await（抽取、决策）。同一个用户的两条消息如果交错执行，
+    第二条的决策就是基于过时的候选记忆做的（它没看到第一条刚写进去的内容）。所以同一个用户的 observe / maybe_reflect
+    在本进程内排队（KeyedLocks，按 (tenant_id, user_id)）；不同用户互不阻塞，照常并发。
+    这把锁只在一个进程里有效：多个 worker 进程要靠按用户分区的队列或数据库锁（第 26 课）。
     """
 
     def __init__(
@@ -358,6 +369,11 @@ class FactMemory:
         self.events: list[str] = []  # 规则兜底 / 降级 / 拦截事件：演示和排查都靠它
         self.last_facts: list[ExtractedFact] = []  # 最近一次抽取的结果（Demo 用它喂给"只追加"的对照组）
         self.llm_calls = 0
+        self._user_locks = KeyedLocks()  # 同一个用户的写入排队；没人用的锁自动回收
+
+    def _lock(self, tenant_id: str, user_id: str):
+        self.store(tenant_id, user_id)  # 先校验身份
+        return self._user_locks.hold(json.dumps([tenant_id, user_id]))  # 用 JSON 拼 key：不会因为分隔符撞车
 
     # ---------------------------------------------------------------- 存储
 
@@ -372,16 +388,20 @@ class FactMemory:
 
     # ---------------------------------------------------------------- 写入
 
-    def observe(
+    async def observe(
         self, tenant_id: str, user_id: str, message: str, *, now: float, source: str = "", source_type: str = "user"
     ) -> list[tuple[MemoryOp, OpResult]]:
-        """观察一条消息，更新记忆。返回 [(执行的操作, 结果)]。"""
+        """观察一条消息，更新记忆。返回 [(执行的操作, 结果)]。同一个用户的调用排队执行（见类说明）。"""
         if source_type not in self.writable_sources:
             # 第 04 课防投毒原则 1：工具输出、网页、文档内容不能自动写进记忆 —— 连模型都不用调
             self.events.append(f"拦截：来源 {source_type!r} 不允许写入记忆（{message[:30]}…）")
             return []
+        async with self._lock(tenant_id, user_id):
+            return await self._observe(tenant_id, user_id, message, now=now, source=source)
+
+    async def _observe(self, tenant_id: str, user_id: str, message: str, *, now: float, source: str):
         store = self.store(tenant_id, user_id)
-        facts = self.last_facts = self._extract(message, now)
+        facts = self.last_facts = await self._extract(message, now)
         if not facts:
             return []
         live = [r for r in store.values() if r.is_live(now)]
@@ -390,7 +410,7 @@ class FactMemory:
             # 没有任何已有记忆可比对：决策只可能是 ADD，省掉一次模型调用
             ops = [MemoryOp("ADD", None, f.text, f.key, f.importance, f.ttl_days, "新用户 / 新话题") for f in facts]
         else:
-            ops = self._decide(message, facts, candidates, now)
+            ops = await self._decide(message, facts, candidates, now)
         ops = self._guard(ops, store, now)
         for op in ops:
             op.source = source
@@ -401,12 +421,12 @@ class FactMemory:
                 self._importance_since_reflect[key] = self._importance_since_reflect.get(key, 0.0) + op.importance
         return list(zip(ops, results))
 
-    def _extract(self, message: str, now: float) -> list[ExtractedFact]:
+    async def _extract(self, message: str, now: float) -> list[ExtractedFact]:
         if self.llm is None:
             raise RuntimeError("FactMemory 需要一个 LLM 来抽取事实")
         try:
             self.llm_calls += 1
-            return complete_json(self.llm, EXTRACT_PROMPT.format(date=fmt_day(now), message=message), Extraction).facts
+            return (await complete_json(self.llm, EXTRACT_PROMPT.format(date=fmt_day(now), message=message), Extraction)).facts
         except (ValueError, LLMError) as e:
             # 抽取失败就不写 —— 宁可少记一条，也不要把一整段原话当成"事实"塞进去
             self.events.append(f"降级：事实抽取失败，本条消息不写入记忆（{e}）")
@@ -426,7 +446,7 @@ class FactMemory:
         by_id = {r.id: r for r in live}
         return [by_id[i] for i in sorted(best, key=lambda i: best[i], reverse=True)]
 
-    def _decide(
+    async def _decide(
         self, message: str, facts: list[ExtractedFact], candidates: list[MemoryRecord], now: float
     ) -> list[MemoryOp]:
         # Mem0 开源实现里的小技巧：给模型看 "0""1"… 这样的短编号，而不是真实的 UUID —— 模型抄长 id 容易抄错、编造
@@ -439,7 +459,7 @@ class FactMemory:
         prompt = DECIDE_PROMPT.format(date=fmt_day(now), message=message, facts=facts_json, existing=existing)
         try:
             self.llm_calls += 1
-            decisions = complete_json(self.llm, prompt, Decisions).ops
+            decisions = (await complete_json(self.llm, prompt, Decisions)).ops
         except (ValueError, LLMError) as e:
             self.events.append(f"降级：决策调用失败，改用纯规则决策（{e}）")
             return [MemoryOp("ADD", None, f.text, f.key, f.importance, f.ttl_days, "规则决策") for f in facts]
@@ -525,13 +545,18 @@ class FactMemory:
 
     # ---------------------------------------------------------------- 反思（Generative Agents）
 
-    def maybe_reflect(
+    async def maybe_reflect(
         self, tenant_id: str, user_id: str, *, now: float, threshold: float = 30.0, max_insights: int = 2
     ) -> list[MemoryRecord]:
         """新增 / 更新记忆的重要性累计超过 threshold 时，让模型从近期记忆里总结更高层的洞察。
 
         洞察作为 key="insight" 的记忆存下来，sources 记录它引用的证据 —— 证据被删除时洞察要跟着删（见 forget）。
+        和 observe 用同一把按用户的锁：读记忆 → 等模型 → 写洞察，中间不能被同一个用户的写入插进来。
         """
+        async with self._lock(tenant_id, user_id):
+            return await self._reflect(tenant_id, user_id, now=now, threshold=threshold, max_insights=max_insights)
+
+    async def _reflect(self, tenant_id: str, user_id: str, *, now: float, threshold: float, max_insights: int):
         key = (tenant_id, user_id)
         if self._importance_since_reflect.get(key, 0.0) < threshold or self.llm is None:
             return []
@@ -544,7 +569,7 @@ class FactMemory:
         )
         try:
             self.llm_calls += 1
-            insights = complete_json(self.llm, REFLECT_PROMPT.format(n=max_insights, memories=listing), Reflection).insights
+            insights = (await complete_json(self.llm, REFLECT_PROMPT.format(n=max_insights, memories=listing), Reflection)).insights
         except (ValueError, LLMError) as e:
             self.events.append(f"降级：反思失败，下次再试（{e}）")
             return []
@@ -751,6 +776,12 @@ def memgpt_tools(core: CoreMemory, archival: MemoryStore, *, clock: Callable[[],
 
     函数名沿用 Letta（MemGPT 的开源实现）旧版的叫法：core_memory_append / core_memory_replace；
     归档记忆的两个工具简化为 archival_insert / archival_search。
+
+    为什么写成 async def（函数体里其实没有 await）：普通函数工具会被 ToolExecutor 放进线程池执行（给阻塞 I/O 用的，
+    见 agentkit/tools.py），那样核心记忆就会在工具线程里被改、同时在事件循环线程里被 CoreMemoryHook 读，
+    并发的会话之间还得加锁。这几个工具只动进程内的数据结构（微秒级），直接在事件循环线程上执行：
+    所有读写都在一个线程里，两次 await 之间不会被打断，不需要锁。
+    换成数据库存储后，函数体里就是真正的 `await db.execute(...)`。
     """
     page_size = 5
 
@@ -760,7 +791,7 @@ def memgpt_tools(core: CoreMemory, archival: MemoryStore, *, clock: Callable[[],
         return ctx.tenant_id, ctx.user_id
 
     @tool(risk="write")
-    def core_memory_append(
+    async def core_memory_append(
         label: Annotated[str, Field(description="记忆块名称，如 human（关于用户）或 persona（关于你自己）")],
         content: Annotated[str, Field(description="要追加的内容，简洁的一句话")],
         ctx: ToolContext,
@@ -771,7 +802,7 @@ def memgpt_tools(core: CoreMemory, archival: MemoryStore, *, clock: Callable[[],
         return f"已写入 {label}（{len(block.value)}/{block.limit} 字符）"
 
     @tool(risk="write")
-    def core_memory_replace(
+    async def core_memory_replace(
         label: Annotated[str, Field(description="记忆块名称，如 human 或 persona")],
         old_content: Annotated[str, Field(description="块中要被替换的原文，必须逐字匹配且唯一")],
         new_content: Annotated[str, Field(description="替换后的新内容；填空字符串表示删除这段")],
@@ -783,7 +814,7 @@ def memgpt_tools(core: CoreMemory, archival: MemoryStore, *, clock: Callable[[],
         return f"已更新 {label}（{len(block.value)}/{block.limit} 字符）"
 
     @tool(risk="write")
-    def archival_insert(
+    async def archival_insert(
         content: Annotated[str, Field(description="要存入归档记忆的内容，写成独立可读的完整句子")],
         ctx: ToolContext,
     ) -> str:
@@ -798,7 +829,7 @@ def memgpt_tools(core: CoreMemory, archival: MemoryStore, *, clock: Callable[[],
         return f"已存入归档记忆（id={item.id}）"
 
     @tool
-    def archival_search(
+    async def archival_search(
         query: Annotated[str, Field(description="检索关键词；关键词匹配，请多写几个相关词和同义词")],
         ctx: ToolContext,
         page: Annotated[int, Field(ge=0, description="页码，从 0 开始；每页 5 条")] = 0,
