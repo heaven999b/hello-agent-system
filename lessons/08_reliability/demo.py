@@ -495,12 +495,9 @@ async def breaker_worker(args) -> None:
     label, pid = args.breaker_worker, os.getpid()
     primary = OpenAICompatLLM(model=PRIMARY_MODEL, base_url=f"{args.url}/v1", api_key="offline-demo-key", timeout=5)
     backup = ScriptedLLM(responder=lambda msgs: reply("（备用模型的回答）"), model="backup-model")
-    opened: list[SQLiteCircuitBreaker] = []
 
     def shared(model: str) -> SQLiteCircuitBreaker:
-        b = SQLiteCircuitBreaker(args.db, model, failure_threshold=SHARED_THRESHOLD, reset_timeout=SHARED_RESET)
-        opened.append(b)
-        return b
+        return SQLiteCircuitBreaker(args.db, model, failure_threshold=SHARED_THRESHOLD, reset_timeout=SHARED_RESET)
 
     llm = ResilientLLM(primary, [backup], max_attempts=2, base_delay=0.05, failure_threshold=SHARED_THRESHOLD,
                        reset_timeout=SHARED_RESET, breaker_factory=None if args.local_breaker else shared)
@@ -514,9 +511,7 @@ async def breaker_worker(args) -> None:
             print(f"      [进程 {label} pid={pid}] 请求 {i}：熔断器 {before} → {after}    回答来自 {answered_by(res)}",
                   flush=True)
     finally:
-        await primary.aclose()
-        for b in opened:
-            await b.close()
+        await llm.aclose()  # 关闭链上各模型的连接池和各熔断器的数据库连接
 
 
 # =====================================================================

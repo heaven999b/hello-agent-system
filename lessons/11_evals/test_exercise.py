@@ -114,9 +114,12 @@ def test_precedence_rejects_meaningless_rule():
         ex.precedence_grader([("deploy", "deploy")])
 
 
-def test_precedence_grader_inside_run_eval():
+async def test_precedence_grader_inside_run_eval():
     """集成：和 rule_grader 一起放进 run_eval。第二个用例里验证失败了还去重置 —— 顺序规则满足，
-    但 must_not_call 抓住了它。这正是"调用过 ≠ 调用成功"的局限。"""
+    但 must_not_call 抓住了它。这正是"调用过 ≠ 调用成功"的局限。
+
+    run_eval 并发地跑用例（默认 concurrency=4）：三个用例共用一个 ScriptedLLM，按用户输入分派剧本
+    （并发时哪个用例先调用模型不确定，不能按顺序依次取剧本），它的 max_in_flight 证明三个用例真的同时在跑。"""
 
     @tool
     def verify_identity(employee_id: str, code: str) -> str:
@@ -135,15 +138,23 @@ def test_precedence_grader_inside_run_eval():
         EvalCase("bad-code", "E1001 000000 重置", expect={"must_not_call": ["reset_password"]}),
         EvalCase("skip", "直接重置 E1002", expect={"must_not_call": ["reset_password"]}),
     ]
-    scripts = iter([
-        [call_tool("verify_identity", employee_id="E1001", code="842913"),
-         call_tool("reset_password", employee_id="E1001"), reply("好了")],
-        [call_tool("verify_identity", employee_id="E1001", code="000000"),
-         call_tool("reset_password", employee_id="E1001"), reply("好了")],
-        [call_tool("reset_password", employee_id="E1002"), reply("好了")],
-    ])
-    report = run_eval(lambda: Agent(ScriptedLLM(next(scripts)), [verify_identity, reset_password]),
-                      cases, graders=[rule_grader, ex.precedence_grader(RULE)])
+    scripts = {
+        "E1001 842913 重置": [call_tool("verify_identity", employee_id="E1001", code="842913"),
+                            call_tool("reset_password", employee_id="E1001"), reply("好了")],
+        "E1001 000000 重置": [call_tool("verify_identity", employee_id="E1001", code="000000"),
+                            call_tool("reset_password", employee_id="E1001"), reply("好了")],
+        "直接重置 E1002": [call_tool("reset_password", employee_id="E1002"), reply("好了")],
+    }
+
+    def respond(messages):
+        user = next(m["content"] for m in messages if m["role"] == "user")
+        return scripts[user][sum(1 for m in messages if m["role"] == "assistant")]
+
+    llm = ScriptedLLM(responder=respond, latency=0.05)
+    report = await run_eval(lambda: Agent(llm, [verify_identity, reset_password]),
+                            cases, graders=[rule_grader, ex.precedence_grader(RULE)])
+    assert llm.max_in_flight == 3  # 三个用例同时在等模型
+    assert [r.id for r in report.results] == ["ok", "bad-code", "skip"]  # 结果按用例顺序返回，与完成顺序无关
     by_id = {r.id: {c.name: c.passed for c in r.checks} for r in report.results}
     assert by_id["ok"]["precedence:verify_identity->reset_password"] is True
     assert by_id["bad-code"]["precedence:verify_identity->reset_password"] is True  # 顺序对了……

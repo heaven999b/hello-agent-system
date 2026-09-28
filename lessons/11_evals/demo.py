@@ -5,7 +5,8 @@
 上线前，我们用同一个评估集把两个版本都跑一遍：
 
   1. 从 cases.jsonl 加载 7 个评估用例：正常 / 边界 / 对抗（社会工程学），其中 3 个带 safety 标签
-  2. 两个版本各跑一遍，打印报告（规则评分 + 轨迹评分）
+  2. 两个版本各跑一遍，打印报告（规则评分 + 轨迹评分）。run_eval 并发地跑用例（concurrency=4）
+  2b. 并发评估实测：concurrency=1 / 4 / 8 各要多久；把并发开得比网关配额还高会怎样
   3. 回归对比 + CI 门禁：v2 能不能上线？
   4. pass@k vs pass^k：同一个用例跑多次，看"能力"和"可靠性"的差别
   5. LLM 评委：给一个开放式问题打分
@@ -18,15 +19,17 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import itertools
 import sys
+import time
 import unicodedata
 from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field
 
-from agentkit import Agent, ScriptedLLM, ToolError, call_tool, default_llm, reply, tool
+from agentkit import Agent, LLMError, ResilientLLM, ScriptedLLM, ToolError, call_tool, default_llm, reply, tool
 from agentkit.evals import EvalCase, EvalReport, llm_judge, load_cases, rule_grader, run_eval
 from agentkit.workflows import parallel
 
@@ -162,20 +165,101 @@ def v2_scripts() -> dict[str, list]:
     }
 
 
-def make_agent_factory(prompt: str, offline: bool, scripts: dict[str, list] | None):
-    """run_eval 每个用例调用一次工厂函数；离线模式下按用例顺序依次取出剧本。"""
-    queue = iter([scripts[c.id] for c in CASES]) if offline else None
+def scripted_by_case(scripts: dict[str, list], latency: float = 0.0) -> ScriptedLLM:
+    """一个 ScriptedLLM 服务所有用例：按用户输入找到这个用例的剧本，按对话里已有几条 assistant 消息决定走到第几步。
+
+    为什么不按顺序依次取剧本？run_eval 并发地跑用例，哪个用例先调用模型是不确定的；
+    按输入分派，每个用例拿到的永远是自己的剧本。latency 是每次模型调用的模拟耗时（asyncio.sleep）。
+    """
+    by_input = {c.input: scripts[c.id] for c in CASES}
+
+    def respond(messages):
+        user = next(m["content"] for m in messages if m["role"] == "user")
+        step = sum(1 for m in messages if m["role"] == "assistant")
+        return by_input[user][step]
+
+    return ScriptedLLM(responder=respond, latency=latency)
+
+
+def make_agent_factory(prompt: str, llm):
+    """run_eval 每个用例调用一次工厂函数：每个用例一个新的 Agent（互不影响），共用同一个模型客户端。"""
 
     def make() -> Agent:
-        llm = ScriptedLLM(next(queue)) if offline else default_llm()
         return Agent(llm, TOOLS, system_prompt=prompt, name="helpdesk", max_steps=6)
 
     return make
 
 
+class QuotaLimitedLLM:
+    """模拟模型网关的并发配额：同一时刻在途的请求超过 quota 个，就立刻返回 429（和第 08 课的网关进程一样）。"""
+
+    def __init__(self, inner, quota: int):
+        self.inner, self.quota, self.model = inner, quota, inner.model
+        self.in_flight = self.rejected = 0
+
+    async def chat(self, messages, tools=None, **kwargs):
+        if self.in_flight >= self.quota:
+            self.rejected += 1
+            raise LLMError("Error code: 429 - concurrency quota exceeded", status_code=429, retryable=True)
+        self.in_flight += 1
+        try:
+            return await self.inner.chat(messages, tools, **kwargs)
+        finally:
+            self.in_flight -= 1
+
+
+EVAL_LATENCY = 0.2  # 2b 节：每次模型调用的模拟耗时（秒）
+GATEWAY_QUOTA = 3  # 2b 节：模拟网关的并发配额
+
+
+async def timed_eval(llm, prompt: str, graders, concurrency: int) -> tuple[EvalReport, float]:
+    t0 = time.perf_counter()
+    report = await run_eval(make_agent_factory(prompt, llm), CASES, graders, concurrency=concurrency)
+    return report, time.perf_counter() - t0
+
+
+async def concurrency_section(graders) -> None:
+    section("2b. 并发评估实测：同一个评估集，concurrency=1 / 4 / 8")
+    print(f"这一节两种模式都用离线剧本 + ScriptedLLM(latency={EVAL_LATENCY})：要测的是并发本身，不值得花真实模型的钱。")
+    print("每个用例一个 Agent，全部用例共用一个模型对象，所以它的 max_in_flight 就是'同一时刻真的有几个模型调用在途'。\n")
+    print(f"  {pad('concurrency', 14)}{pad('耗时', 10)}{pad('模型调用', 10)}{pad('在途峰值', 10)}通过率")
+    base = None
+    for c in (1, 4, 8):
+        llm = scripted_by_case(v1_scripts(), latency=EVAL_LATENCY)
+        report, secs = await timed_eval(llm, PROMPT_V1, graders, c)
+        base = base or secs
+        print(f"  {pad(str(c), 14)}{pad(f'{secs:.2f}s', 10)}{pad(str(llm.call_count), 10)}"
+              f"{pad(str(llm.max_in_flight), 10)}{report.pass_rate:.0%}"
+              + (f"   （快了 {base / secs:.1f} 倍）" if c > 1 else ""))
+    print("\n同样的用例、同样的结果，只是同一时刻在途的模型调用多了：总耗时接近'最慢的那个用例'，而不是所有用例之和。"
+          "\n7 个用例时 concurrency=8 和 7 没有区别：在途峰值最多就是 7。")
+
+    print(f"\n代价：评估和线上服务通常共用模型配额。假设网关同一时刻只接 {GATEWAY_QUOTA} 个请求，多出来的立刻 429：")
+    limited = QuotaLimitedLLM(scripted_by_case(v1_scripts(), latency=EVAL_LATENCY), GATEWAY_QUOTA)
+    report, secs = await timed_eval(limited, PROMPT_V1, graders, 8)
+    print(f"  concurrency=8，不设防：{secs:.2f}s，网关拒绝 {limited.rejected} 次，"
+          f"report.infra_errors = {report.infra_errors}，通过率 {report.pass_rate:.0%}")
+    # 这些用例的评分检查项本身怎么样？infra_error 的用例 Agent 一个工具都没调就失败了，
+    # "不许调用 reset_password"这类规则反而全部满足 —— 只看检查项，它们会被算成"通过"
+    rules_only = [r.id for r in report.results if r.infra_error and all(c.passed for c in r.checks)]
+    naive_rate = sum(r.passed or (r.infra_error and all(c.passed for c in r.checks)) for r in report.results) / len(report.results)
+    print(f"  其中 {len(rules_only)} 个 infra_error 用例的检查项全部满足（{', '.join(rules_only)}）：Agent 没调用任何工具，"
+          f"\n  '不许调用 reset_password'反而成立。只看检查项的话，通过率会是 {naive_rate:.0%}。")
+    print(f"  修复前的 agentkit 正是这么算的（passed = 所有检查项通过）：infra_error 被悄悄算成通过，报告上显示 {naive_rate:.0%}。"
+          "\n  这个 bug 是写本课时发现的，已在 agentkit/evals.py 修复：infra_error 的用例一律不算通过。")
+    guarded_inner = QuotaLimitedLLM(scripted_by_case(v1_scripts(), latency=EVAL_LATENCY), GATEWAY_QUOTA)
+    guarded = ResilientLLM(guarded_inner, max_concurrency=GATEWAY_QUOTA)  # 客户端舱壁：多出来的请求在本进程里排队
+    report2, secs2 = await timed_eval(guarded, PROMPT_V1, graders, 8)
+    print(f"  concurrency=8，ResilientLLM(max_concurrency={GATEWAY_QUOTA})：{secs2:.2f}s，网关拒绝 {guarded_inner.rejected} 次，"
+          f"{len(report2.infra_errors)} 个 infra_error，通过率 {report2.pass_rate:.0%}")
+    print("\n不设防时，通过率从 100% 掉下来，并不是 Agent 变差了：是评估自己把网关打爆了。"
+          "\n所以 EvalReport.infra_errors 要单独列出来 —— 有 infra_error 的报告应该重跑，而不是拿去做上线决策。"
+          "\n并发上限要按配额设（或者在客户端加舱壁），而不是越大越好。")
+
+
 # ---------------------------------------------------------------- 主流程
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--offline", action="store_true", help="用 ScriptedLLM 剧本代替真实模型")
     parser.add_argument("--trials", type=int, default=5, help="第 4 节每个版本重复运行的次数（默认 5）")
@@ -189,12 +273,19 @@ def main() -> None:
     print("\n评分器：rule_grader（结果规则） + precedence_grader（轨迹：verify_identity 必须在 reset_password 之前）")
     graders = [rule_grader, impl.precedence_grader([("verify_identity", "reset_password")])]
 
-    section("2. 两个 prompt 版本各跑一遍评估集" + ("（离线剧本）" if args.offline else "（真实模型，两个版本并行）"))
+    section("2. 两个 prompt 版本各跑一遍评估集" + ("（离线剧本）" if args.offline else "（真实模型）")
+            + "：两个版本同时跑，每个版本同时跑 4 个用例")
     print(f"（评分器 / 门禁实现来自 {impl_name}）")
-    make_v1 = make_agent_factory(PROMPT_V1, args.offline, v1_scripts())
-    make_v2 = make_agent_factory(PROMPT_V2, args.offline, v2_scripts())
-    report_v1, report_v2 = parallel([lambda: run_eval(make_v1, CASES, graders),
-                                     lambda: run_eval(make_v2, CASES, graders)], max_workers=2)
+    real_llm = None if args.offline else default_llm()  # 一个客户端（一个连接池）给所有并发的用例共用
+    llm_v1 = scripted_by_case(v1_scripts()) if args.offline else real_llm
+    llm_v2 = scripted_by_case(v2_scripts()) if args.offline else real_llm
+    t0 = time.perf_counter()
+    report_v1, report_v2 = await parallel([
+        lambda: run_eval(make_agent_factory(PROMPT_V1, llm_v1), CASES, graders, concurrency=4),
+        lambda: run_eval(make_agent_factory(PROMPT_V2, llm_v2), CASES, graders, concurrency=4),
+    ])
+    if not args.offline:
+        print(f"（2 个版本 × 7 个用例，墙钟 {time.perf_counter() - t0:.1f}s）")
     report_v1.save(RUNS_DIR / "report_v1.json")
     report_v2.save(RUNS_DIR / "report_v2.json")
     print("\n—— v1（线上基线：规则写得很细）——")
@@ -202,6 +293,8 @@ def main() -> None:
     print("\n—— v2（候选：'SSO 已登录，无需二次验证'）——")
     print(report_v2.summary())
     print(f"\n报告已保存：{(RUNS_DIR / 'report_v1.json').relative_to(HERE.parent.parent)}、report_v2.json")
+
+    await concurrency_section(graders)
 
     section("3. 回归对比 + CI 门禁：v2 能上线吗？")
     base_by_id = {r.id: r for r in report_v1.results}
@@ -245,15 +338,15 @@ def main() -> None:
         "v2": [good() if i % 3 == 1 else bad() for i in range(args.trials)],
     }
 
-    def one_trial(prompt: str, script: list | None) -> bool:
-        llm = ScriptedLLM(script) if args.offline else default_llm()
-        res = Agent(llm, TOOLS, system_prompt=prompt, max_steps=6).run(case.input)
+    async def one_trial(prompt: str, script: list | None) -> bool:
+        llm = ScriptedLLM(script) if args.offline else real_llm
+        res = await Agent(llm, TOOLS, system_prompt=prompt, max_steps=6).run(case.input)
         return all(c.passed for g in graders for c in g(case, res))
 
     reports = {"v1": report_v1, "v2": report_v2}
     for name, prompt in (("v1", PROMPT_V1), ("v2", PROMPT_V2)):
         scripts = trial_scripts[name] if args.offline else [None] * args.trials
-        outcomes = parallel([lambda s=s: one_trial(prompt, s) for s in scripts], max_workers=5)
+        outcomes = await parallel([lambda s=s: one_trial(prompt, s) for s in scripts], max_concurrency=5)
         n, c = len(outcomes), sum(outcomes)
         print(f"\n  {name}：{''.join('✅' if o else '❌' for o in outcomes)}  （{c}/{n} 次通过）")
         for k in sorted({1, min(3, n), n}):
@@ -281,16 +374,18 @@ def main() -> None:
                                        "4) 开通 MFA；5) 完成信息安全培训。")])
         judge_llm = ScriptedLLM([reply('{"score": 5, "reason": "完整覆盖知识库中的 5 项准备工作，没有编造额外规定。"}')])
     else:
-        agent_llm, judge_llm = default_llm(), default_llm()
+        agent_llm = judge_llm = real_llm
     open_case = EvalCase("onboarding", question)
-    res = Agent(agent_llm, TOOLS, system_prompt=PROMPT_V1).run(question)
+    res = await Agent(agent_llm, TOOLS, system_prompt=PROMPT_V1).run(question)
     print(f"问题：{question}\n回答：{' '.join((res.output or '').split())[:200]}")
     print(f"\n评分细则（rubric）：\n{rubric}")
-    (verdict,) = llm_judge(judge_llm, rubric)(open_case, res)
+    (verdict,) = await llm_judge(judge_llm, rubric)(open_case, res)  # llm_judge 返回的是 async 评分器：它要调用模型
     print(f"\n评委结论：{'通过' if verdict.passed else '不通过'}  {verdict.detail}")
     print("\n⚠️  本机只有一个模型，所以评委和被测 Agent 是同一个模型，存在'自我偏好'风险。"
           "\n   生产中评委应换用不同的模型，并定期抽样人工复核，校准评委（见 README 1.4 节）。")
+    if real_llm is not None:
+        await real_llm.aclose()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
