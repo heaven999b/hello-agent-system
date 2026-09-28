@@ -151,7 +151,7 @@ flowchart TB
 | 二 | [10](../10_observability/) | 可观测性 | 横切 | [`tracing.py`](../../agentkit/tracing.py)、[`viewer.py`](../../agentkit/viewer.py) |
 | 二 | [11](../11_evals/) | 评估驱动开发 | 横切 | [`evals.py`](../../agentkit/evals.py) |
 | 二 | [12](../12_production_architecture/) | 生产架构总览 | 全部（含接入层） | 综合 |
-| 二 | [13](../13_distributed_concurrency/) | 高并发与分布式执行 | 执行与扩展层 | [`distributed/`](../../agentkit/distributed/)（SQLite 单机多进程） |
+| 二 | [13](../13_distributed_concurrency/) | 高并发与分布式执行 | 执行与扩展层 | [`distributed/`](../../agentkit/distributed/)（SQLite 单机多进程）、[`tools.py`](../../agentkit/tools.py)（幂等键）；见该课（`jobqueue.py`、`session_store.py`、`race.py`） |
 | 二 | [14](../14_cost_latency/) | 成本与延迟优化 | 模型层 | 见该课 |
 | 二 | [15](../15_enterprise_rag/) | 企业知识与权限感知 RAG | 上下文与知识层 | 见该课 |
 | 二 | [16](../16_release_ops/) | 发布、变更与运维 | 横切 | 见该课 |
@@ -164,12 +164,12 @@ flowchart TB
 | 三 | [22](../22_eval_methodology/) | 评估方法论进阶：Benchmark 设计、评委校准与统计 | 横切（ML 闭环：评估） | 见该课（`evalstats.py`），配合 [`evals.py`](../../agentkit/evals.py) |
 | 三 | [23](../23_optimization/) | 优化：提示词优化、测试时计算与微调选型 | 横切（ML 闭环：优化） | 见该课（`optkit.py`），配合 [`evals.py`](../../agentkit/evals.py) |
 | 三 | [24](../24_coding_agents/) | 编码 Agent 与长时运行 harness | 工具层、状态层（应用） | 见该课（`aci_tools.py`、`harness.py`），配合 [`tools.py`](../../agentkit/tools.py)、[`hooks.py`](../../agentkit/hooks.py) |
-| 三 | [25](../25_proactive_and_frontier/) | 主动式 Agent 与前沿方向 | 接入层、编排层（应用） | 见该课（`proactive_kit.py`） |
+| 三 | [25](../25_proactive_and_frontier/) | 主动式 Agent 与前沿方向 | 接入层、编排层（应用） | 见该课（`proactive_kit.py`、`proactive_runtime.py`），配合 [`distributed/`](../../agentkit/distributed/)、[`workflows.py`](../../agentkit/workflows.py) |
 | 四 | [26](../26_state_and_queues/) | 状态、队列与分布式协调：Postgres 与 Redis | 状态层、执行与扩展层 | [`contrib/postgres.py`](../../agentkit/contrib/postgres.py)、[`contrib/redis_store.py`](../../agentkit/contrib/redis_store.py) |
 | 四 | [27](../27_durable_workflows/) | 持久化工作流：用 Temporal 运行 Agent | 编排层、状态层 | [`contrib/temporal.py`](../../agentkit/contrib/temporal.py) |
 | 四 | [28](../28_production_observability/) | 生产可观测性：OpenTelemetry、Prometheus 与 LLM 观测平台 | 横切 | [`contrib/otel.py`](../../agentkit/contrib/otel.py) |
 | 四 | [29](../29_gateway_and_guardrails/) | 模型网关、策略即代码与护栏服务 | 模型层、安全护栏层 | [`contrib/gateway.py`](../../agentkit/contrib/gateway.py)、[`contrib/policy.py`](../../agentkit/contrib/policy.py)、[`contrib/guards.py`](../../agentkit/contrib/guards.py) |
-| 四 | [30](../30_async_runtime/) | 异步运行时与高并发服务 | 编排层、执行与扩展层 | [`agent.py`](../../agentkit/agent.py)、[`limits.py`](../../agentkit/limits.py)、[`timeouts.py`](../../agentkit/timeouts.py) |
+| 四 | [30](../30_async_runtime/) | 生产环境的高并发异步运行时 | 编排层、执行与扩展层 | [`agent.py`](../../agentkit/agent.py)、[`limits.py`](../../agentkit/limits.py)、[`timeouts.py`](../../agentkit/timeouts.py)、[`tools.py`](../../agentkit/tools.py)、[`reliability.py`](../../agentkit/reliability.py)、[`distributed/`](../../agentkit/distributed/) |
 | 四 | [31](../31_deployment_and_scaling/) | 部署与扩缩容：从单机到集群 | 接入层、执行与扩展层 | [`production/`](../../production/) |
 
 ### 1.6 课程的四部分与学习路线
@@ -179,7 +179,7 @@ flowchart TB
 | | 第一部分：基础构建 | 第二部分：企业问题与解决方案 | 第三部分：进阶——构建块深入、ML 闭环与应用前沿 | 第四部分：生产落地——结合成熟组件 |
 |---|---|---|---|---|
 | 课程 | 00–07 | 08–16 | 17–25 | 26–31 |
-| 用时 | 约 140 分钟 | 约 160 分钟 | 约 210 分钟 | 约 175 分钟 |
+| 用时 | 约 150 分钟 | 约 170 分钟 | 约 210 分钟 | 约 185 分钟 |
 | 定位 | 主线 | 主线 | **进阶、可选**：学完主线和综合实战之后，按需挑着学 | **进阶、可选**：要把 Agent 真正部署上线、承担多实例高并发负载时学 |
 | 目标 | **学会怎么造**：Agent 的每个零件是什么、怎么从零实现 | **学会怎么选**：企业里遇到真实问题时，有哪些方案、各自的代价、该选哪个 | **学会怎么做深**：把关键构建块做到生产水准，让 Agent 靠数据和评估持续变好，并看清前沿应用怎么搭 | **学会怎么上线**：把教学实现换成成熟组件，接口不变，并用真实并发、真实进程和故障注入证明它扛得住 |
 | 讲法 | 概念 → 从零实现 → 练习 | 真实问题 → 多种方案对比 → 适用场景 → 推荐选择 → 代码实现 | 概念 → 从零实现 → 练习 + 取舍对比 | 教学实现为什么不够 → 成熟组件选型对比 → 适配器怎么接 → 运维要点与坑 → 实测验证 |
@@ -195,12 +195,12 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    P1["<b>第一部分：基础构建</b><br/>学会怎么造 · 约 140 分钟<br/><br/>00 全景图 · 10m<br/>01 LLM 与 Agent 开发必备知识 · 20m<br/>02 Agent 循环 · 20m<br/>03 工具设计 · 20m<br/>04 上下文与记忆 · 15m<br/>05 常见 Agent 架构 · 20m<br/>06 编排模式 · 15m<br/>07 工程考量全景 · 20m"]
-    P2["<b>第二部分：企业问题与解决方案</b><br/>学会怎么选 · 约 160 分钟<br/><br/>08 可靠性工程 · 20m<br/>09 安全与治理 · 20m<br/>10 可观测性 · 15m<br/>11 评估驱动开发 · 20m<br/>12 生产架构总览 · 15m<br/>13 高并发与分布式执行 · 25m<br/>14 成本与延迟优化 · 15m<br/>15 权限感知 RAG · 15m<br/>16 发布、变更与运维 · 15m"]
+    P1["<b>第一部分：基础构建</b><br/>学会怎么造 · 约 150 分钟<br/><br/>00 全景图 · 10m<br/>01 LLM 与 Agent 开发必备知识 · 20m<br/>02 Agent 循环 · 30m<br/>03 工具设计 · 20m<br/>04 上下文与记忆 · 15m<br/>05 常见 Agent 架构 · 20m<br/>06 编排模式 · 15m<br/>07 工程考量全景 · 20m"]
+    P2["<b>第二部分：企业问题与解决方案</b><br/>学会怎么选 · 约 170 分钟<br/><br/>08 可靠性工程 · 30m<br/>09 安全与治理 · 20m<br/>10 可观测性 · 15m<br/>11 评估驱动开发 · 20m<br/>12 生产架构总览 · 15m<br/>13 高并发与分布式执行 · 25m<br/>14 成本与延迟优化 · 15m<br/>15 权限感知 RAG · 15m<br/>16 发布、变更与运维 · 15m"]
     CP["<b>综合实战</b><br/>ITBuddy · 30m"]
     P3["<b>第三部分：进阶</b><br/>构建块深入、ML 闭环与应用前沿<br/>学会怎么做深 · 约 210 分钟<br/><br/>17 检索质量 · 20m<br/>18 记忆系统进阶 · 20m<br/>19 MCP 与代码沙箱 · 25m<br/>20 从 agentkit 到框架 · 25m<br/>21 Agent 的数据 · 25m<br/>22 评估方法论进阶 · 25m<br/>23 优化 · 25m<br/>24 编码 Agent · 25m<br/>25 主动式 Agent 与前沿 · 20m"]
     P1 -->|"07 的维度地图 = 第二部分的目录"| P2 --> CP
-    P4["<b>第四部分：生产落地</b><br/>结合成熟组件<br/>学会怎么上线 · 约 175 分钟<br/><br/>26 状态、队列与分布式协调 · 30m<br/>27 持久化工作流 · 30m<br/>28 生产可观测性 · 25m<br/>29 网关、策略与护栏 · 30m<br/>30 异步运行时 · 30m<br/>31 部署与扩缩容 · 30m"]
+    P4["<b>第四部分：生产落地</b><br/>结合成熟组件<br/>学会怎么上线 · 约 185 分钟<br/><br/>26 状态、队列与分布式协调 · 30m<br/>27 持久化工作流 · 30m<br/>28 生产可观测性 · 25m<br/>29 网关、策略与护栏 · 30m<br/>30 高并发异步运行时 · 40m<br/>31 部署与扩缩容 · 30m"]
     CP -.->|"进阶，可选"| P3
     CP -.->|"要上线时"| P4
 ```
@@ -209,39 +209,39 @@ flowchart LR
 |---|---|---|---|---|
 | 一 基础构建 | [00 全景图](./) | 10 分钟 | 0:10 | 地图和判断力 |
 | | [01 LLM 与 Agent 开发必备知识](../01_llm_essentials/) | 20 分钟 | 0:30 | 知道 token、采样、工具调用、结构化输出、流式在 Agent 里意味着什么 |
-| | [02 Agent 循环](../02_agent_loop/) | 20 分钟 | 0:50 | 亲手写出主循环 |
-| | [03 工具设计](../03_tools/) | 20 分钟 | 1:10 | 模型用得对、攻击者用不歪的工具 |
-| | [04 上下文与记忆](../04_context_memory/) | 15 分钟 | 1:25 | 长对话不爆、记忆不串户 |
-| | [05 常见 Agent 架构](../05_agent_architectures/) | 20 分钟 | 1:45 | 能把任何 Agent 产品拆成架构组合，并为新需求选架构 |
-| | [06 编排模式](../06_orchestration/) | 15 分钟 | 2:00 | 知道何时用 Workflow、何时用 Agent |
-| | [07 工程考量全景](../07_engineering_perspectives/) | 20 分钟 | 2:20 | 20 个维度的审视地图：通用必查点 + 情境触发点 |
-| 二 企业问题 | [08 可靠性工程](../08_reliability/) | 20 分钟 | 2:40 | 限流、宕机、崩溃时怎么办 |
-| | [09 安全与治理](../09_security/) | 20 分钟 | 3:00 | 注入、越权、泄露怎么防 |
-| | [10 可观测性](../10_observability/) | 15 分钟 | 3:15 | 出了问题怎么查 |
-| | [11 评估驱动开发](../11_evals/) | 20 分钟 | 3:35 | 改 prompt 怎么知道没改坏 |
-| | [12 生产架构总览](../12_production_architecture/) | 15 分钟 | 3:50 | 各层怎么组合成一个系统 |
-| | [13 高并发与分布式执行](../13_distributed_concurrency/) | 25 分钟 | 4:15 | 多实例、队列、并发写、限流、补偿 |
-| | [14 成本与延迟优化](../14_cost_latency/) | 15 分钟 | 4:30 | 模型路由、缓存、成本归因 |
-| | [15 企业知识与权限感知 RAG](../15_enterprise_rag/) | 15 分钟 | 4:45 | 检索不越权、知识不过期、引用可校验 |
-| | [16 发布、变更与运维](../16_release_ops/) | 15 分钟 | 5:00 | 灰度、熔断开关、回滚、事故响应 |
-| 实战 | [综合实战 ITBuddy](../../capstone/) | 30 分钟 | 5:30 | 把一切组装起来 |
-| 三 进阶（可选） | [17 检索质量](../17_retrieval_quality/) | 20 分钟 | 5:50 | 用评估集量化检索质量，在稀疏 / 稠密 / 混合检索、重排、切块之间做有数据支撑的选择 |
-| | [18 记忆系统进阶](../18_memory_systems/) | 20 分钟 | 6:10 | 会更新、会遗忘、可查看可纠正可删除的跨会话记忆 |
-| | [19 MCP 与代码执行沙箱](../19_mcp_and_sandbox/) | 25 分钟 | 6:35 | 手写能和官方 SDK 互通的 MCP 服务器与客户端，给模型写的代码搭沙箱 |
-| | [20 从 agentkit 到框架](../20_frameworks_bridge/) | 25 分钟 | 7:00 | 用 DSPy、LangGraph、OpenAI Agents SDK 实现同一个任务，知道框架替你做了什么、藏起了什么 |
-| | [21 Agent 的数据](../21_agent_data/) | 25 分钟 | 7:25 | 把生产 trace 变成可信的评估集和训练数据 |
-| | [22 评估方法论进阶](../22_eval_methodology/) | 25 分钟 | 7:50 | 设计钻不了空子的 benchmark，校准 LLM 评委，用置信区间和配对检验分清真改进和噪声 |
-| | [23 优化](../23_optimization/) | 25 分钟 | 8:15 | 在改提示词、加测试时计算、改权重之间做有依据的选择 |
-| | [24 编码 Agent](../24_coding_agents/) | 25 分钟 | 8:40 | 一个能修 bug、能跨会话接力干长任务的编码 Agent |
-| | [25 主动式 Agent 与前沿](../25_proactive_and_frontier/) | 20 分钟 | 9:00 | 该开口才开口的主动式 Agent，以及对前沿方向的判断 |
-| 四 生产落地（可选） | [26 状态、队列与分布式协调](../26_state_and_queues/) | 30 分钟 | 9:30 | 检查点、任务队列、幂等、限流、锁落到 Postgres 和 Redis 上，多进程 kill -9 也不重复执行副作用 |
-| | [27 持久化工作流](../27_durable_workflows/) | 30 分钟 | 10:00 | 判断什么时候需要 Temporal 这类持久化执行引擎，并把 Agent 拆成 Workflow + Activity |
-| | [28 生产可观测性](../28_production_observability/) | 25 分钟 | 10:25 | OpenTelemetry 追踪跨队列串起来、Prometheus 指标与燃尽率告警 |
-| | [29 模型网关、策略即代码与护栏服务](../29_gateway_and_guardrails/) | 30 分钟 | 10:55 | 模型网关路由与降级、Cedar 策略（出错即拒绝）、分级分类器护栏 |
-| | [30 异步运行时与高并发服务](../30_async_runtime/) | 30 分钟 | 11:25 | 一个进程并发跑几百个会话：真取消、硬超时、舱壁、流式输出 |
-| | [31 部署与扩缩容](../31_deployment_and_scaling/) | 30 分钟 | 11:55 | API 与 worker 分离、按队列深度扩缩容、优雅停机、压测与故障注入 |
+| | [02 Agent 循环](../02_agent_loop/) | 30 分钟 | 1:00 | 亲手写出主循环，并弄清它为什么是 async 的：一个进程同时服务很多会话 |
+| | [03 工具设计](../03_tools/) | 20 分钟 | 1:20 | 模型用得对、攻击者用不歪的工具 |
+| | [04 上下文与记忆](../04_context_memory/) | 15 分钟 | 1:35 | 长对话不爆、记忆不串户 |
+| | [05 常见 Agent 架构](../05_agent_architectures/) | 20 分钟 | 1:55 | 能把任何 Agent 产品拆成架构组合，并为新需求选架构 |
+| | [06 编排模式](../06_orchestration/) | 15 分钟 | 2:10 | 知道何时用 Workflow、何时用 Agent |
+| | [07 工程考量全景](../07_engineering_perspectives/) | 20 分钟 | 2:30 | 20 个维度的审视地图：通用必查点 + 情境触发点 |
+| 二 企业问题 | [08 可靠性工程](../08_reliability/) | 30 分钟 | 3:00 | 限流、宕机、崩溃时怎么办 |
+| | [09 安全与治理](../09_security/) | 20 分钟 | 3:20 | 注入、越权、泄露怎么防 |
+| | [10 可观测性](../10_observability/) | 15 分钟 | 3:35 | 出了问题怎么查 |
+| | [11 评估驱动开发](../11_evals/) | 20 分钟 | 3:55 | 改 prompt 怎么知道没改坏 |
+| | [12 生产架构总览](../12_production_architecture/) | 15 分钟 | 4:10 | 各层怎么组合成一个系统 |
+| | [13 高并发与分布式执行](../13_distributed_concurrency/) | 25 分钟 | 4:35 | 多实例、队列、并发写、限流、补偿 |
+| | [14 成本与延迟优化](../14_cost_latency/) | 15 分钟 | 4:50 | 模型路由、缓存、成本归因 |
+| | [15 企业知识与权限感知 RAG](../15_enterprise_rag/) | 15 分钟 | 5:05 | 检索不越权、知识不过期、引用可校验 |
+| | [16 发布、变更与运维](../16_release_ops/) | 15 分钟 | 5:20 | 灰度、熔断开关、回滚、事故响应 |
+| 实战 | [综合实战 ITBuddy](../../capstone/) | 30 分钟 | 5:50 | 把一切组装起来 |
+| 三 进阶（可选） | [17 检索质量](../17_retrieval_quality/) | 20 分钟 | 6:10 | 用评估集量化检索质量，在稀疏 / 稠密 / 混合检索、重排、切块之间做有数据支撑的选择 |
+| | [18 记忆系统进阶](../18_memory_systems/) | 20 分钟 | 6:30 | 会更新、会遗忘、可查看可纠正可删除的跨会话记忆 |
+| | [19 MCP 与代码执行沙箱](../19_mcp_and_sandbox/) | 25 分钟 | 6:55 | 手写能和官方 SDK 互通的 MCP 服务器与客户端，给模型写的代码搭沙箱 |
+| | [20 从 agentkit 到框架](../20_frameworks_bridge/) | 25 分钟 | 7:20 | 用 DSPy、LangGraph、OpenAI Agents SDK 实现同一个任务，知道框架替你做了什么、藏起了什么 |
+| | [21 Agent 的数据](../21_agent_data/) | 25 分钟 | 7:45 | 把生产 trace 变成可信的评估集和训练数据 |
+| | [22 评估方法论进阶](../22_eval_methodology/) | 25 分钟 | 8:10 | 设计钻不了空子的 benchmark，校准 LLM 评委，用置信区间和配对检验分清真改进和噪声 |
+| | [23 优化](../23_optimization/) | 25 分钟 | 8:35 | 在改提示词、加测试时计算、改权重之间做有依据的选择 |
+| | [24 编码 Agent](../24_coding_agents/) | 25 分钟 | 9:00 | 一个能修 bug、能跨会话接力干长任务的编码 Agent |
+| | [25 主动式 Agent 与前沿](../25_proactive_and_frontier/) | 20 分钟 | 9:20 | 该开口才开口的主动式 Agent，以及对前沿方向的判断 |
+| 四 生产落地（可选） | [26 状态、队列与分布式协调](../26_state_and_queues/) | 30 分钟 | 9:50 | 检查点、任务队列、幂等、限流、锁落到 Postgres 和 Redis 上，多进程 kill -9 也不重复执行副作用 |
+| | [27 持久化工作流](../27_durable_workflows/) | 30 分钟 | 10:20 | 判断什么时候需要 Temporal 这类持久化执行引擎，并把 Agent 拆成 Workflow + Activity |
+| | [28 生产可观测性](../28_production_observability/) | 25 分钟 | 10:45 | OpenTelemetry 追踪跨队列串起来、Prometheus 指标与燃尽率告警 |
+| | [29 模型网关、策略即代码与护栏服务](../29_gateway_and_guardrails/) | 30 分钟 | 11:15 | 模型网关路由与降级、Cedar 策略（出错即拒绝）、分级分类器护栏 |
+| | [30 生产环境的高并发异步运行时](../30_async_runtime/) | 40 分钟 | 11:55 | 用实测找出规模上来之后的天花板（事件循环 CPU、共享数据库写锁、模型配额），以及取消、收尾保存、舱壁与跨进程配额怎么扛住 |
+| | [31 部署与扩缩容](../31_deployment_and_scaling/) | 30 分钟 | 12:25 | API 与 worker 分离、按队列深度扩缩容、优雅停机、压测与故障注入 |
 
-前两部分 17 课共 5 小时，加上综合实战 30 分钟约 5.5 小时，这是完整的主线。第三部分 9 课约 3.5 小时、第四部分 6 课约 3 小时，都是进阶内容，可以学完主线后按需挑着学；全部学完约 12 小时。每课的"深入"一节都可以先跳过，之后再回来读。
+前两部分 17 课共 5 小时 20 分钟，加上综合实战 30 分钟共 5 小时 50 分钟，这是完整的主线。第三部分 9 课约 3.5 小时、第四部分 6 课约 3 小时，都是进阶内容，可以学完主线后按需挑着学；全部学完约 12.5 小时。每课的"深入"一节都可以先跳过，之后再回来读。
 
 #### 4 小时速通路线
 

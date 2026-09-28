@@ -2,7 +2,7 @@
 
 # 第 08 课：可靠性工程 —— 让 Agent 在失败中存活
 
-> 🕐 建议用时：20 分钟 ｜ 🎯 学完你能：面对限流、宕机、死循环、崩溃、重复副作用、长时间审批这六类企业常见故障，说出 2-4 种方案的取舍并选对方案 ｜ 📦 对应源码：`agentkit/reliability.py`、`agentkit/budget.py`、`agentkit/state.py`、`agentkit/tools.py`（幂等）、`agentkit/agent.py`（恢复）、`agentkit/distributed/sqlite.py`（跨进程的熔断器与幂等存储）
+> 🕐 建议用时：30 分钟 ｜ 🎯 学完你能：面对限流、宕机、死循环、崩溃、重复副作用、长时间审批这六类企业常见故障，说出 2-4 种方案的取舍并选对方案 ｜ 📦 对应源码：`agentkit/reliability.py`、`agentkit/budget.py`、`agentkit/state.py`、`agentkit/tools.py`（幂等）、`agentkit/agent.py`（恢复）、`agentkit/distributed/sqlite.py`（跨进程的熔断器与幂等存储）
 >
 > 📖 必读：[Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/)（Mike Ulrich, 2016）—— Google SRE Book 第 22 章，讲清故障如何沿调用链层层放大，本课问题 1 里"多层重试相乘"的例子就出自这里；重点读 "Retries" 和 "Latency and Deadlines" 两节，理解为什么重试要有预算、截止时间要沿调用链传递。
 

@@ -317,8 +317,37 @@ async def _capture(work) -> tuple[Any, Exception | None]:
 # ------------------------------------------------------------------------------------ 进程隔离
 
 
+class _FunctionRef:
+    """按"模块名 + 限定名"引用一个函数，让子进程自己 import 回来。
+
+    直接 pickle 函数也是按名字引用，但它要求 getattr(模块, 名字) 就是这个函数本身；
+    而 @tool(isolation="process") 装饰模块级函数后，模块里这个名字已经变成了 Tool 对象，pickle 会报
+    PicklingError（模型只看到"工具内部出错"）。这里解析时遇到 Tool 就取它的 .fn。
+    """
+
+    def __init__(self, fn):
+        self.module, self.qualname = fn.__module__, fn.__qualname__
+
+    def resolve(self):
+        import importlib
+
+        obj = importlib.import_module(self.module)
+        for part in self.qualname.split("."):
+            obj = getattr(obj, part)
+        return obj.fn if isinstance(obj, Tool) else obj
+
+
+def _function_ref(fn):
+    """能按名字找回来的（模块级函数 / 类里的函数）就传引用；否则原样传，交给 pickle（嵌套函数会在这里报错）。"""
+    if "<locals>" not in getattr(fn, "__qualname__", "<locals>") and getattr(fn, "__module__", None) not in (None, "__main__"):
+        return _FunctionRef(fn)
+    return fn
+
+
 def _subprocess_entry(conn, fn, kwargs) -> None:
     try:
+        if isinstance(fn, _FunctionRef):
+            fn = fn.resolve()
         conn.send(("ok", fn(**kwargs)))
     except ToolError as e:
         conn.send(("tool_error", str(e)))
@@ -337,7 +366,7 @@ async def run_in_subprocess(fn, kwargs: dict, timeout: float):
     """
     mp = multiprocessing.get_context("spawn")  # spawn 比 fork 安全：fork 一个带着事件循环和线程的进程容易死锁
     parent, child = mp.Pipe(duplex=False)
-    proc = mp.Process(target=_subprocess_entry, args=(child, fn, kwargs), daemon=True)
+    proc = mp.Process(target=_subprocess_entry, args=(child, _function_ref(fn), kwargs), daemon=True)
     loop = asyncio.get_running_loop()
     # spawn 一个进程要 fork/exec + 传参，同步调用会卡住事件循环（实测每次 ~10ms，所有会话一起等）
     await loop.run_in_executor(None, proc.start)

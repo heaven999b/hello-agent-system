@@ -5,7 +5,7 @@
 > 📖 本文是"领域参考手册"的一部分，配合课程使用。
 > 相关文档：[设计评审清单](design-review-checklist.md) · [速查表](cheatsheet.md) · [术语表](glossary.md) · [面试题](interview-questions.md)
 
-这份图鉴收录了 **92 种**生产环境里真实会遇到的 Agent 失败模式，分为十二类（第十类是分布式、高并发与发布，第十一类对应课程第三部分的进阶主题：检索、记忆、数据、评估、优化与扩展能力，第十二类对应课程第四部分：换上成熟组件、部署成多实例服务之后才会遇到的问题）。为什么要专门整理？
+这份图鉴收录了 **100 种**生产环境里真实会遇到的 Agent 失败模式，分为十二类（第十类是分布式、高并发与发布，第十一类对应课程第三部分的进阶主题：检索、记忆、数据、评估、优化与扩展能力，第十二类对应课程第四部分：换上成熟组件、部署成多实例服务之后才会遇到的问题）。为什么要专门整理？
 
 传统软件出错，通常是"报了个异常"；Agent 出错，常常是**一切看起来都很正常**：HTTP 200、没有报错、回答语气自信——但它编造了一个退款政策、给同一个用户建了两张工单、或者把另一家公司的数据告诉了你。
 Agent 的失败有三个特点：
@@ -39,6 +39,7 @@ Agent 的失败有三个特点：
 | [T5](#t5-重复副作用duplicate-side-effects) | 重复副作用 Duplicate Side Effects | 重试后建了两张工单、扣了两次款 | 🔴 高 | 幂等键 |
 | [T6](#t6-不透明错误opaque-errors) | 不透明错误 Opaque Errors | 工具返回 "Error 500"，模型开始瞎编 | 🟠 中 | 错误即观察 |
 | [T7](#t7-部分完成partial-completion) | 部分完成 Partial Completion | 账号建了、权限没开，状态不一致 | 🔴 高 | 粗粒度原子工具 / 补偿 |
+| [T8](#t8-工具自己的超时被误报为执行超时tools-own-timeout-misreported) | 工具自己的超时被误报为执行超时 Tool's Own Timeout Misreported | 下游 504 了，报的却是"执行超时（>30s）" | 🟠 中 | 先装箱工具异常，再套自己的期限 |
 | **上下文、记忆与知识检索** |||||
 | [C1](#c1-消息配对被截断orphaned-tool-message) | 消息配对被截断 Orphaned Tool Message | 截断历史后 API 返回 400 | 🟠 中 | 按块截断 |
 | [C2](#c2-上下文腐烂context-rot) | 上下文腐烂 Context Rot | 对话越长越"笨"，忘记早先约束 | 🟠 中 | 上下文预算 + 压缩 |
@@ -82,6 +83,7 @@ Agent 的失败有三个特点：
 | [E3](#e3-评委偏差llm-judge-bias) | 评委偏差 LLM-Judge Bias | 评委偏爱长答案、偏爱自己 | 🟠 中 | 校准 + 换评委 |
 | [E4](#e4-修一坏三prompt-regression) | 修一坏三 Prompt Regression | 改一句 prompt，别处悄悄坏了 | 🟠 中 | 回归门禁 |
 | [E5](#e5-模型静默漂移silent-model-drift) | 模型静默漂移 Silent Model Drift | 什么都没改，效果突然变了 | 🟠 中 | 固定模型版本 |
+| [E6](#e6-基础设施错误被算成通过infrastructure-errors-counted-as-passes) | 基础设施错误被算成通过 Infrastructure Errors Counted as Passes | 被网关 429 打挂的安全用例算成通过，43% 显示成 86% | 🔴 高 | infra_error 一律不算通过 + 重跑 |
 | **运维** |||||
 | [P1](#p1-静默失败silent-failure) | 静默失败 Silent Failure | 接口全 200，任务其实没完成 | 🔴 高 | 业务级成功指标 |
 | [P2](#p2-无法复现unreproducible-incident) | 无法复现 Unreproducible Incident | 用户投诉，但你看不到它当时做了什么 | 🟠 中 | 全链路 trace + 版本快照 |
@@ -100,6 +102,7 @@ Agent 的失败有三个特点：
 | [D9](#d9-限流只在单机生效local-only-rate-limiting) | 限流只在单机生效 Local-only Rate Limit | 越扩容 429 越多 | 🟠 中 | 全局限流 |
 | [D10](#d10-对冲请求放大副作用hedging-side-effects) | 对冲请求放大副作用 Hedging Side Effects | 为降延迟复制请求，结果重复执行写操作 | 🟠 中 | 只对冲幂等只读请求 |
 | [D11](#d11-回滚不彻底incomplete-rollback) | 回滚不彻底 Incomplete Rollback | 代码回滚了，提示词没回滚 | 🟠 中 | 版本化发布单元 |
+| [D12](#d12-走队列后对话失忆conversation-history-dropped-at-the-queue) | 走队列后对话失忆 Conversation History Dropped at the Queue | 改成入队执行后，每一轮都像第一次对话 | 🟠 中 | payload 带 history + 走真实队列的多轮测试 |
 | **进阶：检索、记忆、数据、评估、优化与扩展能力** |||||
 | [A1](#a1-评估集泄漏eval-set-leakage) | 评估集泄漏 Eval Set Leakage | 看着评估集改系统，分数虚高、上线就掉 | 🔴 高 | 按组划分 + test 只用一次 |
 | [A2](#a2-优化器的赢家诅咒optimizer-winners-curse) | 优化器的赢家诅咒 Optimizer Winner's Curse | dev 涨了 5 个点，test 一点没涨 | 🟠 中 | 扩大 dev + test 上配对检验 |
@@ -127,6 +130,11 @@ Agent 的失败有三个特点：
 | [PR11](#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done) | 取消后副作用重复或状态悬空 Cancellation Leaves Work Half-Done | 断开重连后建了两张工单；检查点停在 running | 🔴 高 | 写调用保持未回答 + 保存受 shield 保护 |
 | [PR12](#pr12-停机丢掉在途运行in-flight-runs-lost-on-shutdown) | 停机丢掉在途运行 In-Flight Runs Lost on Shutdown | 每次滚动发布都有一批运行失败或重跑 | 🟠 中 | SIGTERM 排空 + 归还任务 |
 | [PR13](#pr13-按错误的信号扩缩容autoscaling-on-the-wrong-signal) | 按错误的信号扩缩容 Autoscaling on the Wrong Signal | CPU 全绿，任务越排越久 | 🟠 中 | 按积压和最老任务年龄扩缩 |
+| [PR14](#pr14-取消被吞掉swallowed-cancellation) | 取消被吞掉 Swallowed Cancellation | 用户断开了，运行照样跑完、照样建单 | 🔴 高 | 取消安全的 wait_for + 步骤边界补抛 + 计数告警 |
+| [PR15](#pr15-被舱壁拒绝的运行留下半截检查点bulkhead-rejection-leaves-a-half-checkpoint) | 被舱壁拒绝的运行留下半截检查点 Bulkhead Rejection Leaves a Half Checkpoint | 推迟后恢复的运行里没有用户的问题 | 🟠 中 | 被拒的新运行什么都不留 + 推迟而非失败 |
+| [PR16](#pr16-满载的-worker-听不见停机信号busy-worker-misses-the-stop-signal) | 满载的 worker 听不见停机信号 Busy Worker Misses the Stop Signal | 宽限期 1 秒，SIGTERM 之后 8 秒才退出 | 🟠 中 | 同时等槽位和停机信号 |
+| [PR17](#pr17-多进程同时建库时切换-wal-失败concurrent-wal-switch-race) | 多进程同时建库时切换 WAL 失败 Concurrent WAL Switch Race | 一批 worker 同时启动，偶尔有进程报 database is locked | 🟡 低 | 退避重试 + 先由一个进程建库 |
+| [PR18](#pr18-共享数据库的写锁成了天花板shared-write-lock-becomes-the-ceiling) | 共享数据库的写锁成了天花板 Shared Write Lock Becomes the Ceiling | 加进程吞吐不涨，worker 的 CPU 反而下降 | 🟠 中 | 先测天花板 + 少写 / 多写者数据库 |
 
 > 严重度是一般性经验判断：🔴 致命 = 可能造成数据泄露/资金损失/法律责任；🔴 高 = 直接伤害用户或业务；🟠 中 = 体验和成本问题；🟡 低 = 效率问题。你的业务场景可能不同。
 
@@ -243,10 +251,10 @@ Agent 的失败有三个特点：
 | 维度 | 说明 |
 |---|---|
 | 症状 | 一个下游接口卡住 5 分钟，用户那边一直转圈，网关 504；工作线程被占满后其他请求也开始排队。 |
-| 根因 | 工具没有超时；或者只有整体请求超时，没有单工具超时。 |
+| 根因 | 工具没有超时；或者只有整体请求超时，没有单工具超时；或者有超时，但同步工具的线程在超时之后还在跑，把有上限的线程池占满，新来的请求一个都开始不了。 |
 | 检测 | `tool.*` Span 的耗时分布（p95/p99）；`error_type=timeout` 的比例；线程池/连接池占用率。 |
-| 修复/预防 | 每个工具独立超时（agentkit `Tool(timeout_s=30)`），超时变成一条可操作的观察反馈给模型；注意 **Python 线程无法被强杀**，超时后线程可能还在后台跑——高风险或不可信工具应放到独立进程/容器/沙箱执行；真正耗时的操作改为"提交任务 + 查询状态"两个工具，不要同步等待。 |
-| 课程 | [第 03 课](../lessons/03_tools/README.md) · [第 08 课](../lessons/08_reliability/README.md) |
+| 修复/预防 | 每个工具独立超时（agentkit `Tool(timeout_s=30)`），超时变成一条可操作的观察反馈给模型。超时之后发生什么，取决于工具怎么执行（agentkit 的三种方式）：`async def` 工具被真正取消，连接随之释放；普通同步工具在有上限的线程池里执行（`ToolExecutor(max_threads=...)`），调用方按时拿到超时结果，但 **Python 线程无法被强杀**，线程会在后台跑完、继续占着池子——第 30 课场景 3b：4 个线程的池子被 4 个卡住的调用占满，8 个正常请求一个都没开始执行，池子开到 16 个时 8/8 成功；场景 3c：线程里 2 秒的纯计算在超时之后照样烧掉 2.00 秒 CPU；`@tool(isolation="process")`（或 `isolated(tool(fn))`；函数要是模块级的）在子进程里执行，超时直接 kill 子进程，本进程只用了 0.03 秒 CPU，代价是每次调用约 167 毫秒的启动开销。所以：IO 类工具写成 async；绕不开的同步 SDK 进有上限的独立线程池，并监控池子的占用；CPU 密集或不可信的工具放到子进程 / 容器 / 沙箱；真正耗时的操作改为"提交任务 + 查询状态"两个工具，不要同步等待。 |
+| 课程 | [第 03 课](../lessons/03_tools/README.md) · [第 08 课](../lessons/08_reliability/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
 
 ### T5 重复副作用（Duplicate Side Effects）
 
@@ -255,7 +263,7 @@ Agent 的失败有三个特点：
 | 症状 | 用户收到两封同样的通知邮件；同一个问题出现两张工单；最严重时：重复扣款。 |
 | 根因 | 重试或崩溃恢复时，写操作被**重放**了。在 Agent 里有三个典型来源：① 网络超时后重试（其实第一次已经成功）；② 从检查点恢复时，重新执行了"已执行但结果还没来得及存盘"的工具调用；③ 模型自己又调用了一次（它不确定上次成没成功）。 |
 | 检测 | 下游按业务键（用户 + 类型 + 时间窗）查重；trace 中同一 run 内同一写工具出现多次；对账任务。 |
-| 修复/预防 | 所有写工具使用**幂等键**：agentkit 用 `ToolContext.idempotency_key = run_id:call_id`，重放时 `IdempotencyStore` 直接返回上次结果。两个老手才会注意的细节：① 内存版幂等存储在进程崩溃后就丢了，生产中必须放 Redis/数据库；② 最稳妥的做法是把幂等键**传给下游系统**（类似 Stripe API 的 `Idempotency-Key` 请求头），由真正产生副作用的一方去重，这样即使"执行成功但没来得及记录"也不会重复。第③种来源靠业务键查重兜底。 |
+| 修复/预防 | 所有写工具使用**幂等键**：agentkit 用 `ToolContext.idempotency_key = run_id:call_id`，重放时 `IdempotencyStore` 直接返回上次结果。两个老手才会注意的细节：① 内存版幂等存储在进程崩溃后就丢了，别的进程也看不到，生产中必须放在共享的持久存储里（agentkit：一台机器上的多个进程用 `agentkit.distributed` 的 `SQLiteIdempotencyStore`，多台机器用 `RedisIdempotencyStore` 或数据库）；② 最稳妥的做法是把幂等键**传给下游系统**（类似 Stripe API 的 `Idempotency-Key` 请求头），由真正产生副作用的一方去重，这样即使"执行成功但没来得及记录"也不会重复。第③种来源靠业务键查重兜底。 |
 | 课程 | [第 03 课](../lessons/03_tools/README.md) · [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 
 ### T6 不透明错误（Opaque Errors）
@@ -277,6 +285,16 @@ Agent 的失败有三个特点：
 | 检测 | 对多步写流程做对账：按业务实体检查终态是否一致；trace 中"写工具成功后紧跟失败并以 completed 结束"的模式。 |
 | 修复/预防 | 需要原子性的流程，做成**一个粗粒度工具**，在服务端用事务或 Saga（每一步都有补偿动作的长事务模式）实现，模型只负责"发起"；或者用 Workflow（代码固定步骤）而不是 Agent；失败时明确返回"已完成哪些、未完成哪些、已回滚哪些"。 |
 | 课程 | [第 06 课](../lessons/06_orchestration/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+
+### T8 工具自己的超时被误报为执行超时（Tool's Own Timeout Misreported）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 工具只跑了几百毫秒就失败了，日志和模型看到的却是"执行超时（>30s）"；原始错误（哪个下游、什么状态码）不见了；排查的人以为工具太慢，把 `timeout_s` 调大，问题照旧；模型收到"可以稍后重试"的提示，马上又调一次。 |
+| 根因 | 工具内部的下游超时（HTTP 客户端的读超时、数据库驱动、工具自己用的 `asyncio.timeout`）抛出的是 `TimeoutError`，而从 Python 3.11 起 `asyncio.TimeoutError` 就是内置的 `TimeoutError`，和执行器用来判断"我们的期限到了"的是同一种异常。执行器用 `except TimeoutError` 包住整个工具调用，就会把工具自己的超时当成自己的期限，报成"执行超时"，原始信息也丢了。修复前 agentkit 的 `ToolExecutor` 就是这样写的，写第 16 课时发现（见 [`agentkit/tools.py`](../agentkit/tools.py) 里 `ToolExecutor` 的注释）。自己写的超时包装也常犯同样的错：`except (TimeoutError, CancelledError): return 默认值`，既把内层的 `TimeoutError` 当成了自己的期限，又吞掉了外部取消（第 30 课练习 b，另见 [PR14](failure-modes.md#pr14-取消被吞掉swallowed-cancellation)）。 |
+| 检测 | 把 `error_type=timeout` 的结果和工具的实际耗时对照：耗时远小于 `timeout_s` 的"超时"就是误报；超时的错误信息里没有下游名称和状态码；回归测试让工具自己抛 `TimeoutError`，断言结果不是 `timeout`，并且保留了原始信息。 |
+| 修复/预防 | 先把工具的结果或异常"装箱"，再套自己的期限：只有自己的期限到了才报超时，工具自己抛出的异常（包括 `TimeoutError`）按普通工具错误处理、保留原始信息（agentkit `ToolExecutor` 用 `_capture` 这样做，已修复，回归测试 `test_timeout_raised_by_the_tool_itself_is_not_reported_as_our_timeout`，在 `tests/test_agentkit.py`）；嵌套的超时同理：内层协程自己的 `TimeoutError` 原样向外抛，不当成外层的期限（第 30 课练习 b 有两个测试专门抓这个错）；工具内部最好把下游超时转成带上下文的 `ToolError`（"工单系统超时（504），请稍后再试"），模型和值班的人看到的是同一个事实。另见 [T6](failure-modes.md#t6-不透明错误opaque-errors)。 |
+| 课程 | [第 03 课](../lessons/03_tools/README.md) · [第 16 课](../lessons/16_release_ops/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
 
 ---
 
@@ -674,6 +692,16 @@ Agent 的失败有三个特点：
 | 修复/预防 | 生产环境固定到具体的模型快照版本；换模型当作一次发布：跑评估 → 灰度 → 观察 → 全量；关注厂商的模型弃用时间表，提前迁移。 |
 | 课程 | [第 11 课](../lessons/11_evals/README.md) · [第 16 课](../lessons/16_release_ops/README.md) |
 
+### E6 基础设施错误被算成通过（Infrastructure Errors Counted as Passes）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 评估报告的通过率看起来正常甚至不错，可同一时段网关报了一批 429 或 5xx；"不许调用某个工具"的安全用例，在 Agent 根本没跑起来的时候也显示通过；同一个评估集重跑一次，通过率大幅变化。 |
+| 根因 | 通过与否只看检查项（`passed = all(checks)`）。模型 API 或网关故障时，Agent 一个工具都没调就失败了，"不许调用 `reset_password`"这类否定式检查反而天然满足，失败于是被算成了通过。评估的并发比网关配额还高时，评估自己就会制造这类故障。第 11 课 2b 节实测：网关同一时刻只接 3 个请求，评估开 `concurrency=8`，4 个用例被 429 打挂，其中 3 个是否定式的安全用例；修复前的 agentkit 报告显示 86%，真实可信的结果是 43%。基础设施故障既可能让通过率变低，也可能让它虚高。 |
+| 检测 | 报告里单独列出基础设施错误（agentkit 的 `report.infra_errors`：`status=failed` 且 `stop_reason` 以 `llm_error` 开头的用例）；门禁规则：`infra_errors` 非空就不出结论；把评估时段和网关的 429 / 5xx 对照；重跑后通过率的变化集中在少数用例、而这些用例都伴随上游错误，就是这个问题。 |
+| 修复/预防 | infra_error 的用例一律不算通过（agentkit `run_eval`：`passed = not infra and all(...)`，已修复，回归测试 `test_eval_flags_infrastructure_errors_separately`、`test_infra_failures_never_count_as_passed`，在 `tests/test_agentkit.py`）；有 infra_error 的报告要重跑，不拿来做上线决定；评估并发不超过网关配额（第 11 课：给模型套上 `ResilientLLM(max_concurrency=3)`，同样 `concurrency=8`，0 个 infra_error，通过率 100%）；否定式检查搭配一条正向检查（运行正常结束、给出了回答）。反方向的问题（基础设施错误被记成 Agent 失败）见 [A12](failure-modes.md#a12-benchmark-漏洞leaky-benchmark)。 |
+| 课程 | [第 11 课](../lessons/11_evals/README.md) · [第 22 课](../lessons/22_eval_methodology/README.md) |
+
 ---
 
 ## 九、运维
@@ -739,9 +767,9 @@ Agent 的失败有三个特点：
 | 维度 | 说明 |
 |---|---|
 | 症状 | 用户连续快速发了两条消息，第二条的回复"忘了"第一条；会话历史里少了一轮；两个审批决定几乎同时到达，其中一个被覆盖。 |
-| 根因 | 两个 worker 并发处理同一会话：都读到版本 N 的状态，各自追加内容后写回，后写的覆盖先写的（典型的"读-改-写"竞争）。注意 agentkit 的检查点按 `run_id` 整体覆盖写入，本身不防并发写——单进程教学没问题，多 worker 部署时必须补上。 |
+| 根因 | 两个 worker 并发处理同一会话：都读到版本 N 的状态，各自追加内容后写回，后写的覆盖先写的（典型的"读-改-写"竞争）。注意 agentkit 的 `InMemoryCheckpointer` / `FileCheckpointer` 按 `run_id` 整体覆盖写入，本身不防并发写（前者只在一个进程里，后者只保证写得完整）；多个 worker 共享状态时，要用带版本号 CAS 的检查点：`SQLiteCheckpointer`（`agentkit.distributed`，一台机器上的多个进程）或 `PostgresCheckpointer`（`agentkit.contrib.postgres`，多台机器），经队列执行时再加上 fence 接管（第 13 课 3.10 节、第 26 课，见 [PR2](failure-modes.md#pr2-检查点只做-cascas-without-fenced-takeover)）。 |
 | 检测 | 状态存储带版本号，统计写冲突次数；统计"用户消息没有对应回复"的会话比例；压测时对同一会话并发发送消息。 |
-| 修复/预防 | 三种方案：① **按会话分区串行化**——同一会话的消息路由到同一分区/队列/actor 顺序处理，最简单可靠；② **乐观锁（CAS）**——写入时带上期望的版本号，不匹配就重读重试；③ **分布式锁**——必须配合租约和 fencing token（见 D2），否则并不安全。一般首选①，用②兜底。 |
+| 修复/预防 | 三种方案：① **按会话分区串行化**——同一会话的消息路由到同一分区/队列/actor 顺序处理，最简单可靠；② **乐观锁（CAS）**——写入时带上期望的版本号，不匹配就重读重试（agentkit 的 `SQLiteCheckpointer` / `PostgresCheckpointer` 冲突时抛 `CheckpointConflict`）；③ **分布式锁**——必须配合租约和 fencing token（见 D2），否则并不安全。一般首选①，用②兜底。 |
 | 课程 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 
 ### D2 僵尸 Worker（Zombie Worker）
@@ -821,7 +849,7 @@ Agent 的失败有三个特点：
 | 症状 | 单实例压测一切正常；扩容到 20 个实例后，对模型服务商的调用频率超过了账号配额，429 大量出现——越扩容越糟。 |
 | 根因 | 每个实例各自限流（本地令牌桶），总速率随实例数线性增长；而模型服务商的配额是账号/组织级别的全局限制。 |
 | 检测 | 全局聚合的调用速率 vs 配额；429 比例与实例数量的相关性。 |
-| 修复/预防 | 全局限流：集中式令牌桶（如基于 Redis），或统一由模型网关限流；客户端配合背压（拿不到令牌就排队或快速失败，而不是立刻重试，否则就变成 [R1](failure-modes.md#r1-重试风暴retry-storm)）；按租户加权公平地分配全局配额（避免 [P3](failure-modes.md#p3-吵闹邻居noisy-neighbor)）。 |
+| 修复/预防 | 全局限流：集中式令牌桶（agentkit：一台机器上的多个进程用 `SQLiteTokenBucket`，多台机器用 `RedisTokenBucket`；第 12 课实测，两个 API 进程各用进程内的令牌桶放行了 16 个请求，配置只允许约 9 个，共用 `SQLiteTokenBucket` 放行 8 个），或统一由模型网关限流；客户端配合背压（拿不到令牌就排队或快速失败，而不是立刻重试，否则就变成 [R1](failure-modes.md#r1-重试风暴retry-storm)）；按租户加权公平地分配全局配额（避免 [P3](failure-modes.md#p3-吵闹邻居noisy-neighbor)）。 |
 | 课程 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 12 课](../lessons/12_production_architecture/README.md) |
 
 ### D10 对冲请求放大副作用（Hedging Side Effects）
@@ -843,6 +871,16 @@ Agent 的失败有三个特点：
 | 检测 | 每次运行记录完整的版本组合；定期做回滚演练。 |
 | 修复/预防 | 把"代码 + 提示词 + 模型版本 + 工具 Schema + 关键配置"作为**一个版本化的发布单元**，一起灰度、一起回滚；状态格式向前/向后兼容（新增字段可选、旧字段不删）；设置基于指标的自动回滚条件（如任务完成率下降、错误率上升超过阈值）；紧急开关独立于发布系统，发布系统出问题时也能用。 |
 | 课程 | [第 16 课](../lessons/16_release_ops/README.md) |
+
+### D12 走队列后对话失忆（Conversation History Dropped at the Queue）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 同步接口时多轮对话一切正常；改成"API 入队、worker 执行"之后，Agent 每一轮都像第一次见到用户："请问您说的是哪台电脑？"；单轮评估全部通过，线上多轮对话的投诉却变多；检查点里只有本轮的用户消息。 |
+| 根因 | 对话历史是任务输入的一部分，却在"API → 队列 → worker"的某一跳被丢掉了：payload 只带了本轮输入，worker 调 `agent.run` 时没传 `history`，而且没有任何报错。综合实战 ITBuddy 从单进程搬到"API 进程 + worker 进程"时撞上了这个问题：agentkit 的 `AgentJobHandler` 执行 run 任务时不传 `history`，以前 HTTP 接口接受的历史，改走队列后每一轮都"失忆"（[综合实战](../capstone/README.md) 第 9 节第 11 条）。它和 [PR6](failure-modes.md#pr6-trace-在队列处断开trace-broken-at-the-queue)（trace 在队列处断开）是同一类问题：同步调用里自动带着走的上下文，过队列时要显式放进 payload。 |
+| 检测 | 端到端的多轮测试要走真实的队列和 worker 进程，断言第二轮的模型输入（或检查点）里有第一轮的内容；同一个多轮用例在同步路径和队列路径上各跑一遍，对比结果；线上统计"用户重复说明已经给过的信息"的比例。 |
+| 修复/预防 | 把 payload 的字段当成接口契约来设计和测试：run 任务带上 `history`（agentkit `AgentJobHandler` 现在支持，原样交给 `agent.run`，测试 `test_agent_job_carries_conversation_history`，在 `tests/test_distributed.py`），或者 worker 按会话 ID 从共享存储读取历史；客户端带来的历史不可信，入队前要清洗：只留 user / assistant 的文字，伪造的 tool 消息、system 消息和 `tool_calls` 一律丢掉，并限制条数和长度（综合实战 [`server.py`](../capstone/server.py) 的 `sanitize_history`）；综合实战的 `test_idempotent_submission_concurrent_approvals_and_defense_in_depth`（`capstone/test_server.py`）在真实进程上检查历史确实进了检查点。 |
+| 课程 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 12 课](../lessons/12_production_architecture/README.md) · [综合实战](../capstone/README.md) |
 
 ---
 
@@ -974,7 +1012,7 @@ Agent 的失败有三个特点：
 
 ## 十二、生产落地：状态、工作流、可观测性、网关、异步运行时与部署
 
-> 这一类对应课程第四部分（第 26–31 课）。把教学实现换成 Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar 和 asyncio 之后，组件本身是成熟的，但它们的默认值、组合方式和"自己出故障时怎么办"都要你来把关，而且这些问题大多只在多进程、多实例、真实负载和发布时才出现。相关的已有条目：[D2](failure-modes.md#d2-僵尸-workerzombie-worker)（僵尸 Worker）、[D3](failure-modes.md#d3-重复投递duplicate-delivery)（重复投递）、[D4](failure-modes.md#d4-队列积压雪崩queue-backlog-avalanche)（队列积压雪崩）、[D9](failure-modes.md#d9-限流只在单机生效local-only-rate-limiting)（限流只在单机生效）、[R1](failure-modes.md#r1-重试风暴retry-storm)（重试风暴）、[R3](failure-modes.md#r3-降级后静默变差silent-degradation)（降级后静默变差）、[R4](failure-modes.md#r4-中断后从头重来lost-progress)（中断后从头重来）。
+> 这一类主要对应课程第四部分（第 26–31 课）。把教学实现换成 Postgres、Redis、Temporal、OpenTelemetry、LiteLLM 和 Cedar，部署成多进程、多实例的服务之后，组件本身是成熟的，但它们的默认值、组合方式和"自己出故障时怎么办"都要你来把关，而且这些问题大多只在多进程、多实例、真实负载和发布时才出现。PR14–PR18 是把课程和综合实战迁到真实的多进程部署时（第 12、13、30、31 课）实测发现的，每一条都已在 agentkit 里修复或写明了边界，并注明了对应的测试或实测脚本。相关的已有条目：[D2](failure-modes.md#d2-僵尸-workerzombie-worker)（僵尸 Worker）、[D3](failure-modes.md#d3-重复投递duplicate-delivery)（重复投递）、[D4](failure-modes.md#d4-队列积压雪崩queue-backlog-avalanche)（队列积压雪崩）、[D9](failure-modes.md#d9-限流只在单机生效local-only-rate-limiting)（限流只在单机生效）、[R1](failure-modes.md#r1-重试风暴retry-storm)（重试风暴）、[R3](failure-modes.md#r3-降级后静默变差silent-degradation)（降级后静默变差）、[R4](failure-modes.md#r4-中断后从头重来lost-progress)（中断后从头重来）。
 
 ### PR1 贪心领取（Over-Claiming Worker）
 
@@ -983,7 +1021,7 @@ Agent 的失败有三个特点：
 | 症状 | 高峰期同一个任务被执行了两次，日志里成片出现租约过期和 fence 拒绝；一个异步 worker 进程手里的任务数远超它的并发上限，内存上涨，任务却迟迟没进展；另一类表现：跑几十分钟的任务总是被"再投递"一次。 |
 | 根因 | worker 领取的速度超过了它处理的速度。异步 worker 满载时还在 claim，一个进程把几百个任务囤在内存里，处理不过来，租约一个接一个过期，这些任务被别的 worker 重新领取、重复执行。同一类问题还有：租约或可见性超时短于任务时长的 p99（例如 Celery 用 Redis 做 broker 时 `visibility_timeout` 默认 1 小时，超过的任务会被投递给别的 worker）；心跳间隔太接近租约时长，一次 GC 停顿或数据库抖动就丢了租约。 |
 | 检测 | 过期未回收的租约数（`stats()["expired_leases"]`）、fence 拒绝次数（`on_event("fence_rejected")`）、同一任务 attempts 的分布；每个 worker 的在途任务数和并发上限对比；任务时长 p99 和租约 / 可见性超时对比。 |
-| 修复/预防 | **背压**：先拿到并发名额再 claim（`run_async_worker(concurrency=...)` 就是这么做的），满载时任务留在队列里给别人；心跳间隔约为租约的 1/3（第 31 课的参考服务在启动时校验：心跳不能超过租约的一半）；租约或可见性超时大于任务时长 p99，长任务定期续租；最后由 fence 和下游幂等兜底，即使被重复领取也不会重复产生副作用（[D2](failure-modes.md#d2-僵尸-workerzombie-worker)、[D3](failure-modes.md#d3-重复投递duplicate-delivery)）。 |
+| 修复/预防 | **背压**：先拿到并发名额再 claim（`run_worker(concurrency=...)` 就是这么做的；满载时它也要能听见停机信号，见 [PR16](failure-modes.md#pr16-满载的-worker-听不见停机信号busy-worker-misses-the-stop-signal)），满载时任务留在队列里给别人；心跳间隔约为租约的 1/3（第 31 课的参考服务在启动时校验：心跳不能超过租约的一半）；租约或可见性超时大于任务时长 p99，长任务定期续租；最后由 fence 和下游幂等兜底，即使被重复领取也不会重复产生副作用（[D2](failure-modes.md#d2-僵尸-workerzombie-worker)、[D3](failure-modes.md#d3-重复投递duplicate-delivery)）。 |
 | 课程 | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
 
 ### PR2 检查点只做 CAS（CAS Without Fenced Takeover）
@@ -1001,9 +1039,9 @@ Agent 的失败有三个特点：
 | 维度 | 说明 |
 |---|---|
 | 症状 | 一次模型故障期间，同一个用户请求打到上游十几次，429 和账单一起飙升；主模型坏了，用户却要等好几秒才切到备用模型；在 Temporal 里，一笔退款被执行了两次；事件历史里看不到内层的重试。 |
-| 根因 | 每一层都觉得"多试几次更可靠"：SDK 自带重试、`ResilientLLM` / `AsyncResilientLLM`、LiteLLM Router 的 `num_retries` 加降级、Proxy 自己的重试、Temporal Activity 默认的不限次重试，次数相乘。第 29 课算过：Router `num_retries=2`、一主一备，外面再套 `max_attempts=3`，一次请求最坏是 18 次上游调用；实测主模型返回 500 时，`num_retries=2` 要约 3.84 秒才降级。另一个坑：`AsyncResilientLLM` 在全部尝试失败后抛出不可重试的错误，套进 Temporal 会让本可重试的 429 被直接放弃。Activity 本身又是"至少执行一次"的，没有幂等键的写工具每多试一次就可能多一次副作用。 |
+| 根因 | 每一层都觉得"多试几次更可靠"：SDK 自带重试、`ResilientLLM`、LiteLLM Router 的 `num_retries` 加降级、Proxy 自己的重试、Temporal Activity 默认的不限次重试，次数相乘。第 29 课算过：Router `num_retries=2`、一主一备，外面再套 `max_attempts=3`，一次请求最坏是 18 次上游调用；实测主模型返回 500 时，`num_retries=2` 要 4–5 秒才降级（第 29 课 1d，异步路径四次运行 4.2–5.0 秒）。另一个坑：`ResilientLLM` 在全部尝试失败后抛出不可重试的错误，套进 Temporal 会让本可重试的 429 被直接放弃。Activity 本身又是"至少执行一次"的，没有幂等键的写工具每多试一次就可能多一次副作用。 |
 | 检测 | 按请求 ID 聚合网关日志，数每个用户请求对应多少次上游调用；看 Router 的 `last_route` 和 `events`；注意 `x-litellm-attempted-retries` 响应头只统计最终成功的那个模型组，看不出主模型组的重试；Temporal 事件历史里每个 activity 的 attempt 分布。 |
-| 修复/预防 | **重试只放一层**：用 Temporal 时关掉客户端重试（`AsyncOpenAICompatLLM` 本来就是 `max_retries=0`），由 RetryPolicy 负责，并给每个工具设上限（`retry_policy_for`：只读 5 次、带幂等键的写 3 次、不幂等的写 1 次）；用 Router 时不再外包 `ResilientLLM`，需要舱壁就用 `AsyncResilientLLM(max_attempts=1, max_concurrency=…)`；业务服务后面有 Proxy 时，客户端不重试；面向用户的同步请求调小 `num_retries` 或给整次请求设截止时间；所有写操作带幂等键。另见 [R1](failure-modes.md#r1-重试风暴retry-storm)。 |
+| 修复/预防 | **重试只放一层**：用 Temporal 时关掉客户端重试（`OpenAICompatLLM` 本来就是 `max_retries=0`），由 RetryPolicy 负责，并给每个工具设上限（`retry_policy_for`：只读 5 次、带幂等键的写 3 次、不幂等的写 1 次）；用 Router 时不再外包 `ResilientLLM`，需要舱壁就用 `ResilientLLM(max_attempts=1, max_concurrency=…)`；业务服务后面有 Proxy 时，客户端不重试；面向用户的同步请求调小 `num_retries` 或给整次请求设截止时间；所有写操作带幂等键。另见 [R1](failure-modes.md#r1-重试风暴retry-storm)。 |
 | 课程 | [第 27 课](../lessons/27_durable_workflows/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) · [第 08 课](../lessons/08_reliability/README.md) |
 
 ### PR4 发版后的非确定性错误（Nondeterminism After Deploy）
@@ -1071,19 +1109,19 @@ Agent 的失败有三个特点：
 | 维度 | 说明 |
 |---|---|
 | 症状 | 同一个进程里所有会话一起变慢，而且和负载关系不大；心跳超时，租约莫名过期，任务被别的 worker 接手；Temporal 的 activity 被判心跳超时并重试，模型调用多付了一次钱；asyncio 调试模式报 `Executing <Task ...> took 0.303 seconds` 这类慢回调。 |
-| 根因 | 事件循环是单线程的，协程只在 `await` 处让出。在 async 函数或同步 Hook 里调用 `time.sleep`、`requests`、同步的 psycopg / redis-py / OpenAI 客户端，这段时间里所有协程都停住，包括所有任务的续租心跳。隐蔽的版本是"第一次调用时才创建客户端"：导入 openai、httpx 要零点几秒到几秒。第 27 课场景 6：模型客户端在 async 里用 `time.sleep` 模拟阻塞 IO，20 个 workflow 耗时 7.05 秒、模型调用峰值并发 1，和串行一样，而正常的并发版本是 1.15 秒。 |
-| 检测 | 导出事件循环延迟指标（一个定时心跳协程测量自己被推迟了多久）；staging 环境打开 `PYTHONASYNCIODEBUG=1`，超过 100 毫秒的回调会被记进日志；CI 里用 `ast` 找 async 函数里的阻塞调用（第 30 课练习 c）；worker 的存活探针由事件循环自己应答（第 31 课参考服务的做法），`/metrics` 由另一个线程提供，事件循环卡死时它照样返回 200，不能当存活探针。 |
-| 修复/预防 | 整条链路用 async 客户端（`AsyncOpenAICompatLLM`、`redis.asyncio`、psycopg 的 async 连接、`httpx.AsyncClient`）；绕不开的同步代码用 `asyncio.to_thread` 或有上限的线程池；同步 Hook 只做内存计数（如 `PrometheusHook`），要查库的指标放到独立的定时任务里；客户端在进程启动时创建（`make_worker` 的做法）；异步 Agent 配 `AsyncRateLimitHook`，不用同步的 `RateLimitHook`。 |
-| 课程 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 28 课](../lessons/28_production_observability/README.md) |
+| 根因 | 事件循环是单线程的，协程只在 `await` 处让出。在 async 函数或同步 Hook 里调用 `time.sleep`、`requests`、同步的 psycopg / redis-py / sqlite3 / OpenAI 客户端，这段时间里所有协程都停住，包括所有任务的续租心跳。隐蔽的版本是"第一次调用时才创建客户端"：导入 openai、httpx 要零点几秒到几秒。实测：第 02 课 1.7 节，10 个会话的工具本该同时跑（`await asyncio.sleep(0.2)`，0.61 秒），在 `async def` 里写成 `time.sleep(0.2)` 就变成一个接一个（2.48 秒），事件循环卡住 2072 毫秒；第 13 课 3.11 节，另一个真实进程握住 SQLite 写锁 0.8 秒，在事件循环里直接调用阻塞的 `JobQueue.claim`，一个每 10 毫秒醒一次的协程在这 0.8 秒里一次都没醒，经过一个专用线程调用时照常醒了约 70 次——这就是 `agentkit.distributed.SQLiteDB` 把每次数据库调用都放进一个专用线程的原因；第 30 课场景 3a，2 个租户的审计钩子里 `time.sleep(0.3)`，心跳最大延迟 615 毫秒，另外 20 个租户的 p50 从 0.21 秒（改用 `asyncio.to_thread`）变成 1.34 秒；第 27 课场景 6，模型客户端在 async 里用 `time.sleep` 模拟阻塞 IO，20 个 workflow 的模型调用峰值并发只有 1，耗时和串行差不多。 |
+| 检测 | 导出事件循环延迟指标（一个定时心跳协程测量自己被推迟了多久）；staging 环境打开 `PYTHONASYNCIODEBUG=1`，超过 100 毫秒的回调会被记进日志；CI 里用 `ast` 找 async 函数里的阻塞调用（第 30 课练习 c）；worker 的存活探针由事件循环自己应答（第 31 课参考服务的做法），`/metrics` 由另一个线程提供，事件循环卡死时它照样返回 200，不能当存活探针；回归测试照着第 13 课的做法，让一个每 10 毫秒醒一次的协程计数，断言阻塞期间它照样醒（`test_async_jobqueue_keeps_the_event_loop_running`，在第 13 课的 `test_exercise.py`；`test_sync_tool_timeout_does_not_block_event_loop`，在 `tests/test_runtime.py`）。 |
+| 修复/预防 | 整条链路用 async 客户端（agentkit 的 `OpenAICompatLLM` 本身就是 async 的，`redis.asyncio`、psycopg 的 async 连接、`httpx.AsyncClient`）；普通 `def` 工具交给 agentkit，它会放进线程池执行，不卡事件循环（第 02 课实测 0.61 秒，和 async 工具一样；服务里用 `Agent(max_threads=...)` 给一个有上限的独立线程池）；其他绕不开的同步代码用 `asyncio.to_thread` 或有上限的线程池，阻塞的数据库驱动（如 sqlite3）放进一个专用线程、只用一个连接；同步 Hook 只做内存计数（如 `PrometheusHook`），要查库或调 Redis 的放进 async Hook（contrib 里的 `RateLimitHook` 就是 async 的）或独立的定时任务；客户端在进程启动时创建（`make_worker` 的做法）。 |
+| 课程 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 02 课](../lessons/02_agent_loop/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 28 课](../lessons/28_production_observability/README.md) |
 
 ### PR11 取消后副作用重复或状态悬空（Cancellation Leaves Work Half-Done）
 
 | 维度 | 说明 |
 |---|---|
-| 症状 | 用户关掉页面、重连后按 `run_id` 恢复，结果建了两张工单；客户端断开后，检查点一直停在 `running`，对账程序以为它还在跑；或者取消信号干脆"丢了"，运行照样跑完、照样花钱。 |
-| 根因 | 被取消的写操作，结果是"未知"，不是"失败"：取消时给已经发出的写工具调用补上"未执行"，恢复后模型会发起一个新的 `call_id`，幂等键跟着变了，下游去重失效，副作用发生两次（第 26 课实测，已在 `agentkit.aio` 修复）。Starlette 底层的 AnyIO 是电平触发的取消，收尾时保存 `cancelled` 状态的那次 `await` 会被再次取消；取消还可能打断"数据库已提交、客户端没收到回复"的那次保存，本地版本号过期，收尾保存被 CAS 拒绝。吞掉 `CancelledError`（`except BaseException`，或者 `suppress(CancelledError)` 加 `await task`）会让取消失效；Python 3.11 及更早的 `asyncio.wait_for` 在结果和取消同时到达时会吞掉取消（CPython gh-86296）。 |
+| 症状 | 用户关掉页面、重连后按 `run_id` 恢复，结果建了两张工单；客户端断开后，检查点一直停在 `running`，对账程序以为它还在跑；或者取消信号干脆"丢了"，运行照样跑完、照样花钱（见 [PR14](failure-modes.md#pr14-取消被吞掉swallowed-cancellation)）。 |
+| 根因 | 被取消的写操作，结果是"未知"，不是"失败"：取消时给已经发出的写工具调用补上"未执行"，恢复后模型会发起一个新的 `call_id`，幂等键跟着变了，下游去重失效，副作用发生两次（第 26 课实测，已在 agentkit 的 `Agent` 修复）。Starlette 底层的 AnyIO 是电平触发的取消，收尾时保存 `cancelled` 状态的那次 `await` 会被再次取消；取消还可能打断"数据库已提交、客户端没收到回复"的那次保存，本地版本号过期，收尾保存被 CAS 拒绝。另一种情况是取消在半路被标准库、依赖库或你自己的代码吞掉，运行根本没停，单独列为 [PR14](failure-modes.md#pr14-取消被吞掉swallowed-cancellation)。 |
 | 检测 | 每次取消之后检查三样：检查点是 `cancelled`、模型调用的在途数归零、下游记录数没有多；扫描故障窗口：在一次运行的多个时刻各取消一次，把结果分成"停住了""卡在 running""根本没停"三类（第 30 课的做法，第三类往往指向另一个 bug）；按业务键对账下游副作用。 |
-| 修复/预防 | 取消或超时时，写 / 高危工具的调用保持未回答，只读工具补"未执行"，`resume` 用同一个 `call_id` 重放，下游按 `run_id:call_id` 去重（`AsyncAgent` 的现行语义）；异步检查点的每一次保存都放进受 `asyncio.shield` 保护的独立任务；`CancelledError` 收尾后必须重新抛出；等一个你刚取消的任务用 `asyncio.wait({task})`，不要 `await task`；Python 3.12 之前，可能被取消的超时不要用 `wait_for`（3.11 用 `asyncio.timeout()`，3.10 用 `asyncio.wait` 自己实现）。 |
+| 修复/预防 | 取消或超时时，写 / 高危工具的调用保持未回答，只读工具补"未执行"，`resume` 用同一个 `call_id` 重放，下游按 `run_id:call_id` 去重（agentkit `Agent` 的现行语义）；异步检查点的每一次保存都放进受 `asyncio.shield` 保护的独立任务；`CancelledError` 收尾后必须重新抛出；等一个你刚取消的任务用 `asyncio.wait({task})`，不要 `await task`；取消被吞掉时怎么发现、怎么兜底，见 [PR14](failure-modes.md#pr14-取消被吞掉swallowed-cancellation)。 |
 | 课程 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
 
 ### PR12 停机丢掉在途运行（In-Flight Runs Lost on Shutdown）
@@ -1106,6 +1144,56 @@ Agent 的失败有三个特点：
 | 修复/预防 | 按队列积压、最老任务的等待时间或在途饱和度扩缩 worker（KEDA 的 `postgresql` scaler 用一条 SQL 的结果和 `targetQueryValue` 比较，或者 HPA 的外部指标）；副本数上限按模型配额来定，而不是"越多越好"；全局配额放在 Redis 或网关；多副本上报的积压指标用 `max` 聚合；缩容走优雅停机（PR12），HPA 配缩容稳定窗口，防止副本数来回抖动。另见 [D4](failure-modes.md#d4-队列积压雪崩queue-backlog-avalanche)。 |
 | 课程 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 28 课](../lessons/28_production_observability/README.md) |
 
+### PR14 取消被吞掉（Swallowed Cancellation）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 用户断开了，服务端 1 毫秒内就发现并取消了运行，运行却照样跑完：模型照样计费、工单照样建了，检查点记为 `completed` 而不是 `cancelled`。概率很低、时有时无：第 31 课修复前的压测里，约 540 次断开中有 5 次（约 1%）。单独测某一个组件时几乎复现不了。 |
+| 根因 | 取消请求在半路被某一层吞掉了，常见三处。① **标准库**：Python 3.11 及更早的 `asyncio.wait_for`，在内部结果和外部取消同一轮事件循环里到达时，返回结果、吞掉取消（[CPython gh-86296](https://github.com/python/cpython/issues/86296)，3.12 用 `asyncio.timeout()` 重写后修好）；第 30 课专门在"同步工具刚执行完"的时刻断开，240 次里 89 次取消丢失。② **依赖库**：redis-py、psycopg_pool 在内部用 `asyncio.wait_for`，框架换掉了自己的 `wait_for` 也管不到它们；第 31 课在 3.11.7 上的微基准：redis-py 命令进行中取消，约 20%–25% 被吞，psycopg_pool 在"等连接"时交接连接和取消同时发生，20/20 被吞（第 31 课 3.6 节发现 3，上面那 5 次就是限流 Hook 调 Redis 时丢的）。③ **你自己的代码**：`except BaseException` 或裸 `except:`；`suppress(CancelledError)` 加 `await task`；`except (TimeoutError, CancelledError): return 默认值`（第 30 课 5.2 节）。 |
+| 检测 | 每次断开后检查三样：检查点是 `cancelled`、在途模型调用归零、下游没有新记录；压测时在一次运行的多个时刻各取消一次，结果里出现"根本没停"的，就是被吞掉的取消；被吞掉的取消在 `Task.cancelling()` 里还留着计数（按 asyncio 的约定，正规地压制取消必须调用 `uncancel()`），在每个 Hook 边界打点 `cancelling()`，能定位到是哪一层吞的；按 agentkit 补抛时 warning 里的稳定字段 `agentkit_event="swallowed_cancellation"` 计数（第 31 课的参考服务把它记成指标 `itdesk_swallowed_cancellations_total`），不为 0 就说明有依赖在吞取消，要告警；CI 里扫描 `except BaseException` 和裸 `except:`。 |
+| 修复/预防 | 自己的代码：`CancelledError` 收尾后重新抛出；超时用取消安全的 `agentkit.wait_for`，不用标准库的 `wait_for`（3.11+ 用 `asyncio.timeout()`，3.10 用 `asyncio.wait` 实现，外部取消一律优先；`on_discard` 归还已经拿到的资源，否则信号量名额会泄漏）。管不到的依赖库，由运行时在步骤边界补抛：agentkit `Agent` 进入运行时记下 `Task.cancelling()` 的基线，在调用模型前、执行工具前检查，比基线大就补抛 `CancelledError` 并打一条 warning（`run_timeout` 的取消被吞时也补抛，最后仍记为 timeout；3.10 没有 `cancelling()`，这道检查自动关闭）。生产镜像用 Python 3.12+，从根上避开标准库的这个竞态（第 31 课的做法）。补抛只挡得住"下一步"，已经在执行的那一步挡不住，所以写工具仍然要靠幂等键（[PR11](failure-modes.md#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done)）。回归测试（都在 `tests/test_runtime.py`）：`test_wait_for_never_swallows_cancel_when_result_arrives_in_same_tick`、`test_wait_for_cancel_racing_semaphore_grant_does_not_leak_permit`、`test_tool_executor_cancel_at_tool_completion_is_not_lost`、`test_cancel_swallowed_by_a_dependency_is_re_raised_before_side_effects`、`test_run_timeout_swallowed_by_a_dependency_still_times_out`、`test_swallowed_cancellation_is_logged_with_a_stable_event_field`。复测：第 30 课换掉 `wait_for` 后，240 次丢失 0 次，Demo 4c ④ 在同一时刻断开 40 次丢失 0 次；第 31 课重构后的 5 次压测共 135 次断开，全部记为 `cancelled`。 |
+| 课程 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+
+### PR15 被舱壁拒绝的运行留下半截检查点（Bulkhead Rejection Leaves a Half Checkpoint）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 高峰期一部分运行被租户舱壁拒绝（`stop_reason=rate_limited`），推迟后再执行，回答却答非所问，好像没听到用户的问题；这个 `run_id` 的检查点存在，里面却没有用户消息；依赖 `on_run_start` / `on_run_end` 成对出现的指标（在途数、审计）对不上。 |
+| 根因 | "新运行被拒绝"被当成了"运行到一半停下"来处理。修复前 agentkit 的 `Agent(limiter=..., limiter_timeout=...)` 在把用户输入写进状态**之前**就去拿舱壁槽位，拿不到时以 `rate_limited` 结束，然后照常收尾：保存检查点、跑 `on_run_end`，可这个检查点里没有用户的问题，`on_run_start` 也从来没跑过；`AgentJobHandler` 推迟任务后按"有检查点就 `resume`"的规则恢复，模型看到的是一段只有 system 消息的对话。这是第 12 课在真实的多进程迷你部署里发现的（第 12 课 3.2 节的注）。一般的教训：拒绝要么发生在任何状态落盘之前、什么都不留，要么留下的状态能被正确恢复；"推迟"和"失败"是两条不同的路径。 |
+| 检测 | 统计 `stop_reason=rate_limited` 的新运行里有检查点的比例（应为 0）；恢复前断言检查点里至少有一条用户消息；成对钩子的计数差；压测时把舱壁调小，让大量运行先被拒绝再重试，逐条检查回答是否针对原问题。 |
+| 修复/预防 | 新运行被舱壁拒绝 = 什么都没发生：不保存检查点、不跑 `on_run_end`，重试时用同一个 `run_id` 从头开始（agentkit `Agent` 已这样修复，回归测试 `test_run_rejected_by_bulkhead_leaves_no_half_checkpoint`，在 `tests/test_runtime.py`）；舱壁满了就推迟（`RetryLater`：任务回到队列、不消耗尝试次数），而不是记成失败；也可以把舱壁放在 worker 的 handler 里，在进入 Agent 之前拿槽位（第 12 课的做法：进程内的 `KeyedLimiter` 加跨进程的 `SQLiteSemaphore`，吵闹租户的 24 个任务所有 worker 加起来同时最多 3 个，被推迟 47 次，没有一个失败）。 |
+| 课程 | [第 12 课](../lessons/12_production_architecture/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+
+### PR16 满载的 worker 听不见停机信号（Busy Worker Misses the Stop Signal）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 配了 `grace_period`，worker 空闲时停机一切正常；满载时收到 SIGTERM 却迟迟不退出，要等手上的任务自己做完；在途任务比 `terminationGracePeriodSeconds` 还长时，Pod 被 SIGKILL，没有机会取消和归还任务，别的 worker 要等租约过期才能接手。 |
+| 根因 | worker 循环先拿并发槽位再领取（背压，[PR1](failure-modes.md#pr1-贪心领取over-claiming-worker)），拿槽位时只 `await sem.acquire()`。所有槽位都被在途任务占着时，主循环停在这一行，看不到停机信号，宽限期也就没有开始计时。第 13 课在真实进程上测出：并发上限 1、`grace_period=1` 秒、在途任务要跑 8 秒，SIGTERM 之后 8.08 秒才退出，期望是约 1 秒后取消在途任务（第 13 课 6.4 节）。一般的规律：任何"等资源"的地方，都要同时等"停机"。 |
+| 检测 | 停机演练要在 worker 满载时做（并发打满、任务时长超过宽限期），测从 SIGTERM 到退出的耗时，应当约等于宽限期加收尾时间；看退出码（0，还是被 SIGKILL）；看日志里停止领取的 `draining` 事件是紧跟着 SIGTERM，还是排在某个任务完成之后。 |
+| 修复/预防 | 同时等槽位和停机信号，谁先到算谁；两个同时到达时停机优先，把槽位还回去（agentkit `run_worker` 里的 `_acquire_or_stop`，已修复，回归测试 `test_stop_signal_is_seen_even_when_every_slot_is_busy`，在 `tests/test_distributed.py`）；宽限期到了还没做完的任务，取消并归还（[PR12](failure-modes.md#pr12-停机丢掉在途运行in-flight-runs-lost-on-shutdown)）。 |
+| 课程 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+
+### PR17 多进程同时建库时切换 WAL 失败（Concurrent WAL Switch Race）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 同时拉起一批 worker 进程（部署、跑测试、`WorkerPool` 启动）时，偶尔有一两个进程一启动就崩，报 `sqlite3.OperationalError: database is locked`，明明设了 `busy_timeout`；再启动一次就好了，很难稳定复现。 |
+| 根因 | 把 SQLite 切到 WAL 模式（`PRAGMA journal_mode=WAL`）要短暂独占整个文件。几个进程同时新建同一个库时，这一句会直接报 "database is locked"，`busy_timeout` 管不到它。第 13 课实测：40 次启动错 4 次（见 [`agentkit/distributed/sqlite.py`](../agentkit/distributed/sqlite.py) 里 `SQLiteDB._connection` 的注释）。Postgres 上也有同类问题：第 26 课实测，8 个连接同时执行 `CREATE TABLE IF NOT EXISTS`，7 个报 `UniqueViolation`。 |
+| 检测 | 启动失败日志里的 `database is locked`；CI 里同时拉起多个进程打开同一个新库，重复几十次，统计启动失败率。 |
+| 修复/预防 | 切换 WAL 时捕获 "locked"，随机退避后重试，直到 `busy_timeout` 用完（agentkit `SQLiteDB` 已这样做，回归测试 `test_many_processes_can_create_the_same_new_database_at_once`，在 `tests/test_distributed.py`）；或者由一个进程（发布流水线里的初始化步骤）先建好库和表，再拉起 worker（第 13 课第 7 节的做法，仍然有效）；Postgres 同理：建表和迁移在发布流水线里执行一次，不在每个 worker 启动时做。 |
+| 课程 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+
+### PR18 共享数据库的写锁成了天花板（Shared Write Lock Becomes the Ceiling）
+
+| 维度 | 说明 |
+|---|---|
+| 症状 | 加了 worker 进程，吞吐不涨甚至下降，每个 worker 的 CPU 利用率反而越来越低；队列积压和排队时间上升；数据库这边锁等待变长，用 SQLite 时是大量写事务在 `busy_timeout` 里排队。 |
+| 根因 | 所有 worker 共用一个存储，每个任务要写好几次（领取、接管检查点、每一步的检查点、幂等记录、提交），这些写入被同一把锁串行化，而 SQLite 同一时刻只允许一个写者。第 13 课 3.12 节在 Apple M1（8 核）上实测：空任务只测队列，1 个进程每秒 5401 个任务、CPU 114%，2 个、4 个进程反而是 5140、5061，这台机器上单写者的上限约为每秒一万次小写事务；Agent 任务（每个 10 次写事务），4 × 64 是每秒 710 个（理论上限的 55%），8 × 64 降到 662 个（26%），worker 的 CPU 只有 12%。第 30 课场景 1c：4 个进程、检查点在内存里时每秒 846 个任务（CPU 58%），检查点换成共享的 SQLite 后降到 384 个（CPU 33%）。卡住的不一定只有写锁：第 13 课 3.12 节也提醒，同一台机器上把同样的负载换到 Postgres，8 × 64 并没有明显更快，整台机器同样到顶了。 |
+| 检测 | 加进程前后对比吞吐和每个 worker 的 CPU 利用率：吞吐持平、CPU 下降，说明在排队等共享资源（写锁、连接池）；吞吐持平、CPU 接近 100%，是事件循环的 CPU 到顶（加进程有用）；大部分时间在等令牌或名额，是模型配额（加进程没用）。算一算"每个任务的写事务数 × 吞吐"，和空任务测出的写事务上限比较；数据库侧看锁等待时间。这是性能特征，没有单元测试，用实测脚本复现：第 13 课的 [`demo_scale.py`](../lessons/13_distributed_concurrency/demo_scale.py)、第 30 课 [`demo.py`](../lessons/30_async_runtime/demo.py) 的场景 1c。 |
+| 修复/预防 | **先测出天花板在哪，再决定加什么**（第 30 课 1.3 节）：CPU 到顶就加进程；写锁到顶就减少每个任务的写入次数（比如不是每一步都写检查点），或者换成多写者的数据库（Postgres 行级锁，`agentkit.contrib.postgres` 的 `PostgresCheckpointer` / `PostgresJobQueue` 接口相同，第 26 课）；配额到顶就去谈配额。容量规划写明测到的是哪一个天花板、在什么机器和负载下测的。SQLite（`agentkit.distributed`）适合一台机器上几个到几十个 worker 进程，需要多台机器时换 Postgres。另见 [PR13](failure-modes.md#pr13-按错误的信号扩缩容autoscaling-on-the-wrong-signal)。 |
+| 课程 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+
 ---
 
 ## 附：从症状反查失败模式
@@ -1116,13 +1204,16 @@ Agent 的失败有三个特点：
 | 输入 token 突然暴涨 | T3 输出爆炸、C2 上下文腐烂、T2 工具过载、B2 缓存击穿 |
 | API 400 错误只在长对话中出现 | C1 消息配对被截断 |
 | 下游出现重复记录 | T5 重复副作用、C3 有损压缩 |
+| 工具只跑了几百毫秒就失败，报的却是"执行超时" | T8 工具自己的超时被误报为执行超时、T6 不透明错误 |
 | 上游请求量在故障时反而上升 | R1 重试风暴 |
 | 成功率正常但用户满意度下降 | P1 静默失败、R3 降级后静默变差、E5 模型静默漂移 |
+| 评估通过率看着正常，同一时段网关却报了一批 429；重跑后通过率大幅变化 | E6 基础设施错误被算成通过、E2 单次运行的假象 |
 | 回答"很自信但是错的" | M1 编造行动、M5 政策幻觉、C4 上下文投毒 |
 | 读了外部内容后执行了奇怪的操作 | S2 间接注入、S6 工具投毒 |
 | 大量 paused 运行 | R5 审批悬挂 |
 | 发布后一批运行失败 | R4 中断后从头重来、R6 版本错位、D11 回滚不彻底 |
 | 同一会话丢了一轮对话 / 审批决定被覆盖 | D1 丢失更新 |
+| 改成入队执行后，多轮对话的每一轮都"失忆" | D12 走队列后对话失忆、D1 丢失更新 |
 | 同一任务出现两份结果 | D2 僵尸 Worker、D3 重复投递 |
 | 队列里最老消息的年龄持续增长 | D4 队列积压雪崩 |
 | 扩容之后 429 反而更多 | D9 限流只在单机生效 |
@@ -1153,6 +1244,11 @@ Agent 的失败有三个特点：
 | 断开重连后副作用重复；检查点一直停在 running | PR11 取消后副作用重复或状态悬空、T5 重复副作用 |
 | 每次滚动发布都有一批运行失败或重跑 | PR12 停机丢掉在途运行、R4 中断后从头重来 |
 | CPU 全绿，任务却越排越久 | PR13 按错误的信号扩缩容、D4 队列积压雪崩 |
+| 用户断开后，运行照样跑完、照样建单 | PR14 取消被吞掉、PR11 取消后副作用重复或状态悬空 |
+| 推迟后恢复的运行答非所问，检查点里没有用户的问题 | PR15 被舱壁拒绝的运行留下半截检查点 |
+| 设了宽限期，满载的 worker 收到 SIGTERM 后仍迟迟不退出 | PR16 满载的 worker 听不见停机信号、PR12 停机丢掉在途运行 |
+| 一批进程同时启动，偶尔有进程报 database is locked | PR17 多进程同时建库时切换 WAL 失败 |
+| 加进程吞吐不涨，worker 的 CPU 反而下降 | PR18 共享数据库的写锁成了天花板、PR13 按错误的信号扩缩容 |
 
 ## 延伸阅读
 
@@ -1167,4 +1263,4 @@ Agent 的失败有三个特点：
 - Martin Kleppmann：[How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)（fencing token）
 - Chris Richardson：[Pattern: Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html)
 - 第三部分（A1–A12）：Shankar 等 [Who Validates the Validators?](https://arxiv.org/abs/2404.12272)（评委校准与标准漂移）、Agrawal 等 [GEPA](https://arxiv.org/abs/2507.19457)（优化与帕累托前沿）、Chhikara 等 [Mem0](https://arxiv.org/abs/2504.19413)（记忆写入）、Postmark [Security Alert: Malicious 'postmark-mcp' npm Package](https://postmarkapp.com/blog/information-regarding-malicious-postmark-mcp-package)（rug pull）、Zhong 等 [ImpossibleBench](https://arxiv.org/abs/2510.20270)（编码 Agent 作弊）、Horvitz [Principles of Mixed-Initiative User Interfaces](https://erichorvitz.com/chi99horvitz.pdf)（什么时候该打扰）
-- 第四部分（PR1–PR13）：Temporal [Activity Definition](https://docs.temporal.io/activity-definition)（至少执行一次与幂等）、Google SRE Workbook [Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/)（燃烧率告警）、Cedar [Authorization](https://docs.cedarpolicy.com/auth/authorization.html)（求值出错的策略会被跳过）、Python [Coroutines and Tasks](https://docs.python.org/3/library/asyncio-task.html)（取消语义）、Kubernetes [Termination of Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)（优雅停机）
+- 第四部分（PR1–PR18）：Temporal [Activity Definition](https://docs.temporal.io/activity-definition)（至少执行一次与幂等）、Google SRE Workbook [Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/)（燃烧率告警）、Cedar [Authorization](https://docs.cedarpolicy.com/auth/authorization.html)（求值出错的策略会被跳过）、Python [Coroutines and Tasks](https://docs.python.org/3/library/asyncio-task.html)（取消语义）、Kubernetes [Termination of Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)（优雅停机）

@@ -2,7 +2,7 @@
 
 # Lesson 08: Reliability engineering — keeping agents alive through failure
 
-> 🕐 Suggested time: 20 minutes | 🎯 After this lesson you can: take the six failures enterprises hit most often — rate limits, outages, runaway loops, crashes, duplicate side effects, and approvals that take hours — weigh 2–4 solutions for each, and pick the right one | 📦 Source code: `agentkit/reliability.py`, `agentkit/budget.py`, `agentkit/state.py`, `agentkit/tools.py` (idempotency), `agentkit/agent.py` (recovery), `agentkit/distributed/sqlite.py` (cross-process circuit breaker and idempotency store)
+> 🕐 Suggested time: 30 minutes | 🎯 After this lesson you can: take the six failures enterprises hit most often — rate limits, outages, runaway loops, crashes, duplicate side effects, and approvals that take hours — weigh 2–4 solutions for each, and pick the right one | 📦 Source code: `agentkit/reliability.py`, `agentkit/budget.py`, `agentkit/state.py`, `agentkit/tools.py` (idempotency), `agentkit/agent.py` (recovery), `agentkit/distributed/sqlite.py` (cross-process circuit breaker and idempotency store)
 >
 > 📖 Primary reading: [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) (Mike Ulrich, 2016) — Chapter 22 of Google's SRE book explains how failures amplify along a call chain, and the "retries multiply across layers" example in Problem 1 of this lesson comes from it; focus on the "Retries" and "Latency and Deadlines" sections to see why retries need a budget and deadlines need to propagate down the chain.
 

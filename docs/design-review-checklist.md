@@ -5,7 +5,7 @@
 > 📖 本文是"领域参考手册"的一部分，配合课程使用。
 > 相关文档：[失败模式图鉴](failure-modes.md) · [速查表](cheatsheet.md) · [面试题](interview-questions.md) · [术语表](glossary.md)
 
-这是一份可以直接复制到 PR 描述、设计文档或评审会议纪要里的清单，共 **20 个分组、224 项**（其中 P0 68 项）。每一项都附了"为什么要查"，并尽量链接到对应的失败模式（如 [T5](failure-modes.md#t5-重复副作用duplicate-side-effects)）和课程。
+这是一份可以直接复制到 PR 描述、设计文档或评审会议纪要里的清单，共 **20 个分组、232 项**（其中 P0 69 项）。每一项都附了"为什么要查"，并尽量链接到对应的失败模式（如 [T5](failure-modes.md#t5-重复副作用duplicate-side-effects)）和课程。
 
 ## 怎么用
 
@@ -31,7 +31,7 @@
 |---|---|---|---|---|
 | 1 | 需求与范围 | 9 | 4 | [第 00 课](../lessons/00_overview/README.md) · [第 06 课](../lessons/06_orchestration/README.md) |
 | 2 | 模型与提示词 | 9 | 3 | [第 02 课](../lessons/02_agent_loop/README.md) · [第 11 课](../lessons/11_evals/README.md) |
-| 3 | 工具 | 13 | 6 | [第 03 课](../lessons/03_tools/README.md) |
+| 3 | 工具 | 14 | 6 | [第 03 课](../lessons/03_tools/README.md) |
 | 4 | 上下文与记忆 | 9 | 4 | [第 04 课](../lessons/04_context_memory/README.md) |
 | 5 | 编排 | 8 | 3 | [第 06 课](../lessons/06_orchestration/README.md) |
 | 6 | 可靠性 | 10 | 3 | [第 08 课](../lessons/08_reliability/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
@@ -39,17 +39,17 @@
 | 8 | 隐私与合规 | 9 | 3 | [第 09 课](../lessons/09_security/README.md) · [第 12 课](../lessons/12_production_architecture/README.md) |
 | 9 | 权限与审批 | 8 | 4 | [第 09 课](../lessons/09_security/README.md) |
 | 10 | 可观测性 | 9 | 2 | [第 10 课](../lessons/10_observability/README.md) |
-| 11 | 评估 | 10 | 2 | [第 11 课](../lessons/11_evals/README.md) |
+| 11 | 评估 | 11 | 3 | [第 11 课](../lessons/11_evals/README.md) |
 | 12 | 成本 | 10 | 2 | [第 08 课](../lessons/08_reliability/README.md) · [第 14 课](../lessons/14_cost_latency/README.md) |
 | 13 | 部署与运维 | 13 | 2 | [第 12 课](../lessons/12_production_architecture/README.md) · [第 16 课](../lessons/16_release_ops/README.md) |
 | 14 | 多租户 | 7 | 2 | [第 12 课](../lessons/12_production_architecture/README.md) · [第 15 课](../lessons/15_enterprise_rag/README.md) |
 | 15 | 文档与交接 | 7 | 1 | [第 12 课](../lessons/12_production_architecture/README.md) |
-| 16 | 分布式与高并发 | 12 | 4 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 16 | 分布式与高并发 | 14 | 4 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 17 | 企业知识与 RAG | 9 | 2 | [第 15 课](../lessons/15_enterprise_rag/README.md) |
 | 18 | 数据、评估方法论与优化 | 16 | 3 | [第 21 课](../lessons/21_agent_data/README.md) · [第 22 课](../lessons/22_eval_methodology/README.md) · [第 23 课](../lessons/23_optimization/README.md) |
 | 19 | 扩展能力（检索 / 记忆 / MCP / 代码执行 / 编码 Agent / 主动式） | 20 | 6 | [第 17 课](../lessons/17_retrieval_quality/README.md) · [第 18 课](../lessons/18_memory_systems/README.md) · [第 19 课](../lessons/19_mcp_and_sandbox/README.md) · [第 20 课](../lessons/20_frameworks_bridge/README.md) · [第 24 课](../lessons/24_coding_agents/README.md) · [第 25 课](../lessons/25_proactive_and_frontier/README.md) |
-| 20 | 生产落地（状态与队列 / 持久化工作流 / 可观测性 / 网关与策略 / 异步运行时 / 部署与扩缩容） | 25 | 6 | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) · [第 28 课](../lessons/28_production_observability/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
-| | **合计** | **224** | **68** | |
+| 20 | 生产落地（状态与队列 / 持久化工作流 / 可观测性 / 网关与策略 / 异步运行时 / 部署与扩缩容） | 29 | 6 | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) · [第 28 课](../lessons/28_production_observability/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| | **合计** | **232** | **69** | |
 
 ---
 
@@ -119,10 +119,12 @@
   —— 工具越多，选择越容易出错，每次请求的 token 也越多（[T2](failure-modes.md#t2-工具过载tool-overload)）。
 - [ ] 🟠 **P1** 第三方工具（含 MCP 服务器）来源经过审核、版本固定，描述变更需要重新审核。
   —— 工具描述会进入模型上下文，可能被投毒（[S6](failure-modes.md#s6-工具投毒与供应链tool-poisoning)）。
+- [ ] 🟠 **P1** 工具自己抛出的超时（下游 504、驱动的读超时）按工具错误如实报告、保留原始信息；只有框架自己的期限到了才报"执行超时"。
+  —— 否则排查的人会去调大超时，真正的下游问题被掩盖，模型收到的也是错误的观察（[T8](failure-modes.md#t8-工具自己的超时被误报为执行超时tools-own-timeout-misreported)）。
 - [ ] 🟢 **P2** 工具命名使用命名空间前缀，功能互不重叠。
   —— 降低相似工具之间的混淆（[T1](failure-modes.md#t1-工具选错wrong-tool-selection)）。
 - [ ] 🟢 **P2** 执行代码、访问文件系统或调用不可信服务的工具，在沙箱/独立进程中运行。
-  —— 线程超时无法真正终止执行；代码执行类工具是远程代码执行风险的直接入口（OWASP Agentic ASI05）。
+  —— 线程超时无法真正终止执行（agentkit 的 `isolated(tool(fn))` 超时即 kill 子进程，见 [T4](failure-modes.md#t4-慢工具与挂起hanging-tool)）；代码执行类工具是远程代码执行风险的直接入口（OWASP Agentic ASI05）。
 
 ## 4. 上下文与记忆
 
@@ -279,6 +281,8 @@
   —— 没有评估的 Agent 开发就是凭感觉改提示词。
 - [ ] 🔴 **P0** 评估接入 CI：通过率低于阈值或出现回归（以前通过、现在失败）时阻止合并/发布。
   —— 改一处坏三处是提示词工程的常态（[E4](failure-modes.md#e4-修一坏三prompt-regression)）。
+- [ ] 🔴 **P0** 模型 API / 网关故障导致失败的用例（infra_error）一律不算通过、在报告里单独列出；有 infra_error 的报告重跑，不拿来做上线决定；评估并发不超过网关配额。
+  —— "不许调用某工具"的安全用例会在 Agent 根本没跑起来时天然满足：第 11 课实测，真实结果 43% 的报告显示成了 86%（[E6](failure-modes.md#e6-基础设施错误被算成通过infrastructure-errors-counted-as-passes)）。
 - [ ] 🟠 **P1** 评估集持续从线上 bad case（差评、转人工、失败运行）回流补充。
   —— 开发者想象的问题和真实用户的问题分布不同（[E1](failure-modes.md#e1-评估集脱节evalproduction-skew)）。
 - [ ] 🟠 **P1** 同时评估最终结果和执行轨迹（必须调用 / 禁止调用的工具、调用顺序）。
@@ -404,10 +408,14 @@
   —— 防止缓存过期瞬间的请求风暴（[D8](failure-modes.md#d8-缓存未命中风暴cache-stampede)）。
 - [ ] 🟠 **P1** 根据任务时长选择交付方式（同步 / SSE 流式 / 异步队列 + 通知 / 工作流引擎），各层超时一致。
   —— 前端超时了后台还在跑，是浪费也是隐患（[P4](failure-modes.md#p4-长尾延迟爆炸tail-latency-blowup)）。
+- [ ] 🟠 **P1** 经队列执行的任务，payload 带齐运行需要的全部输入（对话历史、可信的身份、traceparent），客户端带来的历史先清洗再入队；端到端的多轮测试走真实的队列和 worker 进程。
+  —— 同步调用里自动带着走的上下文，过队列时要显式传递；漏了不会报错，只会"失忆"（[D12](failure-modes.md#d12-走队列后对话失忆conversation-history-dropped-at-the-queue)、[PR6](failure-modes.md#pr6-trace-在队列处断开trace-broken-at-the-queue)）。
+- [ ] 🟠 **P1** 用 SQLite（`agentkit.distributed`）做队列和共享状态时，设计文档写明它的边界：只能一台机器（WAL 不支持网络文件系统）、同一时刻一个写者、多个进程同时新建库时要有重试或先由一个进程建库；并写明换到 Postgres（`agentkit.contrib.postgres`，接口相同）的触发条件和迁移路径。
+  —— 单写者的吞吐上限和"只能一台机器"都是硬限制，撞上了再迁移就晚了（[PR17](failure-modes.md#pr17-多进程同时建库时切换-wal-失败concurrent-wal-switch-race)、[PR18](failure-modes.md#pr18-共享数据库的写锁成了天花板shared-write-lock-becomes-the-ceiling)）。
 - [ ] 🟢 **P2** 跨多个服务的长流程使用 Saga 补偿或工作流引擎，而不是让模型协调。
   —— 模型不会可靠地回滚（[T7](failure-modes.md#t7-部分完成partial-completion)）。
 - [ ] 🟢 **P2** 压测和故障演练覆盖：同一会话并发消息、worker 在执行中被杀、队列积压、模型服务商限流。
-  —— 这些场景在单机开发环境中永远不会出现。
+  —— 这些场景在单进程的开发环境里永远不会出现；`agentkit.distributed.WorkerPool` 能在一台机器上用真实进程演练其中大部分（第 13 课）。
 
 ## 17. 企业知识与 RAG
 
@@ -526,7 +534,7 @@
   —— 第 26 课实测：8 个连接同时执行 `CREATE TABLE IF NOT EXISTS`，7 个报 `UniqueViolation`；等模型时占着连接，并发就被卡成了连接数。
 - [ ] 🟢 **P2** 队列表单独调低 autovacuum 阈值，已完成的任务定期归档（去重窗口 = 保留时长）；监控最老的可执行任务等了多久、过期租约数和 fence 拒绝次数；Redis 只放丢了能重建的东西。
   —— 队列表是典型的高频更新表，会膨胀；Redis 主从切换时可能丢掉最近约 1 秒的写入。
-- [ ] 🟠 **P1** 引入 Temporal 之前书面论证：单次任务经常超过 30 分钟、要等人、有定时动作、失败要人工善后、有人运维，至少满足两条；否则用 AsyncAgent + Postgres 检查点 + 租约队列。
+- [ ] 🟠 **P1** 引入 Temporal 之前书面论证：单次任务经常超过 30 分钟、要等人、有定时动作、失败要人工善后、有人运维，至少满足两条；否则用 `Agent` + Postgres 检查点 + 租约队列。
   —— 持久化执行的好处在任务长、要等人时才显现，它的成本却从第一天就开始付。
 - [ ] 🟠 **P1** 用 Temporal 时，每个 activity 都设了 `maximum_attempts`（默认不限）、start-to-close 超时和心跳超时；写工具按风险定重试次数，不幂等的写只试一次；客户端重试关闭。
   —— activity 是至少执行一次的，而且它的重试会和客户端重试相乘（[PR3](failure-modes.md#pr3-重试层层叠加stacked-retries)）。
@@ -554,14 +562,22 @@
   —— 一个阻塞调用，会让同一进程里所有会话和心跳一起停住（[PR10](failure-modes.md#pr10-同步调用卡住事件循环event-loop-blocked-by-sync-calls)）。
 - [ ] 🔴 **P0** 取消语义经过验证：`CancelledError` 收尾后重新抛出；客户端断开后检查点记为 `cancelled`、在途模型调用归零；被打断的写调用保持未回答，恢复时用同一个 `call_id` 重放。
   —— 被取消的写操作，结果是未知的；给它补上"未执行"会让幂等键改变，副作用发生两次（[PR11](failure-modes.md#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done)、[T5](failure-modes.md#t5-重复副作用duplicate-side-effects)）。
+- [ ] 🟠 **P1** 被吞掉的取消有指标和告警：按 `agentkit_event="swallowed_cancellation"` 字段计数，不为 0 就告警；生产用 Python 3.12+；代码里没有 `except BaseException` 或裸 `except:`，超时用取消安全的 `agentkit.wait_for`。
+  —— 标准库（3.11 及更早的 `wait_for`）、redis-py、psycopg_pool 都可能吞掉取消，用户断开后运行照样跑完、照样建单（[PR14](failure-modes.md#pr14-取消被吞掉swallowed-cancellation)）。
 - [ ] 🟠 **P1** 时限从内到外递增：工具超时 < 整次运行的截止时间 < 网关和代理的超时；按租户的舱壁、每个模型的并发上限和连接池上限彼此一致；共享的 Agent 和 Hook 不在实例属性上保存本次运行的数据。
   —— 外层先断开，内层还在白干；池子比并发上限小，"模型超时"其实是在自己的池子里排队；共享的实例会被几百个会话同时读写（[D1](failure-modes.md#d1-丢失更新lost-update)）。
+- [ ] 🟠 **P1** 被租户舱壁或限流拒绝的新运行不留下任何状态（没有检查点、不跑收尾钩子），任务推迟（回到队列、不消耗尝试次数）而不是记为失败；压测覆盖"大量运行先被拒绝、再重试"。
+  —— 被拒绝时存下的半截检查点里没有用户的问题，推迟后恢复，模型会答非所问（[PR15](failure-modes.md#pr15-被舱壁拒绝的运行留下半截检查点bulkhead-rejection-leaves-a-half-checkpoint)）。
 - [ ] 🔴 **P0** SIGTERM 优雅停机：就绪探针变失败、停止领取 → 在途任务在宽限期内做完 → 做不完的取消并归还队列 → 刷新追踪、关闭连接池；`terminationGracePeriodSeconds` 大于宽限期加收尾时间；有滚动发布演练的记录。
   —— 否则每次发布都会丢掉或重跑一批运行（[PR12](failure-modes.md#pr12-停机丢掉在途运行in-flight-runs-lost-on-shutdown)、[R4](failure-modes.md#r4-中断后从头重来lost-progress)）。
+- [ ] 🟠 **P1** 停机演练在 worker 满载时做：所有并发槽位都被占满、在途任务比宽限期长时，SIGTERM 之后仍在宽限期内取消并归还任务；worker 等槽位时也在等停机信号。
+  —— 只等槽位的 worker 听不见 SIGTERM：第 13 课实测宽限期 1 秒，进程 8.08 秒后才退出（[PR16](failure-modes.md#pr16-满载的-worker-听不见停机信号busy-worker-misses-the-stop-signal)）。
 - [ ] 🟠 **P1** 存活探针只检查本进程（事件循环能否应答），就绪探针检查依赖和是否正在停机；所有配置来自环境变量，启动时校验、出错即失败，同一个镜像跨环境使用。
   —— 存活探针查数据库，数据库一抖所有 Pod 会被一起重启；配置错误要是等到第一个请求才发现，就已经在生产里了。
 - [ ] 🟠 **P1** worker 按队列积压、最老任务的等待时间或在途饱和度扩缩容，副本数上限按模型配额定；上线前做压测加故障注入（`kill -9`、滚动重启、依赖不可用），逐项核对终态、无重复副作用、指标与数据库一致，尾延迟用开环压测。
   —— 按 CPU 扩缩容，对 IO 密集的 Agent 永远不会触发；闭环压测会美化尾延迟（[PR13](failure-modes.md#pr13-按错误的信号扩缩容autoscaling-on-the-wrong-signal)、[PR11](failure-modes.md#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done)）。
+- [ ] 🟠 **P1** 容量规划写明测到的是哪一个天花板（单个事件循环的 CPU、共享数据库的写锁、模型配额），以及测量用的机器和负载；加进程之前做一次 1 / 2 / 4 / 8 个进程的扩展性测试，同时记录吞吐和 worker 的 CPU 利用率。
+  —— 天花板在写锁或配额时，加进程吞吐不涨：第 13 课 4 × 64 → 8 × 64，每秒 710 个任务反而降到 662 个，worker 的 CPU 只有 12%（[PR18](failure-modes.md#pr18-共享数据库的写锁成了天花板shared-write-lock-becomes-the-ceiling)、[PR13](failure-modes.md#pr13-按错误的信号扩缩容autoscaling-on-the-wrong-signal)）。
 
 ---
 

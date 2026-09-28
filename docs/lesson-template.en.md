@@ -13,7 +13,7 @@ lessons/NN_topic/
 ├── demo.py            Runnable demo: calls a real model by default; --offline uses ScriptedLLM, no API key needed
 ├── exercise.py        Exercises (learners fill them in; each TODO raises NotImplementedError)
 ├── solution.py        Reference solution (exactly the same interface as exercise.py)
-└── test_exercise.py   Exercise tests (offline, deterministic; loaded with agentkit.testing.load_exercise)
+└── test_exercise.py   Exercise tests (offline, deterministic; plain async def test_...; loaded with agentkit.testing.load_exercise)
 ```
 
 To run: `python lessons/NN_topic/demo.py [--offline]`, `make lesson N=NN`, `make test-solutions`.
@@ -62,6 +62,7 @@ To run: `python lessons/NN_topic/demo.py [--offline]`, `make lesson N=NN`, `make
 3. **Concrete beats abstract**: use specific numbers, specific error messages, and specific scenarios.
 4. **Don't make things up**: cited papers, blog posts, and incidents must be real; if you're not sure, leave it out.
 5. **Code must run**: every command and code snippet in the docs must actually have been run.
+6. **Concurrency and multiple processes must really happen, with evidence**: the code is async (`await` wherever it waits on I/O, and nothing blocking on the event loop). If you claim concurrency, show the peak in-flight count (`max_in_flight` from `ScriptedLLM(latency=...)`); if you claim multiple processes or crash takeover, start real processes with `WorkerPool` and send real signals (kill -9 / SIGSTOP / SIGTERM). Don't pass off threads as processes, two objects in one process as two machines, or `sleep` and fake clocks as failures; state honestly what you can't show (multiple hosts, a real Redis failover, and so on) as a limitation. See [CONTRIBUTING](../CONTRIBUTING.en.md#change-the-agentkit-framework).
 
 ## The course has four parts
 
@@ -74,7 +75,7 @@ To run: `python lessons/NN_topic/demo.py [--offline]`, `make lesson N=NN`, `make
 
 Part 3 is advanced, optional material for learners who have finished the first two parts and the capstone. Each lesson keeps the README structure above, implements the core mechanisms from scratch (they can live in lesson-local modules such as `xxx_kit.py`), and compares the trade-offs between industry solutions (in the relevant section or in "Going deeper") rather than presenting just one approach.
 
-Part 4 is also advanced and optional. Each lesson opens §0 with one or two honest sentences on the teaching agentkit's limits in that area; adapters live in `agentkit/contrib/` (the async runtime in `agentkit/aio/`) and keep the teaching interfaces; demos run for real on embedded infrastructure (real Postgres via pgserver, fakeredis, the Temporal dev server) and, when optional dependencies are missing, print the install command and exit with code 0; every number in the lesson must come from a measurement, and the lesson must spell out how the embedded infrastructure differs from a production cluster.
+Part 4 is also advanced and optional. Each lesson opens §0 with one or two honest sentences on the teaching agentkit's limits in that area. The code has three layers with the same interfaces: core `agentkit` (async, one process driving many sessions at once) → `agentkit.distributed` (SQLite, real multiple processes on one machine, Lessons 12 and 13) → adapters in `agentkit/contrib/` plus the `production/` reference service (Postgres, Redis, Temporal, and so on, across machines); demos run for real on embedded infrastructure (real Postgres via pgserver, fakeredis, the Temporal dev server) and, when optional dependencies are missing, print the install command and exit with code 0; every number in the lesson must come from a measurement, and the lesson must spell out how the embedded infrastructure differs from a production cluster.
 
 ## Enterprise problem cards (the main format of every Part 2 lesson)
 

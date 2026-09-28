@@ -93,6 +93,8 @@
 | F3 | [Pattern: Saga](https://microservices.io/patterns/data/saga.html) | microservices.io（Chris Richardson） | 跨服务长事务的补偿模式，对应"新员工入职"这类多系统流程。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | F4 | [singleflight 包文档](https://pkg.go.dev/golang.org/x/sync/singleflight) | Go 项目 | 请求合并模式的经典实现，文档很短，读完就能理解如何防止缓存未命中风暴。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 14 课](../lessons/14_cost_latency/README.md) |
 | F5 | [Server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) | MDN | SSE 的权威参考，流式输出 Agent 进度的常用技术。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| F6 | [Write-Ahead Logging](https://www.sqlite.org/wal.html) | SQLite 文档 | WAL 模式下读和写可以同时进行，只有写和写互斥；文档也写明了代价：WAL 要求所有进程共享一小块内存，所以使用同一个数据库的进程必须在同一台机器上，不支持网络文件系统。第 13 课的 SQLite 队列只能单机，原因就在这里。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| F7 | [Transaction](https://www.sqlite.org/lang_transaction.html) | SQLite 文档 | DEFERRED、IMMEDIATE、EXCLUSIVE 三种事务的区别。默认的 DEFERRED 事务先读后写，如果别的连接已经改过数据库，升级成写事务时直接返回 `SQLITE_BUSY`。第 13 课实测的坑（`busy_timeout` 也救不了，要改用 `BEGIN IMMEDIATE`）在这里找得到原因。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 
 ## G. 成本与延迟
 

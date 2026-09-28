@@ -17,6 +17,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 
+from .tools import tool
+
 
 def load_sibling(anchor_file: str, name: str) -> ModuleType:
     """加载与 anchor_file 同目录的模块 name.py，模块名带上课程目录前缀，避免不同课程的同名模块互相覆盖。"""
@@ -130,4 +132,10 @@ def busy_loop(seconds: float) -> str:
 
 
 def whoami_pid() -> int:
+    return os.getpid()
+
+
+@tool(isolation="process", timeout_s=10)
+def isolated_pid() -> int:
+    """在子进程里返回自己的 pid。@tool(isolation="process") 直接装饰模块级函数的写法（回归测试用）。"""
     return os.getpid()

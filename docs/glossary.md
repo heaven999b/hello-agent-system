@@ -7,7 +7,7 @@
 
 **用法**：每条术语给出一句"大白话"解释。带 `代码字体` 的是 agentkit 中对应的类或函数，可以直接去源码里找。遇到不懂的词，`Ctrl+F` 搜中文或英文都可以。
 
-共收录 **278** 条术语（分 15 组），另附 34 组易混淆术语对比。
+共收录 **291** 条术语（分 15 组），另附 36 组易混淆术语对比。
 
 ---
 
@@ -33,6 +33,9 @@
 | 幻觉 | Hallucination | 模型流畅、自信地说出错误内容；事实要靠工具和检索，"做了什么"要看工具执行记录，不能信模型的文字。 | [第 01 课](../lessons/01_llm_essentials/README.md) |
 | 测试替身（剧本模型） | Test Double / Scripted LLM | 按预先写好的剧本返回结果的"假模型"，让 Agent 测试零成本、可复现。`ScriptedLLM` | [第 02 课](../lessons/02_agent_loop/README.md) |
 | 模型抽象层 | LLM Abstraction | 业务代码只依赖一个很小的 `chat()` 接口，而不是某家厂商的 SDK，方便换模型和叠加能力。`LLM` 协议 | [第 02 课](../lessons/02_agent_loop/README.md) |
+| 事件循环 | Event Loop | asyncio 的调度器，只有一个线程：记着每个会话在等什么，谁等的东西到了就接着跑谁。一个进程里几百个会话能同时"等模型"，靠的就是它；它只用一个 CPU 核，所以里面绝不能有阻塞调用。 | [第 02 课](../lessons/02_agent_loop/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| 协程 | Coroutine | 调用 `async def` 函数得到的"待办单"，`await` 它才真正执行；执行到要等网络的地方就暂停，把事件循环让给别人，等的东西到了再从暂停处继续。agentkit 里每个会话都是一个协程（跑在一个 asyncio Task 里）。 | [第 02 课](../lessons/02_agent_loop/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| 阻塞调用 | Blocking Call | 在 `async def` 里直接调用会占住线程的函数：`time.sleep`、`requests.get`、同步数据库驱动。它不报错，只是让整个事件循环停下来，同一进程里所有会话和心跳一起卡住。第 02 课实测：10 个会话的工具在 `async def` 里用 `time.sleep(0.2)`，总耗时从 0.61 秒变成 2.48 秒。换成 async 客户端，或者交给线程池（普通 `def` 工具由 agentkit 自动放进线程池）。 | [第 02 课](../lessons/02_agent_loop/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
 
 ## 二、工具
 
@@ -214,9 +217,9 @@
 | 可见性超时 | Visibility Timeout | 消息被某个消费者取走后，在这段时间内对其他消费者不可见；超时仍未确认就会被重新投递。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
 | 死信队列 | DLQ (Dead Letter Queue) | 多次处理失败的消息被移到这里，等待人工排查，而不是无限重试拖垮系统。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 毒消息 | Poison Message | 无论重试多少次都会处理失败的消息（如格式错误），不隔离就会反复消耗资源。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
-| 租约 | Lease | 带过期时间的"占有权"：worker 在租约有效期内独占一个任务，过期不续就会被别人接手。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
-| 心跳 | Heartbeat | worker 定期发送"我还活着"的信号，用来续约或让系统判断它是否失联。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) |
-| 防护令牌 | Fencing Token | 每次授予锁/租约时发放的单调递增编号，写入时携带；存储端拒绝旧编号的写入，从而挡住"以为自己还持有锁"的僵尸 worker。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 租约 | Lease | 带过期时间的"占有权"：worker 在租约有效期内独占一个任务，过期不续就会被别人接手。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| 心跳 | Heartbeat | worker 定期发送"我还活着"的信号，用来续约或让系统判断它是否失联。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
+| 防护令牌 | Fencing Token | 每次授予锁/租约时发放的单调递增编号，写入时携带；存储端拒绝旧编号的写入，从而挡住"以为自己还持有锁"的僵尸 worker。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
 | 丢失更新 | Lost Update | 两个进程同时"读-改-写"同一份数据，后写的覆盖了先写的，先写的修改就丢了。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 分布式锁 | Distributed Lock | 跨多台机器的互斥锁；实现正确并不容易，需要配合租约和防护令牌。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
 | 乐观锁 / 比较并交换 | Optimistic Locking / CAS (Compare-And-Swap) | 不加锁，写入时检查版本号是否还是自己读到的那个，不是就重读重试；冲突少时比加锁高效。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
@@ -227,6 +230,15 @@
 | 事务性发件箱 | Transactional Outbox | 把"要发的事件"和业务数据写在同一个数据库事务里，再由独立进程发布，避免"库写了、消息没发"的不一致。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 请求合并 | Singleflight / Request Coalescing | 同一个键的多个并发请求只放行一个去真正执行，其余等待并共享结果；防止缓存过期瞬间的请求风暴。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 全局限流 | Global Rate Limiting | 在所有实例之间共享的限流（如集中式令牌桶），而不是每台机器各限各的。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 在途峰值 | Peak In-Flight | 同一时刻真正在进行中的调用（或任务）数的最大值。证明"并发真的发生了"要看它，不能只看耗时：`ScriptedLLM.max_in_flight`、`run_worker` 返回的 `max_in_flight`。第 02 课：一个接一个时永远是 1，`gather` 10 个会话时是 10，加上 `Semaphore(3)` 就封顶在 3。 | [第 02 课](../lessons/02_agent_loop/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| 僵尸 worker（SIGSTOP 僵尸） | Zombie Worker (SIGSTOP Zombie) | 以为自己还持有任务、其实租约早已过期的 worker：GC 停顿、虚拟机暂停、网络分区之后醒来，接着往下写。第 13 课用真实的 SIGSTOP 冻结一个 worker 进程，租约过期、别人接手之后再用 SIGCONT 唤醒它：它的续租和检查点写入都被 fence 拒绝（`CheckpointConflict`）。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 网络分区 | Network Partition | 进程活着，但和数据库（或别的节点）之间的网络断了：心跳发不出去，租约过期后任务被别人接手，网络恢复后它迟到的写入要被 fence 挡住。第 26 课用 `TcpProxy` 在 worker 和 Postgres 之间真实地断网；局限是它会立刻重置连接，真实的分区更常见的是包被悄悄丢掉、连接挂着不动。 | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 单写者（SQLite） | Single Writer (SQLite) | SQLite 同一时刻只允许一个写事务，所有进程排队等同一把写锁。第 13 课在一台 M1 上测到的上限约为每秒一万次小写事务，再加进程吞吐也不涨。要跨机器、要写得更多，换成多写者的 Postgres（第 26 课）；但先试试少写几次检查点。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 12 课](../lessons/12_production_architecture/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| 预写日志 | WAL (Write-Ahead Log) | SQLite 的一种日志模式：读和写可以同时进行，只有写和写互斥（默认的回滚日志模式下，提交时会挡住所有读者）。它要求所有进程共享同一块内存映射，不支持网络文件系统，所以 SQLite 方案只能在一台机器上。`SQLiteDB` 连接时自动打开它。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| busy_timeout / BEGIN IMMEDIATE | busy_timeout / BEGIN IMMEDIATE | SQLite 多进程写入的两个必备设置。`busy_timeout`：别人正在写时排队等，而不是立刻报 `database is locked`；`BEGIN IMMEDIATE`：事务一开始就拿写锁，"读 → 判断 → 写"整个过程是原子的。默认的 `BEGIN`（DEFERRED）先读后写，升级成写事务时会直接失败，`busy_timeout` 也救不了（第 13 课实测）。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) |
+| 真进程故障注入 | Real-Process Fault Injection | 用真实的操作系统进程和信号验证崩溃接手：`kill -9`（当场死亡）、SIGSTOP / SIGCONT（冻结再唤醒，制造僵尸）、SIGTERM（优雅停机）。不用线程冒充进程，也不用 `sleep` 或假时钟冒充故障。`WorkerPool` 在本机拉起 N 个 `python -m agentkit.distributed.worker` 进程，提供 `kill / pause / resume / terminate / restart`。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 12 课](../lessons/12_production_architecture/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| 跨进程配额 / 共享名额 | Cross-process Quota / Shared Slots | 所有进程加起来的并发上限。每个进程各设一个 `asyncio.Semaphore(4)`，3 个进程就是 12 个（第 30 课场景 5b 实测），所以名额必须放在共享存储里：单机用 `SQLiteSemaphore`（每个名额是带租约的一行，持有者被 kill -9 后租约到期自动归还），多机用 Redis 或网关限额。 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 12 课](../lessons/12_production_architecture/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| 天花板 | Capacity Ceiling | 此刻限制吞吐的那个瓶颈。它会移动：线程数 → 事件循环的 CPU（一个进程只用一个核）→ 共享数据库的写锁 → 模型配额。先测出它在哪，再决定加什么：CPU 到顶就加进程，写锁到顶就少写或换数据库，配额到顶就去谈配额。 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 
 ## 十一、成本与延迟优化
 
@@ -332,7 +344,7 @@
 
 ## 十五、第四部分：生产落地
 
-> 本组对应第 26–31 课：把教学实现换成 Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar、asyncio 这些成熟组件，再部署成多进程、多实例的服务时会遇到的术语。租约、心跳、防护令牌、乐观锁（CAS）、背压、持久化执行、工作流引擎、可见性超时、毒消息、模型网关、护栏、采样、SLO 等术语在前面各组已经收录，并补上了第四部分的课程链接，这里不再重复。
+> 本组对应第 26–31 课：把教学实现换成 Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar、asyncio 这些成熟组件，再部署成多进程、多实例的服务时会遇到的术语。租约、心跳、防护令牌、乐观锁（CAS）、背压、持久化执行、工作流引擎、可见性超时、毒消息、模型网关、护栏、采样、SLO 等术语在前面各组已经收录，并补上了第四部分的课程链接，这里不再重复。事件循环、协程、阻塞调用在第一组；在途峰值、僵尸 worker、网络分区、单写者、跨进程配额、天花板这些多进程术语在第十组，因为第 02、12、13 课就已经用真实的进程讲过它们。
 
 | 中文 | English | 大白话解释 | 课程 |
 |---|---|---|---|
@@ -362,10 +374,11 @@
 | 利特尔法则 | Little's Law | L = λ × W：系统里同时在处理的请求数，等于到达速率乘以平均停留时间。每秒 50 个请求、每个 8 秒，就要能同时"等着" 400 个会话；做容量规划时 W 要按 p95 取，不能按平均值。 | [第 30 课](../lessons/30_async_runtime/README.md) |
 | 舱壁 | Bulkhead | 像船舱之间的隔板：按租户限制同时在跑的运行数，再加一个全局上限，一个租户把自己的名额用满了，别的租户照样有位置。代价是它不"按需分配"：吵闹租户用不上别人空着的名额。`KeyedLimiter` | [第 30 课](../lessons/30_async_runtime/README.md) |
 | 结构化并发 | Structured Concurrency | 子任务不能比创建它的作用域活得更久：作用域退出前要等所有子任务结束，一个出错就取消其余的并等它们收好尾（Trio 的 nursery、asyncio 的 `TaskGroup`）。随手 `create_task` 就像 goto：出错没人知道，取消了也没人等它收尾。 | [第 30 课](../lessons/30_async_runtime/README.md) |
-| 取消传播 | Cancellation Propagation | 调用方的取消（客户端断开、超时、停机）一路传到正在进行的模型调用和工具，让它们真正停下、不再花钱。`CancelledError` 收完尾必须重新抛出；在 AnyIO 这类"电平触发"取消的框架里，收尾时的 `await` 要用 shield 保护。 | [第 30 课](../lessons/30_async_runtime/README.md) |
-| 硬超时 / 进程隔离 | Hard Timeout / Process Isolation | Python 的线程杀不掉，协程只能在 `await` 处取消，一个没有 `await` 的死循环只能靠杀进程停下来：`isolated(tool)` 让工具在子进程里跑，超时就 kill。它不是沙箱，不可信代码仍然要放进容器或 microVM。 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 19 课](../lessons/19_mcp_and_sandbox/README.md) |
+| 取消传播 | Cancellation Propagation | 调用方的取消（客户端断开、超时、停机）一路传到正在进行的模型调用和工具，让它们真正停下、不再花钱。`CancelledError` 收完尾必须重新抛出；在 AnyIO 这类"电平触发"取消的框架里，收尾时的 `await` 要用 shield 保护。 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 02 课](../lessons/02_agent_loop/README.md) |
+| 取消被吞掉 | Swallowed Cancellation | 取消发出了，却被某一层"消化"掉，运行照常往下走、照常花钱、照常产生副作用。三个来源：自己的代码（`except BaseException`，或者 `suppress(CancelledError)` 之后不重新抛出）；标准库（Python 3.11 及更早版本的 `asyncio.wait_for`，结果和取消在同一轮事件循环里到达时吞掉取消，第 30 课修复前 240 次里丢了 89 次）；依赖库（redis-py、psycopg_pool 内部用了 `wait_for`，第 31 课压测时约 1% 的断开没有停下，工单照样建了）。agentkit 用取消安全的 `wait_for`，并在调用模型、执行工具之前补抛被吞掉的取消。 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 02 课](../lessons/02_agent_loop/README.md) |
+| 硬超时 / 进程隔离 | Hard Timeout / Process Isolation | Python 的线程杀不掉，协程只能在 `await` 处取消，一个没有 `await` 的死循环只能靠杀进程停下来：`isolated(tool(fn))` 让工具在子进程里跑，超时就 kill（`fn` 必须是模块级的普通函数，子进程要按模块名找到它）。它不是沙箱，不可信代码仍然要放进容器或 microVM。 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 19 课](../lessons/19_mcp_and_sandbox/README.md) |
 | 存活探针 / 就绪探针 | Liveness / Readiness Probe | Kubernetes 的两种健康检查：存活探针失败会重启容器，所以只该检查"本进程还能应答"；就绪探针失败只把 Pod 从流量里摘掉、不重启，用来检查依赖是否可用、是否正在停机。第 31 课的参考服务不在存活探针里查数据库：否则数据库一抖，所有 Pod 会被一起重启。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
-| 优雅停机 | Graceful Shutdown | 收到 SIGTERM 之后：就绪探针变失败、不再接新请求和领取新任务 → 在途任务在宽限期内做完 → 做不完的取消、把任务归还给队列 → 刷新追踪、关闭连接池后退出。全部要在 `terminationGracePeriodSeconds`（默认 30 秒，preStop 的耗时也算在内）之内完成。`stop_on_signals` | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 优雅停机 / 排空 | Graceful Shutdown / Drain | 收到 SIGTERM 之后：就绪探针变失败、不再接新请求和领取新任务 → 在途任务在宽限期内做完（排空）→ 做不完的取消，归还给队列或者等租约过期后由别人接手 → 刷新追踪、关闭连接池后退出。全部要在 `terminationGracePeriodSeconds`（默认 30 秒，preStop 的耗时也算在内）之内完成。第 13 课用真实的 SIGTERM 验证过：worker 做完在途任务才退出，退出码 0。`stop_on_signals`、`run_worker(grace_period=25)` | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) |
 | 按队列积压扩缩容 | Queue-depth Autoscaling | 按"队列里有多少任务、最老的一个等了多久"加减 worker，而不是按 CPU：Agent worker 大部分时间在等模型，CPU 几乎不动。KEDA 的 `postgresql` scaler 可以直接拿一条 SQL 的结果做依据；副本数上限要按模型配额来定。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
 | 协调遗漏 | Coordinated Omission | 闭环压测（每个虚拟用户等上一个请求返回才发下一个）在系统变慢时自己也发得慢了，最慢的那段延迟于是被漏掉，延迟分布被美化。要测"固定到达率下的尾延迟"，用开环压测，例如 k6 的 arrival-rate 执行器或 wrk2。 | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
 
@@ -407,5 +420,7 @@
 | Signal vs Update | 发出去就算，发送方不知道 workflow 接没接受 vs 等 workflow 处理完并返回结果，可以用验证器在写进历史之前拒绝。 |
 | 头部采样 vs 尾部采样 | 请求开始时就决定，省 SDK 开销，但会按比例丢掉错误 trace vs 整条 trace 到齐后再决定，错误和慢请求全留，要内存，还要按 trace ID 路由到同一个 Collector。 |
 | 舱壁 vs 限流 | 限制同时在跑的数量（并发） vs 限制单位时间内的次数（速率）。 |
+| 进程内上限 vs 跨进程配额 | 每个进程各管各的（`asyncio.Semaphore`、`KeyedLimiter`、`ResilientLLM(max_concurrency=…)`），N 个进程就是 N 倍 vs 名额放在共享存储里（`SQLiteSemaphore`、Redis、网关），所有进程加起来不超过上限。 |
+| kill -9 vs SIGSTOP vs SIGTERM | 进程当场死亡，租约到期后由别人从检查点接手 vs 进程被冻结、自己毫不知情，醒来后的写入被 fence 拒绝 vs 请求优雅停机：停止领取、做完在途任务再退出。 |
 | 存活探针 vs 就绪探针 | 失败就重启容器，只看本进程 vs 失败就摘掉流量、不重启，可以检查依赖。 |
 | 失败即关闭 vs 失败即放行 | 组件故障时一律拒绝，保安全 vs 组件故障时一律放行，保可用；授权和审批选前者，检测层可以选后者，但要记录和告警。 |

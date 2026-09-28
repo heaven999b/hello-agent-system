@@ -7,7 +7,7 @@
 
 ## 怎么用这份题库
 
-- **共 88 道题**：概念题 15 道、场景题 12 道、故障排查题 11 道、分布式/高并发/成本/发布专题 16 道、系统设计短题 7 道、进阶专题（课程第三部分）15 道、生产落地专题（课程第四部分）12 道，外加 **3 道完整系统设计题的作答示范**（第八部分，另计）。
+- **共 91 道题**：概念题 15 道、场景题 12 道、故障排查题 11 道、分布式/高并发/成本/发布专题 16 道、系统设计短题 7 道、进阶专题（课程第三部分）15 道、生产落地专题（课程第四部分）15 道，外加 **3 道完整系统设计题的作答示范**（第八部分，另计）。
 - 难度：⭐ 基础（学完对应课程应能回答）、⭐⭐ 进阶（需要综合多课内容）、⭐⭐⭐ 高级（需要生产经验或深入思考）。
 - **先自己作答，再展开答案要点**。答案给的是"要点"，面试时要用自己的话串起来，最好能结合具体数字和亲身经历。
 - 面试官视角的评分标准：能说出"是什么"是及格；能说出"为什么、不这样会怎样"是良好；能说出"权衡、边界情况、怎么验证"是优秀。
@@ -1227,15 +1227,15 @@
 
 </details>
 
-### P3. 什么时候该引入 Temporal？什么时候 AsyncAgent + Postgres 检查点 + 租约队列就够了？ ⭐⭐
+### P3. 什么时候该引入 Temporal？什么时候 Agent + Postgres 检查点 + 租约队列就够了？ ⭐⭐
 
 <details>
 <summary>答案要点</summary>
 
 - **区别在"谁来保证"**：检查点方案里，发现崩溃、触发恢复、两个进程同时恢复时的互斥、审批计时，都是你写的代码（租约、心跳、fence、扫描器）；Temporal 由服务端记事件历史、按超时判定失败、把任务派给活着的 worker、用持久化定时器计时。
-- **代价从第一天就开始付**：多运维一套服务（或买 Temporal Cloud）、接受确定性约束、每一步多几次网络往返。第 27 课实测，光 Temporal 本身每个 workflow 约 50 毫秒开销。
+- **代价从第一天就开始付**：多运维一套服务（或买 Temporal Cloud）、接受确定性约束、每一步多几次网络往返。第 27 课 Demo 场景 6 实测，光 Temporal 本身每个 workflow 就有几十毫秒的开销。
 - **经验法则**（第 27 课）：单次任务经常超过 30 分钟、要等人、有定时动作、一次失败要人工善后、有人运维或有预算买云服务，满足任意两条再考虑。
-- **迁移成本可以很低**：第 27 课的 `execute_tool` 直接用 `AsyncToolExecutor` 执行工具，和 `AsyncAgent` 是同一套执行语义，从检查点方案迁到 Temporal，工具代码一行不改。
+- **迁移成本可以很低**：第 27 课的 `execute_tool` 直接用 `agentkit.tools.ToolExecutor` 执行工具，和 `Agent` 是同一套执行语义，从检查点方案迁到 Temporal，工具代码一行不改。
 - 课程：[第 27 课](../lessons/27_durable_workflows/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 30 课](../lessons/30_async_runtime/README.md)
 
 </details>
@@ -1326,8 +1326,8 @@
 - **链路**：TCP 断开 → ASGI 服务器报告 `http.disconnect` → Starlette 取消响应任务 → 流式生成器的 `finally` 取消运行任务 → `CancelledError` 抛进正在 await 的模型调用，HTTP 请求被中止、连接归还连接池。前提是模型客户端本身是异步的：同步客户端放在线程里，取消只能"不再等它"，请求照样在后台跑完、照样计费。
 - **收尾要做对**：`CancelledError` 收完尾必须重新抛出；检查点记为 `cancelled`；在 AnyIO 这类电平触发取消的框架里，收尾时的 `await` 会被再次取消，要用 shield 保护；异步检查点的每一次保存都要受保护，否则"数据库已提交、客户端没收到回复"的那次保存会让本地版本号过期，收尾保存被 CAS 拒绝。
 - **被取消的写操作，结果是未知**：写 / 高危工具的调用保持未回答，只读工具补"未执行"；`resume` 用同一个 `call_id` 重放，幂等键 `run_id:call_id` 不变，由下游去重。给写调用补"未执行"，恢复后模型会发起新的 `call_id`，副作用就会发生两次。
-- **怎么证明**：看检查点状态、在途模型调用数是否归零、下游记录数；在一次运行的多个时刻各取消一次，把结果分成"停住了""卡在 running""根本没停"三类。还要知道 Python 3.11 及更早的 `asyncio.wait_for` 可能吞掉取消（`agentkit.aio.wait_for` 在 3.11+ 用 `asyncio.timeout()`、在 3.10 用 `asyncio.wait` 规避）。
-- 课程：[第 30 课](../lessons/30_async_runtime/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · 失败模式 [PR11](failure-modes.md#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done)、[T5](failure-modes.md#t5-重复副作用duplicate-side-effects)
+- **怎么证明**：看检查点状态、在途模型调用数是否归零、下游记录数；在一次运行的多个时刻各取消一次，把结果分成"停住了""卡在 running""根本没停"三类。还要知道 Python 3.11 及更早的 `asyncio.wait_for` 可能吞掉取消（`agentkit.wait_for` 在 3.11+ 用 `asyncio.timeout()`、在 3.10 用 `asyncio.wait` 规避；依赖库里的 `wait_for` 管不到，由运行时在步骤边界补抛，见 P15）。
+- 课程：[第 30 课](../lessons/30_async_runtime/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · 失败模式 [PR11](failure-modes.md#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done)、[PR14](failure-modes.md#pr14-取消被吞掉swallowed-cancellation)、[T5](failure-modes.md#t5-重复副作用duplicate-side-effects)
 
 </details>
 
@@ -1337,7 +1337,7 @@
 <summary>答案要点</summary>
 
 - **利特尔法则**：L = 50 × 8 = 400 个同时在等的会话；做容量规划时 W 要按 p95 取，不能按平均值。
-- **并发模型**：每个 CPU 核一个进程，每个进程一个事件循环（一个 `AsyncAgent` 实例被所有会话复用，本次运行的状态都在 `RunState` 里）；同步老代码进有上限的线程池；超过一两分钟的任务改走队列加 worker。
+- **并发模型**：每个 CPU 核一个进程，每个进程一个事件循环（一个 `Agent` 实例被所有会话复用，本次运行的状态都在 `RunState` 里）；同步老代码进有上限的线程池；超过一两分钟的任务改走队列加 worker。
 - **各层上限要对齐**：每个模型的并发上限 ≤ HTTP 连接池上限；数据库连接池按"同时正在用连接的协程数"估算，所有进程加起来不超过 `max_connections`；异步 worker 先拿名额再领取（背压）。
 - **限流分三层**：网关管合同和钱，Redis 管跨实例的租户配额，进程内的舱壁（`KeyedLimiter`）管"本进程别被压垮"，排不上就快速返回 429。时限从内到外递增：工具超时 < `run_timeout` < 网关和代理的超时。
 - **扩缩容**：按队列积压、最老任务的等待时间或在途饱和度扩缩 worker（KEDA 的 `postgresql` scaler，或 HPA 的外部指标），不按 CPU；副本数上限按模型配额来定。
@@ -1355,6 +1355,48 @@
 - **健康检查**：存活探针只检查本进程（事件循环能否应答），不查数据库，否则数据库一抖，所有 Pod 会被一起重启；就绪探针检查依赖是否可用、是否正在停机。
 - **怎么证明**：压测时注入故障（执行中 `kill -9`、先起新的再给旧的发 SIGTERM 的滚动重启、两个审批人同时点批准、流式中途断开），结束后逐项核对：所有运行都到达可解释的状态、每个写调用恰好对应一条下游记录、断开的运行记为 `cancelled`、指标和数据库里的数量一致。测尾延迟要用开环压测：闭环压测有协调遗漏，会美化延迟分布。
 - 课程：[第 31 课](../lessons/31_deployment_and_scaling/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) · 失败模式 [PR12](failure-modes.md#pr12-停机丢掉在途运行in-flight-runs-lost-on-shutdown)、[PR1](failure-modes.md#pr1-贪心领取over-claiming-worker)
+
+</details>
+
+### P13. 一个进程能扛多少并发？加进程什么时候有用、什么时候没用？ ⭐⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **先用利特尔法则算"要同时等多少个"**：L = λ × W。Agent 的 W 几乎全是等模型，一个 async 进程就能同时等几百上千个会话。第 30 课场景 1a：同一批 200 个会话，一个接一个 80.73 秒，16 个线程 5.27 秒，`asyncio.gather` 0.43 秒（每秒 467 个），吞吐只取决于同时在飞的数量；2000 个会话 0.60 秒，框架本身每个会话约 0.18 毫秒 CPU。
+- **天花板会移动，通常依次是**：① 单个事件循环的 CPU（一个进程只用一个核）；② 所有进程共用的数据库写锁；③ 模型配额。第 30 课场景 1c（真实的 worker 进程，每个任务的 Hook 约 1 毫秒 CPU）：1 / 2 / 4 个进程分别是每秒 348 / 621 / 846 个任务，CPU 利用率 93% / 85% / 58%，这时加进程有用；同样 4 个进程，检查点换成共享的 SQLite，降到 384 个、CPU 33%，写锁到顶；4 个进程共用 8 个模型名额，38 个（理论 40），加多少进程都一样。第 13 课 3.12 节从队列的角度测过同一件事：4 × 64 是每秒 710 个，8 × 64 反而是 662 个，worker 的 CPU 只有 12%。
+- **怎么判断卡在哪一层**：同时看"吞吐 vs 等待上限"和 worker 的 CPU 利用率。吞吐远低于等待上限、CPU 接近 100%：事件循环的 CPU 到顶，加进程，或者减少每个会话的 CPU（Hook、序列化）；加进程吞吐不涨、CPU 反而下降：在排队等共享资源（写锁、连接池），减少每个任务的写入次数或换多写者的数据库；大部分时间在等令牌或名额：模型配额，去谈配额，加 Pod 没用。worker 名额本身不够时加 worker 也有用：第 31 课 1 个 worker × 并发 4 时每秒 3.32 段、建单任务排队 p50 7.07 秒，3 × 4 时每秒 8.79 段、排队 p50 0.94 秒。
+- **加进程的其他理由和吞吐无关**：故障隔离（一个进程崩溃不该带走所有会话）、滚动发布时有别的进程接手、最终要跨机器。
+- **加分点**：单个事件循环到顶之前，心跳和事件循环延迟会先变差（场景 1a 里 2000 个会话时心跳 p99 迟到 96 毫秒），租约续不上比吞吐下降更早出事；容量规划要写明"测到的是哪一个天花板、在什么机器和负载下测的"，换一台机器数字会变，趋势不变。
+- 课程：[第 30 课](../lessons/30_async_runtime/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) · 失败模式 [PR18](failure-modes.md#pr18-共享数据库的写锁成了天花板shared-write-lock-becomes-the-ceiling)、[PR13](failure-modes.md#pr13-按错误的信号扩缩容autoscaling-on-the-wrong-signal)、[PR10](failure-modes.md#pr10-同步调用卡住事件循环event-loop-blocked-by-sync-calls)
+
+</details>
+
+### P14. 只用一台机器上的 SQLite 和几个进程，能证明分布式正确性吗？能证明什么、不能证明什么？ ⭐⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **能证明的是并发语义**：进程之间不共享内存，只通过同一个数据库文件协作，谁先抢到、谁覆盖了谁都是真实的竞争；故障也是真的：`WorkerPool` 拉起真实的 `python -m agentkit.distributed.worker` 进程，`kill -9`（SIGKILL）、`SIGSTOP` / `SIGCONT` 冻结再唤醒的"僵尸"、SIGTERM 优雅停机。第 13 课 `demo_agents.py`：8 个 Agent 任务、3 个 worker 进程、三次故障注入，8 个全部成功、每个恰好提交一次、工具一共只真正执行 8 次，僵尸醒来后的检查点写入被 `CheckpointConflict` 拒绝，收到 SIGTERM 的进程做完在途任务后以退出码 0 退出。原子领取、租约、fence、CAS 的写法和 Postgres 上完全一样。
+- **网络分区能验证一部分**：`agentkit.distributed.chaos.TcpProxy` 放在 worker 和 Postgres 之间，[`tests/contrib/test_postgres.py`](../tests/contrib/test_postgres.py) 里两个 worker 进程通过 TCP 连同一个 Postgres，一个经过代理：断网后它活着，但心跳发不出去，任务被另一个接手；网络恢复后，它的迟到写入被检查点的 CAS 拒绝。局限：代理的"断网"是立刻重置连接，真实的分区更常见的是包被静默丢弃、要等 TCP 超时才发现；而且这些进程仍在同一台机器上。
+- **证明不了的**（第 13 课 3.1 节的对照表）：写并发（SQLite 同一时刻只有一个写者，Postgres 是行级锁）；真正的多台机器（SQLite 的 WAL 不支持网络文件系统）；时钟漂移（所有进程共用一台机器的时钟，多机时租约要以数据库服务器的 `now()` 为准）；网络上"请求发出去了，不知道对方收没收到"；真实 Redis 的持久化、主从切换和集群（fakeredis 不模拟这些）；Postgres 的复制与故障切换；K8s 部署（本仓库没有 Docker，部署配置只做了静态检查）。
+- **怎么补**：语义在单机多进程上证明；规模和基础设施故障在预发环境用真实的多台机器、真实的 Redis / Postgres 故障切换去演练；上线前的故障注入（`kill -9`、滚动重启、依赖不可用）逐项核对终态。说清楚"哪些是测过的、哪些是推理"，比声称"已验证分布式"可信得多。
+- **加分点**：用线程冒充进程、用同一个进程里的两个对象冒充两台机器、用 `sleep` 冒充故障，都证明不了什么：线程共享内存，崩溃语义也不同（线程杀不掉，进程能被 `kill -9`）。SQLite 本身的边界也要写进设计：只能一台机器、单写者，多个进程同时新建库时切换 WAL 会失败（第 13 课实测 40 次启动错 4 次，框架已加退避重试）。
+- 课程：[第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) · 失败模式 [D2](failure-modes.md#d2-僵尸-workerzombie-worker)、[PR2](failure-modes.md#pr2-检查点只做-cascas-without-fenced-takeover)、[PR17](failure-modes.md#pr17-多进程同时建库时切换-wal-失败concurrent-wal-switch-race)、[PR18](failure-modes.md#pr18-共享数据库的写锁成了天花板shared-write-lock-becomes-the-ceiling)
+
+</details>
+
+### P15. 取消为什么难做对？被吞掉的取消怎么发现、怎么兜底？ ⭐⭐⭐
+
+<details>
+<summary>答案要点</summary>
+
+- **难在三处**：① 取消可能落在任何一个 `await` 上，包括收尾时的保存。第 30 课 2.5 节：AnyIO 的电平触发取消打断了保存 `cancelled` 的那次 `await`，真实 Postgres 上检查点 10 次里有 3 到 7 次停在 `running`；第一次修复后重复断开 120 次仍有 5 次漏网（取消打断的是上一次"已提交、未回复"的保存），第二次修复让每一次异步保存都受 shield 保护，才到 120/120。② 被取消的写操作，结果是未知的，不是失败（PR11）。③ 取消可能被别人吞掉，运行根本没停（PR14）。
+- **谁会吞**：标准库（Python 3.11 及更早的 `asyncio.wait_for`，CPython gh-86296：结果和取消同一轮到达时返回结果；第 30 课 2.6 节在同步工具刚完成时断开，240 次丢了 89 次）；依赖库（redis-py、psycopg_pool 内部用 `wait_for`；第 31 课修复前约 540 次断开里有 5 次跑完并建了工单，3.11.7 上的微基准 redis-py 约 20%–25%、psycopg_pool 20/20 被吞）；自己的代码（`except BaseException`、`suppress(CancelledError)` 加 `await task`、`except (TimeoutError, CancelledError): return 默认值`）。
+- **怎么发现**：按 asyncio 的约定，正规地压制取消要调用 `uncancel()`，所以被吞掉的取消在 `Task.cancelling()` 里还留着计数；在每个 Hook 边界打点 `cancelling()`，能定位到是哪一层吞的。框架补抛时打一条带 `agentkit_event="swallowed_cancellation"` 的 warning，按这个字段计数成指标（第 31 课的 `itdesk_swallowed_cancellations_total`），不为 0 就告警。压测里扫描时间窗口：在一次运行的多个时刻各取消一次，把结果分成"停住了 / 卡在 running / 根本没停"，第三类就是被吞掉的取消。
+- **怎么兜底**：自己的代码用取消安全的 `agentkit.wait_for`（`on_discard` 归还已经拿到的资源，否则信号量名额会泄漏）；管不到的依赖库由运行时在步骤边界补抛：进入时记下 `cancelling()` 的基线，调用模型前、执行工具前比较，比基线大就补抛 `CancelledError`（`run_timeout` 的取消被吞时也补抛，仍记为 timeout）；生产用 Python 3.12+，从根上避开标准库的竞态。补抛只挡得住下一步，已经在执行的那一步挡不住，所以写工具仍然靠幂等键兜底。
+- **加分点**：以进入时的计数为基线，而不是看绝对值，才不会误伤调用方自己的状态；3.10 没有 `cancelling()`，这道检查自动关闭；"同步测试全过"不代表异步代码是对的：同步检查点保存时没有 `await` 点，根本碰不到这个窗口；测并发 bug 要扫描整个故障窗口，只在一个时刻取消只能证明"这个时刻没问题"。
+- 课程：[第 30 课](../lessons/30_async_runtime/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) · 失败模式 [PR14](failure-modes.md#pr14-取消被吞掉swallowed-cancellation)、[PR11](failure-modes.md#pr11-取消后副作用重复或状态悬空cancellation-leaves-work-half-done)
 
 </details>
 

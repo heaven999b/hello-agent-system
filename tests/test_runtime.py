@@ -1024,3 +1024,15 @@ def test_swallowed_cancellation_is_logged_with_a_stable_event_field(caplog):
     with caplog.at_level("WARNING", logger="agentkit"):
         run(main())
     assert [getattr(r, "agentkit_event", None) for r in caplog.records] == ["swallowed_cancellation"]
+
+
+async def test_decorated_module_level_tool_runs_in_a_subprocess():
+    """@tool(isolation="process") 直接装饰模块级函数：模块里的名字已经是 Tool 对象，子进程要能找回原函数。"""
+    import os
+
+    from agentkit import ToolRegistry
+    from agentkit.testing import isolated_pid
+
+    r = await ToolRegistry([isolated_pid]).execute(ToolCall("1", "isolated_pid", "{}"))
+    assert r.ok, r
+    assert int(r.content) != os.getpid()

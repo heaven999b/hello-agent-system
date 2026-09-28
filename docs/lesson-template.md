@@ -13,7 +13,7 @@ lessons/NN_topic/
 ├── demo.py            可运行演示：默认调用真实模型；--offline 用 ScriptedLLM，无需 API key
 ├── exercise.py        练习（学员填写，TODO 处 raise NotImplementedError）
 ├── solution.py        参考答案（与 exercise.py 接口完全一致）
-└── test_exercise.py   练习测试（离线、确定性；用 agentkit.testing.load_exercise 加载）
+└── test_exercise.py   练习测试（离线、确定性；直接写 async def test_...；用 agentkit.testing.load_exercise 加载）
 ```
 
 运行：`python lessons/NN_topic/demo.py [--offline]`，`make lesson N=NN`，`make test-solutions`。
@@ -62,6 +62,7 @@ lessons/NN_topic/
 3. **具体胜过抽象**：用具体数字、具体报错、具体场景。
 4. **不编造**：引用的论文、博客、事故必须真实；不确定就不写。
 5. **代码可运行**：文档中出现的命令和代码片段都要真实跑过。
+6. **并发和多进程要真的发生，并拿出证据**：代码是 async 的（等 I/O 的地方 `await`，事件循环里不放阻塞调用）。说"并发"，就给出在途峰值（`ScriptedLLM(latency=...)` 的 `max_in_flight`）；说"多进程 / 崩溃接手"，就用 `WorkerPool` 起真实的进程、发真实的信号（kill -9 / SIGSTOP / SIGTERM）。不用线程冒充进程，不用同一进程里的两个对象冒充两台机器，不用 `sleep` 或假时钟冒充故障；做不到的（多主机、真实的 Redis 故障切换……）如实写成局限。详见 [CONTRIBUTING](../CONTRIBUTING.md#修改-agentkit-框架)。
 
 ## 课程分为四部分
 
@@ -74,7 +75,7 @@ lessons/NN_topic/
 
 第三部分是进阶、可选内容，面向学完前两部分和综合实战的学员。每课沿用上面的 README 结构，核心机制从零实现（可以放在课内的 `xxx_kit.py` 等模块里），并给出业界方案之间的取舍对比（放在正文相关小节或"深入"一节都可以），而不只是介绍一种做法。
 
-第四部分同样是进阶、可选内容。每课第 0 节开头先用一两句话诚实说明教学版 agentkit 在这方面的局限；适配器放在 `agentkit/contrib/`（异步运行时在 `agentkit/aio/`），接口与教学版一致；Demo 用嵌入式基础设施（pgserver 的真实 Postgres、fakeredis、Temporal 开发服务器）实际运行，可选依赖缺失时打印安装命令后以退出码 0 结束；讲义里的数字必须来自实测，嵌入式基础设施与生产集群的差别要写清楚。
+第四部分同样是进阶、可选内容。每课第 0 节开头先用一两句话诚实说明教学版 agentkit 在这方面的局限。代码分三层，接口一致：核心 `agentkit`（async，一个进程同时推进很多会话）→ `agentkit.distributed`（SQLite，一台机器上的真多进程，第 12、13 课）→ `agentkit/contrib/` 的适配器加 `production/` 参考服务（Postgres、Redis、Temporal……，多台机器）；Demo 用嵌入式基础设施（pgserver 的真实 Postgres、fakeredis、Temporal 开发服务器）实际运行，可选依赖缺失时打印安装命令后以退出码 0 结束；讲义里的数字必须来自实测，嵌入式基础设施与生产集群的差别要写清楚。
 
 ## 企业问题卡片（第二部分每节课的主体格式）
 

@@ -5,7 +5,7 @@
 > 📖 Part of the "domain reference" handbook that accompanies the course.
 > Related: [Failure Modes](failure-modes.en.md) · [Cheatsheet](cheatsheet.en.md) · [Interview Questions](interview-questions.en.md) · [Glossary](glossary.en.md)
 
-This checklist is designed to be pasted straight into a PR description, a design doc, or review meeting notes. It has **20 sections and 224 items** (68 of them P0). Every item explains why it matters and, where possible, links to the relevant failure mode (e.g., [T5](failure-modes.en.md#t5-duplicate-side-effects)) and lesson.
+This checklist is designed to be pasted straight into a PR description, a design doc, or review meeting notes. It has **20 sections and 232 items** (69 of them P0). Every item explains why it matters and, where possible, links to the relevant failure mode (e.g., [T5](failure-modes.en.md#t5-duplicate-side-effects)) and lesson.
 
 ## How to Use It
 
@@ -31,7 +31,7 @@ This checklist is designed to be pasted straight into a PR description, a design
 |---|---|---|---|---|
 | 1 | Requirements and Scope | 9 | 4 | [Lesson 00](../lessons/00_overview/README.en.md) · [Lesson 06](../lessons/06_orchestration/README.en.md) |
 | 2 | Model and Prompts | 9 | 3 | [Lesson 02](../lessons/02_agent_loop/README.en.md) · [Lesson 11](../lessons/11_evals/README.en.md) |
-| 3 | Tools | 13 | 6 | [Lesson 03](../lessons/03_tools/README.en.md) |
+| 3 | Tools | 14 | 6 | [Lesson 03](../lessons/03_tools/README.en.md) |
 | 4 | Context and Memory | 9 | 4 | [Lesson 04](../lessons/04_context_memory/README.en.md) |
 | 5 | Orchestration | 8 | 3 | [Lesson 06](../lessons/06_orchestration/README.en.md) |
 | 6 | Reliability | 10 | 3 | [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) |
@@ -39,17 +39,17 @@ This checklist is designed to be pasted straight into a PR description, a design
 | 8 | Privacy and Compliance | 9 | 3 | [Lesson 09](../lessons/09_security/README.en.md) · [Lesson 12](../lessons/12_production_architecture/README.en.md) |
 | 9 | Permissions and Approval | 8 | 4 | [Lesson 09](../lessons/09_security/README.en.md) |
 | 10 | Observability | 9 | 2 | [Lesson 10](../lessons/10_observability/README.en.md) |
-| 11 | Evals | 10 | 2 | [Lesson 11](../lessons/11_evals/README.en.md) |
+| 11 | Evals | 11 | 3 | [Lesson 11](../lessons/11_evals/README.en.md) |
 | 12 | Cost | 10 | 2 | [Lesson 08](../lessons/08_reliability/README.en.md) · [Lesson 14](../lessons/14_cost_latency/README.en.md) |
 | 13 | Deployment and Operations | 13 | 2 | [Lesson 12](../lessons/12_production_architecture/README.en.md) · [Lesson 16](../lessons/16_release_ops/README.en.md) |
 | 14 | Multi-Tenancy | 7 | 2 | [Lesson 12](../lessons/12_production_architecture/README.en.md) · [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
 | 15 | Documentation and Handoff | 7 | 1 | [Lesson 12](../lessons/12_production_architecture/README.en.md) |
-| 16 | Distributed Systems and Concurrency | 12 | 4 | [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) |
+| 16 | Distributed Systems and Concurrency | 14 | 4 | [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) |
 | 17 | Enterprise Knowledge and RAG | 9 | 2 | [Lesson 15](../lessons/15_enterprise_rag/README.en.md) |
 | 18 | Data, Eval Methodology, and Optimization | 16 | 3 | [Lesson 21](../lessons/21_agent_data/README.en.md) · [Lesson 22](../lessons/22_eval_methodology/README.en.md) · [Lesson 23](../lessons/23_optimization/README.en.md) |
 | 19 | Extended Capabilities (Retrieval / Memory / MCP / Code Execution / Coding Agents / Proactive) | 20 | 6 | [Lesson 17](../lessons/17_retrieval_quality/README.en.md) · [Lesson 18](../lessons/18_memory_systems/README.en.md) · [Lesson 19](../lessons/19_mcp_and_sandbox/README.en.md) · [Lesson 20](../lessons/20_frameworks_bridge/README.en.md) · [Lesson 24](../lessons/24_coding_agents/README.en.md) · [Lesson 25](../lessons/25_proactive_and_frontier/README.en.md) |
-| 20 | Production (State and Queues / Durable Workflows / Observability / Gateways and Policy / Async Runtime / Deployment and Scaling) | 25 | 6 | [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 27](../lessons/27_durable_workflows/README.en.md) · [Lesson 28](../lessons/28_production_observability/README.en.md) · [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) · [Lesson 30](../lessons/30_async_runtime/README.en.md) · [Lesson 31](../lessons/31_deployment_and_scaling/README.en.md) |
-| | **Total** | **224** | **68** | |
+| 20 | Production (State and Queues / Durable Workflows / Observability / Gateways and Policy / Async Runtime / Deployment and Scaling) | 29 | 6 | [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 27](../lessons/27_durable_workflows/README.en.md) · [Lesson 28](../lessons/28_production_observability/README.en.md) · [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) · [Lesson 30](../lessons/30_async_runtime/README.en.md) · [Lesson 31](../lessons/31_deployment_and_scaling/README.en.md) |
+| | **Total** | **232** | **69** | |
 
 ---
 
@@ -119,10 +119,12 @@ This checklist is designed to be pasted straight into a PR description, a design
   — The more tools, the more selection errors and the more tokens per request ([T2](failure-modes.en.md#t2-tool-overload)).
 - [ ] 🟠 **P1** Third-party tools (including MCP servers) come from vetted sources, are version-pinned, and get re-reviewed whenever their descriptions change.
   — Tool descriptions go into the model's context and can be poisoned ([S6](failure-modes.en.md#s6-tool-poisoning)).
+- [ ] 🟠 **P1** A timeout raised by the tool itself (a downstream 504, a driver's read timeout) is reported faithfully as a tool error with its original message; only the framework's own deadline produces "execution timed out."
+  — Otherwise whoever investigates raises the timeout, the real downstream problem stays hidden, and the model gets the wrong observation ([T8](failure-modes.en.md#t8-tools-own-timeout-misreported)).
 - [ ] 🟢 **P2** Tool names use namespace prefixes, and tools don't overlap in functionality.
   — Reduces confusion between similar tools ([T1](failure-modes.en.md#t1-wrong-tool-selection)).
 - [ ] 🟢 **P2** Tools that execute code, access the file system, or call untrusted services run in a sandbox / separate process.
-  — A thread timeout can't truly stop execution, and code-execution tools are a direct entry point for remote code execution (OWASP Agentic ASI05).
+  — A thread timeout can't truly stop execution (agentkit's `isolated(tool(fn))` kills the child process on timeout; see [T4](failure-modes.en.md#t4-hanging-tool)), and code-execution tools are a direct entry point for remote code execution (OWASP Agentic ASI05).
 
 ## 4. Context and Memory
 
@@ -279,6 +281,8 @@ This checklist is designed to be pasted straight into a PR description, a design
   — Without evals, developing an agent means tweaking prompts by feel.
 - [ ] 🔴 **P0** Evals are wired into CI: a pass rate below the threshold, or any regression (previously passing, now failing), blocks the merge or release.
   — Fix one thing, break three: that's the norm in prompt engineering ([E4](failure-modes.en.md#e4-prompt-regression)).
+- [ ] 🔴 **P0** Cases that failed because of the model API or gateway (infra_error) never count as passes and are listed separately in the report; a report with infra errors is rerun, not used for a release decision; eval concurrency stays within the gateway's quota.
+  — Safety cases of the form "must not call this tool" are trivially satisfied when the agent never ran: in Lesson 11's measurement, a report whose trustworthy result was 43% showed 86% ([E6](failure-modes.en.md#e6-infrastructure-errors-counted-as-passes)).
 - [ ] 🟠 **P1** The eval set is continuously replenished with production bad cases (negative ratings, human handoffs, failed runs).
   — The questions developers imagine and the questions real users ask follow different distributions ([E1](failure-modes.en.md#e1-eval-production-skew)).
 - [ ] 🟠 **P1** Evaluate both the final result and the execution trajectory (required / forbidden tool calls, call order).
@@ -404,10 +408,14 @@ This checklist is designed to be pasted straight into a PR description, a design
   — Prevents a request storm the moment a cache entry expires ([D8](failure-modes.en.md#d8-cache-stampede)).
 - [ ] 🟠 **P1** Choose the delivery mechanism by task duration (synchronous / SSE streaming / async queue + notification / workflow engine), and keep timeouts consistent across layers.
   — A backend that keeps running after the frontend has timed out is both waste and a hazard ([P4](failure-modes.en.md#p4-tail-latency-blowup)).
+- [ ] 🟠 **P1** Jobs that run through a queue carry every input the run needs in the payload (conversation history, trusted identity, traceparent), with client-supplied history cleaned before it's enqueued; end-to-end multi-turn tests go through the real queue and real worker processes.
+  — Context that a synchronous call carries along implicitly has to be passed explicitly across a queue; leave it out and nothing errors, the agent just "forgets" ([D12](failure-modes.en.md#d12-conversation-history-dropped-at-the-queue), [PR6](failure-modes.en.md#pr6-trace-broken-at-the-queue)).
+- [ ] 🟠 **P1** When SQLite (`agentkit.distributed`) holds the queue and shared state, the design doc states its limits: one machine only (WAL doesn't work over network filesystems), one writer at a time, and a retry (or one process creating the database first) when several processes create it at once; it also states when and how you'll move to Postgres (`agentkit.contrib.postgres`, same interfaces).
+  — The single-writer throughput ceiling and "one machine only" are hard limits; migrating after you hit them is too late ([PR17](failure-modes.en.md#pr17-concurrent-wal-switch-race), [PR18](failure-modes.en.md#pr18-shared-write-lock-becomes-the-ceiling)).
 - [ ] 🟢 **P2** Long flows that span multiple services use Saga compensation or a workflow engine instead of letting the model coordinate them.
   — Models don't roll back reliably ([T7](failure-modes.en.md#t7-partial-completion)).
 - [ ] 🟢 **P2** Load tests and failure drills cover concurrent messages in one session, a worker killed mid-execution, queue backlogs, and model provider rate limiting.
-  — These scenarios never come up in a single-machine development environment.
+  — These scenarios never come up in a single-process development environment; `agentkit.distributed.WorkerPool` can rehearse most of them with real processes on one machine (Lesson 13).
 
 ## 17. Enterprise Knowledge and RAG
 
@@ -526,7 +534,7 @@ This checklist is designed to be pasted straight into a PR description, a design
   — Measured in Lesson 26: with 8 connections running `CREATE TABLE IF NOT EXISTS` at once, 7 failed with `UniqueViolation`; holding a connection while waiting on the model caps concurrency at the number of connections.
 - [ ] 🟢 **P2** The queue table gets its own lower autovacuum threshold, and finished tasks are archived regularly (the dedup window equals the retention period); monitor how long the oldest runnable task has waited, expired leases, and fence rejections; Redis holds only data you can rebuild if it's lost.
   — A queue table is a textbook high-churn table and bloats; a Redis failover can lose roughly the last second of writes.
-- [ ] 🟠 **P1** Adopting Temporal comes with a written justification that at least two of these hold: single tasks often exceed 30 minutes, you wait on people, there are timed actions, failures need human cleanup, and someone will run it. Otherwise, use AsyncAgent + Postgres checkpoints + a lease queue.
+- [ ] 🟠 **P1** Adopting Temporal comes with a written justification that at least two of these hold: single tasks often exceed 30 minutes, you wait on people, there are timed actions, failures need human cleanup, and someone will run it. Otherwise, use `Agent` + Postgres checkpoints + a lease queue.
   — Durable execution pays off only when tasks are long and wait on people, but you pay its costs from day one.
 - [ ] 🟠 **P1** With Temporal, every activity has `maximum_attempts` (unlimited by default), a start-to-close timeout, and a heartbeat timeout; write tools get retry counts by risk, with a single attempt for non-idempotent writes; client-side retries are off.
   — Activities are at-least-once, and their retries multiply with client retries ([PR3](failure-modes.en.md#pr3-stacked-retries)).
@@ -554,14 +562,22 @@ This checklist is designed to be pasted straight into a PR description, a design
   — One blocking call stalls every session and heartbeat in the process ([PR10](failure-modes.en.md#pr10-event-loop-blocked-by-sync-calls)).
 - [ ] 🔴 **P0** Cancellation semantics are verified: `CancelledError` is re-raised after cleanup; after a client disconnects, the checkpoint records `cancelled` and in-flight model calls drop to zero; interrupted write calls stay unanswered and are replayed with the same `call_id` on resume.
   — A cancelled write's outcome is unknown; filling in "not executed" changes the idempotency key and repeats the side effect ([PR11](failure-modes.en.md#pr11-cancellation-leaves-work-half-done), [T5](failure-modes.en.md#t5-duplicate-side-effects)).
+- [ ] 🟠 **P1** Swallowed cancellations have a metric and an alert: count logs by the field `agentkit_event="swallowed_cancellation"` and alert when the count is above zero; production runs Python 3.12+; the code has no `except BaseException` or bare `except:`, and timeouts use the cancellation-safe `agentkit.wait_for`.
+  — The standard library (`wait_for` in 3.11 and earlier), redis-py, and psycopg_pool can all swallow cancellations, so a run keeps going and opens the ticket after the user has disconnected ([PR14](failure-modes.en.md#pr14-swallowed-cancellation)).
 - [ ] 🟠 **P1** Timeouts grow from the inside out: tool timeout < the run's overall deadline < gateway and proxy timeouts; per-tenant bulkheads, per-model concurrency caps, and connection pool limits agree with one another; shared Agents and Hooks keep no per-run data on instance attributes.
   — If the outer layer gives up first, the inner layer keeps working for nothing; a pool smaller than the concurrency cap turns "model timeouts" into queueing in your own pool; a shared instance is read and written by hundreds of sessions at once ([D1](failure-modes.en.md#d1-lost-update)).
+- [ ] 🟠 **P1** A new run rejected by a per-tenant bulkhead or rate limit leaves no state behind (no checkpoint, no cleanup hooks), and its job is deferred (back to the queue without using up an attempt) rather than recorded as a failure; load tests cover "many runs rejected first, then retried."
+  — A half checkpoint saved at rejection holds no user question, so the deferred run resumes and the model answers something else ([PR15](failure-modes.en.md#pr15-bulkhead-rejection-leaves-a-half-checkpoint)).
 - [ ] 🔴 **P0** Graceful shutdown on SIGTERM: fail the readiness probe and stop claiming → let in-flight tasks finish within the grace period → cancel the rest and hand them back to the queue → flush traces and close connection pools; `terminationGracePeriodSeconds` exceeds the grace period plus cleanup; rolling-update drills are on record.
   — Otherwise every release loses or reruns a batch of runs ([PR12](failure-modes.en.md#pr12-in-flight-runs-lost-on-shutdown), [R4](failure-modes.en.md#r4-lost-progress)).
+- [ ] 🟠 **P1** Shutdown drills run with the worker saturated: with every concurrency slot taken and in-flight tasks longer than the grace period, SIGTERM still cancels and hands back tasks within the grace period; a worker waiting for a slot is also waiting for the stop signal.
+  — A worker that waits only for a slot can't hear SIGTERM: in Lesson 13's measurement, with a 1-second grace period, the process took 8.08 seconds to exit ([PR16](failure-modes.en.md#pr16-busy-worker-misses-the-stop-signal)).
 - [ ] 🟠 **P1** The liveness probe checks only this process (whether the event loop responds), and the readiness probe checks dependencies and whether the process is shutting down; all configuration comes from environment variables, is validated at startup, and fails fast; the same image is used across environments.
   — A liveness probe that checks the database restarts every Pod at once when the database blips; a config error found only at the first request is already in production.
 - [ ] 🟠 **P1** Workers scale on queue backlog, the age of the oldest task, or in-flight saturation, with the replica ceiling set by the model quota; before launch, a load test with fault injection (`kill -9`, rolling restarts, unavailable dependencies) verifies end states, no duplicate side effects, and metrics that match the database, with tail latency measured by an open-loop test.
   — CPU-based autoscaling never triggers for IO-bound agents; closed-loop load tests flatter tail latency ([PR13](failure-modes.en.md#pr13-autoscaling-on-the-wrong-signal), [PR11](failure-modes.en.md#pr11-cancellation-leaves-work-half-done)).
+- [ ] 🟠 **P1** The capacity plan names the ceiling that was measured (a single event loop's CPU, the shared database's write lock, or the model quota) and the machine and load it was measured on; before adding processes, run a scaling test at 1 / 2 / 4 / 8 processes and record both throughput and worker CPU utilization.
+  — When the ceiling is the write lock or the quota, more processes don't raise throughput: in Lesson 13, going from 4 × 64 to 8 × 64 dropped throughput from 710 to 662 jobs per second, with worker CPU at 12% ([PR18](failure-modes.en.md#pr18-shared-write-lock-becomes-the-ceiling), [PR13](failure-modes.en.md#pr13-autoscaling-on-the-wrong-signal)).
 
 ---
 

@@ -776,7 +776,7 @@ row = conn.execute(f"""
 
 本课手写的 `JobQueue` 没有实现"主动归还"，你可以试着加一个 `release(job_id, fence)`：校验 fence，把状态改回 `queued`，并把 `attempts` 减一。框架里这些都有了：`stop_on_signals` 用 `loop.add_signal_handler` 把 SIGTERM 接到一个 `asyncio.Event` 上；`run_worker` 看到它就不再领取，等在途任务最多 `grace_period` 秒，超时的任务被**取消、不提交、不归还**，它们的租约自然过期后由别的 worker 从检查点接手（fence 保证取消前的写入不会覆盖接手者）；`SQLiteJobQueue.release()` 归还任务时不消耗次数（被限流推迟的任务就走这条路）。`demo_agents.py` 里，被 SIGTERM 的 worker 没有再领取新任务，把在途的任务做完后以退出码 0 退出。
 
-实测还发现了一个框架问题（已报告给维护者）：`run_worker` 在领取前要先拿到一个并发槽位，**所有槽位都被在途任务占着时，它停在"等槽位"那一步，看不到停机信号**，直到有任务结束。结果是 `grace_period` 在这种情况下不起作用：并发上限 1、`grace=1` 秒、在途任务要跑 8 秒，SIGTERM 之后进程 8.08 秒才退出（期望是约 1 秒后取消任务）。如果在途任务比 K8s 的宽限期还长，Pod 会被 SIGKILL，而不是由 worker 自己干净地取消。修复方法是让"等槽位"和"等停机信号"同时等待，谁先到算谁。生产版 worker 的完整停机时间线（停止领取 → 排空 → 交还 → 退出）和实测见[第 31 课](../31_deployment_and_scaling/README.md)。
+写这一课时实测还发现了一个框架 bug（**现已修复**，回归测试 `tests/test_distributed.py::test_stop_signal_is_seen_even_when_every_slot_is_busy`）：`run_worker` 在领取前要先拿到一个并发槽位，**所有槽位都被在途任务占着时，它停在"等槽位"那一步，看不到停机信号**，直到有任务结束。结果是 `grace_period` 在这种情况下不起作用：并发上限 1、`grace=1` 秒、在途任务要跑 8 秒，SIGTERM 之后进程 8.08 秒才退出（期望是约 1 秒后取消任务）。如果在途任务比 K8s 的宽限期还长，Pod 会被 SIGKILL，而不是由 worker 自己干净地取消。修复方法是让"等槽位"和"等停机信号"同时等待，谁先到算谁 —— 框架现在就是这样做的（`agentkit/distributed/jobs.py` 的 `_acquire_or_stop`）。生产版 worker 的完整停机时间线（停止领取 → 排空 → 交还 → 退出）和实测见[第 31 课](../31_deployment_and_scaling/README.md)。
 
 ### 6.5 Saga 的最小骨架（示意代码）
 

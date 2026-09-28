@@ -309,24 +309,27 @@ Which memory design to choose:
 
 ## 9. Part 4 quick reference
 
-> Covers Lessons 26–31. Defaults come from the agentkit source (`agentkit/aio`, `agentkit/contrib`) and the official docs the lessons cite. They're starting points, not answers; your own load and load tests have the final word.
+> Covers Lessons 26–31, plus the one-machine, multi-process versions from Lessons 12 and 13 that they build on. Defaults come from the agentkit source (`agentkit`, `agentkit/distributed`, `agentkit/contrib`) and the official docs the lessons cite. They're starting points, not answers; your own load and load tests have the final word.
+>
+> Three layers with the same interfaces: core `agentkit` (async, one process driving many sessions at once) → `agentkit.distributed` (SQLite, real multiple processes on one machine) → `agentkit.contrib` + `production/` (Postgres, Redis, Temporal, and so on, across machines).
 
 ### 9.1 Choosing components
 
 | Problem | Default choice | When to switch | Lessons |
 |---|---|---|---|
-| Checkpoints (multi-instance) | Postgres: jsonb + version-number CAS + fenced takeover (`PostgresCheckpointer` / `AsyncPostgresCheckpointer`) | Processes that span hours or days, wait on people, or need reliable timers → Temporal; already deep into LangGraph → its own checkpointer | [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 27](../lessons/27_durable_workflows/README.en.md) |
-| Task queue | Postgres `FOR UPDATE SKIP LOCKED` (`PostgresJobQueue` / `AsyncPostgresJobQueue`) | On AWS and don't want to run it → SQS; several subscribers to the same data, replay, or too much write volume → add Kafka (alongside the task queue) | [Lesson 26](../lessons/26_state_and_queues/README.en.md) |
-| Idempotency | Downstream unique constraint or Idempotency-Key (the floor) + a Redis cache (`RedisIdempotencyStore`, optional) | Downstream has no idempotency and concurrent duplicates are expensive → add a `claim()` marker, knowing it doesn't cover every case | [Lesson 26](../lessons/26_state_and_queues/README.en.md) |
-| Cross-instance rate limiting | Redis Lua token bucket (`RedisTokenBucket` + `RateLimitHook`; async versions carry an `Async` prefix) | Several teams share one model egress → the gateway's team budgets; the provider's quota is the last wall, not your rate limiter | [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) |
+| Checkpoints (multi-process / multi-instance) | Version-number CAS + fenced takeover behind one interface: SQLite on one machine (`SQLiteCheckpointer`), Postgres jsonb across machines (`PostgresCheckpointer`) | You need more than one machine, or the single writer is maxed out even after cutting writes → Postgres; processes that span hours or days, wait on people, or need reliable timers → Temporal; already deep into LangGraph → its own checkpointer | [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 27](../lessons/27_durable_workflows/README.en.md) |
+| Task queue | One machine: `SQLiteJobQueue`; many machines: Postgres `FOR UPDATE SKIP LOCKED` (`PostgresJobQueue`). Both plug into the same `run_worker` | On AWS and don't want to run it → SQS; several subscribers to the same data, replay, or too much write volume → add Kafka (alongside the task queue) | [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) |
+| Idempotency | Downstream unique constraint or Idempotency-Key (the floor) + a shared cache (`SQLiteIdempotencyStore` on one machine, `RedisIdempotencyStore` across machines; optional) | Downstream has no idempotency and concurrent duplicates are expensive → add a `claim()` marker, knowing it doesn't cover every case | [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) |
+| Cross-process / cross-instance rate limiting | One machine: `SQLiteTokenBucket`; many machines: Redis Lua token bucket (`RedisTokenBucket` + `RateLimitHook`) | Several teams share one model egress → the gateway's team budgets; the provider's quota is the last wall, not your rate limiter | [Lesson 12](../lessons/12_production_architecture/README.en.md) · [Lesson 26](../lessons/26_state_and_queues/README.en.md) · [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) |
+| Cross-process concurrency quota | An in-process `KeyedLimiter` for self-protection, plus shared slots: `SQLiteSemaphore` on one machine (leased, so slots come back after the holder is `kill -9`'d), Redis or gateway limits across machines | Only one process → `ResilientLLM(max_concurrency=…)` is enough; with more processes, per-process caps add up (Lesson 30, scenario 5b: 3 processes capped at 4 each, and the gateway saw 12 at once) | [Lesson 13](../lessons/13_distributed_concurrency/README.en.md) · [Lesson 30](../lessons/30_async_runtime/README.en.md) |
 | Locks | Avoid them: turn the job into "a task + an idempotency key"; resource lives in Postgres → `pg_advisory_xact_lock` | Cross-system and correctness-critical → etcd (revision as the fencing token); efficiency only → `RedisLock` | [Lesson 26](../lessons/26_state_and_queues/README.en.md) |
-| Long processes, approvals, timers | AsyncAgent + Postgres checkpoints + a lease queue | At least two of "over 30 minutes / waits on people / timed actions / failures need human cleanup / someone will run it" → Temporal (`make_worker` / `start_agent`) | [Lesson 27](../lessons/27_durable_workflows/README.en.md) |
+| Long processes, approvals, timers | `Agent` + fenced checkpoints + a lease queue (`AgentJobHandler`) | At least two of "over 30 minutes / waits on people / timed actions / failures need human cleanup / someone will run it" → Temporal (`make_worker` / `start_agent`) | [Lesson 27](../lessons/27_durable_workflows/README.en.md) |
 | Tracing | OTel + GenAI semantic conventions + OTLP → Collector (`OTelTracer`) | Need to read conversations or run online evals → the Collector fans out a second path to a self-hostable LLM platform | [Lesson 28](../lessons/28_production_observability/README.en.md) |
 | Metrics and alerts | `PrometheusHook` counting every run + multiwindow, multi-burn-rate alerts | Organization standardized on OTel Metrics → send metrics over OTLP; high-cardinality dimensions → traces and logs | [Lesson 28](../lessons/28_production_observability/README.en.md) |
 | Model egress | One service: in-process `LiteLLMRouterLLM`; many services: LiteLLM Proxy or a cloud AI gateway | Deep into one cloud → its gateway; self-hosted or multi-cloud → a self-hosted open-source gateway | [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) |
 | Authorization policy | Few rules, one team → `PermissionPolicy`; cross-team, reviewed, needs ABAC → Cedar (`CedarPolicy`) | Platform already standardized on OPA → OPA; product is about hierarchical sharing → OpenFGA | [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) |
 | Injection detection | Cascade: regex → LLM judge (`CascadeClassifier`) | High traffic, mostly English → add a Prompt Guard–style small model in the middle; already on a cloud and compliance allows → a managed guardrail service | [Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md) |
-| Concurrency model | One process per CPU core, one event loop per process (one `AsyncAgent` instance shared by all sessions) | Tasks over a minute or two, or work you can't afford to lose → queue + workers (still `AsyncAgent` inside); untrusted code → a container or microVM | [Lesson 30](../lessons/30_async_runtime/README.en.md) |
+| Concurrency model | One process per CPU core, one event loop per process (one `Agent` instance shared by all sessions) | Tasks over a minute or two, or work you can't afford to lose → queue + worker processes (`run_worker`, still the same `Agent` inside); untrusted code → a container or microVM | [Lesson 02](../lessons/02_agent_loop/README.en.md) · [Lesson 30](../lessons/30_async_runtime/README.en.md) |
 | Streaming protocol | SSE + cancel on disconnect + resume by `run_id` | Voice, or interrupting mid-answer → WebSocket; long tasks you can't afford to lose → don't cancel on disconnect, buffer events, and replay from `Last-Event-ID` | [Lesson 30](../lessons/30_async_runtime/README.en.md) · [Lesson 31](../lessons/31_deployment_and_scaling/README.en.md) |
 | Deployment and scaling | Deploy the API and workers separately; scale workers on queue backlog (KEDA's `postgresql` scaler or HPA external metrics) | — | [Lesson 31](../lessons/31_deployment_and_scaling/README.en.md) |
 
@@ -334,11 +337,12 @@ Which memory design to choose:
 
 | Parameter | Starting point | How to choose |
 |---|---|---|
-| Lease / heartbeat | 30-second lease (the `run_worker` / `run_async_worker` default), heartbeat = 1/3 of the lease (default) | Keep the heartbeat at no more than half the lease, or a single GC pause loses it; long tasks renew their lease rather than getting a longer one |
-| Async worker concurrency | Start at 16–64 (`run_async_worker` defaults to 16), one process per CPU core | Tune by model quota and memory, not CPU |
+| Lease / heartbeat | 30-second lease (`run_worker(lease_seconds=30)`), heartbeat = 1/3 of the lease (when `heartbeat_interval=None`) | Keep the heartbeat at no more than half the lease, or a single GC pause loses it; long tasks renew their lease rather than getting a longer one |
+| Worker concurrency | Start at 16–64 (`run_worker` defaults to 16; the worker CLI's `--concurrency` defaults to 8), one process per CPU core | Tune by model quota and memory, not CPU; with many processes, check the shared database's write lock first (SQLite's single writer, Lesson 13 §3.12) |
+| SQLite (one machine, many processes) | WAL + `synchronous=NORMAL`, every write transaction `BEGIN IMMEDIATE`, 30-second `busy_timeout` (the `SQLiteDB` default) | Only one writer at a time: Lesson 13 measured about 10,000 small write transactions per second on one M1; WAL doesn't work over a network file system, so it's one machine only; when you hit the ceiling, first save fewer checkpoints, then move to Postgres |
 | Database connection pool | Start at 1/4 of the concurrency | Watch whether `requests_queued` in `get_stats()` keeps growing; all processes together < `max_connections` |
-| Shutdown grace period | `run_async_worker(grace_period=25)`; Kubernetes's `terminationGracePeriodSeconds` defaults to 30 seconds | The latter > the former + cleanup time; the grace period doesn't need to cover the longest task |
-| Queue max attempts | `PostgresJobQueue(max_attempts=5)`, backoff starting at 1 second and capped at 300 | Count at claim time; rate-limit deferrals and shutdown returns don't count |
+| Shutdown grace period | `run_worker(grace_period=25)` (the CLI's `--grace` defaults to 25); Kubernetes's `terminationGracePeriodSeconds` defaults to 30 seconds | The latter > the former + cleanup time; the grace period doesn't need to cover the longest task |
+| Queue max attempts | `SQLiteJobQueue` / `PostgresJobQueue` default to `max_attempts=5`, backoff starting at 1 second and capped at 300 | Count at claim time; rate-limit deferrals and shutdown returns don't count |
 | Temporal tool retries | Read 5, write with an idempotency key 3, non-idempotent write 1 (`retry_policy_for`) | Activities retry without limit by default, so set a cap; turn client retries off |
 | Temporal heartbeat timeout / approval timeout | 10 seconds / 24 hours (`AgentInput` defaults) | The heartbeat timeout decides both how fast a dead worker is noticed and how fast a cancellation arrives |
 | Temporal worker concurrency | `max_concurrent_activities` and `max_concurrent_workflow_tasks` default to 100 each | Match the former to your model gateway's concurrency quota |
@@ -346,7 +350,7 @@ Which memory design to choose:
 | Burn-rate alerts | Page: 1h and 5m both > 14.4, or 6h and 30m both > 6; ticket: 3d and 6h both > 1 | Add a minimum-sample guard; with too loose an SLO, the burn-rate ceiling of 1 ÷ (1 − SLO) falls below the threshold |
 | Tenant label cap | `PrometheusHook(max_tenants=50)` | Better yet, pass an `allowed_tenants` allowlist; everything else goes to `__other__` |
 | Gateway retries | `LiteLLMRouterLLM` defaults to `num_retries=2` | When the primary fails, it retries before falling back; lower it for synchronous user-facing requests, or set a deadline for the whole request |
-| AsyncAgent limits | `max_parallel_tools=8`, `max_threads=32`; `AsyncOpenAICompatLLM(max_connections=100)` | Each model's `max_concurrency` ≤ `max_connections`; set `run_timeout` and `limiter_timeout`, and the worst-case latency is their sum |
+| `Agent` limits | `max_parallel_tools=8`, `max_threads=None` (sync tools use the event loop's default thread pool, shared by the whole process; for a separate, bounded pool, set a number or inject `executor=ToolExecutor(...)`); `OpenAICompatLLM(max_connections=100)` | Each model's `max_concurrency` ≤ `max_connections`; set `run_timeout` and `limiter_timeout`, and the worst-case latency is their sum |
 
 ### 9.3 Five numbers you must be able to compute
 
@@ -360,46 +364,81 @@ Which memory design to choose:
 
 ### 9.4 Key code
 
-**Multiple workers: Postgres queue + fenced checkpoints + Redis idempotency and rate limiting** ([Lesson 26](../lessons/26_state_and_queues/README.en.md))
+The snippets leave out application variables such as `TOOLS`, `text`, `DSN`, and `REDIS_URL`. Every snippet has actually been run, against embedded Postgres, fakeredis, and the Temporal dev server, with an offline stand-in for the model (`ScriptedLLM`, or LiteLLM's `mock_response` for the gateway snippet).
+
+**One machine, many processes: SQLite queue + fenced checkpoints + worker processes** ([Lesson 12](../lessons/12_production_architecture/README.en.md) · [Lesson 13](../lessons/13_distributed_concurrency/README.en.md))
 
 ```python
-from psycopg_pool import AsyncConnectionPool
-from agentkit.aio import AsyncAgent, default_async_llm
-from agentkit.contrib.postgres import AgentJobHandler, AsyncPostgresCheckpointer, AsyncPostgresJobQueue, run_async_worker, stop_on_signals
-from agentkit.contrib.redis_store import AsyncRateLimitHook, AsyncRedisIdempotencyStore, AsyncRedisTokenBucket
+# app.py: each worker process loads it once at startup → python -m agentkit.distributed.worker --queue sqlite:///jobs.db --app app.py:factory
+from agentkit import Agent, default_llm
+from agentkit.distributed import AgentJobHandler, SQLiteCheckpointer, SQLiteIdempotencyStore, SQLiteJobQueue, WorkerPool
 
-pool = AsyncConnectionPool(DSN, max_size=8, kwargs={"autocommit": True})   # the queue and checkpoints share one pool
-queue, ckpt = AsyncPostgresJobQueue(pool), AsyncPostgresCheckpointer(pool)
-limiter = AsyncRateLimitHook(AsyncRedisTokenBucket(REDIS_URL, rate_per_sec=5, capacity=10), wait_timeout=2)
-agent = AsyncAgent(default_async_llm(max_connections=20), TOOLS, checkpointer=ckpt, hooks=[limiter],
-                   idempotency_store=AsyncRedisIdempotencyStore(REDIS_URL))   # just a cache; the floor is a downstream unique constraint
-stop = asyncio.Event(); stop_on_signals(stop)                               # SIGTERM → stop claiming, drain
-await run_async_worker(queue, AgentJobHandler(agent, ckpt), worker_id=os.environ["HOSTNAME"],
-                       stop_event=stop, concurrency=32, grace_period=25)   # each task gets a fenced checkpoint view
+async def factory(ctx):                                    # ctx.db: a connection to the same SQLite file as the queue
+    ckpt, idem = SQLiteCheckpointer(ctx.db), SQLiteIdempotencyStore(ctx.db)
+    await ckpt.setup(); await idem.setup()
+    agent = Agent(default_llm(max_connections=20), TOOLS, checkpointer=ckpt, idempotency_store=idem)
+    return AgentJobHandler(agent, ckpt)                    # one Agent serves the whole process; each job gets a fenced checkpoint view
+
+# API process: enqueue and return 202 right away; resubmitting the same idempotency key returns the same job
+queue = SQLiteJobQueue("jobs.db"); await queue.setup()
+job_id = await queue.enqueue("agent", {"op": "run", "input": text, "run_id": run_id}, tenant_id="acme",
+                             idempotency_key=f"run:{run_id}")
+pool = WorkerPool("sqlite:///jobs.db", "app.py:factory", n=4, concurrency=16).start()   # 4 real processes on this machine
+pool.kill(0); pool.pause(1); pool.terminate(2)             # fault drill: kill -9 / SIGSTOP / SIGTERM
+```
+
+**Many machines: Postgres queue + fenced checkpoints + Redis idempotency and rate limiting** ([Lesson 26](../lessons/26_state_and_queues/README.en.md))
+
+```python
+import asyncio, os
+from psycopg_pool import AsyncConnectionPool
+from agentkit import Agent, default_llm
+from agentkit.contrib.postgres import AgentJobHandler, PostgresCheckpointer, PostgresJobQueue, run_worker, stop_on_signals
+from agentkit.contrib.redis_store import RateLimitHook, RedisIdempotencyStore, RedisTokenBucket
+
+pool = AsyncConnectionPool(DSN, max_size=8, kwargs={"autocommit": True}, open=False)   # the queue and checkpoints share one pool
+await pool.open()                                          # tables come from the migration job (queue.setup(), ckpt.setup())
+queue, ckpt = PostgresJobQueue(pool), PostgresCheckpointer(pool)
+limiter = RateLimitHook(RedisTokenBucket(REDIS_URL, rate_per_sec=5, capacity=10), wait_timeout=2)
+agent = Agent(default_llm(max_connections=20), TOOLS, checkpointer=ckpt, hooks=[limiter],
+              idempotency_store=RedisIdempotencyStore(REDIS_URL))   # just a cache; the floor is a downstream unique constraint
+stop = asyncio.Event(); stop_on_signals(stop)              # SIGTERM → stop claiming, drain
+await run_worker(queue, AgentJobHandler(agent, ckpt), worker_id=os.environ["HOSTNAME"],
+                 stop_event=stop, concurrency=32, grace_period=25)   # each job gets a fenced checkpoint view
+
+# API process: same queue table, enqueue only; if run_id already has a checkpoint, the worker resumes from it
+await queue.enqueue("agent", {"op": "run", "input": text, "run_id": run_id, "history": history},
+                    tenant_id="acme", idempotency_key=f"run:{run_id}")
 ```
 
 **Temporal: start, approve, check status** ([Lesson 27](../lessons/27_durable_workflows/README.en.md))
 
 ```python
+from agentkit import default_llm
+from agentkit.contrib.redis_store import RedisIdempotencyStore
 from agentkit.contrib.temporal import agent_status, approve, make_worker, start_agent
 
-worker = make_worker(client, "support-agents", lambda: default_async_llm(max_connections=20), TOOLS,
-                     idempotency_store=AsyncRedisIdempotencyStore(REDIS_URL))   # shared across workers, so write tools retry as idempotent
+worker = make_worker(client, "support-agents", lambda: default_llm(max_connections=20), TOOLS,
+                     idempotency_store=RedisIdempotencyStore(REDIS_URL))   # shared across workers, so write tools retry as idempotent
+await worker.run()                                         # worker process: runs until cancelled
+
+# API process
 handle = await start_agent(client, "Order A1001: refund request", {"tenant_id": "acme", "user_id": "u1"},
                            workflow_id="refund-A1001", task_queue="support-agents", approval_timeout_s=24 * 3600)
-st = await agent_status(client, "refund-A1001")                              # query: pending approvals, tools called
+st = await agent_status(client, "refund-A1001")            # query: pending approvals, tools called
 await approve(client, "refund-A1001", st.pending_approvals[0]["call_id"], True, by="zhang.manager", wait=True)  # update
 ```
 
 **OpenTelemetry + Prometheus + propagation across the queue** ([Lesson 28](../lessons/28_production_observability/README.en.md))
 
 ```python
+from agentkit import Agent
 from agentkit.contrib.otel import OTelTracer, PrometheusHook, continue_trace, inject_context, setup_tracing, start_metrics_server
 
 tracer = OTelTracer(setup_tracing("support-agent", sample_ratio=1.0))       # endpoint from OTEL_EXPORTER_OTLP_ENDPOINT; no content by default
 metrics = PrometheusHook(tenant_label=True, allowed_tenants={"acme", "globex"})
 start_metrics_server(9464, addr="0.0.0.0")
-agent = AsyncAgent(llm, TOOLS, tracer=tracer, hooks=[tracer, metrics])
+agent = Agent(llm, TOOLS, tracer=tracer, hooks=[tracer, metrics])
 
 payload = {"input": text, "trace": inject_context({})}                      # producer: traceparent travels in the payload
 async with continue_trace(payload["trace"]):                                # worker: continue the same trace
@@ -409,28 +448,31 @@ async with continue_trace(payload["trace"]):                                # wo
 **Gateway + Cedar + cascaded guardrails** ([Lesson 29](../lessons/29_gateway_and_guardrails/README.en.md))
 
 ```python
-from agentkit.contrib.gateway import AsyncLiteLLMRouterLLM
-from agentkit.contrib.guards import AsyncClassifierGuard, CascadeClassifier, LLMClassifier, RegexClassifier
+from agentkit import Agent
+from agentkit.contrib.gateway import LiteLLMRouterLLM
+from agentkit.contrib.guards import CascadeClassifier, ClassifierGuard, LLMClassifier, RegexClassifier
 from agentkit.contrib.policy import CedarPolicy, entity_args_context
 
-llm = AsyncLiteLLMRouterLLM.from_env()          # falls back from LLM_MODEL to LLM_FALLBACK_MODEL; retries live only at this layer
+llm = LiteLLMRouterLLM.from_env()          # falls back from LLM_MODEL to LLM_FALLBACK_MODEL; retries live only at this layer
 policy = CedarPolicy("policies.cedar", "schema.cedarschema", tools=TOOLS,    # schema-validated at construction; evaluation errors deny
                      context_fn=entity_args_context({"reset_password": {"target_user_id": ("target_user", "User")}}))
-guard = AsyncClassifierGuard(CascadeClassifier([RegexClassifier(), LLMClassifier(llm)], [(0.1, 0.95), (0.5, 0.5)]),
-                             on="input", mode="serial")
-agent = AsyncAgent(llm, TOOLS, hooks=[guard, policy])
+guard = ClassifierGuard(CascadeClassifier([RegexClassifier(), LLMClassifier(llm)], [(0.1, 0.95), (0.5, 0.5)]),
+                        on="input", mode="serial")
+agent = Agent(llm, TOOLS, hooks=[guard, policy])
 ```
 
-**AsyncAgent: bulkheads, deadlines, process isolation, streaming, and cancellation** ([Lesson 30](../lessons/30_async_runtime/README.en.md))
+**`Agent`: bulkheads, deadlines, process isolation, streaming, and cancellation** ([Lesson 30](../lessons/30_async_runtime/README.en.md))
 
 ```python
-from agentkit.aio import AsyncAgent, AsyncOpenAICompatLLM, AsyncResilientLLM, KeyedLimiter, isolated
+import contextlib
+from agentkit import Agent, KeyedLimiter, OpenAICompatLLM, ResilientLLM, isolated, tool
 
-agent = AsyncAgent(
-    AsyncResilientLLM(AsyncOpenAICompatLLM(max_connections=50), max_concurrency=20),  # per-model concurrency ≤ connection pool
-    tools=[search_kb, isolated(run_report)],               # isolated: the sync tool runs in a subprocess and is killed on timeout
+agent = Agent(
+    ResilientLLM(OpenAICompatLLM(max_connections=50), max_concurrency=20),  # per-model concurrency ≤ connection pool
+    tools=[search_kb, isolated(tool(run_report))],         # run_report is a plain module-level function: runs in a subprocess, killed on timeout
     limiter=KeyedLimiter(per_key=5, global_limit=200), limiter_timeout=0.5,   # per-tenant bulkhead; no slot → rate_limited
     run_timeout=120,                                       # deadline for the whole run
+    max_threads=16,                                        # cap on the sync-tool thread pool (default: the event loop's pool)
 )
 async with contextlib.aclosing(agent.stream(text, metadata={"tenant_id": "acme"})) as events:
     async for event in events: ...                         # consumer disconnects → run cancelled, checkpoint records cancelled

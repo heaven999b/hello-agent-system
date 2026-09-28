@@ -309,24 +309,27 @@ flowchart TD
 
 ## 9. 第四部分速查
 
-> 对应第 26–31 课。默认值取自 agentkit 源码（`agentkit/aio`、`agentkit/contrib`）和各课引用的官方文档；它们是起点，不是标准答案，最终以你自己的负载和压测为准。
+> 对应第 26–31 课，以及它们依赖的第 12、13 课的单机多进程版本。默认值取自 agentkit 源码（`agentkit`、`agentkit/distributed`、`agentkit/contrib`）和各课引用的官方文档；它们是起点，不是标准答案，最终以你自己的负载和压测为准。
+>
+> 三层，接口相同：核心 `agentkit`（async，一个进程同时推进很多会话）→ `agentkit.distributed`（SQLite，一台机器上的真多进程）→ `agentkit.contrib` + `production/`（Postgres、Redis、Temporal……，多台机器）。
 
 ### 9.1 组件怎么选
 
 | 要解决的问题 | 默认选择 | 什么时候换 | 课程 |
 |---|---|---|---|
-| 检查点（多实例） | Postgres：jsonb + 版本号 CAS + fence 接管（`PostgresCheckpointer` / `AsyncPostgresCheckpointer`） | 流程跨小时到天、要等人、要可靠的定时器 → Temporal；已经深度使用 LangGraph → 它自带的 checkpointer | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) |
-| 任务队列 | Postgres `FOR UPDATE SKIP LOCKED`（`PostgresJobQueue` / `AsyncPostgresJobQueue`） | 在 AWS 上、不想运维 → SQS；同一份数据要被多方订阅、要回放、写入量太大 → 加 Kafka（和任务队列并存） | [第 26 课](../lessons/26_state_and_queues/README.md) |
-| 幂等 | 下游唯一约束或 Idempotency-Key（底线）+ Redis 缓存（`RedisIdempotencyStore`，可选） | 下游不支持幂等、并发重复的代价又很高 → 加 `claim()` 占位，但它挡不住所有情况 | [第 26 课](../lessons/26_state_and_queues/README.md) |
-| 跨实例限流 | Redis Lua 令牌桶（`RedisTokenBucket` + `RateLimitHook`，异步版带 `Async` 前缀） | 多个团队共用一个模型出口 → 网关的团队预算；厂商配额是最后一道墙，不是限流方案 | [第 26 课](../lessons/26_state_and_queues/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 检查点（多进程 / 多实例） | 版本号 CAS + fence 接管，接口相同：一台机器用 SQLite（`SQLiteCheckpointer`），多台机器用 Postgres jsonb（`PostgresCheckpointer`） | 要跨机器，或者单写者到顶、减少写入也不够 → Postgres；流程跨小时到天、要等人、要可靠的定时器 → Temporal；已经深度使用 LangGraph → 它自带的 checkpointer | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 27 课](../lessons/27_durable_workflows/README.md) |
+| 任务队列 | 一台机器：`SQLiteJobQueue`；多台机器：Postgres `FOR UPDATE SKIP LOCKED`（`PostgresJobQueue`）。两者都交给同一个 `run_worker` | 在 AWS 上、不想运维 → SQS；同一份数据要被多方订阅、要回放、写入量太大 → 加 Kafka（和任务队列并存） | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 幂等 | 下游唯一约束或 Idempotency-Key（底线）+ 共享缓存（单机 `SQLiteIdempotencyStore`，多机 `RedisIdempotencyStore`，可选） | 下游不支持幂等、并发重复的代价又很高 → 加 `claim()` 占位，但它挡不住所有情况 | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
+| 跨进程 / 跨实例限流 | 单机：`SQLiteTokenBucket`；多机：Redis Lua 令牌桶（`RedisTokenBucket` + `RateLimitHook`） | 多个团队共用一个模型出口 → 网关的团队预算；厂商配额是最后一道墙，不是限流方案 | [第 12 课](../lessons/12_production_architecture/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) · [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
+| 跨进程并发配额 | 进程内 `KeyedLimiter` 做自我保护，再加共享名额：单机 `SQLiteSemaphore`（带租约，持有者被 kill -9 后自动归还），多机 Redis 或网关限额 | 只有一个进程 → `ResilientLLM(max_concurrency=…)` 就够；进程一多，各自的上限会相加（第 30 课场景 5b：3 个进程各限 4，网关实测同时收到 12 个） | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
 | 锁 | 尽量不用：改成"任务 + 幂等键"；资源就在 Postgres 里 → `pg_advisory_xact_lock` | 跨系统、正确性要求高 → etcd（revision 当 fencing token）；只为效率 → `RedisLock` | [第 26 课](../lessons/26_state_and_queues/README.md) |
-| 长流程、审批、定时 | AsyncAgent + Postgres 检查点 + 租约队列 | "超过 30 分钟 / 要等人 / 有定时动作 / 失败要人工善后 / 有人运维"中满足任意两条 → Temporal（`make_worker` / `start_agent`） | [第 27 课](../lessons/27_durable_workflows/README.md) |
+| 长流程、审批、定时 | `Agent` + 带 fence 的检查点 + 租约队列（`AgentJobHandler`） | "超过 30 分钟 / 要等人 / 有定时动作 / 失败要人工善后 / 有人运维"中满足任意两条 → Temporal（`make_worker` / `start_agent`） | [第 27 课](../lessons/27_durable_workflows/README.md) |
 | 追踪 | OTel + GenAI 语义约定 + OTLP → Collector（`OTelTracer`） | 需要看对话、做在线评估 → Collector 再分一路给能自托管的 LLM 平台 | [第 28 课](../lessons/28_production_observability/README.md) |
 | 指标与告警 | `PrometheusHook` 全量计数 + 多窗口多燃烧率告警 | 组织统一用 OTel Metrics → 用 OTLP 发指标；高基数维度 → 放进 trace 和日志 | [第 28 课](../lessons/28_production_observability/README.md) |
 | 模型出口 | 单个服务：进程内 `LiteLLMRouterLLM`；多个服务：LiteLLM Proxy 或云厂商的 AI 网关 | 已经深度使用某朵云 → 它的网关；要自托管、多云 → 自建开源网关 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
 | 权限策略 | 规则少、只有一个团队 → `PermissionPolicy`；跨团队、要评审、要 ABAC → Cedar（`CedarPolicy`） | 平台已经统一用 OPA → OPA；产品核心是层级共享 → OpenFGA | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
 | 注入检测 | 级联：正则 → LLM 评委（`CascadeClassifier`） | 高流量、英文为主 → 中间加一级 Prompt Guard 类小模型；已在某朵云上且合规允许 → 托管护栏服务 | [第 29 课](../lessons/29_gateway_and_guardrails/README.md) |
-| 并发模型 | 每个 CPU 核一个进程，每个进程一个事件循环（一个 `AsyncAgent` 实例被所有会话复用） | 任务超过一两分钟或者不能白跑 → 队列 + worker（worker 里仍是 `AsyncAgent`）；不可信代码 → 容器或 microVM | [第 30 课](../lessons/30_async_runtime/README.md) |
+| 并发模型 | 每个 CPU 核一个进程，每个进程一个事件循环（一个 `Agent` 实例被所有会话复用） | 任务超过一两分钟或者不能白跑 → 队列 + worker 进程（`run_worker`，worker 里仍是同一个 `Agent`）；不可信代码 → 容器或 microVM | [第 02 课](../lessons/02_agent_loop/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
 | 流式协议 | SSE + 断开即取消 + 按 `run_id` 恢复 | 语音、需要中途插话 → WebSocket；长任务、不能白跑 → 断开不取消，事件写进缓冲区，按 `Last-Event-ID` 重放 | [第 30 课](../lessons/30_async_runtime/README.md) · [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
 | 部署与扩缩容 | API 和 worker 分开部署；worker 按队列积压扩缩（KEDA 的 `postgresql` scaler 或 HPA 外部指标） | — | [第 31 课](../lessons/31_deployment_and_scaling/README.md) |
 
@@ -334,11 +337,12 @@ flowchart TD
 
 | 参数 | 起点 | 取值思路 |
 |---|---|---|
-| 租约 / 心跳 | 租约 30 秒（`run_worker` / `run_async_worker` 的默认值），心跳 = 租约的 1/3（默认） | 心跳不超过租约的一半，否则一次 GC 停顿就丢租约；长任务靠续租，不靠把租约拉长 |
-| 异步 worker 并发 | 从 16–64 开始（`run_async_worker` 默认 16），每个 CPU 核一个进程 | 按模型配额和内存调，不按 CPU |
+| 租约 / 心跳 | 租约 30 秒（`run_worker(lease_seconds=30)`），心跳 = 租约的 1/3（`heartbeat_interval=None` 时） | 心跳不超过租约的一半，否则一次 GC 停顿就丢租约；长任务靠续租，不靠把租约拉长 |
+| worker 并发 | 从 16–64 开始（`run_worker` 默认 16；worker 命令行 `--concurrency` 默认 8），每个 CPU 核一个进程 | 按模型配额和内存调，不按 CPU；进程多了先看共享数据库的写锁（SQLite 单写者，第 13 课 3.12 节） |
+| SQLite（单机多进程） | WAL + `synchronous=NORMAL`，写事务一律 `BEGIN IMMEDIATE`，`busy_timeout` 30 秒（`SQLiteDB` 的默认值） | 同一时刻只有一个写者：第 13 课在一台 M1 上测到每秒约一万次小写事务；WAL 不支持网络文件系统，只能在一台机器上；到顶了先少写几次检查点，再换 Postgres |
 | 数据库连接池 | 先按并发度的 1/4 起步 | 看 `get_stats()` 里的 `requests_queued` 是否持续增长；所有进程加起来 < `max_connections` |
-| 停机宽限期 | `run_async_worker(grace_period=25)`；K8s 的 `terminationGracePeriodSeconds` 默认 30 秒 | 后者 > 前者 + 收尾时间；宽限期不必覆盖最长的任务 |
-| 队列最大尝试次数 | `PostgresJobQueue(max_attempts=5)`，退避从 1 秒起、上限 300 秒 | 领取时计数；限流推迟和停机归还不计入 |
+| 停机宽限期 | `run_worker(grace_period=25)`（命令行 `--grace` 默认 25）；K8s 的 `terminationGracePeriodSeconds` 默认 30 秒 | 后者 > 前者 + 收尾时间；宽限期不必覆盖最长的任务 |
+| 队列最大尝试次数 | `SQLiteJobQueue` / `PostgresJobQueue` 默认 `max_attempts=5`，退避从 1 秒起、上限 300 秒 | 领取时计数；限流推迟和停机归还不计入 |
 | Temporal 工具重试 | 只读 5 次、带幂等键的写 3 次、不幂等的写 1 次（`retry_policy_for`） | Activity 默认不限次数，必须设上限；客户端重试关掉 |
 | Temporal 心跳超时 / 审批超时 | 10 秒 / 24 小时（`AgentInput` 的默认值） | 心跳超时同时决定"多久发现 worker 死了"和"取消多久送达" |
 | Temporal worker 并发 | `max_concurrent_activities`、`max_concurrent_workflow_tasks` 默认各 100 | 前者对齐模型网关的并发配额 |
@@ -346,7 +350,7 @@ flowchart TD
 | 燃烧率告警 | page：1h 与 5m 都 > 14.4，或 6h 与 30m 都 > 6；ticket：3d 与 6h 都 > 1 | 加最小样本数保护；SLO 太松时，燃烧率的上限 1 ÷ (1 − SLO) 会低于阈值 |
 | 租户标签上限 | `PrometheusHook(max_tenants=50)` | 最好再给白名单 `allowed_tenants`，其余归入 `__other__` |
 | 网关重试 | `LiteLLMRouterLLM` 默认 `num_retries=2` | 主模型出错时先重试再降级；面向用户的同步请求调小，或者给整次请求设截止时间 |
-| AsyncAgent 上限 | `max_parallel_tools=8`、`max_threads=32`；`AsyncOpenAICompatLLM(max_connections=100)` | 每个模型的 `max_concurrency` ≤ `max_connections`；设 `run_timeout` 和 `limiter_timeout`，最坏延迟是两者之和 |
+| `Agent` 上限 | `max_parallel_tools=8`、`max_threads=None`（同步工具用事件循环的默认线程池，全进程共享；要独立、有上限的池就设一个数，或注入 `executor=ToolExecutor(...)`）；`OpenAICompatLLM(max_connections=100)` | 每个模型的 `max_concurrency` ≤ `max_connections`；设 `run_timeout` 和 `limiter_timeout`，最坏延迟是两者之和 |
 
 ### 9.3 五个必须会算的数
 
@@ -360,46 +364,81 @@ flowchart TD
 
 ### 9.4 关键代码
 
-**多 worker：Postgres 队列 + fence 检查点 + Redis 幂等与限流**（[第 26 课](../lessons/26_state_and_queues/README.md)）
+下面的片段省略了业务里的 `TOOLS`、`text`、`DSN`、`REDIS_URL` 这类变量。每一段都实际跑过：用的是嵌入式 Postgres、fakeredis 和 Temporal 开发服务器，模型换成了离线替身（`ScriptedLLM`，网关那段用 LiteLLM 的 `mock_response`）。
+
+**单机多进程：SQLite 队列 + fence 检查点 + worker 进程**（[第 12 课](../lessons/12_production_architecture/README.md) · [第 13 课](../lessons/13_distributed_concurrency/README.md)）
 
 ```python
-from psycopg_pool import AsyncConnectionPool
-from agentkit.aio import AsyncAgent, default_async_llm
-from agentkit.contrib.postgres import AgentJobHandler, AsyncPostgresCheckpointer, AsyncPostgresJobQueue, run_async_worker, stop_on_signals
-from agentkit.contrib.redis_store import AsyncRateLimitHook, AsyncRedisIdempotencyStore, AsyncRedisTokenBucket
+# app.py：每个 worker 进程启动时加载一次 → python -m agentkit.distributed.worker --queue sqlite:///jobs.db --app app.py:factory
+from agentkit import Agent, default_llm
+from agentkit.distributed import AgentJobHandler, SQLiteCheckpointer, SQLiteIdempotencyStore, SQLiteJobQueue, WorkerPool
 
-pool = AsyncConnectionPool(DSN, max_size=8, kwargs={"autocommit": True})   # 队列和检查点共用一个池
-queue, ckpt = AsyncPostgresJobQueue(pool), AsyncPostgresCheckpointer(pool)
-limiter = AsyncRateLimitHook(AsyncRedisTokenBucket(REDIS_URL, rate_per_sec=5, capacity=10), wait_timeout=2)
-agent = AsyncAgent(default_async_llm(max_connections=20), TOOLS, checkpointer=ckpt, hooks=[limiter],
-                   idempotency_store=AsyncRedisIdempotencyStore(REDIS_URL))   # 只是缓存，底线是下游唯一约束
-stop = asyncio.Event(); stop_on_signals(stop)                               # SIGTERM → 停止领取、排空
-await run_async_worker(queue, AgentJobHandler(agent, ckpt), worker_id=os.environ["HOSTNAME"],
-                       stop_event=stop, concurrency=32, grace_period=25)   # 每个任务自动用带 fence 的检查点视图
+async def factory(ctx):                                    # ctx.db：和队列同一个 SQLite 文件的连接
+    ckpt, idem = SQLiteCheckpointer(ctx.db), SQLiteIdempotencyStore(ctx.db)
+    await ckpt.setup(); await idem.setup()
+    agent = Agent(default_llm(max_connections=20), TOOLS, checkpointer=ckpt, idempotency_store=idem)
+    return AgentJobHandler(agent, ckpt)                    # 一个 Agent 服务整个进程；每个任务用带 fence 的检查点视图
+
+# API 进程：入队后立刻返回 202；同一个幂等键重复提交，拿到的是同一个任务
+queue = SQLiteJobQueue("jobs.db"); await queue.setup()
+job_id = await queue.enqueue("agent", {"op": "run", "input": text, "run_id": run_id}, tenant_id="acme",
+                             idempotency_key=f"run:{run_id}")
+pool = WorkerPool("sqlite:///jobs.db", "app.py:factory", n=4, concurrency=16).start()   # 本机 4 个真进程
+pool.kill(0); pool.pause(1); pool.terminate(2)             # 故障演练：kill -9 / SIGSTOP / SIGTERM
+```
+
+**多机：Postgres 队列 + fence 检查点 + Redis 幂等与限流**（[第 26 课](../lessons/26_state_and_queues/README.md)）
+
+```python
+import asyncio, os
+from psycopg_pool import AsyncConnectionPool
+from agentkit import Agent, default_llm
+from agentkit.contrib.postgres import AgentJobHandler, PostgresCheckpointer, PostgresJobQueue, run_worker, stop_on_signals
+from agentkit.contrib.redis_store import RateLimitHook, RedisIdempotencyStore, RedisTokenBucket
+
+pool = AsyncConnectionPool(DSN, max_size=8, kwargs={"autocommit": True}, open=False)   # 队列和检查点共用一个池
+await pool.open()                                          # 表由迁移任务建好（queue.setup()、ckpt.setup()）
+queue, ckpt = PostgresJobQueue(pool), PostgresCheckpointer(pool)
+limiter = RateLimitHook(RedisTokenBucket(REDIS_URL, rate_per_sec=5, capacity=10), wait_timeout=2)
+agent = Agent(default_llm(max_connections=20), TOOLS, checkpointer=ckpt, hooks=[limiter],
+              idempotency_store=RedisIdempotencyStore(REDIS_URL))   # 只是缓存，底线是下游唯一约束
+stop = asyncio.Event(); stop_on_signals(stop)              # SIGTERM → 停止领取、排空
+await run_worker(queue, AgentJobHandler(agent, ckpt), worker_id=os.environ["HOSTNAME"],
+                 stop_event=stop, concurrency=32, grace_period=25)   # 每个任务自动用带 fence 的检查点视图
+
+# API 进程：同一张队列表，只入队；run_id 已有检查点时，worker 从断点续跑
+await queue.enqueue("agent", {"op": "run", "input": text, "run_id": run_id, "history": history},
+                    tenant_id="acme", idempotency_key=f"run:{run_id}")
 ```
 
 **Temporal：启动、审批、查状态**（[第 27 课](../lessons/27_durable_workflows/README.md)）
 
 ```python
+from agentkit import default_llm
+from agentkit.contrib.redis_store import RedisIdempotencyStore
 from agentkit.contrib.temporal import agent_status, approve, make_worker, start_agent
 
-worker = make_worker(client, "support-agents", lambda: default_async_llm(max_connections=20), TOOLS,
-                     idempotency_store=AsyncRedisIdempotencyStore(REDIS_URL))   # 跨 worker 共享，写工具才按幂等重试
+worker = make_worker(client, "support-agents", lambda: default_llm(max_connections=20), TOOLS,
+                     idempotency_store=RedisIdempotencyStore(REDIS_URL))   # 跨 worker 共享，写工具才按幂等重试
+await worker.run()                                         # worker 进程：一直运行，直到被取消
+
+# API 进程
 handle = await start_agent(client, "订单 A1001 申请退款", {"tenant_id": "acme", "user_id": "u1"},
                            workflow_id="refund-A1001", task_queue="support-agents", approval_timeout_s=24 * 3600)
-st = await agent_status(client, "refund-A1001")                              # query：等待中的审批、调用过的工具
+st = await agent_status(client, "refund-A1001")            # query：等待中的审批、调用过的工具
 await approve(client, "refund-A1001", st.pending_approvals[0]["call_id"], True, by="zhang.manager", wait=True)  # update
 ```
 
 **OpenTelemetry + Prometheus + 跨队列传播**（[第 28 课](../lessons/28_production_observability/README.md)）
 
 ```python
+from agentkit import Agent
 from agentkit.contrib.otel import OTelTracer, PrometheusHook, continue_trace, inject_context, setup_tracing, start_metrics_server
 
 tracer = OTelTracer(setup_tracing("support-agent", sample_ratio=1.0))       # 端点从 OTEL_EXPORTER_OTLP_ENDPOINT 读；默认不采集内容
 metrics = PrometheusHook(tenant_label=True, allowed_tenants={"acme", "globex"})
 start_metrics_server(9464, addr="0.0.0.0")
-agent = AsyncAgent(llm, TOOLS, tracer=tracer, hooks=[tracer, metrics])
+agent = Agent(llm, TOOLS, tracer=tracer, hooks=[tracer, metrics])
 
 payload = {"input": text, "trace": inject_context({})}                      # 生产者：traceparent 随 payload 走
 async with continue_trace(payload["trace"]):                                # worker：接着同一条 trace
@@ -409,28 +448,31 @@ async with continue_trace(payload["trace"]):                                # wo
 **网关 + Cedar + 级联护栏**（[第 29 课](../lessons/29_gateway_and_guardrails/README.md)）
 
 ```python
-from agentkit.contrib.gateway import AsyncLiteLLMRouterLLM
-from agentkit.contrib.guards import AsyncClassifierGuard, CascadeClassifier, LLMClassifier, RegexClassifier
+from agentkit import Agent
+from agentkit.contrib.gateway import LiteLLMRouterLLM
+from agentkit.contrib.guards import CascadeClassifier, ClassifierGuard, LLMClassifier, RegexClassifier
 from agentkit.contrib.policy import CedarPolicy, entity_args_context
 
-llm = AsyncLiteLLMRouterLLM.from_env()          # LLM_MODEL 失败时降级到 LLM_FALLBACK_MODEL；重试只放在这一层
+llm = LiteLLMRouterLLM.from_env()          # LLM_MODEL 失败时降级到 LLM_FALLBACK_MODEL；重试只放在这一层
 policy = CedarPolicy("policies.cedar", "schema.cedarschema", tools=TOOLS,    # 构造时用 schema 校验；求值出错按拒绝
                      context_fn=entity_args_context({"reset_password": {"target_user_id": ("target_user", "User")}}))
-guard = AsyncClassifierGuard(CascadeClassifier([RegexClassifier(), LLMClassifier(llm)], [(0.1, 0.95), (0.5, 0.5)]),
-                             on="input", mode="serial")
-agent = AsyncAgent(llm, TOOLS, hooks=[guard, policy])
+guard = ClassifierGuard(CascadeClassifier([RegexClassifier(), LLMClassifier(llm)], [(0.1, 0.95), (0.5, 0.5)]),
+                        on="input", mode="serial")
+agent = Agent(llm, TOOLS, hooks=[guard, policy])
 ```
 
-**AsyncAgent：舱壁、截止时间、进程隔离、流式与取消**（[第 30 课](../lessons/30_async_runtime/README.md)）
+**`Agent`：舱壁、截止时间、进程隔离、流式与取消**（[第 30 课](../lessons/30_async_runtime/README.md)）
 
 ```python
-from agentkit.aio import AsyncAgent, AsyncOpenAICompatLLM, AsyncResilientLLM, KeyedLimiter, isolated
+import contextlib
+from agentkit import Agent, KeyedLimiter, OpenAICompatLLM, ResilientLLM, isolated, tool
 
-agent = AsyncAgent(
-    AsyncResilientLLM(AsyncOpenAICompatLLM(max_connections=50), max_concurrency=20),  # 每个模型的并发 ≤ 连接池
-    tools=[search_kb, isolated(run_report)],               # isolated：同步工具在子进程里跑，超时直接 kill
+agent = Agent(
+    ResilientLLM(OpenAICompatLLM(max_connections=50), max_concurrency=20),  # 每个模型的并发 ≤ 连接池
+    tools=[search_kb, isolated(tool(run_report))],         # run_report 是模块级的普通函数：在子进程里跑，超时直接 kill
     limiter=KeyedLimiter(per_key=5, global_limit=200), limiter_timeout=0.5,   # 按租户的舱壁，排不上就 rate_limited
     run_timeout=120,                                       # 整次运行的截止时间
+    max_threads=16,                                        # 同步工具的线程池上限（不设就用事件循环的默认池）
 )
 async with contextlib.aclosing(agent.stream(text, metadata={"tenant_id": "acme"})) as events:
     async for event in events: ...                         # 消费方断开 → 运行被取消，检查点记为 cancelled

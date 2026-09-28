@@ -290,7 +290,7 @@ Demo 第 4 节的实测：free 套餐（容量 5、每秒补 2 个），2 秒内
 
 **按租户的舱壁**（Demo 第 5 节）是另一种限流：不限"每秒多少次"，而是限"同时有几个在跑"。worker 在把任务交给 Agent 之前先拿两层槽位：进程内的 `KeyedLimiter`（每个租户在一个 worker 里最多 2 个）和跨进程的 `SQLiteSemaphore`（所有 worker 加起来最多 3 个）；拿不到就抛 `RetryLater`，任务放回队列、不消耗重试次数，worker 转去领别的任务。实测 hooli 的 24 个任务：所有 worker 加起来同时最多 3 个、每个 worker 里最多 2 个，被推迟 47 次，没有一个失败。只有进程内的舱壁时，上限是 2 × worker 数，扩容就会放大；跨进程的槽位不随副本数变化。
 
-> 注意：这里的舱壁放在 worker 的 handler 里，而没有用 `Agent(limiter=..., limiter_timeout=...)`。实测发现后者有一个框架问题（已报告给维护者）：Agent 在把用户输入写进状态**之前**就去拿槽位，拿不到时以 `rate_limited` 结束并保存检查点，这个检查点里没有用户的问题；`AgentJobHandler` 推迟后再 `resume`，模型看到的是一段没有用户问题的对话。
+> 注意：这里的舱壁放在 worker 的 handler 里，而没有用 `Agent(limiter=..., limiter_timeout=...)`。写这一课时实测发现后者当时有一个框架 bug：Agent 在把用户输入写进状态**之前**就去拿槽位，拿不到时以 `rate_limited` 结束并保存检查点，这个检查点里没有用户的问题；`AgentJobHandler` 推迟后再 `resume`，模型看到的是一段没有用户问题的对话。**这个 bug 已在框架里修复**：新运行拿不到槽位时不落盘、不跑 `on_run_end`，重试时从头开始（回归测试 `tests/test_runtime.py::test_run_rejected_by_bulkhead_leaves_no_half_checkpoint`）。放在 handler 里的写法仍然正确，而且能跨 worker 进程计数，所以保留。
 
 > 🏭 **生产版**：放在 Redis 里、用 Lua 脚本保证原子性的跨实例令牌桶，以及 Postgres 上的检查点和任务队列，见[第 26 课](../26_state_and_queues/README.md)；用 LiteLLM Router 落地的模型网关、用 Cedar 写成策略文件的权限、分级的分类器护栏，见[第 29 课](../29_gateway_and_guardrails/README.md)；把参考架构真正组装起来的 API + 多 worker 服务、压测、故障注入和扩缩容，见[第 31 课](../31_deployment_and_scaling/README.md)。
 

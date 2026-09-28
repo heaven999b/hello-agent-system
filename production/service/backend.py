@@ -1,7 +1,8 @@
 """IT 服务台的"企业后端"，数据全部在 Postgres 里（多个 API / worker 进程共享同一份）。
 
-capstone 的 Backend 是进程内的字典：它在单进程里讲清了租户隔离和幂等，但换成多进程就失效了 ——
-两个 worker 各有一份字典，"同一个幂等键只建一张单"只在各自进程内成立。这里把同样的约束落到数据库：
+capstone 的 Backend 用一个 SQLite 文件模拟企业系统，API 进程和各 worker 进程共享它（同一台机器上真的跨进程），
+约束也是同一套：每个方法带 tenant_id、UNIQUE (tenant_id, idempotency_key)。但 SQLite 只能在一台机器上共享、
+同一时刻只有一个写者；这里把同样的约束落到 Postgres，多台机器上的进程也能共享：
 
 1. 租户隔离：每个查询都带 tenant_id，没有跨租户的入口。
 2. 幂等下沉到数据所在的地方：it_tickets / it_password_resets 上有 UNIQUE (tenant_id, idempotency_key)，

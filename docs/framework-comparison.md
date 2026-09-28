@@ -30,6 +30,8 @@
 | `PermissionPolicy` / `PauseRun` | 最小权限、人工审批 | [第 09 课](../lessons/09_security/README.md) |
 | `Tracer` / `Span` | 追踪 | [第 10 课](../lessons/10_observability/README.md) |
 | `evals.py` | 评估 | [第 11 课](../lessons/11_evals/README.md) |
+| `Agent` 的 async 运行时（`KeyedLimiter`、`run_timeout`、`stream`） | 一个进程同时服务很多会话：并发上限、按租户的舱壁、截止时间、取消 | [第 02 课](../lessons/02_agent_loop/README.md) · [第 30 课](../lessons/30_async_runtime/README.md) |
+| `agentkit.distributed`（`run_worker`、`SQLiteJobQueue`、`SQLiteCheckpointer.fenced`） | 多个进程之间分工：租约队列、fence 接管、崩溃接手（单机 SQLite；多机换成 `agentkit.contrib` 里接口相同的 Postgres 版） | [第 13 课](../lessons/13_distributed_concurrency/README.md) · [第 26 课](../lessons/26_state_and_queues/README.md) |
 
 > 课程第二部分的 [第 13 课](../lessons/13_distributed_concurrency/README.md)（分布式与高并发）、[第 14 课](../lessons/14_cost_latency/README.md)（成本与延迟）、[第 15 课](../lessons/15_enterprise_rag/README.md)（企业 RAG）、[第 16 课](../lessons/16_release_ops/README.md)（发布与运维）讨论的问题——会话并发写、投递语义、全局限流、缓存隔离、权限感知检索、灰度与回滚——**大多不在 Agent 框架的职责范围内**，而属于你的基础设施层。框架能帮上忙的部分见 2.7（持久化执行）、2.12（重试）、2.13（预算）和 2.9（记忆/检索）；其余需要自己设计，这正是这几节课的价值。
 
@@ -154,7 +156,7 @@ agentkit 的钩子时机：`on_run_start → [before_llm → LLM → after_llm �
 | MS Agent Framework | Workflow 检查点：在每个 superstep 结束时创建，存储后端 `InMemoryCheckpointStorage` / `FileCheckpointStorage` 等；Agent 会话 `AgentSession` 可序列化 | |
 | Temporal | **持久化执行（Durable Execution）**：Event History + Replay（重放）。Workflow 代码必须是确定性的；外部 I/O 放在 Activity | 最彻底的方案。Activity 可能被执行多次，官方建议 Activity 幂等（可用 Workflow Run ID + Activity ID 作为幂等键）——与 agentkit `run_id:call_id` 的思路完全相同 |
 
-> 🔑 **多实例部署时还要注意**：检查点只解决"崩溃后能恢复"，不解决"同一会话被两个 worker 并发写"和"僵尸 worker 在租约过期后仍在写"——这些需要按会话串行化、版本号 CAS 或 fencing token（[第 13 课](../lessons/13_distributed_concurrency/README.md)，[失败模式 D1](failure-modes.md#d1-丢失更新lost-update)、[D2](failure-modes.md#d2-僵尸-workerzombie-worker)）。
+> 🔑 **多实例部署时还要注意**：检查点只解决"崩溃后能恢复"，不解决"同一会话被两个 worker 并发写"和"僵尸 worker 在租约过期后仍在写"——这些需要按会话串行化、版本号 CAS 或 fencing token。agentkit 的做法是带 fence 接管的检查点（单机 `SQLiteCheckpointer`、多机 `PostgresCheckpointer`），并用真实进程的 kill -9 / SIGSTOP 验证过（[第 13 课](../lessons/13_distributed_concurrency/README.md)、[第 26 课](../lessons/26_state_and_queues/README.md)，[失败模式 D1](failure-modes.md#d1-丢失更新lost-update)、[D2](failure-modes.md#d2-僵尸-workerzombie-worker)）。
 
 > 🔑 **通用规律**：所有检查点方案都存在"副作用已执行、但检查点还没写入"的窗口，框架无法替你消除它。**写操作幂等**是唯一的解（见[失败模式 T5](failure-modes.md#t5-重复副作用duplicate-side-effects)）。
 

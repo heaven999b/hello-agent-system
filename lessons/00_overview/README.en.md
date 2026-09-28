@@ -151,7 +151,7 @@ How the lessons map to architecture layers and agentkit modules:
 | 2 | [10](../10_observability/README.en.md) | Observability | Cross-cutting | [`tracing.py`](../../agentkit/tracing.py), [`viewer.py`](../../agentkit/viewer.py) |
 | 2 | [11](../11_evals/README.en.md) | Eval-driven development | Cross-cutting | [`evals.py`](../../agentkit/evals.py) |
 | 2 | [12](../12_production_architecture/README.en.md) | Production architecture overview | All (including access) | Everything combined |
-| 2 | [13](../13_distributed_concurrency/README.en.md) | High concurrency and distributed execution | Execution and scaling | [`distributed/`](../../agentkit/distributed/) (SQLite, multiple processes on one machine) |
+| 2 | [13](../13_distributed_concurrency/README.en.md) | High concurrency and distributed execution | Execution and scaling | [`distributed/`](../../agentkit/distributed/) (SQLite, multiple processes on one machine), [`tools.py`](../../agentkit/tools.py) (idempotency keys); see the lesson (`jobqueue.py`, `session_store.py`, `race.py`) |
 | 2 | [14](../14_cost_latency/README.en.md) | Cost and latency optimization | Model | See the lesson |
 | 2 | [15](../15_enterprise_rag/README.en.md) | Enterprise knowledge and permission-aware RAG | Context and knowledge | See the lesson |
 | 2 | [16](../16_release_ops/README.en.md) | Release, change, and operations | Cross-cutting | See the lesson |
@@ -164,12 +164,12 @@ How the lessons map to architecture layers and agentkit modules:
 | 3 | [22](../22_eval_methodology/README.en.md) | Advanced eval methodology: benchmark design, judge calibration, and statistics | Cross-cutting (ML loop: evaluation) | See the lesson (`evalstats.py`); works with [`evals.py`](../../agentkit/evals.py) |
 | 3 | [23](../23_optimization/README.en.md) | Optimization: prompt optimization, test-time compute, and when to fine-tune | Cross-cutting (ML loop: optimization) | See the lesson (`optkit.py`); works with [`evals.py`](../../agentkit/evals.py) |
 | 3 | [24](../24_coding_agents/README.en.md) | Coding agents and long-running harnesses | Tools, state (application) | See the lesson (`aci_tools.py`, `harness.py`); works with [`tools.py`](../../agentkit/tools.py), [`hooks.py`](../../agentkit/hooks.py) |
-| 3 | [25](../25_proactive_and_frontier/README.en.md) | Proactive agents and the frontier | Access, orchestration (application) | See the lesson (`proactive_kit.py`) |
+| 3 | [25](../25_proactive_and_frontier/README.en.md) | Proactive agents and the frontier | Access, orchestration (application) | See the lesson (`proactive_kit.py`, `proactive_runtime.py`); works with [`distributed/`](../../agentkit/distributed/), [`workflows.py`](../../agentkit/workflows.py) |
 | 4 | [26](../26_state_and_queues/README.en.md) | State, queues, and distributed coordination: Postgres and Redis | State, execution and scaling | [`contrib/postgres.py`](../../agentkit/contrib/postgres.py), [`contrib/redis_store.py`](../../agentkit/contrib/redis_store.py) |
 | 4 | [27](../27_durable_workflows/README.en.md) | Durable workflows: running agents on Temporal | Orchestration, state | [`contrib/temporal.py`](../../agentkit/contrib/temporal.py) |
 | 4 | [28](../28_production_observability/README.en.md) | Production observability: OpenTelemetry, Prometheus, and LLM observability platforms | Cross-cutting | [`contrib/otel.py`](../../agentkit/contrib/otel.py) |
 | 4 | [29](../29_gateway_and_guardrails/README.en.md) | Model gateways, policy as code, and guardrail services | Model, guardrails | [`contrib/gateway.py`](../../agentkit/contrib/gateway.py), [`contrib/policy.py`](../../agentkit/contrib/policy.py), [`contrib/guards.py`](../../agentkit/contrib/guards.py) |
-| 4 | [30](../30_async_runtime/README.en.md) | Async runtime and high-concurrency serving | Orchestration, execution and scaling | [`agent.py`](../../agentkit/agent.py), [`limits.py`](../../agentkit/limits.py), [`timeouts.py`](../../agentkit/timeouts.py) |
+| 4 | [30](../30_async_runtime/README.en.md) | A high-concurrency async runtime in production | Orchestration, execution and scaling | [`agent.py`](../../agentkit/agent.py), [`limits.py`](../../agentkit/limits.py), [`timeouts.py`](../../agentkit/timeouts.py), [`tools.py`](../../agentkit/tools.py), [`reliability.py`](../../agentkit/reliability.py), [`distributed/`](../../agentkit/distributed/) |
 | 4 | [31](../31_deployment_and_scaling/README.en.md) | Deployment and scaling: from one machine to a cluster | Access, execution and scaling | [`production/`](../../production/) |
 
 ### 1.6 The four parts of the course and the learning path
@@ -179,7 +179,7 @@ The course has four parts, and you study them differently:
 | | Part 1: Building blocks | Part 2: Enterprise problems and solutions | Part 3: Advanced — building blocks in depth, the ML loop, and the application frontier | Part 4: Production on mature components |
 |---|---|---|---|---|
 | Lessons | 00–07 | 08–16 | 17–25 | 26–31 |
-| Time | ~140 minutes | ~160 minutes | ~210 minutes | ~175 minutes |
+| Time | ~150 minutes | ~170 minutes | ~210 minutes | ~185 minutes |
 | Role | Core path | Core path | **Advanced, optional**: pick lessons as you need them after the core path and the capstone | **Advanced, optional**: study it when you need to actually deploy an agent and carry multi-instance, high-concurrency load |
 | Goal | **Learn how to build**: what each part of an agent is and how to implement it from scratch | **Learn how to choose**: when a real problem hits in an enterprise, what the options are, what each one costs, and which to pick | **Learn how to go deep**: bring key building blocks up to production grade, make the agent keep improving through data and evals, and see how frontier applications are put together | **Learn how to ship**: swap the teaching implementations for mature components behind the same interfaces, and prove they hold up with real concurrency, real processes, and failure injection |
 | Approach | Concept → build from scratch → exercise | Real problem → compare several solutions → where each fits → recommendation → code | Concept → build from scratch → exercise + trade-off comparison | Why the teaching version falls short → compare component options → how the adapter plugs in → operations and pitfalls → verify by measurement |
@@ -195,12 +195,12 @@ Part 4 answers a different question. The teaching agentkit has a single async co
 
 ```mermaid
 flowchart LR
-    P1["<b>Part 1: Building blocks</b><br/>Learn how to build · ~140 min<br/><br/>00 The big picture · 10m<br/>01 LLM essentials for agent developers · 20m<br/>02 The agent loop · 20m<br/>03 Tool design · 20m<br/>04 Context and memory · 15m<br/>05 Common agent architectures · 20m<br/>06 Orchestration patterns · 15m<br/>07 Engineering perspectives · 20m"]
-    P2["<b>Part 2: Enterprise problems and solutions</b><br/>Learn how to choose · ~160 min<br/><br/>08 Reliability engineering · 20m<br/>09 Security and governance · 20m<br/>10 Observability · 15m<br/>11 Eval-driven development · 20m<br/>12 Production architecture overview · 15m<br/>13 High concurrency and distributed execution · 25m<br/>14 Cost and latency optimization · 15m<br/>15 Permission-aware RAG · 15m<br/>16 Release, change, and operations · 15m"]
+    P1["<b>Part 1: Building blocks</b><br/>Learn how to build · ~150 min<br/><br/>00 The big picture · 10m<br/>01 LLM essentials for agent developers · 20m<br/>02 The agent loop · 30m<br/>03 Tool design · 20m<br/>04 Context and memory · 15m<br/>05 Common agent architectures · 20m<br/>06 Orchestration patterns · 15m<br/>07 Engineering perspectives · 20m"]
+    P2["<b>Part 2: Enterprise problems and solutions</b><br/>Learn how to choose · ~170 min<br/><br/>08 Reliability engineering · 30m<br/>09 Security and governance · 20m<br/>10 Observability · 15m<br/>11 Eval-driven development · 20m<br/>12 Production architecture overview · 15m<br/>13 High concurrency and distributed execution · 25m<br/>14 Cost and latency optimization · 15m<br/>15 Permission-aware RAG · 15m<br/>16 Release, change, and operations · 15m"]
     CP["<b>Capstone</b><br/>ITBuddy · 30m"]
     P3["<b>Part 3: Advanced</b><br/>Building blocks in depth, the ML loop, and the application frontier<br/>Learn how to go deep · ~210 min<br/><br/>17 Retrieval quality · 20m<br/>18 Advanced memory systems · 20m<br/>19 MCP and code sandboxes · 25m<br/>20 From agentkit to frameworks · 25m<br/>21 Agent data · 25m<br/>22 Advanced eval methodology · 25m<br/>23 Optimization · 25m<br/>24 Coding agents · 25m<br/>25 Proactive agents and the frontier · 20m"]
     P1 -->|"Lesson 07's map = Part 2's table of contents"| P2 --> CP
-    P4["<b>Part 4: Production</b><br/>On mature components<br/>Learn how to ship · ~175 min<br/><br/>26 State, queues, and coordination · 30m<br/>27 Durable workflows · 30m<br/>28 Production observability · 25m<br/>29 Gateways, policy, and guardrails · 30m<br/>30 Async runtime · 30m<br/>31 Deployment and scaling · 30m"]
+    P4["<b>Part 4: Production</b><br/>On mature components<br/>Learn how to ship · ~185 min<br/><br/>26 State, queues, and coordination · 30m<br/>27 Durable workflows · 30m<br/>28 Production observability · 25m<br/>29 Gateways, policy, and guardrails · 30m<br/>30 High-concurrency async runtime · 40m<br/>31 Deployment and scaling · 30m"]
     CP -.->|"Advanced, optional"| P3
     CP -.->|"When you ship"| P4
 ```
@@ -209,39 +209,39 @@ flowchart LR
 |---|---|---|---|---|
 | 1 Building blocks | [00 The big picture](README.en.md) | 10 min | 0:10 | A map and the judgment to use it |
 | | [01 LLM essentials for agent developers](../01_llm_essentials/README.en.md) | 20 min | 0:30 | What tokens, sampling, tool calling, structured output, and streaming mean inside an agent |
-| | [02 The agent loop](../02_agent_loop/README.en.md) | 20 min | 0:50 | A main loop you wrote yourself |
-| | [03 Tool design](../03_tools/README.en.md) | 20 min | 1:10 | Tools the model uses correctly and attackers can't misuse |
-| | [04 Context and memory](../04_context_memory/README.en.md) | 15 min | 1:25 | Long conversations that don't overflow, and memory that never leaks across users |
-| | [05 Common agent architectures](../05_agent_architectures/README.en.md) | 20 min | 1:45 | Breaking any agent product down into its architectures, and picking one for a new requirement |
-| | [06 Orchestration patterns](../06_orchestration/README.en.md) | 15 min | 2:00 | Knowing when to use a workflow and when to use an agent |
-| | [07 Engineering perspectives](../07_engineering_perspectives/README.en.md) | 20 min | 2:20 | A 20-dimension review map: general checks + situational checks |
-| 2 Enterprise problems | [08 Reliability engineering](../08_reliability/README.en.md) | 20 min | 2:40 | What to do when you're rate-limited, the model goes down, or the process crashes |
-| | [09 Security and governance](../09_security/README.en.md) | 20 min | 3:00 | Defending against injection, privilege escalation, and data leaks |
-| | [10 Observability](../10_observability/README.en.md) | 15 min | 3:15 | How to investigate when something goes wrong |
-| | [11 Eval-driven development](../11_evals/README.en.md) | 20 min | 3:35 | How to know a prompt change didn't break anything |
-| | [12 Production architecture overview](../12_production_architecture/README.en.md) | 15 min | 3:50 | How the layers fit together into one system |
-| | [13 High concurrency and distributed execution](../13_distributed_concurrency/README.en.md) | 25 min | 4:15 | Multiple instances, queues, concurrent writes, rate limiting, compensation |
-| | [14 Cost and latency optimization](../14_cost_latency/README.en.md) | 15 min | 4:30 | Model routing, caching, cost attribution |
-| | [15 Enterprise knowledge and permission-aware RAG](../15_enterprise_rag/README.en.md) | 15 min | 4:45 | Retrieval that respects permissions, knowledge that stays current, citations you can verify |
-| | [16 Release, change, and operations](../16_release_ops/README.en.md) | 15 min | 5:00 | Progressive rollout, kill switches, rollback, incident response |
-| Capstone | [ITBuddy capstone](../../capstone/README.en.md) | 30 min | 5:30 | Putting it all together |
-| 3 Advanced (optional) | [17 Retrieval quality](../17_retrieval_quality/README.en.md) | 20 min | 5:50 | Measuring retrieval quality with an eval set, and making data-backed choices between sparse / dense / hybrid retrieval, reranking, and chunking |
-| | [18 Advanced memory systems](../18_memory_systems/README.en.md) | 20 min | 6:10 | Cross-session memory that updates, forgets, and can be viewed, corrected, and deleted |
-| | [19 MCP and code-execution sandboxes](../19_mcp_and_sandbox/README.en.md) | 25 min | 6:35 | A hand-written MCP server and client that interoperate with the official SDK, and a sandbox for model-written code |
-| | [20 From agentkit to frameworks](../20_frameworks_bridge/README.en.md) | 25 min | 7:00 | The same task in DSPy, LangGraph, and the OpenAI Agents SDK, and what each framework does for you and hides from you |
-| | [21 Agent data](../21_agent_data/README.en.md) | 25 min | 7:25 | Turning production traces into trustworthy eval sets and training data |
-| | [22 Advanced eval methodology](../22_eval_methodology/README.en.md) | 25 min | 7:50 | Designing benchmarks that can't be gamed, calibrating LLM judges, and using confidence intervals and paired tests to tell real improvements from noise |
-| | [23 Optimization](../23_optimization/README.en.md) | 25 min | 8:15 | Choosing between editing prompts, adding test-time compute, and changing weights, for a concrete reason |
-| | [24 Coding agents](../24_coding_agents/README.en.md) | 25 min | 8:40 | A coding agent that fixes bugs and hands long tasks off across sessions |
-| | [25 Proactive agents and the frontier](../25_proactive_and_frontier/README.en.md) | 20 min | 9:00 | A proactive agent that speaks up only when it should, and informed views on where agents are heading |
-| 4 Production (optional) | [26 State, queues, and distributed coordination](../26_state_and_queues/README.en.md) | 30 min | 9:30 | Checkpoints, job queue, idempotency, rate limits, and locks on Postgres and Redis, with no duplicate side effects even under multi-process kill -9 |
-| | [27 Durable workflows](../27_durable_workflows/README.en.md) | 30 min | 10:00 | Knowing when you need a durable execution engine like Temporal, and splitting an agent into a Workflow plus Activities |
-| | [28 Production observability](../28_production_observability/README.en.md) | 25 min | 10:25 | OpenTelemetry traces stitched across queues, Prometheus metrics, and burn-rate alerts |
-| | [29 Model gateways, policy as code, and guardrail services](../29_gateway_and_guardrails/README.en.md) | 30 min | 10:55 | Gateway routing and fallback, Cedar policies that fail closed, and tiered classifier guardrails |
-| | [30 Async runtime and high-concurrency serving](../30_async_runtime/README.en.md) | 30 min | 11:25 | Hundreds of concurrent sessions in one process: real cancellation, hard timeouts, bulkheads, and streaming |
-| | [31 Deployment and scaling](../31_deployment_and_scaling/README.en.md) | 30 min | 11:55 | Separate API and workers, queue-depth autoscaling, graceful shutdown, load tests, and failure injection |
+| | [02 The agent loop](../02_agent_loop/README.en.md) | 30 min | 1:00 | A main loop you wrote yourself, and why it is async: one process serves many sessions at once |
+| | [03 Tool design](../03_tools/README.en.md) | 20 min | 1:20 | Tools the model uses correctly and attackers can't misuse |
+| | [04 Context and memory](../04_context_memory/README.en.md) | 15 min | 1:35 | Long conversations that don't overflow, and memory that never leaks across users |
+| | [05 Common agent architectures](../05_agent_architectures/README.en.md) | 20 min | 1:55 | Breaking any agent product down into its architectures, and picking one for a new requirement |
+| | [06 Orchestration patterns](../06_orchestration/README.en.md) | 15 min | 2:10 | Knowing when to use a workflow and when to use an agent |
+| | [07 Engineering perspectives](../07_engineering_perspectives/README.en.md) | 20 min | 2:30 | A 20-dimension review map: general checks + situational checks |
+| 2 Enterprise problems | [08 Reliability engineering](../08_reliability/README.en.md) | 30 min | 3:00 | What to do when you're rate-limited, the model goes down, or the process crashes |
+| | [09 Security and governance](../09_security/README.en.md) | 20 min | 3:20 | Defending against injection, privilege escalation, and data leaks |
+| | [10 Observability](../10_observability/README.en.md) | 15 min | 3:35 | How to investigate when something goes wrong |
+| | [11 Eval-driven development](../11_evals/README.en.md) | 20 min | 3:55 | How to know a prompt change didn't break anything |
+| | [12 Production architecture overview](../12_production_architecture/README.en.md) | 15 min | 4:10 | How the layers fit together into one system |
+| | [13 High concurrency and distributed execution](../13_distributed_concurrency/README.en.md) | 25 min | 4:35 | Multiple instances, queues, concurrent writes, rate limiting, compensation |
+| | [14 Cost and latency optimization](../14_cost_latency/README.en.md) | 15 min | 4:50 | Model routing, caching, cost attribution |
+| | [15 Enterprise knowledge and permission-aware RAG](../15_enterprise_rag/README.en.md) | 15 min | 5:05 | Retrieval that respects permissions, knowledge that stays current, citations you can verify |
+| | [16 Release, change, and operations](../16_release_ops/README.en.md) | 15 min | 5:20 | Progressive rollout, kill switches, rollback, incident response |
+| Capstone | [ITBuddy capstone](../../capstone/README.en.md) | 30 min | 5:50 | Putting it all together |
+| 3 Advanced (optional) | [17 Retrieval quality](../17_retrieval_quality/README.en.md) | 20 min | 6:10 | Measuring retrieval quality with an eval set, and making data-backed choices between sparse / dense / hybrid retrieval, reranking, and chunking |
+| | [18 Advanced memory systems](../18_memory_systems/README.en.md) | 20 min | 6:30 | Cross-session memory that updates, forgets, and can be viewed, corrected, and deleted |
+| | [19 MCP and code-execution sandboxes](../19_mcp_and_sandbox/README.en.md) | 25 min | 6:55 | A hand-written MCP server and client that interoperate with the official SDK, and a sandbox for model-written code |
+| | [20 From agentkit to frameworks](../20_frameworks_bridge/README.en.md) | 25 min | 7:20 | The same task in DSPy, LangGraph, and the OpenAI Agents SDK, and what each framework does for you and hides from you |
+| | [21 Agent data](../21_agent_data/README.en.md) | 25 min | 7:45 | Turning production traces into trustworthy eval sets and training data |
+| | [22 Advanced eval methodology](../22_eval_methodology/README.en.md) | 25 min | 8:10 | Designing benchmarks that can't be gamed, calibrating LLM judges, and using confidence intervals and paired tests to tell real improvements from noise |
+| | [23 Optimization](../23_optimization/README.en.md) | 25 min | 8:35 | Choosing between editing prompts, adding test-time compute, and changing weights, for a concrete reason |
+| | [24 Coding agents](../24_coding_agents/README.en.md) | 25 min | 9:00 | A coding agent that fixes bugs and hands long tasks off across sessions |
+| | [25 Proactive agents and the frontier](../25_proactive_and_frontier/README.en.md) | 20 min | 9:20 | A proactive agent that speaks up only when it should, and informed views on where agents are heading |
+| 4 Production (optional) | [26 State, queues, and distributed coordination](../26_state_and_queues/README.en.md) | 30 min | 9:50 | Checkpoints, job queue, idempotency, rate limits, and locks on Postgres and Redis, with no duplicate side effects even under multi-process kill -9 |
+| | [27 Durable workflows](../27_durable_workflows/README.en.md) | 30 min | 10:20 | Knowing when you need a durable execution engine like Temporal, and splitting an agent into a Workflow plus Activities |
+| | [28 Production observability](../28_production_observability/README.en.md) | 25 min | 10:45 | OpenTelemetry traces stitched across queues, Prometheus metrics, and burn-rate alerts |
+| | [29 Model gateways, policy as code, and guardrail services](../29_gateway_and_guardrails/README.en.md) | 30 min | 11:15 | Gateway routing and fallback, Cedar policies that fail closed, and tiered classifier guardrails |
+| | [30 A high-concurrency async runtime in production](../30_async_runtime/README.en.md) | 40 min | 11:55 | Finding by measurement where the ceiling is once load grows (event-loop CPU, the shared database's write lock, model quota), and how the runtime handles cancellation, final saves, bulkheads, and cross-process quotas |
+| | [31 Deployment and scaling](../31_deployment_and_scaling/README.en.md) | 30 min | 12:25 | Separate API and workers, queue-depth autoscaling, graceful shutdown, load tests, and failure injection |
 
-The first two parts' 17 lessons take 5 hours; with the 30-minute capstone that's about 5.5 hours, which is the complete core path. Part 3's 9 lessons take about 3.5 hours and Part 4's 6 lessons about 3 hours. Both are advanced material you can pick from as needed once you finish the core path; the whole course takes about 12 hours. You can skip each lesson's "Going deeper" section at first and come back to it later.
+The first two parts' 17 lessons take 5 hours 20 minutes; with the 30-minute capstone that's 5 hours 50 minutes, which is the complete core path. Part 3's 9 lessons take about 3.5 hours and Part 4's 6 lessons about 3 hours. Both are advanced material you can pick from as needed once you finish the core path; the whole course takes about 12.5 hours. You can skip each lesson's "Going deeper" section at first and come back to it later.
 
 #### The 4-hour fast track
 

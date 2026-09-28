@@ -219,7 +219,7 @@ None of these is always best: conflict frequency, latency requirements, and your
 <details>
 <summary>Answer</summary>
 
-**B.** The first two parts plus the capstone take about 5.5 hours, and by the end you can build and ship an enterprise agent. Part 3 takes about 3.5 hours and comes in three groups — building blocks in depth (17–20), the ML loop (21–23), and the application frontier (24–25) — so you pick lessons to match your project. A is wrong: the fast track skips Part 3 entirely. C is wrong: every lesson has a from-scratch implementation and exercises. D is wrong: Lesson 20's conclusion is exactly that a framework saves you the work of *writing* the loop, not the responsibility of *understanding* it; every layer from the first two parts is still there inside the framework. (README 1.6)
+**B.** The first two parts plus the capstone take about 6 hours (5 hours 50 minutes), and by the end you can build and ship an enterprise agent. Part 3 takes about 3.5 hours and comes in three groups — building blocks in depth (17–20), the ML loop (21–23), and the application frontier (24–25) — so you pick lessons to match your project. A is wrong: the fast track skips Part 3 entirely. C is wrong: every lesson has a from-scratch implementation and exercises. D is wrong: Lesson 20's conclusion is exactly that a framework saves you the work of *writing* the loop, not the responsibility of *understanding* it; every layer from the first two parts is still there inside the framework. (README 1.6)
 </details>
 
 ---
@@ -268,7 +268,7 @@ None of these is always best: conflict frequency, latency requirements, and your
 | 2 | [27 Durable workflows](../27_durable_workflows/README.en.md) | Wait for the approval with a Temporal Signal/Update while the engine persists workflow state; mind determinism and versioning when you deploy |
 | 3 | [28 Production observability](../28_production_observability/README.en.md) | Put the trace context into the queue along with the job, so the worker continues the same trace |
 | 4 | [29 Model gateways, policy as code, and guardrail services](../29_gateway_and_guardrails/README.en.md) | A model gateway handles routing and fallback; Cedar turns permissions into policy files and denies when evaluation fails (fail closed) |
-| 5 | [30 Async runtime and high-concurrency serving](../30_async_runtime/README.en.md) | Per-tenant bulkheads (KeyedLimiter) isolate noisy tenants; cancellation must propagate all the way to the model call and tool that are being awaited (the async basics are in Lesson 02) |
+| 5 | [30 A high-concurrency async runtime in production](../30_async_runtime/README.en.md) | Per-tenant bulkheads (KeyedLimiter) isolate noisy tenants; cancellation must propagate all the way to the model call and tool that are being awaited (the async basics are in Lesson 02) |
 | 6 | [31 Deployment and scaling](../31_deployment_and_scaling/README.en.md) | On SIGTERM, stop taking new jobs and finish or hand back the ones in hand; scale on queue depth rather than CPU |
 
 (README 1.6)

@@ -174,3 +174,24 @@ This repository is bilingual. Every Markdown document has a Chinese version (`xx
 | 按队列积压扩缩容 | queue-depth autoscaling |
 | 压测 / 故障注入 | load test / fault injection |
 | 闭环压测 / 开环压测 / 协调遗漏 | closed-loop / open-loop load test / coordinated omission |
+
+### Async and multi-process terms (Lessons 02, 12, 13, 30) / async 与多进程术语（第 02、12、13、30 课）
+
+| 中文 | English |
+|---|---|
+| 阻塞调用 / 让出事件循环 | blocking call / yield to the event loop |
+| 在途 / 在途峰值 | in flight / peak in-flight (`max_in_flight`) |
+| 取消被吞掉 / 补抛 | swallowed cancellation / re-raise |
+| 取消安全的超时 | cancellation-safe timeout (`agentkit.wait_for`) |
+| 防护令牌 / fence | fencing token / fence (keep `fence` as is when it names the agentkit field) |
+| 续租 / 丢了租约 | renew the lease / lose the lease |
+| 冻结 / 唤醒 | freeze (SIGSTOP) / wake (SIGCONT) |
+| SIGSTOP 僵尸 | SIGSTOP zombie |
+| 网络分区 / 断网 | network partition / cut the network |
+| 单写者 / 写锁 | single writer / write lock |
+| 预写日志 | write-ahead log (WAL) |
+| 单机多进程 / 多机 | multiple processes on one machine / multiple machines |
+| 真进程 / 真信号 / 演出来的 | real processes / real signals / staged (simulated) |
+| 真进程故障注入 | real-process fault injection |
+| 跨进程配额 / 共享名额 | cross-process quota / shared slots |
+| 天花板 | ceiling (capacity ceiling) |
