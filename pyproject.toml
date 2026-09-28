@@ -1,7 +1,7 @@
 [project]
 name = "agentkit"
 version = "0.2.0"
-description = "Hello Agent System：企业级 Agent 系统设计训练营——从零手写一个看得懂的教学框架，再用异步运行时与成熟组件（Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar）落地生产"
+description = "Hello Agent System：企业级 Agent 系统设计训练营——从零手写一个看得懂的 async Agent 框架，在真实的多进程上验证崩溃接手与故障注入，再用成熟组件（Postgres、Redis、Temporal、OpenTelemetry、LiteLLM、Cedar）落地生产"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
