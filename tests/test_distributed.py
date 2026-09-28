@@ -540,3 +540,18 @@ async def test_release_on_cancel_hands_the_job_back_immediately(tmp_path):
     again = await q.claim("w2", lease_seconds=5)
     assert again.id == jid and again.attempts == 1 and again.fence > job.fence
     await q.close()
+
+
+async def test_agent_job_carries_conversation_history(tmp_path):
+    db = SQLiteDB(tmp_path / "h.db")
+    q, ckpt = SQLiteJobQueue(db), SQLiteCheckpointer(db)
+    await q.setup()
+    await ckpt.setup()
+    llm = ScriptedLLM(responder=lambda m: reply(f"你之前说的是：{m[-3]['content']}"))
+    handler = AgentJobHandler(Agent(llm, [], checkpointer=ckpt), ckpt)
+    history = [{"role": "user", "content": "我的工号是 E-42"}, {"role": "assistant", "content": "记住了"}]
+    await q.enqueue("run", {"op": "run", "input": "我的工号是多少？", "history": history}, tenant_id="acme")
+    await run_worker(q, handler, worker_id="w", stop_event=asyncio.Event(), poll_interval=0.01, max_jobs=1)
+    job = (await q.list_jobs())[0]
+    assert job.result["output"] == "你之前说的是：我的工号是 E-42"
+    await db.close()

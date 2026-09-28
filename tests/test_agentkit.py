@@ -789,3 +789,19 @@ async def test_timeout_raised_by_the_tool_itself_is_not_reported_as_our_timeout(
     for name in ("call_upstream", "call_upstream_sync"):
         r = await reg.execute(ToolCall("1", name, "{}"))
         assert r.error_type == "exception" and "upstream 504" in r.detail, (name, r)
+
+
+async def test_run_eval_accepts_async_agent_factory():
+    async def make():
+        return Agent(ScriptedLLM([reply("3")]), [add])
+
+    report = await run_eval(make, [EvalCase("a", "1+2", expect={"must_contain": ["3"]})])
+    assert report.pass_rate == 1.0
+
+
+def test_audit_log_keeps_bounded_history_in_memory(tmp_path):
+    audit = AuditLog(tmp_path / "a.jsonl", keep_last=3)
+    for i in range(10):
+        audit._write({"i": i})
+    assert [r["i"] for r in audit.records] == [7, 8, 9]
+    assert len((tmp_path / "a.jsonl").read_text().splitlines()) == 10  # 文件里是完整的

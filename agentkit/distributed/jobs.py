@@ -407,7 +407,7 @@ class AgentJobHandler:
         （例如按租户选模型）。想共用线程池，就在工厂里给每个 Agent 传同一个 executor=ToolExecutor(...)。
 
     payload 格式：
-        {"op": "run", "input": "...", "metadata": {...}, "run_id": "可选"}
+        {"op": "run", "input": "...", "metadata": {...}, "run_id": "可选", "history": [多轮对话的前几轮，可选]}
         {"op": "resume", "run_id": "...", "approvals": {"call_id": true}, "by": "审批人", "comment": "可选"}
 
     - run_id 默认 f"job-{job.id}"：由任务决定而不是随机生成，接手的 worker 才能找到同一个检查点、算出同样的幂等键。
@@ -503,7 +503,8 @@ class AgentJobHandler:
                     raise PermanentJobError("run 任务缺少 input")
                 else:
                     metadata = {**(p.get("metadata") or {}), "tenant_id": job.tenant_id}
-                    result = await agent.run(p["input"], metadata=metadata, run_id=run_id, **kw)
+                    # history：多轮对话的前几轮（RunResult.history）。不带它，走队列的每一轮都会"失忆"
+                    result = await agent.run(p["input"], history=p.get("history"), metadata=metadata, run_id=run_id, **kw)
             else:
                 run_id = p.get("run_id")
                 state = await ckpt.load(run_id) if run_id else None

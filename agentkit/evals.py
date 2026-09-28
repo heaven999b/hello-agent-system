@@ -184,7 +184,7 @@ def load_cases(path: str | Path) -> list[EvalCase]:
 
 
 async def run_eval(
-    make_agent: Callable[[], Agent],
+    make_agent: Callable[[], Agent | Awaitable[Agent]],
     cases: Iterable[EvalCase],
     graders: Iterable[Grader] = (rule_grader,),
     *,
@@ -199,7 +199,7 @@ async def run_eval(
     graders = list(graders)
 
     async def one(case: EvalCase) -> CaseResult:
-        agent = make_agent()
+        agent = await maybe_await(make_agent())  # 工厂可以是普通函数，也可以是 async 函数（比如要先打开数据库）
         t0 = time.perf_counter()
         res = await agent.run(case.input, metadata=case.metadata)
         latency = (time.perf_counter() - t0) * 1000

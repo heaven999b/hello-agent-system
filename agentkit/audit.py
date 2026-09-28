@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import time
 from pathlib import Path
@@ -17,9 +18,11 @@ from .hooks import Hook
 
 
 class AuditLog(Hook):
-    def __init__(self, path: str | Path | None = None):
+    def __init__(self, path: str | Path | None = None, keep_last: int = 1000):
         self.path = Path(path) if path else None
-        self.records: list[dict] = []
+        # 内存里只留最近 keep_last 条（方便测试和打印）：长期运行的 worker 进程不会因为审计把内存吃光。
+        # 完整记录在 path 指向的文件里；多个进程共享、要能查询的审计请写数据库（见 capstone 的 AuditStore）
+        self.records: collections.deque[dict] = collections.deque(maxlen=keep_last)
 
     def _write(self, record: dict) -> None:
         self.records.append(record)
